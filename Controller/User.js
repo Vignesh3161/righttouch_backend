@@ -208,8 +208,6 @@ export const resendOtp = async (req, res) => {
 //  Verify OTP
 
 export const verifyOtp = async (req, res) => {
-  const session = await mongoose.startSession();
-
   try {
     const { tempUserId, otp } = req.body;
 
@@ -217,91 +215,61 @@ export const verifyOtp = async (req, res) => {
       return res.status(400).json({ message: "TempUser ID and OTP are required" });
     }
 
-    // Start MongoDB Transaction
-    session.startTransaction();
-
-    // 1️⃣ Get latest OTP record
-    const otpRecord = await Otp.findOne({ userId: tempUserId })
-      .sort({ createdAt: -1 })
-      .session(session);
+    // Get latest OTP
+    const otpRecord = await Otp.findOne({ userId: tempUserId }).sort({ createdAt: -1 });
 
     if (!otpRecord) {
-      await session.abortTransaction();
       return res.status(404).json({ message: "OTP not found for this user" });
     }
 
-    // 2️⃣ Check expiry
     if (otpRecord.expiresAt < Date.now()) {
-      await session.abortTransaction();
       return res.status(400).json({ message: "OTP expired" });
     }
 
-    // 3️⃣ Check match
     if (otpRecord.otp !== otp) {
-      await session.abortTransaction();
       return res.status(400).json({ message: "Invalid OTP" });
     }
 
-    // 4️⃣ Mark OTP verified
+    // Mark verified
     otpRecord.isVerified = true;
-    await otpRecord.save({ session });
+    await otpRecord.save();
 
-    // 5️⃣ Update TempUser status
-    const tempUser = await TempUser.findByIdAndUpdate(
-      tempUserId,
-      { tempstatus: "Verified" },
-      { new: true, session }
-    );
-
+    // Get temp user
+    const tempUser = await TempUser.findById(tempUserId);
     if (!tempUser) {
-      await session.abortTransaction();
       return res.status(404).json({ message: "TempUser not found" });
     }
 
-    // 6️⃣ Create User from TempUser
-    const newUser = await User.create(
-      [
-        {
-          firstName: tempUser.firstName,
-          lastName: tempUser.lastName,
-          username: tempUser.username,
-          gender: tempUser.gender,
-          mobileNumber: tempUser.mobileNumber,
-          email: tempUser.email,
-          password: tempUser.password,
-          role: tempUser.role,
-          locality: tempUser.locality,
-          tempstatus: "Expired"
-        },
-      ],
-      { session }
-    );
+    // Create final user
+    const newUser = await User.create({
+      firstName: tempUser.firstName,
+      lastName: tempUser.lastName,
+      username: tempUser.username,
+      gender: tempUser.gender,
+      mobileNumber: tempUser.mobileNumber,
+      email: tempUser.email,
+      password: tempUser.password,
+      role: tempUser.role,
+      locality: tempUser.locality
+    });
 
-    // 7️⃣ Delete TempUser
-    await TempUser.findByIdAndDelete(tempUserId, { session });
-
-    // 8️⃣ Commit Transaction
-    await session.commitTransaction();
-    session.endSession();
+    // Cleanup
+    await TempUser.findByIdAndDelete(tempUserId);
+    await Otp.deleteMany({ userId: tempUserId });
 
     return res.status(200).json({
       message: "OTP verified and user created successfully",
-      user: newUser[0],
+      user: newUser
     });
 
   } catch (error) {
     console.error("verifyOtp Error:", error);
-
-    await session.abortTransaction();
-    session.endSession();
-
     return res.status(500).json({
       message: "Server error",
       error: error.message,
     });
   }
 };
-
 
 
 // Create Password and Move to User
