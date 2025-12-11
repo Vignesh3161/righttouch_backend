@@ -79,9 +79,9 @@ router.get("/getallusers", Auth,authorizeRoles('Owner'), getAllUsers);
 router.get("/getuserbyid/:id", getUserById);
 router.get("/getMyProfile", Auth, getMyProfile);
 
-router.put("/changepassword", Auth, changePassword);
-router.post("/requestPasswordResetOtp", Auth, requestPasswordResetOtp);
-router.post("/verifyPasswordResetOtp", Auth, verifyPasswordResetOtp);
+router.post("/requestPasswordResetOtp",  requestPasswordResetOtp);
+router.post("/verifyPasswordResetOtp",  verifyPasswordResetOtp);
+router.put("/changepassword",  changePassword);
 router.post("/resetPassword", Auth, resetPassword);
 
 // ******category**********
