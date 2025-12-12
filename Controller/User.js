@@ -8,8 +8,12 @@ import mongoose from "mongoose";
 
 // ---------- Helpers ----------
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// // Password regex: min 6 chars, 1 letter, 1 number (keeps original intent)
+// const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,}$/;
+
 // Password regex: min 6 chars, 1 letter, 1 number (keeps original intent)
-const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,}$/;
+const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d).{6,}$/;
+
 
 // Generate Username with collision avoidance
 const generateUsername = async (firstName, mobileNumber) => {
@@ -629,3 +633,4 @@ export const deleteUser = async (req, res) => {
     res.status(500).json({ message: "Server error", error: error.message });
   }
 };
+
