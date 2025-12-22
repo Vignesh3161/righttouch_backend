@@ -2,19 +2,21 @@ import mongoose from "mongoose";
 
 const ProductSchema = new mongoose.Schema({
   productName: {
-    type: String,
-    required: true,
-    trim: true,
-    match: [/^[A-Za-z ]{2,50}$/, "Product name must contain only letters and spaces (2-50 characters)"],
-    set: function (value) {
-      return value
-        .toLowerCase()
-        .split(" ")
-        .filter(Boolean)
-        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-        .join(" ");
-    },
+  type: String,
+  required: true,
+  trim: true,
+  match: [/^[A-Za-z ]{2,50}$/, "Product name must contain only letters and spaces (2-50 characters)"],
+  set: function (value) {
+    if (typeof value !== "string") return value; // ✅ guard
+
+    return value
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
   },
+},
   productDescription: {
     type: String,
     required: true,

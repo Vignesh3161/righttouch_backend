@@ -1,34 +1,40 @@
 import ServiceBook from "../Schemas/ServiceBooking.js";
 
-// Create A new Services
+
+// Create A new Service Booking
 export const serviceBook = async (req, res) => {
   try {
-    const { technicianId, userId, categoryId, serviceId } = req.body;
+    const { technicianId, userId, serviceId, amount } = req.body;
 
-    if (!technicianId || !userId || !categoryId || !serviceId) {
+    if (!technicianId || !userId || !serviceId || amount === undefined) {
       return res.status(400).json({
+        success: false,
         message: "All fields are required",
+        result: "Missing required fields",
       });
     }
 
     const serviceData = await ServiceBook.create({
       technicianId,
       userId,
-      categoryId,
       serviceId,
+      amount,
     });
 
     res.status(201).json({
+      success: true,
       message: "Service booking created successfully",
-      data: serviceData,
+      result: serviceData,
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Server error",
-      error: error.message,
+      result: error.message,
     });
   }
 };
+
 
 export const getAllServiceBooking = async (req, res) => {
   try {
@@ -45,18 +51,22 @@ export const getAllServiceBooking = async (req, res) => {
 
     if (getAllBooking.length === 0) {
       return res.status(404).json({
+        success: false,
         message: "No service booking data found",
+        result: "No service bookings exist"
       });
     }
 
     res.status(200).json({
+      success: true,
       message: "Data fetched successfully",
-      data: getAllBooking,
+      result: getAllBooking
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Error fetching service bookings",
-      error: error.message,
+      result: error.message
     });
   }
 };
@@ -68,7 +78,9 @@ export const serviceBookUpdate = async (req, res) => {
 
     if (!technicianId || !userId || !categoryId || !serviceId) {
       return res.status(400).json({
+        success: false,
         message: "All fields are required",
+        result: "Missing required fields"
       });
     }
 
@@ -79,17 +91,19 @@ export const serviceBookUpdate = async (req, res) => {
     );
 
     if (!updateBooking) {
-      return res.status(404).json({ message: "Booking not found" });
+      return res.status(404).json({ success: false, message: "Booking not found", result: "No booking exists with this ID" });
     }
 
     res.status(200).json({
+      success: true,
       message: "Booking updated successfully",
-      data: updateBooking,
+      result: updateBooking
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Server error",
-      error: error.message,
+      result: error.message
     });
   }
 };
@@ -100,7 +114,9 @@ export const serviceBookingCancel = async (req, res) => {
 
     if (!id) {
       return res.status(400).json({
+        success: false,
         message: "Booking ID is required",
+        result: "Missing booking ID"
       });
     }
 
@@ -112,18 +128,22 @@ export const serviceBookingCancel = async (req, res) => {
 
     if (!cancelBooking) {
       return res.status(404).json({
+        success: false,
         message: "Your booking was not found",
+        result: "No booking exists with this ID"
       });
     }
 
     res.status(200).json({
+      success: true,
       message: "Your booking has been cancelled successfully",
-      data: cancelBooking,
+      result: cancelBooking
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Server error",
-      error: error.message,
+      result: error.message
     });
   }
 };

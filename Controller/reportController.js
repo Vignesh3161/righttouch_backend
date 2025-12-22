@@ -7,7 +7,9 @@ export const userReport = async (req, res) => {
 
     if (!technicianId || !customerId || !serviceId || !complaint || !image) {
       return res.status(400).json({
+        success: false,
         message: "All fields are required",
+        result: "Missing required fields"
       });
     }
 
@@ -20,11 +22,12 @@ export const userReport = async (req, res) => {
     });
 
     res.status(201).json({
+      success: true,
       message: "Report sent successfully",
-      data: reportData,
+      result: reportData
     });
   } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+    res.status(500).json({ success: false, message: "Server error", result: error.message });
   }
 };
 
@@ -56,19 +59,20 @@ export const getAllReports = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "No reports found",
+        result: "No reports match the search criteria"
       });
     }
 
     return res.status(200).json({
       success: true,
       message: "Reports fetched successfully",
-      data: reports,
+      result: reports
     });
   } catch (error) {
     return res.status(500).json({
       success: false,
       message: "Server error",
-      error: error.message,
+      result: error.message
     });
   }
 };
@@ -87,17 +91,19 @@ export const getReportById = async (req, res) => {
 
       if (report.length === 0) {
       return res.status(404).json({
+        success: false,
         message: "No report data found",
+        result: "No report exists with this ID"
       });
     }
 
     if (!report)
       return res
         .status(404)
-        .json({ success: false, message: "Report not found" });
+        .json({ success: false, message: "Report not found", result: "No report exists with this ID" });
 
-    return res.status(200).json({ success: true, data: report });
+    return res.status(200).json({ success: true, message: "Report fetched successfully", result: report });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, message: "Server error", result: error.message });
   }
 };

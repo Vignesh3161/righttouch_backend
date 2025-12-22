@@ -27,14 +27,18 @@ export const service = async (req, res) => {
       active === undefined
     ) {
       return res.status(400).json({
+        success: false,
         message: "All fields are required",
+        result: "Missing required fields"
       });
     }
 
     const matchService = await Service.findOne({ serviceName });
     if (matchService) {
       return res.status(409).json({
+        success: false,
         message: "Service name already registered",
+        result: "Duplicate service found"
       });
     }
 
@@ -52,13 +56,15 @@ export const service = async (req, res) => {
     });
 
     res.status(201).json({
+      success: true,
       message: "Service created successfully",
-      data: serviceData,
+      result: serviceData
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Server error",
-      error: error.message,
+      result: error.message
     });
   }
 };
@@ -85,13 +91,15 @@ export const getAllServices = async (req, res) => {
 
     if (services.length === 0) {
       return res.status(404).json({
+        success: false,
         message: "No service data found",
+        result: "No services match the search criteria"
       });
     }
 
-    return res.status(200).json(services);
+    return res.status(200).json({ success: true, message: "Services fetched successfully", result: services });
   } catch (error) {
-    return res.status(400).json({ message: error.message });
+    return res.status(400).json({ success: false, message: "Server error", result: error.message });
   }
 };
 
@@ -108,13 +116,15 @@ export const getServiceById = async (req, res) => {
 
     if (service.length === 0) {
       return res.status(404).json({
+        success: false,
         message: "No service data found",
+        result: "No service exists with this ID"
       });
     }
-    if (!service) return res.status(404).json({ message: "Service not found" });
-    return res.status(200).json(service);
+    if (!service) return res.status(404).json({ success: false, message: "Service not found", result: "No service exists with this ID" });
+    return res.status(200).json({ success: true, message: "Service fetched successfully", result: service });
   } catch (error) {
-    return res.status(400).json({ message: error.message });
+    return res.status(400).json({ success: false, message: "Server error", result: error.message });
   }
 };
 
@@ -130,15 +140,16 @@ export const updateService = async (req, res) => {
     );
 
     if (!updatedService) {
-      return res.status(404).json({ message: "Service not found" });
+      return res.status(404).json({ success: false, message: "Service not found", result: "No service exists with this ID" });
     }
 
     return res.status(200).json({
+      success: true,
       message: "Service updated successfully",
-      updatedService,
+      result: updatedService
     });
   } catch (error) {
-    return res.status(400).json({ message: error.message });
+    return res.status(400).json({ success: false, message: "Server error", result: error.message });
   }
 };
 
@@ -148,11 +159,11 @@ export const deleteService = async (req, res) => {
     const { id } = req.params;
     const service = await Service.findByIdAndDelete(id);
     if (!service) {
-      return res.status(404).json({ message: "Service not found" });
+      return res.status(404).json({ success: false, message: "Service not found", result: "No service exists with this ID" });
     }
 
-    return res.status(200).json({ message: "Service deleted successfully" });
+    return res.status(200).json({ success: true, message: "Service deleted successfully", result: "Service has been deleted" });
   } catch (error) {
-    return res.status(400).json({ message: error.message });
+    return res.status(400).json({ success: false, message: "Server error", result: error.message });
   }
 };

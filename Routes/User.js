@@ -73,9 +73,8 @@ router.post("/signup", signupAndSendOtp);
 router.post("/login", login);
 router.post("/resendOtp", resendOtp);
 router.post("/verify-otp", verifyOtp);
-// router.post("/create-password", createPassword);
 router.put("/update-user/:id", updateUser);
-router.get("/getallusers", Auth,authorizeRoles('Owner'), getAllUsers);
+router.get("/getallusers", Auth, getAllUsers);
 router.get("/getuserbyid/:id", getUserById);
 router.get("/getMyProfile", Auth, getMyProfile);
 

@@ -5,13 +5,19 @@ const categorySchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true,
-    match: [/^[A-Za-z &]{2,50}$/, "Category name must contain only letters, spaces, or '&' (2-50 characters)"],
+    match: [
+      /^[A-Za-z &]{2,50}$/,
+      "Category name must contain only letters, spaces, or '&' (2-50 characters)",
+    ],
     set: function (value) {
+      if (typeof value !== "string") return value; // ✅ IMPORTANT GUARD
+
       return value
-        .toLowerCase()
-        .split(" ")
-        .filter(Boolean)
-        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+        .trim()
+        .split(/\s+/)
+        .map(
+          (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+        )
         .join(" ");
     },
   },
@@ -20,10 +26,12 @@ const categorySchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+
   image: {
     type: String,
     required: true,
   },
+
   createdAt: {
     type: Date,
     default: Date.now,

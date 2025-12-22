@@ -22,19 +22,19 @@ export const TechnicianData = async (req, res) => {
 
     // ✅ Manual validations
     if (!userId) {
-      return res.status(400).json({ success: false, message: "User ID is required" });
+      return res.status(400).json({ success: false, message: "User ID is required", result: "Missing user ID" });
     }
     if (!panNumber || !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(panNumber)) {
-      return res.status(400).json({ success: false, message: "Invalid or missing PAN number" });
+      return res.status(400).json({ success: false, message: "Invalid or missing PAN number", result: "PAN validation failed" });
     }
     if (!aadhaarNumber || !/^\d{12}$/.test(aadhaarNumber)) {
-      return res.status(400).json({ success: false, message: "Invalid or missing Aadhaar number" });
+      return res.status(400).json({ success: false, message: "Invalid or missing Aadhaar number", result: "Aadhaar validation failed" });
     }
     if (passportNumber && !/^[A-PR-WY][1-9]\d{6}$/.test(passportNumber)) {
-      return res.status(400).json({ success: false, message: "Invalid Passport number" });
+      return res.status(400).json({ success: false, message: "Invalid Passport number", result: "Passport validation failed" });
     }
     if (!drivingLicenseNumber || !/^[A-Z]{2}\d{2}\s\d{11}$/.test(drivingLicenseNumber)) {
-      return res.status(400).json({ success: false, message: "Invalid or missing Driving License number" });
+      return res.status(400).json({ success: false, message: "Invalid or missing Driving License number", result: "Driving license validation failed" });
     }
 
     // ✅ Handle uploaded PDF documents from multer
@@ -74,17 +74,18 @@ export const TechnicianData = async (req, res) => {
     }); 
 
     await technician.save();
-    res.status(201).json({ success: true, data: technician });
+    res.status(201).json({ success: true, message: "Technician created successfully", result: technician });
 
   } catch (err) {
     if (err.code === 11000) {
       // Duplicate key error (unique fields)
       return res.status(400).json({
         success: false,
-        message: `Duplicate value for field: ${Object.keys(err.keyPattern)[0]}`
+        message: `Duplicate value for field: ${Object.keys(err.keyPattern)[0]}`,
+        result: "Duplicate entry found"
       });
     }
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: "Server error", result: err.message });
   }
 };
 
@@ -111,12 +112,12 @@ export const TechnicianAll = async (req, res) => {
 
     const technicians = await Technician.find(query).populate("report"); // virtual populate
 
-    res.status(200).json({ success: true, data: technicians });
+    res.status(200).json({ success: true, message: "Technicians fetched successfully", result: technicians });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Server Error",
-      error: error.message,
+      result: error.message
     });
   }
 };
@@ -129,7 +130,9 @@ export const technicianById = async (req, res) => {
 
     if (!id) {
       return res.status(400).json({
-        message: "Technician ID is required"
+        success: false,
+        message: "Technician ID is required",
+        result: "Missing technician ID"
       });
     }
 
@@ -137,16 +140,19 @@ export const technicianById = async (req, res) => {
 
     if (!technician) {
       return res.status(404).json({
-        message: "Technician not found"
+        success: false,
+        message: "Technician not found",
+        result: "No technician exists with this ID"
       });
     }
 
-    res.status(200).json(technician);
+    res.status(200).json({ success: true, message: "Technician fetched successfully", result: technician });
 
   } catch (error) {
     res.status(500).json({
+      success: false,
       message: "Server Error",
-      error: error.message
+      result: error.message
     });
   }
 };
@@ -173,20 +179,25 @@ export const technicianUpdate =  async (req ,res)=>{
     
     if(!req.params.id){
       return res.status(404).json({
-        message : "Technician id is not found"
+        success: false,
+        message : "Technician id is not found",
+        result: "Missing technician ID"
       })
     }
     if(!technicianUpdateOne){
       return res.status(404).json({
-        message : "Technician is not found"
+        success: false,
+        message : "Technician is not found",
+        result: "No technician exists with this ID"
       })
     }
-    res.status(200).json(technicianUpdateOne);
+    res.status(200).json({ success: true, message: "Technician updated successfully", result: technicianUpdateOne });
 
   } catch (error) {
     res.status(500).json({
+      success: false,
       message : "Server Error",
-      error : error.message
+      result: error.message
     })
   }
 }
@@ -198,7 +209,9 @@ export const technicianDelete = async (req , res)=>{
     const { id } = req.params;
     if(!id){
       return res.status(404).json({
-        message : "Technician id is not found"
+        success: false,
+        message : "Technician id is not found",
+        result: "Missing technician ID"
       })
     }
 
@@ -206,12 +219,16 @@ export const technicianDelete = async (req , res)=>{
 
     if(!technicianDeleteOne){
       return res.status(404).json({
-        message : "Technician id is not found"
+        success: false,
+        message : "Technician id is not found",
+        result: "No technician exists with this ID"
       })
     }
 
     res.status(200).json({
-      message:"Delete successfully..."
+      success: true,
+      message:"Delete successfully...",
+      result: "Technician has been deleted"
     });
     
   } catch (error) {
