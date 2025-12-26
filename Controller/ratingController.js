@@ -112,14 +112,11 @@ export const getRatingById = async (req, res) => {
           select: "username email",
         },
       });
-
-    if (!rating) {
-      return res.status(404).json({
-        success: false,
-        message: "Rating not found",
-        result: "No rating exists with this ID",
-      });
-    }
+    
+    if (!rating)
+      return res
+        .status(404)
+        .json({ success: false, message: "Rating not found", result: "No rating exists with this ID" });
 
     res.status(200).json({
       success: true,

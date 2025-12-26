@@ -88,7 +88,7 @@ const technicianSchema = new mongoose.Schema(
       ref: "ServiceBooking",
       default: null,
     },
-    exprienceYear: {
+    experienceYear: {
       type: Number,
       default: 0,
       min: [0, "Years cannot be negative"],

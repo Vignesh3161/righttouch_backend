@@ -1,14 +1,14 @@
 import mongoose from "mongoose";
 const ProductBookingSchema = new mongoose.Schema({
-  ProductId: {
+  productId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Product",
-    require: true,
+    required: true,
   },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
-    required : true
+    required: true,
   },
   status: {
     type: String,
@@ -20,7 +20,7 @@ const ProductBookingSchema = new mongoose.Schema({
     required: true,
     min: [0, "Amount must be positive"],
   },
-    createdAt: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now },
 
 });
 

@@ -1,115 +1,174 @@
 import mongoose from "mongoose";
 
-const serviceSchema = new mongoose.Schema({
-  categoryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Category",
-    required: true,
-  },
-  serviceName: {
-    type: String,
-    required: true,
-    trim: true,
-    match: [/^[A-Za-z ]{2,50}$/, "service name must contain only letters and spaces (2-50 characters)"],
-    set: function (value) {
-      return value
-        .toLowerCase()
-        .split(" ")
-        .filter(Boolean)
-        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-        .join(" ");
+const serviceSchema = new mongoose.Schema(
+  {
+    // ================= BASIC =================
+    categoryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Category",
+      required: true,
     },
-  },
-  description: {
-    type: String,
-    required: true,
-  },
-  serviceCost: {
-    type: Number,
-    required: true,
-  },
 
-  // commission
-  commissionPercentage: {
-    type: Number,
-    required: true,
-    default: 0,
-    max: [50, "Commission cannot exceed 50%"],
-  },
+    serviceName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
 
-  // auto-calculated amounts
-  CommissionAmount: {
-    type: Number,
-    default: 0,
-  },
-  TechnicianAmount: {
-    type: Number,
-    default: 0,
-  },
+    description: {
+      type: String,
+      required: true,
+    },
 
-  serviceDiscountPercentage: {
-    type: Number,
-    required: true,
-    validate: {
-      validator: function (value) {
-        return value <= 100;
+    // ================= SERVICE TYPE =================
+    serviceType: {
+      type: String,
+      enum: ["Repair", "Installation", "Maintenance", "Inspection"],
+      required: true,
+    },
+
+    pricingType: {
+      type: String,
+      enum: ["fixed", "after_inspection", "per_unit"],
+      default: "fixed",
+    },
+
+    // ================= PRICING =================
+    serviceCost: {
+      type: Number, 
+      required: true,
+    },
+
+    minimumVisitCharge: {
+      type: Number,
+      default: 0,
+    },
+
+    serviceDiscountPercentage: {
+      type: Number,
+      default: 0,
+      max: 100,
+    },
+
+    discountAmount: {
+      type: Number,
+      default: 0,
+    },
+
+    discountedPrice: {
+      type: Number,
+      default: 0,
+    },
+
+    // ================= COMMISSION =================
+    commissionPercentage: {
+      type: Number,
+      default: 0,
+      max: 50,
+    },
+
+    commissionAmount: {
+      type: Number,
+      default: 0,
+    },
+
+    technicianAmount: {
+      type: Number,
+      default: 0,
+    },
+
+    // ================= CONTENT FOR FRONTEND =================
+    whatIncluded: {
+      type: [String],
+      default: [],
+    },
+
+    whatNotIncluded: {
+      type: [String],
+      default: [],
+    },
+
+    serviceImages: {
+      type: [String],
+      default: [],
+    },
+
+    serviceHighlights: {
+      type: [String], // "30-day warranty", "Verified technician"
+      default: [],
+    },
+
+    serviceWarranty: {
+      type: String, // "30 days"
+    },
+
+    cancellationPolicy: {
+      type: String,
+    },
+
+    requiresSpareParts: {
+      type: Boolean,
+      default: false,
+    },
+
+    // ================= TIME & VISIT =================
+    duration: {
+      type: String, // "60–90 mins"
+    },
+
+    siteVisitRequired: {
+      type: Boolean,
+      default: false,
+    },
+
+    // ================= RATING SUMMARY =================
+    ratingSummary: {
+      averageRating: {
+        type: Number,
+        default: 0,
       },
-      message: "Service discount percentage cannot exceed 100%",
+      totalRatings: {
+        type: Number,
+        default: 0,
+      },
+    },
+
+    // ================= FLAGS =================
+    isPopular: {
+      type: Boolean,
+      default: false,
+    },
+
+    isRecommended: {
+      type: Boolean,
+      default: false,
+    },
+
+    isActive: {
+      type: Boolean,
+      default: true,
     },
   },
-  quantity: {
-    type: Number,
-    required: true,
-    default: 1,
-  },
-  active: {
-    type: String,
-    enum: ["active", "inactive"],
-    required: true,
-  },
-  status: {
-    type: String,
-    enum: ["waiting", "accepted", "decline"],
-    required: true,
-    default: "waiting",
-  },
-  duration: {
-    type: String,
-  },
-
-  // discount calculations
-  discountAmount: {
-    type: Number,
-    default: 0,
-  },
-  discountedPrice: {
-    type: Number,
-    default: 0,
-  },
-
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
-});
-
-// Auto-calculation before save
-serviceSchema.pre("save", function (next) {
-  // Step 1: Discount calculation
-  let discountAmount = 0;
-  let discountedPrice = this.serviceCost;
-
-  if (this.serviceDiscountPercentage > 0) {
-    discountAmount = (this.serviceCost * this.serviceDiscountPercentage) / 100;
-    discountedPrice = this.serviceCost - discountAmount;
+  {
+    timestamps: true,
   }
+);
+
+// ================= AUTO CALCULATIONS =================
+serviceSchema.pre("save", function (next) {
+  // Discount
+  const discountAmount =
+    (this.serviceCost * this.serviceDiscountPercentage) / 100;
 
   this.discountAmount = discountAmount;
-  this.discountedPrice = discountedPrice;
+  this.discountedPrice = this.serviceCost - discountAmount;
 
-  // Step 2: Commission & Technician calculation (based on discountedPrice)
-  this.CommissionAmount = (discountedPrice * this.commissionPercentage) / 100;
-  this.TechnicianAmount = discountedPrice - this.CommissionAmount;
+  // Commission
+  this.commissionAmount =
+    (this.discountedPrice * this.commissionPercentage) / 100;
+
+  this.technicianAmount =
+    this.discountedPrice - this.commissionAmount;
 
   next();
 });

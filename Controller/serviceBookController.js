@@ -47,7 +47,7 @@ export const getAllServiceBooking = async (req, res) => {
           path: "userId",
           select: "username email",
         },
-      });;
+      });
 
     if (getAllBooking.length === 0) {
       return res.status(404).json({

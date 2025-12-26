@@ -20,7 +20,7 @@ cloudinary.config({
 const storage = new CloudinaryStorage({
   cloudinary,
   params: async (req, file) => ({
-    folder: "boutique/category", // change folder as needed
+    folder: "boutique/category",
     allowed_formats: ["jpg", "jpeg", "png", "webp"],
     public_id: `${Date.now()}-${file.originalname.split(".")[0]}`,
     transformation: [
@@ -33,7 +33,7 @@ const storage = new CloudinaryStorage({
 });
 
 // --------------------------------------------------
-// ✅ File Filter (Images only)
+// ✅ File Filter (Images only) — FIXED
 // --------------------------------------------------
 const fileFilter = (req, file, cb) => {
   const allowedTypes = [
@@ -43,14 +43,16 @@ const fileFilter = (req, file, cb) => {
     "image/webp",
   ];
 
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(
-      new Error("Only JPG, JPEG, PNG, WEBP images are allowed"),
-      false
+  if (!allowedTypes.includes(file.mimetype)) {
+    return cb(
+      new multer.MulterError(
+        "LIMIT_UNEXPECTED_FILE",
+        "Only JPG, JPEG, PNG, WEBP images are allowed"
+      )
     );
   }
+
+  cb(null, true);
 };
 
 // --------------------------------------------------

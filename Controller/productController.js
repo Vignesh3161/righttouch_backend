@@ -1,258 +1,232 @@
 import Product from "../Schemas/Product.js";
 
-export const product = async (req, res) => {
+/* ================= CREATE PRODUCT (JSON ONLY) ================= */
+export const createProduct = async (req, res) => {
   try {
     const {
       productName,
-      productDescription,
-      productPrice,
-      productDiscountPercentage,
-      productGst,
-      productCount,
-      inStock,
-      productImage,
-      productBrand,
-      productFeatures,
-      warranty,
+      productType,
+      description,
+      pricingModel,
+      estimatedPriceFrom,
+      estimatedPriceTo,
+      siteInspectionRequired,
+      installationDuration,
+      usageType,
+      whatIncluded,
+      whatNotIncluded,
+      technicalSpecifications,
+      warrantyPeriod,
+      amcAvailable,
+      amcPricePerYear,
+      complianceCertificates,
     } = req.body;
 
-    // validation
-    if (
-      !productName ||
-      !productDescription ||
-      !productPrice ||
-      !productDiscountPercentage ||
-      !productGst ||
-      inStock === undefined
-    ) {
+    if (!productName || !productType || !description) {
       return res.status(400).json({
         success: false,
-        message: "All fields are required",
-        result: "Missing required fields"
+        message: "Required fields missing",
       });
     }
 
-    // check product duplication
-    const matchProduct = await Product.findOne({ productName });
-    if (matchProduct) {
-      return res.status(400).json({
-        success: false,
-        message: "Product already registered",
-        result: "Duplicate product found"
-      });
-    }
-
-    // create product
-    const productData = await Product.create({
+    const product = await Product.create({
       productName,
-      productDescription,
-      productPrice,
-      productDiscountPercentage,
-      productGst,
-      productCount,
-      inStock,
-      productImage,
-      productBrand,
-      productFeatures,
-      warranty,
-      status: inStock === 0 ? "Unavailable" : "Available",
+      productType,
+      description,
+      pricingModel,
+      estimatedPriceFrom,
+      estimatedPriceTo,
+      siteInspectionRequired,
+      installationDuration,
+      usageType,
+      whatIncluded,
+      whatNotIncluded,
+      technicalSpecifications,
+      warrantyPeriod,
+      amcAvailable,
+      amcPricePerYear,
+      complianceCertificates,
+      productImages: [], // 👈 images added later
     });
+
+    
 
     res.status(201).json({
       success: true,
       message: "Product created successfully",
-      result: productData
+      result: product,
     });
   } catch (error) {
+    console.log(error)
     res.status(500).json({
-      message: "Server Error",
-      error: error.message,
+      success: false,
+      message: "Server error",
+      result: error.message,
     });
   }
 };
 
+/* ================= UPLOAD PRODUCT IMAGES ================= */
+export const uploadProductImages = async (req, res) => {
+  try {
+    const { productId } = req.body;
+
+    if (!productId) {
+      return res.status(400).json({
+        success: false,
+        message: "Product ID is required",
+      });
+    }
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Product images are required",
+      });
+    }
+
+    const product = await Product.findById(productId);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    const imageUrls = req.files.map(file => file.path);
+    product.productImages.push(...imageUrls);
+    await product.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Product images uploaded successfully",
+      result: product,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      result: error.message,
+    });
+  }
+};
+
+/* ================= GET ALL PRODUCTS ================= */
 export const getProduct = async (req, res) => {
   try {
-    const { search } = req.query;
-
+    const { search, type, usageType, active } = req.query;
     let query = {};
 
-    if (search) {
-      // Try converting search to number
-      const searchAsNumber = Number(search);
+    if (active !== undefined) query.isActive = active === "true";
+    if (type) query.productType = { $regex: type, $options: "i" };
+    if (usageType) query.usageType = usageType;
 
+    if (search) {
       query.$or = [
         { productName: { $regex: search, $options: "i" } },
-        { productDescription: { $regex: search, $options: "i" } },
-        { productBrand: { $regex: search, $options: "i" } },
-        { warranty: { $regex: search, $options: "i" } },
+        { productType: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
       ];
-
-      // If search is a valid number, also search in price
-      if (!isNaN(searchAsNumber)) {
-        query.$or.push({ productPrice: searchAsNumber });
-      }
     }
 
-    const getProduct = await Product.find(query);
+    const products = await Product.find(query).sort({ createdAt: -1 });
 
-    if (getProduct.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No product data found",
-        result: "No products match the search criteria"
-      });
-    }
-
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
-      message: "Fetch data successfully",
-      result: getProduct
+      message: "Products fetched successfully",
+      result: products,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Server Error",
-      result: error.message
+      message: "Server error",
+      result: error.message,
     });
   }
 };
 
+/* ================= GET ONE PRODUCT ================= */
 export const getOneProduct = async (req, res) => {
   try {
-    const { id } = req.params;
-    const getOneProduct = await Product.findById(id);
+    const product = await Product.findById(req.params.id);
 
-    if (!getOneProduct) {
+    if (!product) {
       return res.status(404).json({
         success: false,
         message: "Product not found",
-        result: "No product exists with this ID"
       });
     }
 
     res.status(200).json({
       success: true,
-      message: "Fetch data successfully",
-      result: getOneProduct
+      message: "Product fetched successfully",
+      result: product,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Server Error",
-      result: error.message
+      message: "Server error",
+      result: error.message,
     });
   }
 };
 
-export const deleteProduct = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const deleteProductDate = await Product.findByIdAndDelete(id);
-    if (!deleteProductDate) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found",
-        result: "No product exists with this ID"
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "successfully delete product",
-      result: "Product has been deleted"
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Server Error",
-      result: error.message
-    });
-  }
-};
-
+/* ================= UPDATE PRODUCT ================= */
 export const updateProduct = async (req, res) => {
   try {
-    const productId = req.params.id;
-
-    const existingProduct = await Product.findById(productId);
-    if (!existingProduct) {
-      return res.status(400).json({ success: false, message: "No data provided to update", result: "Missing request body" });
+    const product = await Product.findById(req.params.id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
     }
 
-    // ✅ Allow all updatable fields
-    const allowedFields = [
-      "productName",
-      "productDescription",
-      "productPrice",
-      "productDiscountPercentage",
-      "productGst",
-      "productCount",
-      "inStock",
-      "outStock",
-      "productImage",
-      "productBrand",
-      "productFeatures",
-      "warranty",
-    ];
-
-    const updatePayload = {};
-
-    allowedFields.forEach((field) => {
-      if (req.body[field] !== undefined) {
-        updatePayload[field] = req.body[field];
-      }
-    });
-
-    // ✅ Stock status
-    if (updatePayload.inStock !== undefined) {
-      updatePayload.status =
-        updatePayload.inStock === 0 ? "Unavailable" : "Available";
+    let productImages = product.productImages;
+    if (req.files && req.files.length > 0) {
+      productImages = req.files.map(file => file.path);
     }
 
-    // ✅ Price calculations (safe fallback)
-    const price =
-      updatePayload.productPrice ?? existingProduct.productPrice;
-    const discount =
-      updatePayload.productDiscountPercentage ??
-      existingProduct.productDiscountPercentage;
-    const gst =
-      updatePayload.productGst ?? existingProduct.productGst;
-
-    let discountAmount = 0;
-    let discountedPrice = price;
-
-    if (discount > 0) {
-      discountAmount = (price * discount) / 100;
-      discountedPrice = price - discountAmount;
-    }
-
-    const gstAmount = (discountedPrice * gst) / 100;
-    const finalPrice = discountedPrice + gstAmount;
-
-    updatePayload.discountAmount = discountAmount;
-    updatePayload.discountedPrice = discountedPrice;
-    updatePayload.gstAmount = gstAmount;
-    updatePayload.finalPrice = finalPrice;
-
-    // ✅ Update product
     const updatedProduct = await Product.findByIdAndUpdate(
-      productId,
-      updatePayload,
+      req.params.id,
+      { ...req.body, productImages },
       { new: true, runValidators: true }
     );
 
     res.status(200).json({
       success: true,
       message: "Product updated successfully",
-      data: updatedProduct,
+      result: updatedProduct,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Server Error",
-      result: error.message
+      message: "Server error",
+      result: error.message,
     });
   }
 };
 
+/* ================= DELETE PRODUCT ================= */
+export const deleteProduct = async (req, res) => {
+  try {
+    const deleted = await Product.findByIdAndDelete(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Product deleted successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      result: error.message,
+    });
+  }
+};

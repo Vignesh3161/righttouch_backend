@@ -89,14 +89,6 @@ export const getReportById = async (req, res) => {
         populate: { path: "userId", select: "username email" },
       });
 
-      if (report.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No report data found",
-        result: "No report exists with this ID"
-      });
-    }
-
     if (!report)
       return res
         .status(404)

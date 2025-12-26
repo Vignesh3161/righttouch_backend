@@ -5,7 +5,7 @@ export const Auth = async (req, res, next) => {      // 🔹 Token validation mi
   const token = req.headers.token; // frontend should send header: { token: "<jwt_token>" }
 
   if (!token) {
-    return res.status(401).json({ message: "Authorization token required" });
+    return res.status(401).json({ success: false, message: "Authorization token required", result: "Missing authorization token" });
   }
 
   try {
@@ -17,7 +17,7 @@ export const Auth = async (req, res, next) => {      // 🔹 Token validation mi
 
     next(); // continue to next middleware / controller
   } catch (err) {
-    return res.status(401).json({ message: "Token invalid or expired" });
+    return res.status(401).json({ success: false, message: "Token invalid or expired", result: "Authentication failed" });
   }
 };
 
@@ -27,7 +27,7 @@ export const authorizeRoles = (...allowedRoles) => {
     const token = req.headers.token;
 
     if (!token) {
-      return res.status(401).json({ message: "Authorization token required" });
+      return res.status(401).json({ success: false, message: "Authorization token required", result: "Missing authorization token" });
     }
 
     try {
@@ -37,7 +37,7 @@ export const authorizeRoles = (...allowedRoles) => {
       const user = await UserSchema.findById(decoded.userId).select("-password");
 
       if (!user) {
-        return res.status(404).json({ message: "User not found" });
+        return res.status(404).json({ success: false, message: "User not found", result: "No user exists with this ID" });
       }
 
       // ✅ Case-insensitive role check
@@ -48,14 +48,14 @@ export const authorizeRoles = (...allowedRoles) => {
       if (!isAllowed) {
         return res
           .status(403)
-          .json({ message: `Access denied: ${allowedRoles.join(", ")} only` });
+          .json({ success: false, message: `Access denied: ${allowedRoles.join(", ")} only`, result: "Insufficient permissions" });
       }
 
       // Attach user info to request
       req.user = user;
       next();
     } catch (error) {
-      return res.status(401).json({ message: "Token invalid or expired" });
+      return res.status(401).json({ success: false, message: "Token invalid or expired", result: "Authentication failed" });
     }
   };
 };
