@@ -1,41 +1,25 @@
 {
   "name": "righttouch_backend",
   "version": "1.0.0",
-  "description": "Electorinics Appliances services and products ",
-  "main": "node index.js",
+  "description": "Electorinics Appliances services and products",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "npx nodemon index.js",
+    "start": "node index.js",
     "dev": "nodemon index.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/FlareMindsTech/righttouch_backend.git"
-  },
-  "keywords": [
-    "right",
-    "touch"
-  ],
-  "author": "Flareminds",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/FlareMindsTech/righttouch_backend/issues"
-  },
-  "homepage": "https://github.com/FlareMindsTech/righttouch_backend#readme",
   "dependencies": {
     "bcrypt": "^6.0.0",
     "body-parser": "^2.2.0",
-    "cloudinary": "^2.8.0",
+    "cloudinary": "1.41.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.17.1",
     "multer": "^2.0.2",
-    "multer-storage-cloudinary": "^4.0.0",
+    "multer-storage-cloudinary": "4.0.0",
     "nodemailer": "^7.0.5",
-    "nodemon": "^3.1.10",
     "twilio": "^5.9.0"
   }
 }
