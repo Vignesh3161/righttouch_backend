@@ -1,6 +1,6 @@
  import multer from "multer";
 import { Storage } from "@google-cloud/storage";
-// import sharp from "sharp";
+import sharp from "sharp";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -13,7 +13,7 @@ dotenv.config();
 //   projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
 //   keyFilename: process.env.GOOGLE_CLOUD_KEY_FILE,
 // });
-const storage = new Storage();
+const storage = new Storage(); 
 
 const bucket = storage.bucket(
   process.env.GOOGLE_CLOUD_BUCKET_NAME
@@ -25,7 +25,7 @@ const bucket = storage.bucket(
 
 const multerStorage = multer.memoryStorage();
 
-/* ======================================================
+/* ======================================================/
    FILE FILTER (IMAGES ONLY)
 ====================================================== */
 
@@ -81,16 +81,15 @@ export const uploadToGCS = async (
        IMAGE OPTIMIZATION
     ========================================== */
 
-    // const optimizedBuffer = await sharp(file.buffer)
-    //   .resize({
-    //     width: 1200,
-    //     withoutEnlargement: true,
-    //   })
-    //   .webp({
-    //     quality: 80,
-    //   })
-    //   .toBuffer();
-    const optimizedBuffer = file.buffer;
+    const optimizedBuffer = await sharp(file.buffer)
+      .resize({
+        width: 1200,
+        withoutEnlargement: true,
+      })
+      .webp({
+        quality: 80,
+      })
+      .toBuffer();
 
     const blobStream = blob.createWriteStream({
       resumable: false,
