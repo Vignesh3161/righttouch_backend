@@ -62,7 +62,7 @@ app.use("/api/addresses", AddressRoutes);
 app.use("/api/admin", adminWalletRoutes);
 app.use("/api/dev", DevRoutes);
 
-initBookingCrons(io);
+
 // HTTP SERVER
 const httpServer = createServer(app);
 
@@ -73,8 +73,11 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST"],
   },
 });
+
+
 io.use(socketAuth);
 
+initBookingCrons(io);
 io.on("connection", (socket) => {
   console.log("🔌 Socket Connected:", socket.id);
 
