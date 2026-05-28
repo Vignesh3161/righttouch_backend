@@ -16,6 +16,7 @@ import { socketAuth } from "./Middleware/socketAuth.js";
 import { handleLocationUpdate } from "./Utils/technicianLocation.js";
 import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
+import { initBookingCrons } from "./Utils/bookingCron.js";
 // ENV
 dotenv.config();
 
@@ -61,6 +62,7 @@ app.use("/api/addresses", AddressRoutes);
 app.use("/api/admin", adminWalletRoutes);
 app.use("/api/dev", DevRoutes);
 
+initBookingCrons(io);
 // HTTP SERVER
 const httpServer = createServer(app);
 
