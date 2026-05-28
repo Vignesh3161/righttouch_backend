@@ -6,6 +6,12 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import UserRoutes from "./Routes/User.js";
+import TechnicianRoutes from "./Routes/technician.js";
+import AddressRoutes from "./Routes/address.js";
+import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
+import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
+import DevRoutes from "./Routes/dev.js";
 
 // ENV
 dotenv.config();
@@ -45,7 +51,12 @@ mongoose
 app.get("/", (req, res) => {
   res.send("Cloud Run Working");
 });
-
+app.use("/api/user", UserRoutes);
+app.use("/api/technician", TechnicianRoutes);
+app.use("/api/technician", technicianWalletRoutes);
+app.use("/api/addresses", AddressRoutes);
+app.use("/api/admin", adminWalletRoutes);
+app.use("/api/dev", DevRoutes);
 // HTTP SERVER
 const httpServer = createServer(app);
 
