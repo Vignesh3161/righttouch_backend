@@ -12,11 +12,12 @@ import AddressRoutes from "./Routes/address.js";
 import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
 import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
 import DevRoutes from "./Routes/dev.js";
+import { socketAuth } from "./Middleware/socketAuth.js";
 // ENV
 dotenv.config();
 
 const app = express();
-
+io.use(socketAuth);
 // BASIC MIDDLEWARES
 app.use(cors());
 app.use(helmet());
