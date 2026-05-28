@@ -13,6 +13,9 @@ import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
 import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
 import DevRoutes from "./Routes/dev.js";
 import { socketAuth } from "./Middleware/socketAuth.js";
+import { handleLocationUpdate } from "./Utils/technicianLocation.js";
+import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
+import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
 // ENV
 dotenv.config();
 
@@ -77,7 +80,13 @@ io.on("connection", (socket) => {
     console.log("🔌 Socket Disconnected:", socket.id);
   });
 });
+io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
+  console.log(`🔌 Connected: ${socket.id}`);
 
+  socket.on(SOCKET_EVENTS.DISCONNECT, () => {
+    console.log(`🔌 Disconnected: ${socket.id}`);
+  });
+});
 // START SERVER
 const port = process.env.PORT || 8080;
 
