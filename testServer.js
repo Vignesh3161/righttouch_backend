@@ -49,7 +49,7 @@ mongoose
 
 // ROOT API
 app.get("/", (req, res) => {
-  res.send("Cloud Run Workingggggggggggggggggggg");
+  res.send("Cloud Run Working test server");
 });
 app.use("/api/user", UserRoutes);
 app.use("/api/technician", TechnicianRoutes);
@@ -57,6 +57,7 @@ app.use("/api/technician", technicianWalletRoutes);
 app.use("/api/addresses", AddressRoutes);
 app.use("/api/admin", adminWalletRoutes);
 app.use("/api/dev", DevRoutes);
+import { socketAuth } from "./Middleware/socketAuth.js";
 // HTTP SERVER
 const httpServer = createServer(app);
 
@@ -67,6 +68,8 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST"],
   },
 });
+
+io.use(socketAuth);
 
 io.on("connection", (socket) => {
   console.log("🔌 Socket Connected:", socket.id);
