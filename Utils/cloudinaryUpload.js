@@ -1,6 +1,6 @@
  import multer from "multer";
 import { Storage } from "@google-cloud/storage";
-import sharp from "sharp";
+// import sharp from "sharp";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -9,6 +9,10 @@ dotenv.config();
    GOOGLE CLOUD STORAGE CONFIG
 ====================================================== */
 
+// const storage = new Storage({
+//   projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+//   keyFilename: process.env.GOOGLE_CLOUD_KEY_FILE,
+// });
 const storage = new Storage();
 
 const bucket = storage.bucket(
@@ -77,15 +81,16 @@ export const uploadToGCS = async (
        IMAGE OPTIMIZATION
     ========================================== */
 
-    const optimizedBuffer = await sharp(file.buffer)
-      .resize({
-        width: 1200,
-        withoutEnlargement: true,
-      })
-      .webp({
-        quality: 80,
-      })
-      .toBuffer();
+    // const optimizedBuffer = await sharp(file.buffer)
+    //   .resize({
+    //     width: 1200,
+    //     withoutEnlargement: true,
+    //   })
+    //   .webp({
+    //     quality: 80,
+    //   })
+    //   .toBuffer();
+    const optimizedBuffer = file.buffer;
 
     const blobStream = blob.createWriteStream({
       resumable: false,
