@@ -17,7 +17,6 @@ import { socketAuth } from "./Middleware/socketAuth.js";
 dotenv.config();
 
 const app = express();
-io.use(socketAuth);
 // BASIC MIDDLEWARES
 app.use(cors());
 app.use(helmet());
@@ -69,6 +68,7 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST"],
   },
 });
+io.use(socketAuth);
 
 io.on("connection", (socket) => {
   console.log("🔌 Socket Connected:", socket.id);
