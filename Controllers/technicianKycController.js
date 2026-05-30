@@ -2,7 +2,6 @@ import mongoose from "mongoose";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { getTechnicianJobEligibility } from "../Utils/technicianEligibility.js";
-import { uploadToGCS } from "../Utils/cloudinaryUpload.js";
 
 const isValidObjectId = mongoose.Types.ObjectId.isValid;
 
@@ -259,50 +258,17 @@ export const uploadTechnicianKycDocuments = async (req, res) => {
       });
     }
 
-if (req.files.aadhaarImage) {
-  const aadhaarUrls = [];
+    if (req.files.aadhaarImage) {
+      kyc.documents.aadhaarUrl = req.files.aadhaarImage.map((f) => f.path);
+    }
 
-  for (const file of req.files.aadhaarImage) {
-    const imageUrl = await uploadToGCS(
-      file,
-      "kyc/aadhaar"
-    );
+    if (req.files.panImage) {
+      kyc.documents.panUrl = req.files.panImage.map((f) => f.path);
+    }
 
-    aadhaarUrls.push(imageUrl);
-  }
-
-  kyc.documents.aadhaarUrl = aadhaarUrls;
-}
-
-if (req.files.panImage) {
-  const panUrls = [];
-
-  for (const file of req.files.panImage) {
-    const imageUrl = await uploadToGCS(
-      file,
-      "kyc/pan"
-    );
-
-    panUrls.push(imageUrl);
-  }
-
-  kyc.documents.panUrl = panUrls;
-}
-
-if (req.files.dlImage) {
-  const dlUrls = [];
-
-  for (const file of req.files.dlImage) {
-    const imageUrl = await uploadToGCS(
-      file,
-      "kyc/dl"
-    );
-
-    dlUrls.push(imageUrl);
-  }
-
-  kyc.documents.dlUrl = dlUrls;
-}
+    if (req.files.dlImage) {
+      kyc.documents.dlUrl = req.files.dlImage.map((f) => f.path);
+    }
 
     await kyc.save();
 

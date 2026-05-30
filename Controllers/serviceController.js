@@ -1,7 +1,6 @@
 import mongoose from "mongoose";
 import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
-import { uploadToGCS } from "../utils/cloudinaryUpload.js";
 
 const SERVICE_TYPES = ["Repair", "Installation", "Maintenance", "Inspection"];
 const PRICING_TYPES = ["fixed", "after_inspection", "per_unit"];
@@ -189,16 +188,7 @@ export const uploadServiceImages = async (req, res) => {
       });
     }
 
-    const images = [];
-
-for (const file of req.files) {
-  const imageUrl = await uploadToGCS(
-    file,
-    "services"
-  );
-
-  images.push(imageUrl);
-}
+    const images = req.files.map(file => file.path);
     service.serviceImages.push(...images);
     await service.save();
 
@@ -223,7 +213,7 @@ for (const file of req.files) {
 };
 
 // REMOVE SERVICE IMAGE
-export const removeServiceImage = async (req, res) => { 
+export const removeServiceImage = async (req, res) => {
   try {
     const { serviceId, imageUrl } = req.body;
 
@@ -313,17 +303,7 @@ export const replaceServiceImages = async (req, res) => {
       });
     }
 
-    
-    const images = [];
-
-for (const file of req.files) {
-  const imageUrl = await uploadToGCS(
-    file,
-    "services"
-  );
-
-  images.push(imageUrl);
-}
+    const images = req.files.map(file => file.path);
     service.serviceImages = images;
     await service.save();
 

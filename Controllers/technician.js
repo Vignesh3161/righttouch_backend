@@ -7,7 +7,6 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
 import { handleLocationUpdate } from "../Utils/technicianLocation.js";
-import { uploadToGCS } from "../Utils/cloudinaryUpload.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
@@ -996,16 +995,11 @@ export const uploadProfileImage = async (req, res) => {
       });
     }
 
-const imageUrl = await uploadToGCS(
-  req.file,
-  "profiles"
-);
-
-const technician = await TechnicianProfile.findByIdAndUpdate(
-  technicianProfileId,
-  { profileImage: imageUrl },
-  { new: true, runValidators: true }
-).select("-password");
+    const technician = await TechnicianProfile.findByIdAndUpdate(
+      technicianProfileId,
+      { profileImage: req.file.path },
+      { new: true, runValidators: true }
+    ).select("-password");
 
     if (!technician) {
       return res.status(404).json({

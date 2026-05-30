@@ -273,24 +273,24 @@ App.use((req, res, next) => {
         success: false,
         message: "Request timeout",
         result: "Request took too long to process",
-      }); 
+      });
     }
   });
-  next(); 
+  next();
 });
 
 mongoose.set("strictQuery", false);
 
 mongoose
   .connect(process.env.MONGO_URI, {
-       serverSelectionTimeoutMS: 10000, // 10 seconds
+    serverSelectionTimeoutMS: 10000, // 10 seconds
     socketTimeoutMS: 45000, // 45 seconds
   })
   .then(() => console.log("Connected to MongoDB Atlas..."))
   .catch((err) => console.error("Could not connect to MongoDB...", err));
 
 App.get("/", (req, res) => {
-  res.send("welcome index");
+  res.send("welcome");
 });
 
 // Routes
@@ -342,9 +342,8 @@ App.use((err, req, res, next) => {
   });
 });
 
-const port = parseInt(process.env.PORT, 10) || 8080;
-
-httpServer.listen(port, "0.0.0.0", () => {
+const port = parseInt(process.env.PORT, 10) || 7372;
+httpServer.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
   console.log(`🔌 Socket.IO ready for real-time notifications`);
 });

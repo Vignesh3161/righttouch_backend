@@ -1,6 +1,5 @@
 import Category from "../Schemas/Category.js";
 import mongoose from "mongoose";
-import { uploadToGCS } from "../Utils/cloudinaryUpload.js";
 
 // Escape regex special chars (for safe user-provided search)
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -110,12 +109,7 @@ export const uploadCategoryImage = async (req, res) => {
       });
     }
 
-    const imageUrl = await uploadToGCS(
-  req.file,
-  "categories"
-);
-
-category.image = imageUrl;
+    category.image = req.file.path;
     await category.save();
 
     return res.status(200).json({
