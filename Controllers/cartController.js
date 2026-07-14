@@ -98,11 +98,11 @@ export const addToCart = async (req, res) => {
         const cartItem = await Cart.findOneAndUpdate(
             { customerId, itemType, itemId: targetItemId },
             { $inc: { quantity } },
-            { 
-                new: true, 
-                runValidators: true, 
+            {
+                new: true,
+                runValidators: true,
                 upsert: true,
-                setDefaultsOnInsert: true 
+                setDefaultsOnInsert: true
             }
         ).populate({
             path: "itemId",
@@ -120,7 +120,7 @@ export const addToCart = async (req, res) => {
         // Return in the same shape as getMyCart for consistency
         const obj = cartItem.toObject();
         const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
-        
+
         res.status(200).json({
             success: true,
             message: `${itemType} added to cart`,
@@ -283,6 +283,49 @@ export const getCartById = async (req, res) => {
     } catch (error) {
         if (res.headersSent) return;
         console.error("Get cart by id error:", error);
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: "Failed to fetch cart item",
+            result: { reason: getErrorMessage(error) },
+        });
+    }
+};
+
+/* ================= GET CART BY ID (UNRESTRICTED) ================= */
+export const getCartByIdUnrestricted = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const cartItem = await Cart.findById(id);
+
+        if (!cartItem) {
+            return res.status(404).json({
+                success: false,
+                message: "Cart item not found",
+                result: {},
+            });
+        }
+
+        // Populate the item (uses populate; keeps response shape the same)
+        const model = cartItem.itemType === "product" ? "Product" : "Service";
+        await cartItem.populate({ path: "itemId", model });
+
+        const obj = cartItem.toObject();
+        const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
+        const item = isPopulated ? obj.itemId : null;
+
+        res.status(200).json({
+            success: true,
+            message: "Cart item fetched",
+            result: {
+                ...obj,
+                itemId: isPopulated ? obj.itemId._id : obj.itemId,
+                item,
+            },
+        });
+    } catch (error) {
+        if (res.headersSent) return;
+        console.error("Get cart by id unrestricted error:", error);
         res.status(error.statusCode || 500).json({
             success: false,
             message: "Failed to fetch cart item",
@@ -501,6 +544,37 @@ export const removeFromCart = async (req, res) => {
     }
 };
 
+/* ================= REMOVE FROM CART (UNRESTRICTED) ================= */
+export const removeFromCartUnrestricted = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const cartItem = await Cart.findByIdAndDelete(id);
+
+        if (!cartItem) {
+            return res.status(404).json({
+                success: false,
+                message: "Cart item not found",
+                result: {},
+            });
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Item removed from cart",
+            result: {},
+        });
+    } catch (error) {
+        if (res.headersSent) return;
+        console.error("Remove from cart unrestricted error:", error);
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: "Failed to remove item from cart",
+            result: { reason: getErrorMessage(error) },
+        });
+    }
+};
+
 /* ================= CHECKOUT (WITH TRANSACTION & VALIDATION) ================= */
 export const checkout = async (req, res) => {
     const session = await mongoose.startSession();
@@ -697,9 +771,9 @@ export const checkout = async (req, res) => {
             await session.abortTransaction();
             return res.status(400).json({
                 success: false,
-                message: invalidSchedules.length > 0 
-                  ? "Some items in your cart have outdated schedules. Please refresh your selected date/time."
-                  : "Some items in your cart are no longer available.",
+                message: invalidSchedules.length > 0
+                    ? "Some items in your cart have outdated schedules. Please refresh your selected date/time."
+                    : "Some items in your cart are no longer available.",
                 result: { removedItems, invalidSchedules },
             });
         }

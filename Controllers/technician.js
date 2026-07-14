@@ -169,18 +169,7 @@ export const addTechnicianSkills = async (req, res) => {
       });
     }
 
-    const technician = await TechnicianProfile.findByIdAndUpdate(
-      technicianProfileId,
-      {
-        $addToSet: {
-          skills: { $each: serviceObjectIds.map((sid) => ({ serviceId: sid })) },
-        },
-      },
-      { new: true, runValidators: true }
-    )
-      .populate("skills.serviceId", "serviceName")
-      .select("-password");
-
+    const technician = await TechnicianProfile.findById(technicianProfileId).select("-password");
     if (!technician) {
       return res.status(404).json({
         success: false,
@@ -188,6 +177,19 @@ export const addTechnicianSkills = async (req, res) => {
         result: {},
       });
     }
+
+    // Filter out serviceIds that the technician already has
+    const existingServiceIds = technician.skills.map((skill) => String(skill.serviceId));
+    const newServiceObjectIds = serviceObjectIds.filter((sid) => !existingServiceIds.includes(String(sid)));
+
+    if (newServiceObjectIds.length > 0) {
+      const newSkills = newServiceObjectIds.map((sid) => ({ serviceId: sid }));
+      technician.skills.push(...newSkills);
+      await technician.save();
+    }
+
+    // Populate skills for the response
+    await technician.populate("skills.serviceId", "serviceName");
 
     return res.status(200).json({
       success: true,

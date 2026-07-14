@@ -113,6 +113,8 @@ import {
   updateCartById,
   setCartItemSchedule,
   checkout,
+  getCartByIdUnrestricted,
+  removeFromCartUnrestricted,
 } from "../Controllers/cartController.js";
 
 import { Auth } from "../Middleware/Auth.js";
@@ -336,6 +338,9 @@ router.put("/cart/update", Auth, updateCartItem);
 router.put("/cart/:id", Auth, updateCartById);
 router.post("/cart/set-schedule", Auth, setCartItemSchedule);
 router.delete("/cart/remove/:id", Auth, removeFromCart);
+
+router.get("/carts/:id", getCartByIdUnrestricted);
+router.delete("/cart/removed/:id", removeFromCartUnrestricted);
 
 /* ================= CHECKOUT ================= */
 router.post("/checkout", Auth, checkout);

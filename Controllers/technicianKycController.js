@@ -313,7 +313,7 @@ export const getAllTechnicianKyc = async (req, res) => {
 
     const technicians = technicianIds.length
       ? await TechnicianProfile.find({ _id: { $in: technicianIds } })
-        .select("-__v")
+        .select("-__v -bankDetails")
         .populate({
           path: "userId",
           select: "-password -__v",
@@ -424,7 +424,7 @@ export const getTechnicianKyc = async (req, res) => {
     }
 
     const technician = await TechnicianProfile.findById(technicianId)
-      .select("-__v")
+      .select("-__v -bankDetails")
       .populate({
         path: "userId",
         select: "-password -__v",
@@ -503,7 +503,7 @@ export const getMyTechnicianKyc = async (req, res) => {
     const kyc = await TechnicianKyc.findOne({ technicianId: technicianProfileId })
       .populate({
         path: "technicianId",
-        select: "-__v",
+        select: "-__v -bankDetails",
         populate: {
           path: "userId",
           select: "-password -__v"

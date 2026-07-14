@@ -698,7 +698,10 @@ export const getTechnicianJobHistory = async (req, res) => {
       status: { $in: ["completed", "cancelled"] },
     })
       .populate("customerId", "fname lname mobileNumber email")
-      .populate("serviceId", "serviceName serviceType serviceCost technicianAmount")
+      .populate({
+        path: "serviceId",
+        populate: { path: "categoryId" }
+      })
       .sort({ updatedAt: -1 });
 
     // Remove baseAmount and add technicianAmount from service
@@ -794,7 +797,7 @@ export const getTechnicianCurrentJobs = async (req, res) => {
       })
       .populate({
         path: "serviceId",
-        select: "serviceName serviceType technicianAmount",
+        populate: { path: "categoryId" }
       })
       .sort({ createdAt: -1 });
 
@@ -826,12 +829,7 @@ export const getTechnicianCurrentJobs = async (req, res) => {
         : null;
 
       // Format service details
-      const service = jobObj.serviceId
-        ? {
-          serviceName: jobObj.serviceId.serviceName || "",
-          serviceType: jobObj.serviceId.serviceType || "",
-        }
-        : null;
+      const service = jobObj.serviceId || null;
 
       // Format address details
       let address = null;

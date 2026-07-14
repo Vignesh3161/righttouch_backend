@@ -745,7 +745,7 @@ export const resendOtp = async (req, res) => {
 
     // Generate and hash new OTP
     let otp = generateOtp();
-    if (finalIdentifier === "9876543210") otp = "3161"; // [TESTING_ONLY]
+    if (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") otp = "3161"; // [TESTING_ONLY]
     const hashedOtp = await bcrypt.hash(otp, 10);
 
     // Store new OTP
@@ -816,9 +816,9 @@ export const verifyOtp = async (req, res) => {
     let record = await Otp.findOne(query).sort({ createdAt: -1 });
 
     // [TESTING_ONLY] Bypass for fixed number and OTP
-    if (!record && finalIdentifier === "9876543210" && otp === "3161") {
+    if (!record && (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") && otp === "3161") {
       record = {
-        identifier: "9876543210",
+        identifier: finalIdentifier,
         otp: await bcrypt.hash("3161", 10),
         role: normalizedRole || "Customer",
         purpose: "LOGIN",
@@ -1111,7 +1111,7 @@ export const login = async (req, res) => {
 
       // Generate and hash OTP
       let otp = generateOtp();
-      if (finalIdentifier === "9876543210") otp = "3161"; // [TESTING_ONLY]
+      if (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") otp = "3161"; // [TESTING_ONLY]
       const hashedOtp = await bcrypt.hash(otp, 10);
 
       // Store OTP

@@ -51,7 +51,7 @@ export const Auth = async (req, res, next) => {
 
     next();
   } catch (err) {
-    console.error("Auth Middleware - Error:", err.message);
+    console.error("Auth Middleware - Error:", err.message, "Secret used:", process.env.JWT_SECRET ? `[length: ${process.env.JWT_SECRET.length}]` : "undefined");
     return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
   }
 };
