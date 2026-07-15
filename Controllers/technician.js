@@ -135,6 +135,15 @@ export const addTechnicianSkills = async (req, res) => {
       });
     }
 
+    const { experienceYears } = req.body;
+    if (experienceYears !== undefined && experienceYears > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Experience cannot exceed 15 years",
+        result: {},
+      });
+    }
+
     const serviceIds = normalizeServiceIdsInput(req.body);
     if (serviceIds.length === 0) {
       return res.status(400).json({
@@ -183,7 +192,8 @@ export const addTechnicianSkills = async (req, res) => {
     const newServiceObjectIds = serviceObjectIds.filter((sid) => !existingServiceIds.includes(String(sid)));
 
     if (newServiceObjectIds.length > 0) {
-      const newSkills = newServiceObjectIds.map((sid) => ({ serviceId: sid }));
+      const exp = experienceYears !== undefined ? Number(experienceYears) : 0;
+      const newSkills = newServiceObjectIds.map((sid) => ({ serviceId: sid, experienceYears: exp }));
       technician.skills.push(...newSkills);
       await technician.save();
     }
@@ -591,8 +601,18 @@ export const updateTechnician = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
     }
 
-    if (skills !== undefined && !validateSkills(skills)) {
-      return res.status(400).json({ success: false, message: "Invalid skills format", result: {} });
+    if (experienceYears !== undefined && experienceYears > 15) {
+      return res.status(400).json({ success: false, message: "Experience cannot exceed 15 years", result: {} });
+    }
+
+    if (skills !== undefined) {
+      if (!validateSkills(skills)) {
+        return res.status(400).json({ success: false, message: "Invalid skills format", result: {} });
+      }
+      const hasOverExperience = skills.some(s => s.experienceYears !== undefined && s.experienceYears > 15);
+      if (hasOverExperience) {
+        return res.status(400).json({ success: false, message: "Experience cannot exceed 15 years", result: {} });
+      }
     }
 
     let technician = await TechnicianProfile.findById(technicianProfileId);
