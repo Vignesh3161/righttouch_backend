@@ -76,7 +76,10 @@ import {
   deleteAllCustomerBookings,
   getOwnerAllBookings,
   getOwnerBookingById,
+  getCompletedServices,
+  rebookService,
 } from "../Controllers/serviceBookController.js";
+
 
 import {
   createProduct,
@@ -278,6 +281,11 @@ router.put("/booking/cancel/:id", Auth, cancelBooking);
 router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
+
+/* ================= BOOK AGAIN ================= */
+router.get("/booking/completed-services", Auth, getCompletedServices);
+router.post("/booking/book-again", Auth, rebookService);
+
 
 /* ================= OWNER BOOKING MANAGEMENT ================= */
 router.get("/booking/getAllBookings", getOwnerAllBookings);

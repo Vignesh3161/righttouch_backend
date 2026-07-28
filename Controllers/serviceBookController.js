@@ -1565,3 +1565,7 @@ export const deleteAllCustomerBookings = async (req, res) => {
     });
   }
 };
+
+// 🔄 Re-export Book Again endpoints for modular accessibility
+export { getCompletedServices, rebookService } from "./bookAgainController.js";
+
