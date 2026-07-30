@@ -630,13 +630,56 @@ export const getCustomerBookings = async (req, res) => {
     if (!req.user.userId || !mongoose.Types.ObjectId.isValid(req.user.userId)) {
       return res.status(401).json({ success: false, message: "Invalid token user", result: {} });
     }
-    const bookings = await ServiceBooking.find({
-      customerId: req.user.userId,
-    })
-      .populate("serviceId", "serviceName serviceType serviceCost")
+
+    const { status, paymentStatus, bookingType, search, page, limit } = req.query;
+    const filter = { customerId: req.user.userId };
+
+    // 1️⃣ Filter by Booking Status ("completed", "pending", "accepted", "in_progress", "cancelled", "active", "expired")
+    if (status && typeof status === "string" && status.trim() !== "") {
+      const trimmedStatus = status.trim().toLowerCase();
+      if (trimmedStatus === "active") {
+        filter.status = { $in: ["pending", "accepted", "on_the_way", "reached", "in_progress", "broadcasted", "requested"] };
+      } else {
+        filter.status = trimmedStatus;
+      }
+    }
+
+    // 2️⃣ Filter by Payment Status ("paid", "unpaid", "pending", "refunded")
+    if (paymentStatus && typeof paymentStatus === "string" && paymentStatus.trim() !== "") {
+      const pStatus = paymentStatus.trim().toLowerCase();
+      if (pStatus === "unpaid") {
+        filter.paymentStatus = "pending";
+      } else {
+        filter.paymentStatus = pStatus;
+      }
+    }
+
+    // 3️⃣ Filter by Booking Type ("instant", "schedule", "scheduled")
+    if (bookingType && typeof bookingType === "string" && bookingType.trim() !== "") {
+      const bType = bookingType.trim().toLowerCase();
+      filter.bookingType = bType === "scheduled" ? "schedule" : bType;
+    }
+
+    // 4️⃣ Search Query (Searches address, fault notes, payment order ID, or booking ID)
+    if (search && typeof search === "string" && search.trim().length >= 2) {
+      const searchTerm = search.trim();
+      const searchRegex = new RegExp(searchTerm, "i");
+      filter.$or = [
+        { address: searchRegex },
+        { faultProblem: searchRegex },
+        { paymentOrderId: searchRegex },
+      ];
+      if (mongoose.Types.ObjectId.isValid(searchTerm)) {
+        filter.$or.push({ _id: new mongoose.Types.ObjectId(searchTerm) });
+      }
+    }
+
+    // 5️⃣ Query Execution & Pagination
+    let query = ServiceBooking.find(filter)
+      .populate("serviceId", "serviceName serviceType serviceCost serviceImages description discountedPrice")
       .populate({
         path: "technicianId",
-        select: "userId profileImage workStatus",
+        select: "userId profileImage workStatus ratingSummary",
         populate: {
           path: "userId",
           select: "fname lname mobileNumber"
@@ -644,10 +687,29 @@ export const getCustomerBookings = async (req, res) => {
       })
       .sort({ createdAt: -1 });
 
+    if (page || limit) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.max(1, parseInt(limit, 10) || 20);
+      const skip = (pageNum - 1) * limitNum;
+      query = query.skip(skip).limit(limitNum);
+    }
+
+    const bookings = await query;
+    const totalCount = await ServiceBooking.countDocuments(filter);
+
     return res.status(200).json({
       success: true,
       message: "Customer booking history",
       result: bookings,
+      meta: {
+        totalCount,
+        filtersApplied: {
+          status: status || "all",
+          paymentStatus: paymentStatus || "all",
+          bookingType: bookingType || "all",
+          search: search || null
+        }
+      }
     });
   } catch (err) {
     return res.status(500).json({
@@ -657,6 +719,7 @@ export const getCustomerBookings = async (req, res) => {
     });
   }
 };
+
 
 /* =====================================================
    GET JOB FOR (TECHNICIAN)
