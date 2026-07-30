@@ -98,11 +98,11 @@ export const addToCart = async (req, res) => {
         const cartItem = await Cart.findOneAndUpdate(
             { customerId, itemType, itemId: targetItemId },
             { $inc: { quantity } },
-            { 
-                new: true, 
-                runValidators: true, 
+            {
+                new: true,
+                runValidators: true,
                 upsert: true,
-                setDefaultsOnInsert: true 
+                setDefaultsOnInsert: true
             }
         ).populate({
             path: "itemId",
@@ -120,7 +120,6 @@ export const addToCart = async (req, res) => {
         // Return in the same shape as getMyCart for consistency
         const obj = cartItem.toObject();
         const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
-        
         res.status(200).json({
             success: true,
             message: `${itemType} added to cart`,
@@ -291,6 +290,49 @@ export const getCartById = async (req, res) => {
     }
 };
 
+/* ================= GET CART BY ID (UNRESTRICTED) ================= */
+export const getCartByIdUnrestricted = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const cartItem = await Cart.findById(id);
+
+        if (!cartItem) {
+            return res.status(404).json({
+                success: false,
+                message: "Cart item not found",
+                result: {},
+            });
+        }
+
+        // Populate the item (uses populate; keeps response shape the same)
+        const model = cartItem.itemType === "product" ? "Product" : "Service";
+        await cartItem.populate({ path: "itemId", model });
+
+        const obj = cartItem.toObject();
+        const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
+        const item = isPopulated ? obj.itemId : null;
+
+        res.status(200).json({
+            success: true,
+            message: "Cart item fetched",
+            result: {
+                ...obj,
+                itemId: isPopulated ? obj.itemId._id : obj.itemId,
+                item,
+            },
+        });
+    } catch (error) {
+        if (res.headersSent) return;
+        console.error("Get cart by id unrestricted error:", error);
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: "Failed to fetch cart item",
+            result: { reason: getErrorMessage(error) },
+        });
+    }
+};
+
 /* ================= UPDATE CART BY ID ================= */
 export const updateCartById = async (req, res) => {
     try {
@@ -368,10 +410,116 @@ export const updateCartById = async (req, res) => {
 };
 
 /* ================= SET CART ITEM SCHEDULE ================= */
+// Helper to parse timeSlot range ("02:00 PM - 03:00 PM") or time string ("14:00", "02:00 PM") into HH:MM
+const parseTimeString = (timeInput) => {
+    if (!timeInput || typeof timeInput !== "string") return null;
+    let str = timeInput.trim();
+
+    if (str.includes("-")) {
+        str = str.split("-")[0].trim();
+    }
+
+    const match12 = str.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (match12) {
+        let hours = parseInt(match12[1], 10);
+        const minutes = match12[2];
+        const ampm = match12[3].toUpperCase();
+        if (ampm === "PM" && hours < 12) hours += 12;
+        if (ampm === "AM" && hours === 12) hours = 0;
+        const hh = hours < 10 ? `0${hours}` : `${hours}`;
+        return `${hh}:${minutes}`;
+    }
+
+    const match24 = str.match(/^(\d{1,2}):(\d{2})$/);
+    if (match24) {
+        const hours = parseInt(match24[1], 10);
+        const minutes = match24[2];
+        const hh = hours < 10 ? `0${hours}` : `${hours}`;
+        return `${hh}:${minutes}`;
+    }
+
+    return null;
+};
+
+/**
+ * @route   GET /api/user/cart/schedule-slots
+ * @desc    Get allowed schedule dates (Tomorrow & Day After Tomorrow) and formatted time slots
+ * @access  Private (Auth) / Public
+ */
+export const getCartScheduleSlots = async (req, res) => {
+    try {
+        const now = new Date();
+
+        const allowedDates = [];
+        for (let i = 1; i <= 2; i++) {
+            const d = new Date(now);
+            d.setDate(d.getDate() + i);
+            const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
+            const month = d.toLocaleDateString("en-US", { month: "short" });
+            const fullDate = d.toISOString().split("T")[0];
+
+            allowedDates.push({
+                label: i === 1 ? "Tomorrow" : "Day after Tomorrow",
+                date: d.getDate(),
+                month,
+                dayName,
+                bookingDate: fullDate,
+            });
+        }
+
+        const timeSlots = [];
+        const startHour = 9;
+        const endHour = 20;
+
+        for (let h = startHour; h <= endHour; h++) {
+            const nextH = h + 1;
+
+            const formatHour = (hour) => {
+                const period = hour < 12 || hour === 24 ? "AM" : "PM";
+                const display = hour % 12 === 0 ? 12 : hour % 12;
+                return `${display < 10 ? "0" + display : display}:00 ${period}`;
+            };
+
+            const startLabel = formatHour(h);
+            const endLabel = formatHour(nextH);
+            const slotRange = `${startLabel} - ${endLabel}`;
+            const militaryTime = `${h < 10 ? "0" + h : h}:00`;
+
+            timeSlots.push({
+                timeSlot: slotRange,
+                startTime: militaryTime,
+                label: slotRange
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Cart schedule slots retrieved successfully (Tomorrow and Day After Tomorrow only)",
+            result: {
+                allowedDates,
+                timeSlots,
+                samplePayloadFormat: {
+                    itemId: "SAMPLE_ITEM_ID",
+                    bookingDate: allowedDates[0].bookingDate,
+                    timeSlot: timeSlots[0].timeSlot,
+                    faultProblem: "Optional description of issue"
+                }
+            }
+        });
+    } catch (error) {
+        console.error("❌ getCartScheduleSlots Error:", error);
+        return res.status(500).json({
+            success: false,
+            message: error.message || "Failed to retrieve schedule slots",
+            result: { error: error.message }
+        });
+    }
+};
+
 export const setCartItemSchedule = async (req, res) => {
     try {
         ensureCustomer(req);
-        const { itemId, scheduledDate, scheduledTime, scheduledAt, faultProblem } = req.body;
+        const { itemId, scheduledDate, bookingDate, scheduledTime, timeSlot, scheduledAt, faultProblem } = req.body;
         const itemType = req.body.itemType || "service"; // Default to service
         const customerId = req.user.userId;
 
@@ -383,9 +531,13 @@ export const setCartItemSchedule = async (req, res) => {
             });
         }
 
+        const effectiveDate = scheduledDate || bookingDate;
+        const rawTime = scheduledTime || timeSlot;
+        const parsedTime = parseTimeString(rawTime);
+
         // ─── Resolve Time ────────────────────────────────────────────────
         let finalScheduledAt = null;
-        if (scheduledDate && scheduledTime) {
+        if (effectiveDate && parsedTime) {
             // Enforce Tomorrow or Day after Tomorrow
             const now = new Date();
 
@@ -397,17 +549,17 @@ export const setCartItemSchedule = async (req, res) => {
             dayAfter.setDate(dayAfter.getDate() + 2);
             const dayAfterStr = dayAfter.toISOString().split("T")[0];
 
-            if (scheduledDate !== tomorrowStr && scheduledDate !== dayAfterStr) {
+            if (effectiveDate !== tomorrowStr && effectiveDate !== dayAfterStr) {
                 return res.status(400).json({
                     success: false,
                     message: "Scheduling is only allowed for Tomorrow or Day after Tomorrow. Please refresh slots.",
-                    result: { providedDate: scheduledDate, allowed: [tomorrowStr, dayAfterStr] },
+                    result: { providedDate: effectiveDate, allowed: [tomorrowStr, dayAfterStr] },
                 });
             }
 
-            const combined = new Date(`${scheduledDate}T${scheduledTime}:00`);
+            const combined = new Date(`${effectiveDate}T${parsedTime}:00`);
             if (isNaN(combined.getTime())) {
-                return res.status(400).json({ success: false, message: "Invalid scheduledDate or scheduledTime", result: {} });
+                return res.status(400).json({ success: false, message: "Invalid date or time format", result: {} });
             }
             // Must be 30 min in future
             if (combined <= new Date(Date.now() + 30 * 60 * 1000)) {
@@ -419,9 +571,10 @@ export const setCartItemSchedule = async (req, res) => {
         }
 
         // If neither time provided, and we're not just clearing it, error
-        if (!finalScheduledAt && (scheduledDate || scheduledTime || scheduledAt)) {
+        if (!finalScheduledAt && (effectiveDate || rawTime || scheduledAt)) {
             return res.status(400).json({ success: false, message: "Invalid date/time format provided", result: {} });
         }
+
 
         const updateData = {};
         if (finalScheduledAt) updateData.scheduledAt = finalScheduledAt;
@@ -493,6 +646,37 @@ export const removeFromCart = async (req, res) => {
     } catch (error) {
         if (res.headersSent) return;
         console.error("Remove from cart error:", error);
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: "Failed to remove item from cart",
+            result: { reason: getErrorMessage(error) },
+        });
+    }
+};
+
+/* ================= REMOVE FROM CART (UNRESTRICTED) ================= */
+export const removeFromCartUnrestricted = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const cartItem = await Cart.findByIdAndDelete(id);
+
+        if (!cartItem) {
+            return res.status(404).json({
+                success: false,
+                message: "Cart item not found",
+                result: {},
+            });
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Item removed from cart",
+            result: {},
+        });
+    } catch (error) {
+        if (res.headersSent) return;
+        console.error("Remove from cart unrestricted error:", error);
         res.status(error.statusCode || 500).json({
             success: false,
             message: "Failed to remove item from cart",
@@ -697,9 +881,9 @@ export const checkout = async (req, res) => {
             await session.abortTransaction();
             return res.status(400).json({
                 success: false,
-                message: invalidSchedules.length > 0 
-                  ? "Some items in your cart have outdated schedules. Please refresh your selected date/time."
-                  : "Some items in your cart are no longer available.",
+                message: invalidSchedules.length > 0
+                    ? "Some items in your cart have outdated schedules. Please refresh your selected date/time."
+                    : "Some items in your cart are no longer available.",
                 result: { removedItems, invalidSchedules },
             });
         }

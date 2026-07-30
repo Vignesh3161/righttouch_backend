@@ -135,6 +135,15 @@ export const addTechnicianSkills = async (req, res) => {
       });
     }
 
+    const { experienceYears } = req.body;
+    if (experienceYears !== undefined && experienceYears > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Experience cannot exceed 15 years",
+        result: {},
+      });
+    }
+
     const serviceIds = normalizeServiceIdsInput(req.body);
     if (serviceIds.length === 0) {
       return res.status(400).json({
@@ -169,18 +178,7 @@ export const addTechnicianSkills = async (req, res) => {
       });
     }
 
-    const technician = await TechnicianProfile.findByIdAndUpdate(
-      technicianProfileId,
-      {
-        $addToSet: {
-          skills: { $each: serviceObjectIds.map((sid) => ({ serviceId: sid })) },
-        },
-      },
-      { new: true, runValidators: true }
-    )
-      .populate("skills.serviceId", "serviceName")
-      .select("-password");
-
+    const technician = await TechnicianProfile.findById(technicianProfileId).select("-password");
     if (!technician) {
       return res.status(404).json({
         success: false,
@@ -188,6 +186,20 @@ export const addTechnicianSkills = async (req, res) => {
         result: {},
       });
     }
+
+    // Filter out serviceIds that the technician already has
+    const existingServiceIds = technician.skills.map((skill) => String(skill.serviceId));
+    const newServiceObjectIds = serviceObjectIds.filter((sid) => !existingServiceIds.includes(String(sid)));
+
+    if (newServiceObjectIds.length > 0) {
+      const exp = experienceYears !== undefined ? Number(experienceYears) : 0;
+      const newSkills = newServiceObjectIds.map((sid) => ({ serviceId: sid, experienceYears: exp }));
+      technician.skills.push(...newSkills);
+      await technician.save();
+    }
+
+    // Populate skills for the response
+    await technician.populate("skills.serviceId", "serviceName");
 
     return res.status(200).json({
       success: true,
@@ -589,8 +601,18 @@ export const updateTechnician = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
     }
 
-    if (skills !== undefined && !validateSkills(skills)) {
-      return res.status(400).json({ success: false, message: "Invalid skills format", result: {} });
+    if (experienceYears !== undefined && experienceYears > 15) {
+      return res.status(400).json({ success: false, message: "Experience cannot exceed 15 years", result: {} });
+    }
+
+    if (skills !== undefined) {
+      if (!validateSkills(skills)) {
+        return res.status(400).json({ success: false, message: "Invalid skills format", result: {} });
+      }
+      const hasOverExperience = skills.some(s => s.experienceYears !== undefined && s.experienceYears > 15);
+      if (hasOverExperience) {
+        return res.status(400).json({ success: false, message: "Experience cannot exceed 15 years", result: {} });
+      }
     }
 
     let technician = await TechnicianProfile.findById(technicianProfileId);

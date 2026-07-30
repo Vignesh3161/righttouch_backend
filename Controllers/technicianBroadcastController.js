@@ -183,7 +183,10 @@ export const respondToJob = async (req, res) => {
         technicianSnapshot
       },
       { new: true, session }
-    ).populate("customerId").populate("serviceId", "serviceName serviceType technicianAmount");
+    ).populate("customerId").populate({
+      path: "serviceId",
+      populate: { path: "categoryId" }
+    });
 
     if (!booking) {
       await session.abortTransaction();

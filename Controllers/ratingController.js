@@ -134,8 +134,8 @@ export const userRating = async (req, res) => {
         });
       }
     } else {
-      // ProductBooking uses userId
-      booking = await ProductBooking.findOne({ _id: bookingId, userId });
+      // ProductBooking uses customerId
+      booking = await ProductBooking.findOne({ _id: bookingId, customerId: userId });
       if (!booking) {
         return res.status(404).json({
           success: false,

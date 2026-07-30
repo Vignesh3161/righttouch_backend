@@ -36,7 +36,7 @@ export const userReport = async (req, res) => {
       booking = await ServiceBooking.findOne({ _id: bookingId, customerId });
       if (!booking) return res.status(404).json({ success: false, message: "Service booking not found", result: {} });
     } else if (bookingType === "product") {
-      booking = await ProductBooking.findOne({ _id: bookingId, userId: customerId });
+      booking = await ProductBooking.findOne({ _id: bookingId, customerId });
       if (!booking) return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
     } else {
       return res.status(400).json({ success: false, message: "Invalid bookingType", result: {} });

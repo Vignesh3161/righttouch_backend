@@ -76,7 +76,10 @@ import {
   deleteAllCustomerBookings,
   getOwnerAllBookings,
   getOwnerBookingById,
+  getCompletedServices,
+  rebookService,
 } from "../Controllers/serviceBookController.js";
+
 
 import {
   createProduct,
@@ -113,6 +116,8 @@ import {
   updateCartById,
   setCartItemSchedule,
   checkout,
+  getCartByIdUnrestricted,
+  removeFromCartUnrestricted,
 } from "../Controllers/cartController.js";
 
 import { Auth } from "../Middleware/Auth.js";
@@ -277,6 +282,11 @@ router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
 
+/* ================= BOOK AGAIN ================= */
+router.get("/booking/completed-services", Auth, getCompletedServices);
+router.post("/booking/book-again", Auth, rebookService);
+
+
 /* ================= OWNER BOOKING MANAGEMENT ================= */
 router.get("/booking/getAllBookings", getOwnerAllBookings);
 router.get("/booking/getBookingById/:id", getOwnerBookingById);
@@ -336,6 +346,9 @@ router.put("/cart/update", Auth, updateCartItem);
 router.put("/cart/:id", Auth, updateCartById);
 router.post("/cart/set-schedule", Auth, setCartItemSchedule);
 router.delete("/cart/remove/:id", Auth, removeFromCart);
+
+router.get("/carts/:id", getCartByIdUnrestricted);
+router.delete("/cart/removed/:id", removeFromCartUnrestricted);
 
 /* ================= CHECKOUT ================= */
 router.post("/checkout", Auth, checkout);
