@@ -11,28 +11,27 @@ const technicianKycSchema = new mongoose.Schema(
     },
 
     /* ==========================
-       📋 KYC DOCUMENTS (PLAINTEXT)
+       📋 KYC DOCUMENTS (ENCRYPTED AT REST)
+       Sensitive identity fields are AES-256-GCM encrypted at rest
+       (envelope encryption via Utils/kycFieldCrypto.js). They hold either
+       legacy plaintext strings (pre-encryption records) or ciphertext
+       objects { ciphertext, iv, authTag }. All code MUST go through
+       decryptIdentityFields/decryptBankDetails to read them.
     ========================== */
     aadhaarNumber: {
-      type: String,
-      trim: true,
+      type: mongoose.Schema.Types.Mixed,
       sparse: true,
       index: true,
-      // select: true (default)
     },
 
     panNumber: {
-      type: String,
-      trim: true,
-      uppercase: true,
+      type: mongoose.Schema.Types.Mixed,
       sparse: true,
       index: true,
     },
 
     drivingLicenseNumber: {
-      type: String,
-      trim: true,
-      uppercase: true,
+      type: mongoose.Schema.Types.Mixed,
       sparse: true,
       index: true,
     },
@@ -71,11 +70,13 @@ const technicianKycSchema = new mongoose.Schema(
 
     /* ==========================
        💳 BANK & SALARY PAYOUT DETAILS
+       accountHolderName / accountNumber / ifscCode / upiId are encrypted
+       at rest (same scheme as identity fields). bankName and branchName
+       are NOT sensitive — kept as plaintext strings.
     ========================== */
     bankDetails: {
       accountHolderName: {
-        type: String,
-        trim: true,
+        type: mongoose.Schema.Types.Mixed,
       },
 
       bankName: {
@@ -84,15 +85,21 @@ const technicianKycSchema = new mongoose.Schema(
       },
 
       accountNumber: {
-        type: String,
-        trim: true,
+        type: mongoose.Schema.Types.Mixed,
         sparse: true,
       },
 
-      ifscCode: {
+      // SHA-256 of accountNumber — deterministic, used for dedup lookups
+      // ONLY. Never decryptable, never returned in responses.
+      accountNumberHash: {
         type: String,
         trim: true,
-        uppercase: true,
+        sparse: true,
+        index: true,
+      },
+
+      ifscCode: {
+        type: mongoose.Schema.Types.Mixed,
       },
 
       branchName: {
@@ -101,15 +108,22 @@ const technicianKycSchema = new mongoose.Schema(
       },
 
       upiId: {
-        type: String,
-        trim: true,
-        lowercase: true,
+        type: mongoose.Schema.Types.Mixed,
       },
     },
 
     bankVerified: {
       type: Boolean,
       default: false,
+    },
+
+    // Fingerprint (SHA-256) of the exact bank details that were verified.
+    // Recomputed before every payout — if the current details no longer
+    // match, verification is invalid and the payout is blocked.
+    bankDetailsFingerprint: {
+      type: String,
+      trim: true,
+      default: null,
     },
 
     bankUpdateRequired: {
@@ -140,10 +154,21 @@ const technicianKycSchema = new mongoose.Schema(
     bankEditableUntil: {
       type: Date, // After verification, this is set to null
     },
+
+    /* ==========================
+       🔐 ENVELOPE ENCRYPTION
+       Per-document Data Encryption Key, itself encrypted by the KMS master
+       key (Utils/kmsClient.js). Presence of this field marks the document
+       as encrypted; records without it are legacy plaintext and are read
+       transparently.
+    ========================== */
+    encryptedDek: {
+      type: String,
+      trim: true,
+      default: null,
+    },
   },
   { timestamps: true }
 );
-
-// No more encryption hooks or methods needed
 
 export default mongoose.models.TechnicianKyc || mongoose.model("TechnicianKyc", technicianKycSchema);

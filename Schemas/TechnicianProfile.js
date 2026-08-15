@@ -142,6 +142,16 @@ const technicianProfileSchema = new mongoose.Schema(
       default: 0,
     },
 
+    /* ──────────────────────────────────────────────────────────────
+       💰 WALLET MODEL (integer paise) — four explicit balances.
+       `walletBalance` above is the legacy rupee mirror of
+       availableBalancePaise (maintained by new code + migration).
+    ────────────────────────────────────────────────────────────── */
+    availableBalancePaise: { type: Number, default: 0, min: 0 },
+    reservedBalancePaise: { type: Number, default: 0, min: 0 },
+    lifetimeEarnedPaise: { type: Number, default: 0, min: 0 },
+    lifetimeWithdrawnPaise: { type: Number, default: 0, min: 0 },
+
     // Razorpay X (Payout) identifiers – cached to avoid re-creating on every payout
     razorpayContactId: {
       type: String,
@@ -183,12 +193,65 @@ const technicianProfileSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+
+    // 📍 Feed cursor: bumped whenever this technician's job feed changes
+    // (broadcast created/revived, job taken, broadcast expired). Lets the
+    // socket get_jobs poll answer "nothing changed" with a cheap single-field
+    // read instead of the full 3-query + populate fetch.
+    lastJobsChangeAt: {
+      type: Date,
+      default: null,
+    },
+
+    // ⏱ Last location ping timestamp (staleness gate — a stale ping means
+    // the app is backgrounded/killed, not that the tech is standing still).
+    // Set on every ping in handleLocationUpdate, no distance gate.
+    locationUpdatedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    // 🏘 CITY ZONE — technicians are locked to a single zone (their registered city).
+    // Set during registration/update from their coordinates.
+    cityZoneId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CityZone",
+      default: null,
+      index: true,
+    },
+
+    // ⚠️ Zone mismatch — set to true when a location ping lands outside the
+    // technician's registered cityZone polygon. Cleared when back inside.
+    zoneMismatch: {
+      type: Boolean,
+      default: false,
+    },
+
+    // Timestamp of when zone mismatch first started (for admin reporting)
+    zoneMismatchSince: {
+      type: Date,
+      default: null,
+    },
+
+    // 🔒 Per-technician dispatch mutex (self-expiring, no Redis needed).
+    // Set atomically by findOneAndUpdate before schedule-accept conflict
+    // checks; expires after a few seconds so a crashed handler can never
+    // deadlock the technician.
+    dispatchLockUntil: {
+      type: Date,
+      default: null,
+      index: true,
+    },
   },
   { timestamps: true }
 );
 
 // 2dsphere index for geo queries (nearby technicians)
 technicianProfileSchema.index({ location: "2dsphere" });
+
+// Dispatch hot paths: staleness filter + mutex acquisition
+technicianProfileSchema.index({ locationUpdatedAt: -1 });
 
 export default mongoose.models.TechnicianProfile ||
   mongoose.model("TechnicianProfile", technicianProfileSchema);

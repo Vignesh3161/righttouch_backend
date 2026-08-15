@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { normalizeBookingStatus } from "../Utils/bookingStatus.js";
 
 const geoPointSchema = new mongoose.Schema(
   {
@@ -79,6 +80,29 @@ const serviceBookingSchema = new mongoose.Schema(
       min: 0,
     },
 
+    // 🧾 TAX SNAPSHOT — GST is charged on top of baseAmount and is a separate
+    // liability (remitted to government), never part of technician earnings.
+    gstPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+
+    gstAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    // 💝 TIP SNAPSHOT — customer tip. 100% goes to the technician on
+    // settlement (added to technicianAmount), collected first by the platform.
+    tipAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     // 📍 ADDRESS SNAPSHOT
     locationType: {
       type: String,
@@ -126,6 +150,41 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
+    // ──────────────────────────────────────────────────────────────
+    // 💰 IMMUTABLE FINANCIAL SNAPSHOT (paise) — written ONCE at booking
+    // creation (or by an authorized admin override on an unpaid booking).
+    // NEVER recomputed at payment/settlement/withdrawal time. Never edited
+    // by clients. Historical bookings are never retroactively modified.
+    // ──────────────────────────────────────────────────────────────
+    financialSnapshot: {
+      baseAmountPaise: { type: Number, default: 0, min: 0 },
+      discountAmountPaise: { type: Number, default: 0, min: 0 },
+      totalAmountPaise: { type: Number, default: 0, min: 0 },
+      commissionPercentage: { type: Number, default: 0, min: 0, max: 100 },
+      commissionAmountPaise: { type: Number, default: 0, min: 0 },
+      technicianAmountPaise: { type: Number, default: 0, min: 0 },
+      commissionRuleSource: { type: String, default: null },
+      commissionRuleId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "ServiceCommissionRule",
+        default: null,
+      },
+      calculationVersion: { type: Number, default: 1 },
+      commissionOverridden: { type: Boolean, default: false },
+      financialSnapshotAt: { type: Date, default: null },
+      // TAX — GST snapshot (service flow; product flow snapshots its own lines)
+      gstPercentage: { type: Number, default: 0, min: 0, max: 100 },
+      gstAmountPaise: { type: Number, default: 0, min: 0 },
+      tipAmountPaise: { type: Number, default: 0, min: 0 },
+    },
+
+    // Paid amount snapshot (paise) — set once when payment succeeds
+    paidAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     paymentProvider: {
       type: String,
       enum: ["razorpay"],
@@ -163,6 +222,14 @@ const serviceBookingSchema = new mongoose.Schema(
       min: 0,
     },
 
+    // True only when an Admin/Owner explicitly overrode commission for this booking
+    // (set via the admin commission-override endpoint). Distinguishes an admin
+    // override from the booking-time estimate snapshot.
+    commissionOverridden: {
+      type: Boolean,
+      default: false,
+    },
+
     technicianAmount: {
       type: Number,
       default: 0,
@@ -172,6 +239,17 @@ const serviceBookingSchema = new mongoose.Schema(
     paymentId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Payment",
+    },
+
+    // Reconciliation bookkeeping
+    reconciliationAttempts: {
+      type: Number,
+      default: 0,
+    },
+
+    lastReconciliationAt: {
+      type: Date,
+      default: null,
     },
 
     // ✅ Settlement to technician wallet (idempotent)
@@ -200,6 +278,7 @@ const serviceBookingSchema = new mongoose.Schema(
       type: String,
       enum: [
         "pending",
+        "broadcasted",
         "accepted",
         "on_the_way",
         "reached",
@@ -207,13 +286,128 @@ const serviceBookingSchema = new mongoose.Schema(
         "completed",
         "cancelled",
         "expired",
-        "SEARCHING",    // Legacy/Internal compatibility
+        // Legacy values retained ONLY for the migration window — normalized
+        // to canonical values by the pre-save hook. Never used in logic.
+        "SEARCHING",
         "ACCEPTED",
-        "broadcasted",
         "requested",
       ],
       default: "pending",
       index: true,
+    },
+
+    // 👥 ASSIGNMENT STATUS — separate from execution status. Tracks the
+    // technician-assignment lifecycle independently of job execution.
+    assignmentStatus: {
+      type: String,
+      enum: ["unassigned", "broadcasted", "assigned", "released"],
+      default: "unassigned",
+      index: true,
+    },
+
+    // ↩️ CANCELLATION STATUS — who cancelled and why (for audit/reports).
+    cancellationStatus: {
+      type: String,
+      enum: [
+        "active",
+        "customer_cancelled",
+        "technician_cancelled",
+        "system_cancelled",
+      ],
+      default: "active",
+      index: true,
+    },
+
+    // 💳 CANCELLATION FEE COLLECTION STATE — a recorded fee is NOT collected
+    // revenue until a real collection mechanism (wallet hold / payment) exists.
+    cancellationFeeStatus: {
+      type: String,
+      enum: ["not_collected", "collected", "waived", "disputed"],
+      default: "not_collected",
+      index: true,
+    },
+
+    // 📅 SCHEDULE TIMEZONE SAFETY — scheduledAt is UTC; local display fields
+    // are derived from the configured business timezone and stored for display.
+    timezone: {
+      type: String,
+      default: null,
+    },
+    scheduledDateLocal: {
+      type: String,
+      default: null,
+    },
+    scheduledTimeLocal: {
+      type: String,
+      default: null,
+    },
+
+    // 🕒 INSTANT ETA — estimate only, NOT a guaranteed SLA promise.
+    estimatedArrivalAt: {
+      type: Date,
+      default: null,
+    },
+    etaGeneratedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // ✅ COMPLETION
+    completedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    // 📡 BROADCAST VERSION — incremented on every re-broadcast; used for the
+    // atomic acceptance claim (status + technicianId + activeBroadcastVersion).
+    activeBroadcastVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    // 🧾 ASSIGNMENT ATTEMPT HISTORY — one entry per technician assignment.
+    // Preserved across scheduled re-dispatch (never overwritten).
+    assignmentAttempts: [
+      {
+        technicianId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "TechnicianProfile",
+        },
+        attemptNumber: { type: Number, min: 1 },
+        status: {
+          type: String,
+          enum: ["assigned", "released", "cancelled", "expired"],
+        },
+        acceptedAt: { type: Date, default: null },
+        releasedAt: { type: Date, default: null },
+        releaseReason: { type: String, default: null },
+        penaltyTransactionId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "WalletTransaction",
+          default: null,
+        },
+        feasibilitySnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
+      },
+    ],
+
+    // 🔒 CRON/WORKER LEASE — multi-instance safety for worker jobs.
+    leaseUntil: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    leaseOwner: {
+      type: String,
+      default: null,
+    },
+
+    // 🔢 OPTIMISTIC VERSION — bumped on every write; used by idempotent
+    // commands and admin overrides.
+    version: {
+      type: Number,
+      default: 0,
     },
 
     cancelReason: {
@@ -249,9 +443,29 @@ const serviceBookingSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // Integer-paise mirrors (rupee fields above are legacy/display)
+    cancellationFeePaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     technicianPenalty: {
       type: Number,
       default: 0,
+    },
+
+    // Penalty amount per policy (paise) vs what was actually debited
+    // (shortfall remains an outstanding receivable tracked by reconciliation).
+    technicianPenaltyPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    technicianPenaltyDebitedPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
 
     retryCount: {
@@ -320,6 +534,10 @@ const serviceBookingSchema = new mongoose.Schema(
       h1: { type: Boolean, default: false },
       min15: { type: Boolean, default: false },
       enforceOTW: { type: Boolean, default: false },
+      // Scheduled-job escalation ladder (technician did not start travel)
+      escalate25: { type: Boolean, default: false },
+      escalate15: { type: Boolean, default: false },
+      escalate10: { type: Boolean, default: false },
     },
 
     enforcementAlertAt: {
@@ -340,12 +558,25 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+
+    // 🏘 CITY ZONE — resolved at booking time from customer coordinates.
+    // Used for zone-based service availability and analytics.
+    cityZoneId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CityZone",
+      default: null,
+      index: true,
+    },
   },
   { timestamps: true }
 );
 
 // Helpful index for technician dashboard
 serviceBookingSchema.index({ technicianId: 1, status: 1 });
+
+// Settlement/reconciliation hot paths
+serviceBookingSchema.index({ paymentStatus: 1, settlementStatus: 1 });
+serviceBookingSchema.index({ settlementStatus: 1, status: 1, paymentStatus: 1 });
 
 // 2dsphere index for geo queries (optional, but required when using $near for bookings)
 serviceBookingSchema.index({ location: "2dsphere" });
@@ -357,5 +588,22 @@ serviceBookingSchema.index({ status: 1, "remindersSent.h24": 1, scheduledAt: 1 }
 serviceBookingSchema.index({ status: 1, "remindersSent.h1": 1, scheduledAt: 1 });
 serviceBookingSchema.index({ status: 1, "remindersSent.min15": 1, scheduledAt: 1 });
 serviceBookingSchema.index({ status: 1, technicianId: 1, autoCancelAt: 1 });
+
+// Worker lease / expiry hot path
+serviceBookingSchema.index({ leaseUntil: 1, status: 1 });
+
+// ── NORMALIZATION HOOK ────────────────────────────────────────────────────
+// Legacy statuses (ACCEPTED / SEARCHING / requested) are normalized to the
+// canonical vocabulary before every save. Business logic may then rely on the
+// canonical values exclusively.
+serviceBookingSchema.pre("save", function (next) {
+  if (this.status) {
+    this.status = normalizeBookingStatus(this.status);
+  }
+  if (!this.assignmentStatus) this.assignmentStatus = "unassigned";
+  if (!this.cancellationStatus) this.cancellationStatus = "active";
+  if (!this.cancellationFeeStatus) this.cancellationFeeStatus = "not_collected";
+  next();
+});
 
 export default mongoose.models.ServiceBooking || mongoose.model("ServiceBooking", serviceBookingSchema);

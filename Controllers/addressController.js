@@ -4,6 +4,7 @@ import axios from "axios";
 import Address from "../Schemas/Address.js";
 import User from "../Schemas/User.js";
 import { ensureCustomer } from "../Utils/ensureCustomer.js";
+import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
 
 const getAddressIdFromReq = (req) => req.params?.id || req.body?.addressId || req.body?.id;
 
@@ -172,16 +173,20 @@ export const createAddress = async (req, res) => {
         }
 
         // Use provided name/phone or fallback to profile data
-        const finalName = (name && name.trim()) || profileName;
-        const finalPhone = (phone && phone.trim()) || profilePhone;
+        let finalName = (name && name.trim()) || profileName;
+        let finalPhone = (phone && phone.trim()) || profilePhone;
 
-        // Validate phone format if provided
-        if (finalPhone && !/^[0-9]{10}$/.test(finalPhone)) {
-            return res.status(400).json({
-                success: false,
-                message: "Phone must be 10 digits",
-                result: {},
-            });
+        // Validate phone format if provided (+91 prefix optional)
+        if (finalPhone) {
+            const normalizedPhone = normalizeIndianMobile(finalPhone);
+            if (!normalizedPhone) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Phone must be 10 digits (optional +91 prefix)",
+                    result: {},
+                });
+            }
+            finalPhone = normalizedPhone;
         }
 
         // Validate coordinates if provided
@@ -351,17 +356,17 @@ export const updateAddress = async (req, res) => {
 
         for (const key of allowed) {
             if (req.body[key] !== undefined) {
-                // Validate phone format if being updated
+                // Validate phone format if being updated (+91 prefix optional)
                 if (key === "phone" && req.body[key]) {
-                    const phoneStr = String(req.body[key]).trim();
-                    if (!/^[0-9]{10}$/.test(phoneStr)) {
+                    const normalizedPhone = normalizeIndianMobile(req.body[key]);
+                    if (!normalizedPhone) {
                         return res.status(400).json({
                             success: false,
-                            message: "Phone must be 10 digits",
+                            message: "Phone must be 10 digits (optional +91 prefix)",
                             result: {},
                         });
                     }
-                    address[key] = phoneStr;
+                    address[key] = normalizedPhone;
                 } else if (key === "latitude" || key === "longitude") {
                     // Convert latitude/longitude to number if provided as string
                     if (req.body[key] !== null && req.body[key] !== '') {

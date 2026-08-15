@@ -328,7 +328,7 @@ export const replaceServiceImages = async (req, res) => {
 
 export const getAllServices = async (req, res) => {
   try {
-    const { search, categoryId } = req.query;
+    const { search, categoryId, latitude, longitude, zoneId } = req.query;
 
     let query = { isActive: true };
 
@@ -350,6 +350,50 @@ export const getAllServices = async (req, res) => {
         { serviceName: { $regex: search, $options: "i" } },
         { description: { $regex: search, $options: "i" } },
       ];
+    }
+
+    // 🏘 ZONE FILTER — services that are NOT zone-restricted are always shown.
+    // Zone-restricted services are shown ONLY when the caller's zone is known
+    // (via zoneId, or coordinates resolved against CityZone polygons) AND an
+    // active ZoneServiceMapping exists for that zone.
+    let zoneRestrictedIds = null;
+    let knownZoneId = zoneId || null;
+    if (!knownZoneId && latitude && longitude) {
+      const { resolveZoneFromCoordinates } = await import("../Utils/resolveZoneFromCoordinates.js");
+      const { zone } = await resolveZoneFromCoordinates(Number(latitude), Number(longitude));
+      knownZoneId = zone?._id || null;
+    }
+
+    if (knownZoneId) {
+      const { default: ZoneServiceMapping } = await import("../Schemas/ZoneServiceMapping.js");
+      const mappings = await ZoneServiceMapping.find({
+        zoneId: knownZoneId,
+        active: true,
+      })
+        .select("serviceId")
+        .lean();
+      const mappedServiceIds = mappings.map((m) => m.serviceId);
+
+      if (mappedServiceIds.length > 0) {
+        // Any service that is zone-restricted is shown only if mapped in this zone.
+        const restrictedServices = await Service.find({
+          isActive: true,
+          zoneRestricted: true,
+        })
+          .select("_id")
+          .lean();
+        zoneRestrictedIds = restrictedServices
+          .map((s) => s._id.toString())
+          .filter((id) => !mappedServiceIds.some((m) => m.toString() === id));
+      }
+      // If the zone has NO mappings at all, restricted services are hidden.
+    }
+
+    if (zoneRestrictedIds !== null) {
+      query._id = { $nin: zoneRestrictedIds };
+    } else if (!knownZoneId) {
+      // Location unknown — hide zone-restricted services entirely.
+      query.zoneRestricted = { $ne: true };
     }
 
     const services = await Service.find(query)
@@ -434,6 +478,46 @@ export const getServiceById = async (req, res) => {
       message: "Server error",
       result: { error: error.message },
     });
+  }
+};
+
+/**
+ * 🎯 TOGGLE ZONE RESTRICTION (Admin/Owner)
+ * When ON, the service is only visible/bookable in zones with an active
+ * ZoneServiceMapping. When OFF, the service is available everywhere.
+ * ZoneServiceMapping rows are managed via the existing adminZones routes.
+ */
+export const toggleZoneRestriction = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { zoneRestricted } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid service ID format", result: {} });
+    }
+    if (typeof zoneRestricted !== "boolean") {
+      return res.status(400).json({ success: false, message: "zoneRestricted must be a boolean", result: {} });
+    }
+
+    const service = await Service.findByIdAndUpdate(
+      id,
+      { $set: { zoneRestricted } },
+      { new: true }
+    ).select("_id serviceName zoneRestricted isActive");
+
+    if (!service) {
+      return res.status(404).json({ success: false, message: "Service not found", result: {} });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: zoneRestricted
+        ? `"${service.serviceName}" is now zone-restricted (visible only in mapped zones).`
+        : `"${service.serviceName}" is now available in all zones.`,
+      result: service,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message, result: { error: error.message } });
   }
 };
 
@@ -579,3 +663,105 @@ export const deleteService = async (req, res) => {
   }
 };
 
+
+/* =====================================================
+   SERVICE COVERAGE POLYGON (Admin/Owner, audited)
+   Polygon = area where the service can be booked AND
+   where technicians are matched for its jobs.
+===================================================== */
+import { writeAuditLog } from "../Utils/audit.js";
+import { validateGeoJsonPolygon } from "../Utils/servicePolygon.js";
+
+const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
+
+// GET service coverage polygon
+export const getServicePolygon = async (req, res) => {
+  try {
+    if (!isOwnerOrAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Owner/Admin access only", result: {} });
+    }
+    const service = await Service.findById(req.params.id).select("serviceName coveragePolygon").lean();
+    if (!service) {
+      return res.status(404).json({ success: false, message: "Service not found", result: {} });
+    }
+    return res.status(200).json({
+      success: true,
+      result: { serviceId: service._id, serviceName: service.serviceName, coveragePolygon: service.coveragePolygon || null },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message, result: {} });
+  }
+};
+
+// SET / UPDATE service coverage polygon
+export const setServicePolygon = async (req, res) => {
+  try {
+    if (!isOwnerOrAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Owner/Admin access only", result: {} });
+    }
+    const polygon = req.body.polygon;
+    const polygonError = validateGeoJsonPolygon(polygon);
+    if (polygonError) {
+      return res.status(400).json({ success: false, message: polygonError, result: {} });
+    }
+
+    const service = await Service.findByIdAndUpdate(
+      req.params.id,
+      { $set: { coveragePolygon: polygon } },
+      { new: true, runValidators: true }
+    ).select("serviceName coveragePolygon");
+    if (!service) {
+      return res.status(404).json({ success: false, message: "Service not found", result: {} });
+    }
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "SERVICE_POLYGON_SET",
+      targetType: "Service",
+      targetId: service._id,
+      after: { serviceName: service.serviceName, coveragePolygon: service.coveragePolygon },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Service coverage polygon set. Customers outside it cannot book; only technicians inside it get these jobs.",
+      result: { serviceId: service._id, serviceName: service.serviceName, coveragePolygon: service.coveragePolygon },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message, result: {} });
+  }
+};
+
+// REMOVE service coverage polygon (unrestrict)
+export const removeServicePolygon = async (req, res) => {
+  try {
+    if (!isOwnerOrAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Owner/Admin access only", result: {} });
+    }
+    const service = await Service.findById(req.params.id);
+    if (!service) {
+      return res.status(404).json({ success: false, message: "Service not found", result: {} });
+    }
+    const hadPolygon = Boolean(service.coveragePolygon);
+    service.coveragePolygon = undefined;
+    await service.save();
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "SERVICE_POLYGON_REMOVED",
+      targetType: "Service",
+      targetId: service._id,
+      before: { hadPolygon },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Service coverage polygon removed. Service is bookable everywhere.",
+      result: { serviceId: service._id, serviceName: service.serviceName, coveragePolygon: null },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message, result: {} });
+  }
+};

@@ -1,5 +1,8 @@
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import { broadcastPendingJobsToTechnician } from "./technicianMatching.js";
+import { geoAdd } from "./technicianGeo.js";
+import { resolveZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
 
 /**
  * Common logic to update technician location from HTTP or Socket.
@@ -12,8 +15,23 @@ import { broadcastPendingJobsToTechnician } from "./technicianMatching.js";
  * @returns {Object} result
  */
 export const handleLocationUpdate = async (technicianProfileId, latitude, longitude, io) => {
-    const profile = await TechnicianProfile.findById(technicianProfileId).select("location lastMatchingAt availability workStatus");
+    const profile = await TechnicianProfile.findById(technicianProfileId).select("location lastMatchingAt availability workStatus trainingCompleted");
     if (!profile) throw new Error("Technician profile not found");
+
+    // A location ping must never re-activate an ineligible technician —
+    // only an explicit go-online action (already gated by workStatus) may.
+    // This closes the "suspended technician self-reactivates" hole.
+    const canGoOnline =
+        profile.workStatus === "approved" &&
+        profile.trainingCompleted === true;
+
+    let canGoOnlineFinal = canGoOnline;
+    if (canGoOnline) {
+        const kyc = await TechnicianKyc.findOne({ technicianId: technicianProfileId })
+            .select("verificationStatus")
+            .lean();
+        canGoOnlineFinal = kyc?.verificationStatus === "approved";
+    }
 
     const [oldLng, oldLat] = profile.location?.coordinates || [0, 0];
 
@@ -39,10 +57,59 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
                     type: "Point",
                     coordinates: [longitude, latitude],
                 },
-                "availability.isOnline": true,
+                "availability.isOnline": canGoOnlineFinal,
+                locationUpdatedAt: new Date(),
             }
         );
-        console.log(`📍 Tech ${technicianProfileId} moved ${dist.toFixed(1)}m. Location updated.`);
+        console.log(`📍 Tech ${technicianProfileId} moved ${dist.toFixed(1)}m. Location updated${canGoOnlineFinal ? "" : " (kept offline — eligibility not met)"}.`);
+    } else {
+        // No movement — still stamp freshness so the staleness gate
+        // (matching excludes pings older than ~90s) keeps working.
+        // Single tiny $set, no matching triggered.
+        await TechnicianProfile.updateOne(
+            { _id: technicianProfileId },
+            { locationUpdatedAt: new Date() }
+        );
+    }
+
+    // 🗺 Redis GEO hot path — upsert position for sub-ms radius pre-filtering
+    // during matching. Best-effort: never blocks or fails the ping handler.
+    if (canGoOnlineFinal) {
+        geoAdd(technicianProfileId, longitude, latitude).catch(() => {});
+    }
+
+    // 🏘 ZONE MISMATCH DETECTION — compare live location against registered zone.
+    // If the technician has a cityZoneId and their ping lands outside it, flag it.
+    // If they drift back inside, clear the mismatch.
+    try {
+        const profileWithZone = await TechnicianProfile.findById(technicianProfileId)
+            .select("cityZoneId zoneMismatch")
+            .lean();
+
+        if (profileWithZone?.cityZoneId) {
+            const { zone } = await resolveZoneFromCoordinates(latitude, longitude);
+            const insideZone = zone && String(zone._id) === String(profileWithZone.cityZoneId);
+            const currentlyMismatched = profileWithZone.zoneMismatch;
+
+            if (!insideZone && !currentlyMismatched) {
+                // Drifted outside → flag mismatch
+                await TechnicianProfile.updateOne(
+                    { _id: technicianProfileId },
+                    { $set: { zoneMismatch: true, zoneMismatchSince: new Date() } }
+                );
+                console.log(`⚠️ Tech ${technicianProfileId} drifted outside zone ${profileWithZone.cityZoneId}`);
+            } else if (insideZone && currentlyMismatched) {
+                // Back inside → clear mismatch
+                await TechnicianProfile.updateOne(
+                    { _id: technicianProfileId },
+                    { $set: { zoneMismatch: false, zoneMismatchSince: null } }
+                );
+                console.log(`✅ Tech ${technicianProfileId} returned to zone ${profileWithZone.cityZoneId}`);
+            }
+        }
+    } catch (zoneErr) {
+        // Zone check is best-effort — never block location updates
+        console.error("Zone mismatch check error:", zoneErr.message);
     }
 
     // 2. Rate Limit Gate (Job matching once every 30 seconds)

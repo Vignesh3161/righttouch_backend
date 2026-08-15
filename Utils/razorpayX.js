@@ -78,6 +78,13 @@ const razorpayXRequest = async ({ method, path, body, referenceId }) => {
             });
         });
 
+        // ⏱ Abort hung upstream calls (10s) instead of pinning a worker.
+        req.setTimeout(10000, () => {
+            const err = new Error("Razorpay X request timed out");
+            err.statusCode = 504;
+            req.destroy(err);
+        });
+
         req.on("error", reject);
         if (payload) req.write(payload);
         req.end();
@@ -175,6 +182,17 @@ export const createOrGetFundAccount = async ({
 /* =========================
    PAYOUT SERVICE
 ========================= */
+
+export const fetchPayout = async (payoutId) =>
+    razorpayXRequest({
+        method: "GET",
+        path: `/v1/payouts/${payoutId}`,
+    });
+
+// Razorpay X payout statuses that mean the money moved out of the platform
+export const PAYOUT_SUCCESS_STATUSES = ["sent", "processed"];
+// Statuses that mean the payout will never complete
+export const PAYOUT_FINAL_FAILURE_STATUSES = ["failed", "cancelled", "reversed", "returned", "bounced"];
 
 export const createPayout = async ({
     fundAccountId,

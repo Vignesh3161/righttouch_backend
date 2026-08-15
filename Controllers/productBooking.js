@@ -30,7 +30,7 @@ export const productBooking = async (req, res) => {
     ensureCustomer(req);
     const customerId = req.user.userId; // Ensure customerId is used consistently
 
-    const { productId, amount, quantity = 1, paymentStatus } = req.body;
+    const { productId, amount, quantity = 1 } = req.body;
 
     if (!productId || amount === undefined) {
       return res.status(400).json({
@@ -60,18 +60,16 @@ export const productBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: "quantity must be an integer >= 1", result: {} });
     }
 
-    let paymentStatusValue = paymentStatus || "pending";
-    if (!PAYMENT_STATUSES.includes(paymentStatusValue)) {
-      return res.status(400).json({ success: false, message: "Invalid paymentStatus", result: {} });
-    }
-
+    // 🔒 SECURITY FIX: paymentStatus is NEVER accepted from the client —
+    // it starts "pending" and can only move via the verified payment
+    // pipeline (Razorpay order → webhook/verify). No more payment bypass.
     const productData = await ProductBooking.create({
       customerId,
       productId,
       status: "active",
       amount: amountNum,
       quantity: quantityNum,
-      paymentStatus: paymentStatusValue,
+      paymentStatus: "pending",
     });
 
     res.status(201).json({

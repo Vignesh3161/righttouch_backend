@@ -15,10 +15,26 @@ const withdrawalRequestSchema = new mongoose.Schema(
       min: 1,
     },
 
+    // Integer paise (primary financial field)
+    amountPaise: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
+
     status: {
       type: String,
-     //sk
-      enum: ["pending", "requested", "approved", "rejected", "paid", "cancelled"],
+      enum: [
+        "pending",
+        "requested",
+        "approved",
+        "rejected",
+        "paid",
+        "cancelled",
+        "processing",
+        "failed",
+        "manual_review",
+      ],
       default: "pending",
       index: true,
     },
@@ -35,6 +51,16 @@ const withdrawalRequestSchema = new mongoose.Schema(
     },
 
     rejectedAt: {
+      type: Date,
+      default: null,
+    },
+
+    paidAt: {
+      type: Date,
+      default: null,
+    },
+
+    failedAt: {
       type: Date,
       default: null,
     },
@@ -81,6 +107,12 @@ const withdrawalRequestSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+
+    payoutOutboxId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PayoutOutbox",
+      default: null,
+    },
   },
   { timestamps: true }
 );
@@ -96,6 +128,12 @@ withdrawalRequestSchema.index(
     } 
   }
 );
+
+// Admin list/summary hot paths (status filters + date ranges)
+withdrawalRequestSchema.index({ status: 1, createdAt: 1 });
+
+// Admin list with no status filter sorts by createdAt alone (S12)
+withdrawalRequestSchema.index({ createdAt: -1 });
 
 export default mongoose.models.WithdrawalRequest ||
   mongoose.model("WithdrawalRequest", withdrawalRequestSchema);

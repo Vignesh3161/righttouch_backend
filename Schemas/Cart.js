@@ -28,6 +28,19 @@ const cartSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // Local display fields captured at schedule-selection time (business timezone)
+    scheduledDate: {
+      type: String,
+      default: null,
+    },
+    scheduledTime: {
+      type: String,
+      default: null,
+    },
+    timezone: {
+      type: String,
+      default: null,
+    },
     // 📝 Problem Description (Optional)
     faultProblem: {
       type: String,

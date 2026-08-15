@@ -34,6 +34,14 @@ const productSchema = new mongoose.Schema({
   estimatedPriceFrom: Number,
   estimatedPriceTo: Number,
 
+  // GST percentage applied on top of the product price (default 0)
+  productGst: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100,
+  },
+
   siteInspectionRequired: {
     type: Boolean,
     default: true,

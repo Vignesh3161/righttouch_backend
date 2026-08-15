@@ -125,8 +125,7 @@ export const getAllUsers = async (req, res) => {
       users = await User.aggregate([
         {
           $match: { role: "Technician", ...searchMatch }
-        },
-        {
+        },        {
           $lookup: {
             from: "technicianprofiles",
             localField: "_id",
@@ -177,22 +176,30 @@ export const getAllUsers = async (req, res) => {
             email: 1,
             createdAt: 1,
             lastLoginAt: 1,
+            technicianId: { $ifNull: ["$techProfile._id", null] },
             profile: {
               fname: {
                 $cond: [
                   { $gt: [{ $strLenCP: { $trim: { input: { $ifNull: ["$fname", ""] } } } }, 0] },
                   "$fname",
                   {
-                    $let: {
-                      vars: { name: { $ifNull: ["$kycData.bankDetails.accountHolderName", ""] } },
-                      in: {
-                        $cond: [
-                          { $gt: [{ $strLenCP: { $trim: { input: "$$name" } } }, 0] },
-                          { $arrayElemAt: [{ $split: ["$$name", " "] }, 0] },
-                          ""
-                        ]
-                      }
-                    }
+                    $cond: [
+                      // Ciphertext objects must not be treated as names
+                      { $eq: [{ $type: "$kycData.bankDetails.accountHolderName" }, "string"] },
+                      {
+                        $let: {
+                          vars: { name: { $ifNull: ["$kycData.bankDetails.accountHolderName", ""] } },
+                          in: {
+                            $cond: [
+                              { $gt: [{ $strLenCP: { $trim: { input: "$$name" } } }, 0] },
+                              { $arrayElemAt: [{ $split: ["$$name", " "] }, 0] },
+                              ""
+                            ]
+                          }
+                        }
+                      },
+                      ""
+                    ]
                   }
                 ]
               },
@@ -201,16 +208,23 @@ export const getAllUsers = async (req, res) => {
                   { $gt: [{ $strLenCP: { $trim: { input: { $ifNull: ["$lname", ""] } } } }, 0] },
                   "$lname",
                   {
-                    $let: {
-                      vars: { name: { $ifNull: ["$kycData.bankDetails.accountHolderName", ""] } },
-                      in: {
-                        $cond: [
-                          { $gt: [{ $strLenCP: { $trim: { input: "$$name" } } }, 0] },
-                          { $arrayElemAt: [{ $split: ["$$name", " "] }, 1] },
-                          ""
-                        ]
-                      }
-                    }
+                    $cond: [
+                      // Ciphertext objects must not be treated as names
+                      { $eq: [{ $type: "$kycData.bankDetails.accountHolderName" }, "string"] },
+                      {
+                        $let: {
+                          vars: { name: { $ifNull: ["$kycData.bankDetails.accountHolderName", ""] } },
+                          in: {
+                            $cond: [
+                              { $gt: [{ $strLenCP: { $trim: { input: "$$name" } } }, 0] },
+                              { $arrayElemAt: [{ $split: ["$$name", " "] }, 1] },
+                              ""
+                            ]
+                          }
+                        }
+                      },
+                      ""
+                    ]
                   }
                 ]
               },
@@ -335,6 +349,11 @@ export const getAllUsers = async (req, res) => {
           $sort: { createdAt: -1 }
         }
       ]);
+
+      // KYC identity/bank fields are encrypted at rest — decrypt them here so
+      // admins see the same plaintext they did before encryption, and the
+      // response never leaks ciphertext objects.
+      await decryptAdminUserList(users);
 
     } else {
       // For other roles (Owner, Admin), return basic info
@@ -490,6 +509,11 @@ import mongoose from "mongoose";
 
 import Otp from "../Schemas/Otp.js";
 import TempUser from "../Schemas/TempUser.js";
+import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
+import { hashAccountNumber } from "../Utils/kycPrivacy.js";
+import { toPlaintext } from "../Utils/kycEncryption.js";
+import { kmsDecryptDek } from "../Utils/kmsClient.js";
+import { getDekForKycDoc, getOrCreateDekForKycDoc, encryptBankDetails, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
 import User from "../Schemas/User.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
@@ -498,7 +522,6 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import ProductBooking from "../Schemas/ProductBooking.js";
 import Address from "../Schemas/Address.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
-import crypto from "crypto";
 
 import sendSms from "../Utils/sendSMS.js";
 
@@ -517,9 +540,44 @@ const fail = (res, status, message, code, details) =>
   res.status(status).json({
     success: false,
     message,
-    result: {},
-    ...(code ? { error: { code, ...(details !== undefined ? { details } : {}) } } : {}),
+    code,
+    details,
   });
+
+/**
+ * Decrypt KYC identity/bank fields on the admin user list (getAllUsers).
+ * The aggregation projects them raw, so ciphertext objects are converted
+ * back to the plaintext admins saw before encryption-at-rest.
+ */
+const decryptAdminUserList = async (users) => {
+  const techUsers = users.filter((u) => u.technicianId);
+  if (techUsers.length === 0) return;
+  const kycDocs = await TechnicianKyc.find({
+    technicianId: { $in: techUsers.map((u) => u.technicianId) },
+  })
+    .select("technicianId encryptedDek")
+    .lean();
+  const dekByTech = new Map();
+  for (const doc of kycDocs) {
+    if (!doc.encryptedDek) continue; // legacy plaintext doc — nothing to decrypt
+    const dek = await kmsDecryptDek(doc.encryptedDek);
+    dekByTech.set(doc.technicianId.toString(), dek);
+  }
+  for (const u of users) {
+    const dek = u.technicianId ? dekByTech.get(u.technicianId.toString()) : undefined;
+    if (!dek) continue;
+    if (u.kyc) {
+      u.kyc.aadhaarNumber = toPlaintext(u.kyc.aadhaarNumber, dek);
+      u.kyc.panNumber = toPlaintext(u.kyc.panNumber, dek);
+      u.kyc.drivingLicenseNumber = toPlaintext(u.kyc.drivingLicenseNumber, dek);
+    }
+    if (u.bankDetails) {
+      u.bankDetails.accountHolderName = toPlaintext(u.bankDetails.accountHolderName, dek);
+      u.bankDetails.ifscCode = toPlaintext(u.bankDetails.ifscCode, dek);
+      u.bankDetails.upiId = toPlaintext(u.bankDetails.upiId, dek);
+    }
+  }
+};
 
 /* ======================================================
   CONSTANTS & HELPERS
@@ -570,15 +628,46 @@ const buildLocation = (lat, lng) => {
 ====================================================== */
 export const signupAndSendOtp = async (req, res) => {
   try {
+    req.body = req.body || {};
     let { identifier, role, termsAndServices, privacyPolicy } = req.body;
 
     role = normalizeRole(role);
-    identifier = identifier?.trim();
+    const rawIdentifier = (identifier || "")?.trim();
+    identifier = normalizeIndianMobile(rawIdentifier);
 
-    if (!identifier || !role) {
+    if (!identifier) {
+      const invalidFormat = Boolean(rawIdentifier);
+      return fail(
+        res,
+        400,
+        invalidFormat
+          ? "Invalid mobile number (10 digits, optional +91 prefix)"
+          : "Identifier (Mobile Number) required",
+        invalidFormat ? "INVALID_MOBILE_NUMBER" : "VALIDATION_ERROR",
+        { required: ["identifier", "role"] }
+      );
+    }
+    if (!role) {
       return fail(res, 400, "Identifier and role required", "VALIDATION_ERROR", {
         required: ["identifier", "role"],
       });
+    }
+
+    // 🛡 Owner signup is invite-only. Enforced here (not just on the
+    // /owner/signup route) because the generic /signup route also accepts
+    // role from the body. Without OWNER_SIGNUP_INVITE_CODE configured,
+    // Owner accounts cannot be created via self-signup at all.
+    if (role === "Owner") {
+      const inviteCode = String(req.body?.inviteCode || "").trim();
+      const expected = process.env.OWNER_SIGNUP_INVITE_CODE;
+      if (!expected || !inviteCode || inviteCode !== expected) {
+        return fail(
+          res,
+          403,
+          "Owner signup requires a valid invite code",
+          "OWNER_INVITE_REQUIRED"
+        );
+      }
     }
 
     // Validate terms and privacy acceptance (required for Customer and Technician)
@@ -708,10 +797,10 @@ export const signupAndSendOtp = async (req, res) => {
 export const resendOtp = async (req, res) => {
   try {
     const { identifier, mobileNumber } = req.body;
-    const finalIdentifier = (identifier || mobileNumber)?.trim();
+    const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
 
     if (!finalIdentifier) {
-      return fail(res, 400, "Identifier (mobile number) required", "VALIDATION_ERROR");
+      return fail(res, 400, "Valid mobile number required (10 digits, optional +91 prefix)", "VALIDATION_ERROR");
     }
 
     // 1. Find the latest OTP record for this identifier to infer role and purpose
@@ -745,7 +834,6 @@ export const resendOtp = async (req, res) => {
 
     // Generate and hash new OTP
     let otp = generateOtp();
-    if (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") otp = "3161"; // [TESTING_ONLY]
     const hashedOtp = await bcrypt.hash(otp, 10);
 
     // Store new OTP
@@ -787,9 +875,10 @@ export const resendOtp = async (req, res) => {
 ====================================================== */
 export const verifyOtp = async (req, res) => {
   try {
+    req.body = req.body || {};
     // Standardize input: accept identifier (or mobileNumber for backward compat)
     let { identifier, mobileNumber, otp, role } = req.body;
-    const finalIdentifier = (identifier || mobileNumber)?.trim();
+    const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
     // Role is optional here if we can infer from OTP, but safer to validate if provided
     const normalizedRole = role ? normalizeRole(role) : null;
 
@@ -814,19 +903,6 @@ export const verifyOtp = async (req, res) => {
 
     // Sort by createdAt desc to get the latest OTP
     let record = await Otp.findOne(query).sort({ createdAt: -1 });
-
-    // [TESTING_ONLY] Bypass for fixed number and OTP
-    if (!record && (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") && otp === "3161") {
-      record = {
-        identifier: finalIdentifier,
-        otp: await bcrypt.hash("3161", 10),
-        role: normalizedRole || "Customer",
-        purpose: "LOGIN",
-        verified: false,
-        attempts: 0,
-        _id: new mongoose.Types.ObjectId(),
-      };
-    }
 
     if (!record) {
       return fail(res, 400, "OTP expired, invalid, or already used", "OTP_INVALID_OR_EXPIRED");
@@ -923,6 +999,11 @@ export const verifyOtp = async (req, res) => {
 
     } else if (record.purpose === "LOGIN") {
       // --- LOGIN COMPLETION LOGIC ---
+      // Owner/Admin accounts are password-only — OTP login is never allowed
+      if (["Owner", "Admin"].includes(record.role)) {
+        return fail(res, 403, "Owner/Admin accounts use phone number and password login only", "PASSWORD_ONLY_LOGIN");
+      }
+
       const user = await User.findOne({ mobileNumber: finalIdentifier, role: record.role });
       if (!user) {
         return fail(res, 404, "User account not found.", "USER_NOT_FOUND");
@@ -1025,19 +1106,23 @@ export const setPassword = async (req, res) => {
 };
 
 /* ======================================================
-  5️⃣ LOGIN (Hybrid: Password for Owner, OTP for Cust/Tech)
+  5️⃣ LOGIN (ROLE-WISE, ROLE NEVER REQUIRED FROM BODY)
+  - Owner & Admin  → phone number + PASSWORD only (no OTP)
+  - Customer & Technician → OTP only (no password)
+  The role-wise endpoints decide the role; req.body.role is ignored.
 ====================================================== */
-export const login = async (req, res) => {
+export const login = async (req, res, opts = {}) => {
   try {
+    req.body = req.body || {};
+    const privilegedMode = opts?.privileged === true;
     const { identifier, mobileNumber, role, password } = req.body;
-    const finalIdentifier = (identifier || mobileNumber)?.trim();
-    const normalizedRole = normalizeRole(role);
+    const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
+    // Role is optional from the body — when omitted it is derived from the
+    // stored account (Customer / Technician login only sends the mobile number).
+    const requestedRole = privilegedMode ? null : normalizeRole(role);
 
     if (!finalIdentifier) {
-      return fail(res, 400, "Identifier (Mobile Number) required", "VALIDATION_ERROR");
-    }
-    if (!normalizedRole) {
-      return fail(res, 400, "Valid role required", "VALIDATION_ERROR");
+      return fail(res, 400, "Valid mobile number required (10 digits, optional +91 prefix)", "VALIDATION_ERROR");
     }
 
     // Check if user exists (ignoring role initially to give better error)
@@ -1047,14 +1132,17 @@ export const login = async (req, res) => {
       return fail(res, 404, "User not found. Please signup first.", "USER_NOT_FOUND");
     }
 
-    // Role Mismatch Check
-    if (user.role !== normalizedRole) {
+    // 🔐 The account's stored role is authoritative. If a role was supplied in
+    // the body, enforce it matches; otherwise use the stored role (so login
+    // works with just the mobile number for Customer & Technician).
+    const normalizedRole = user.role;
+    if (!privilegedMode && requestedRole && requestedRole !== user.role) {
       return fail(
         res,
         403,
         `This account is registered as a ${user.role}. Please use the ${user.role} app to login.`,
         "ROLE_MISMATCH",
-        { registeredRole: user.role, requestedRole: normalizedRole }
+        { registeredRole: user.role, requestedRole }
       );
     }
 
@@ -1066,17 +1154,25 @@ export const login = async (req, res) => {
       return fail(res, 403, "Account deleted", "ACCOUNT_DELETED");
     }
 
-    if (normalizedRole === "Technician") {
-      const techProfile = await TechnicianProfile.findOne({ userId: user._id }).select("workStatus");
-      if (techProfile?.workStatus === "deleted") {
-        return fail(res, 403, "Account deleted", "ACCOUNT_DELETED");
+    // --- OWNER / ADMIN LOGIN (PASSWORD ONLY — NO OTP) ---
+    if (privilegedMode || normalizedRole === "Owner" || normalizedRole === "Admin") {
+      // The privileged endpoint serves Owner + Admin accounts only
+      if (privilegedMode && !["Owner", "Admin"].includes(user.role)) {
+        return fail(
+          res,
+          403,
+          `This endpoint is for Owner/Admin accounts only. This number is registered as a ${user.role}.`,
+          "ROLE_MISMATCH",
+          { registeredRole: user.role }
+        );
       }
-    }
 
-    // --- OWNER LOGIN (PASSWORD) ---
-    if (normalizedRole === "Owner" && user.password) {
+      if (!user.password) {
+        return fail(res, 400, "Password not set for this account. Use the Owner signup flow to set one.", "PASSWORD_NOT_SET");
+      }
+
       if (!password) {
-        return fail(res, 400, "Password is required for Owner login", "PASSWORD_REQUIRED");
+        return fail(res, 400, "Password is required for login", "PASSWORD_REQUIRED");
       }
 
       const isMatch = await bcrypt.compare(password, user.password);
@@ -1100,44 +1196,48 @@ export const login = async (req, res) => {
       });
     }
 
-    // --- CUSTOMER / TECHNICIAN LOGIN (OTP) ---
-    else {
-      // Remove old login OTPs
-      await Otp.deleteMany({
-        identifier: finalIdentifier,
-        role: normalizedRole,
-        purpose: "LOGIN",
-      });
-
-      // Generate and hash OTP
-      let otp = generateOtp();
-      if (finalIdentifier === "9876543210" || finalIdentifier === "9090909090") otp = "3161"; // [TESTING_ONLY]
-      const hashedOtp = await bcrypt.hash(otp, 10);
-
-      // Store OTP
-      await Otp.create({
-        identifier: finalIdentifier,
-        role: normalizedRole,
-        purpose: "LOGIN",
-        otp: hashedOtp,
-        expiresAt: Date.now() + 5 * 60 * 1000,
-      });
-
-      // Send SMS
-      try {
-        await sendSms(finalIdentifier, otp);
-      } catch (smsErr) {
-        console.error("SMS sending failed:", smsErr.message);
-        return fail(res, 500, "Failed to send OTP. Please try again.", "SMS_SEND_FAILED");
+    // --- CUSTOMER / TECHNICIAN LOGIN (OTP ONLY — NO PASSWORD) ---
+    if (normalizedRole === "Technician") {
+      const techProfile = await TechnicianProfile.findOne({ userId: user._id }).select("workStatus");
+      if (techProfile?.workStatus === "deleted") {
+        return fail(res, 403, "Account deleted", "ACCOUNT_DELETED");
       }
-
-      return ok(res, 200, "OTP sent successfully", {
-        identifier: finalIdentifier,
-        role: normalizedRole,
-        purpose: "LOGIN",
-        expiresInSeconds: 300,
-      });
     }
+
+    // Remove old login OTPs
+    await Otp.deleteMany({
+      identifier: finalIdentifier,
+      role: normalizedRole,
+      purpose: "LOGIN",
+    });
+
+    // Generate and hash OTP
+    let otp = generateOtp();
+    const hashedOtp = await bcrypt.hash(otp, 10);
+
+    // Store OTP
+    await Otp.create({
+      identifier: finalIdentifier,
+      role: normalizedRole,
+      purpose: "LOGIN",
+      otp: hashedOtp,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    // Send SMS
+    try {
+      await sendSms(finalIdentifier, otp);
+    } catch (smsErr) {
+      console.error("SMS sending failed:", smsErr.message);
+      return fail(res, 500, "Failed to send OTP. Please try again.", "SMS_SEND_FAILED");
+    }
+
+    return ok(res, 200, "OTP sent successfully", {
+      identifier: finalIdentifier,
+      role: normalizedRole,
+      purpose: "LOGIN",
+      expiresInSeconds: 300,
+    });
 
   } catch (err) {
     return fail(res, 500, err.message, "SERVER_ERROR");
@@ -1149,16 +1249,19 @@ export const login = async (req, res) => {
 ====================================================== */
 
 export const ownerLogin = async (req, res) => {
-  req.body.role = "Owner";
-  return login(req, res);
+  // Serves BOTH Owner and Admin — phone number + password.
+  // Role is NEVER read from the body; the account's stored role decides.
+  return login(req, res, { privileged: true });
 };
 
 export const technicianLogin = async (req, res) => {
+  req.body = req.body || {};
   req.body.role = "Technician";
   return login(req, res);
 };
 
 export const customerLogin = async (req, res) => {
+  req.body = req.body || {};
   req.body.role = "Customer";
   return login(req, res);
 };
@@ -1168,11 +1271,13 @@ export const customerLogin = async (req, res) => {
 ====================================================== */
 
 export const verifyCustomerOtp = async (req, res) => {
+  req.body = req.body || {};
   req.body.role = "Customer";
   return verifyOtp(req, res);
 };
 
 export const verifyTechnicianOtp = async (req, res) => {
+  req.body = req.body || {};
   req.body.role = "Technician";
   return verifyOtp(req, res);
 };
@@ -1211,9 +1316,13 @@ export const getMyProfile = async (req, res) => {
     if (!profile) return fail(res, 404, "Profile not found", "PROFILE_NOT_FOUND");
     const result = profile.toObject();
     // Optionally fetch KYC
-    const kyc = await TechnicianKyc.findOne({ technicianId: profile._id }).select("bankDetails bankVerified bankUpdateRequired");
+    const kyc = await TechnicianKyc.findOne({ technicianId: profile._id }).select(
+      "bankDetails bankVerified bankUpdateRequired encryptedDek"
+    );
     if (kyc && kyc.bankDetails) {
-      result.bankDetails = kyc.bankDetails;
+      // Self data — return plaintext, not ciphertext.
+      const dek = await getDekForKycDoc(kyc);
+      result.bankDetails = decryptBankDetails(kyc.bankDetails, dek);
       result.bankVerified = kyc.bankVerified || false;
       result.bankUpdateRequired = kyc.bankUpdateRequired || false;
     }
@@ -1392,12 +1501,12 @@ export const updateMyProfile = async (req, res) => {
       return fail(res, 400, "Invalid bank details", "VALIDATION_ERROR", { errors });
     }
     if (bankDetails.accountNumber) {
-      const accountNumberHash = crypto
-        .createHash("sha256")
-        .update(String(bankDetails.accountNumber))
-        .digest("hex");
+      const accountNumberHash = hashAccountNumber(bankDetails.accountNumber);
       const dup = await TechnicianKyc.findOne({
-        "bankDetails.accountNumberHash": accountNumberHash,
+        $or: [
+          { "bankDetails.accountNumberHash": accountNumberHash },
+          { "bankDetails.accountNumber": String(bankDetails.accountNumber).trim() },
+        ],
         technicianId: { $ne: technicianProfile._id },
       });
       if (dup) {
@@ -1415,13 +1524,15 @@ export const updateMyProfile = async (req, res) => {
       bankName: bankDetails.bankName ? String(bankDetails.bankName).trim() : bankDetails.bankName,
       accountNumber: bankDetails.accountNumber ? String(bankDetails.accountNumber).trim() : bankDetails.accountNumber,
       accountNumberHash: bankDetails.accountNumber
-        ? crypto.createHash("sha256").update(String(bankDetails.accountNumber).trim()).digest("hex")
+        ? hashAccountNumber(bankDetails.accountNumber)
         : kyc.bankDetails?.accountNumberHash,
       ifscCode: bankDetails.ifscCode ? String(bankDetails.ifscCode).toUpperCase().trim() : bankDetails.ifscCode,
       branchName: bankDetails.branchName ? String(bankDetails.branchName).trim() : bankDetails.branchName,
       upiId: bankDetails.upiId ? String(bankDetails.upiId).toLowerCase().trim() : bankDetails.upiId,
     };
-    kyc.bankDetails = { ...(kyc.bankDetails || {}), ...processed };
+    // Encrypt the sensitive bank fields before persisting.
+    const dek = await getOrCreateDekForKycDoc(kyc);
+    kyc.bankDetails = { ...(kyc.bankDetails || {}), ...encryptBankDetails(processed, dek) };
     kyc.bankVerified = false;
     kyc.bankUpdateRequired = false;
     kyc.bankVerificationStatus = "pending";

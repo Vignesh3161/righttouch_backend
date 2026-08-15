@@ -5,6 +5,7 @@
  */
 
 import { sendPushNotification, sendSocketNotification } from "./sendNotification.js";
+import { SOCKET_EVENTS } from "./socketConstants.js";
 import sendSms from "./sendSMS.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import User from "../Schemas/User.js";
@@ -56,7 +57,7 @@ export const sendScheduledReminder = async (booking, type, io) => {
 
         // 2️⃣ Socket notification
         if (io) {
-            sendSocketNotification(io, technicianProfileId, "booking:reminder", {
+            sendSocketNotification(io, technicianProfileId, SOCKET_EVENTS.BOOKING_REMINDER, {
                 type,
                 bookingId: booking._id,
                 scheduledAt: booking.scheduledAt,
@@ -96,7 +97,7 @@ export const notifyCustomerOfRebroadcast = async (booking, io) => {
 
         // Socket notification to customer
         if (io) {
-            io.to(`customer_${customerId}`).emit("booking:rebroadcast", {
+            io.to(`customer_${customerId}`).emit(SOCKET_EVENTS.BOOKING_REBROADCAST, {
                 bookingId: booking._id,
                 message,
                 timestamp: new Date(),

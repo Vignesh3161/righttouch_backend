@@ -16,12 +16,22 @@ import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
 dotenv.config();
 
 import { socketAuth } from "./Middleware/socketAuth.js";
+import { createHandshakeLimiter } from "./Middleware/socketRateLimiter.js";
+import { startSocketMetricsLogger } from "./Utils/socketMetrics.js";
+import TechnicianProfile from "./Schemas/TechnicianProfile.js";
 import UserRoutes from "./Routes/User.js";
 import TechnicianRoutes from "./Routes/technician.js";
 import AddressRoutes from "./Routes/address.js";
 import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
 import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
+import operationalCityRoutes from "./Routes/operationalCityRoutes.js";
+import adminZoneRoutes from "./Routes/adminZones.js";
+import userZoneRoutes from "./Routes/userZones.js";
 import DevRoutes from "./Routes/dev.js";
+import { adminFinanceRoutes, technicianFinanceRoutes } from "./Routes/financeRoutes.js";
+
+// 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
+const activeSocketByUser = new Map(); // userId -> socket.id
 
 const App = express();
 
@@ -76,11 +86,12 @@ App.use(helmet());
 // 🔒 Security Hardening - Apply globally
 
 App.use((req, res, next) => {
-  sanitizeNoSqlPayload(req.body);
+  // NOTE: req.body is NOT parsed yet at this point (express.json runs later).
+  // Params and query are already populated, so they are sanitized here;
+  // body sanitization is re-applied AFTER the JSON parser below.
   sanitizeNoSqlPayload(req.params);
   sanitizeNoSqlPayload(req.query);
 
-  sanitizeStringPayload(req.body);
   sanitizeStringPayload(req.params);
   sanitizeStringPayload(req.query);
 
@@ -110,8 +121,25 @@ const trustProxy =
 App.set("trust proxy", trustProxy);
 
 // 🔌 Initialize Socket.IO
+// Socket Analysis Fix #2/B1.4: restrict browser-origin handshakes via env.
+// Fix #6/B2.2-B4.6: connection-state recovery for short disconnects +
+// a tight 500KB payload cap (DTOs are small; the 1MB default kills slow 2G
+// clients on large payloads).
+const allowedOrigins = () => {
+  const raw = process.env.ALLOWED_ORIGINS;
+  if (!raw || !raw.trim()) return true; // native mobile clients have no Origin; keep open unless configured
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+};
+
 const io = new Server(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: { origin: allowedOrigins(), credentials: true },
+  connectionStateRecovery: {
+    // Replays missed events for short disconnects (tunnel/elevator/app-switch)
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    // keep middlewares running on recovery so socket.user is re-attached
+    skipMiddlewares: false,
+  },
+  maxHttpBufferSize: 5e5, // 500 KB
 });
 
 // 🔌 Redis Adapter Setup for Scaling (Required for multi-instance production)
@@ -129,6 +157,10 @@ const io = new Server(httpServer, {
 //   console.error("❌ Redis Adapter Connection Failed:", err.message);
 //   console.warn("⚠️ Continuing in single-instance mode...");
 // });
+
+// 🛡 Handshake rate limiter MUST run before auth: a flood of junk tokens
+// never reaches jwt.verify (Socket Analysis B1.3).
+io.use(createHandshakeLimiter({ max: 20, windowMs: 60000 }));
 
 // Socket.IO Middleware & Connection Handler
 io.use(socketAuth);
@@ -151,6 +183,30 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     console.log(`🏠 Technician joined room: technician_${techProfileId}`);
   }
 
+  // Admin/Owner dashboard feed (replaces the old global new_booking io.emit —
+  // Socket Analysis Fix #1). Only Admin/Owner roles ever see it.
+  if (role === "Admin" || role === "Owner") {
+    socket.join(SOCKET_ROOMS.ADMIN_DASHBOARD);
+  }
+
+  // 🛡 SINGLE ACTIVE SESSION (Socket Analysis Fix #9 / B3.4):
+  // one user = one live socket. A new device silently kicks the older one so
+  // job alerts / job_taken are never delivered twice.
+  // NOTE: reconnection recovery resumes the SAME socket.id, so this only
+  // fires on genuine multi-device connections.
+  if (userId) {
+    const previousSocketId = activeSocketByUser.get(userId);
+    if (previousSocketId && previousSocketId !== socket.id) {
+      const previousSocket = io.sockets.sockets.get(previousSocketId);
+      previousSocket?.emit(SOCKET_EVENTS.SESSION_REPLACED, {
+        message: "You have connected from another device.",
+      });
+      previousSocket?.disconnect(true);
+      console.log(`🔁 User ${userId} replaced old socket ${previousSocketId}`);
+    }
+    activeSocketByUser.set(userId, socket.id);
+  }
+
   // 🛡 RATE LIMITER for Socket Events (simple memory-based)
   const socketRateLimit = new Map();
   const checkRateLimit = (event, limit = 10, windowMs = 1000) => {
@@ -166,7 +222,7 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   // 📍 Location Update Listener (Real-time)
   socket.on(SOCKET_EVENTS.TECH_LOCATION_UPDATE, async (data, ack) => {
     try {
-      if (!role === "Technician" || !techProfileId) return;
+      if (role !== "Technician" || !techProfileId) return;
 
       // Rate limit protection - Prevent spamming DB updates
       if (!checkRateLimit(SOCKET_EVENTS.TECH_LOCATION_UPDATE, 1, 5000)) {
@@ -186,18 +242,52 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     }
   });
 
-  // 📋 Job Fetch Listener (Real-time)
-  socket.on(SOCKET_EVENTS.TECH_GET_JOBS, async (ack) => {
+  // 📋 Job Fetch Listener (Real-time) — Socket Analysis Fix #5 (B3.2):
+  // rate-limited per socket + cursor-based "unchanged" short-circuit so
+  // poll-heavy clients stop paying 3 queries + 3 populates per poll.
+  socket.on(SOCKET_EVENTS.TECH_GET_JOBS, async (data, ack) => {
     try {
       if (role !== "Technician" || !techProfileId) {
         return ack?.({ success: false, message: "Unauthorized" });
       }
 
+      // sockets sometimes call emit() with only the ack callback
+      if (typeof data === "function") {
+        ack = data;
+        data = {};
+      }
+      const payload = data || {};
+
+      if (checkRateLimit(SOCKET_EVENTS.TECH_GET_JOBS, 1, 3000) === false) {
+        return ack?.({ success: false, throttled: true, retryAfterMs: 3000 });
+      }
+
+      // Cursor short-circuit: if the client's `since` is >= the tech's
+      // lastJobsChangeAt, nothing changed — answer without the heavy query.
+      let latestVersion = 0;
+      try {
+        const tech = await TechnicianProfile.findById(techProfileId)
+          .select("lastJobsChangeAt")
+          .lean();
+        latestVersion = tech?.lastJobsChangeAt ? new Date(tech.lastJobsChangeAt).getTime() : 0;
+      } catch (err) {
+        console.error("Socket Get Jobs cursor read error:", err.message);
+      }
+
+      const since = Number(payload?.since) || 0;
+      if (since >= latestVersion && latestVersion > 0) {
+        // NOTHING CHANGED — no heavy query, no emit. The ack tells the client
+        // to back off; clients should prefer the technician:jobs_changed push
+        // and call get_jobs only when the push fires (or on connect/foreground).
+        return ack?.({ success: true, unchanged: true, count: 0, latestVersion });
+      }
+
       const jobs = await fetchTechnicianJobsInternal(techProfileId);
+      // Emit the list ONLY when something actually changed.
       socket.emit(SOCKET_EVENTS.TECH_JOBS_LIST, jobs);
 
       // ✅ ACK support
-      ack?.({ success: true, count: jobs.length });
+      ack?.({ success: true, unchanged: false, count: jobs.length, latestVersion });
     } catch (err) {
       console.error("Socket Get Jobs Error:", err.message);
       ack?.({ success: false, message: err.message });
@@ -207,12 +297,25 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   socket.on(SOCKET_EVENTS.DISCONNECT, () => {
     console.log(`🔌 Disconnected: ${socket.id}`);
     socketRateLimit.clear();
+
+    // release single-active-session slot
+    if (userId && activeSocketByUser.get(userId) === socket.id) {
+      activeSocketByUser.delete(userId);
+    }
+  });
+
+  socket.on(SOCKET_EVENTS.ERROR, (err) => {
+    console.error(`🚨 Socket error on ${socket.id}:`, err?.message || err);
   });
 });
 
 import { handleLocationUpdate } from "./Utils/technicianLocation.js";
 import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
 import { initBookingCrons } from "./Utils/bookingCron.js";
+import { initPaymentCrons } from "./Utils/paymentCrons.js";
+import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
+import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
+import { ensureConnected as ensureGeoConnected } from "./Utils/technicianGeo.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -220,8 +323,10 @@ App.use((req, res, next) => {
   next();
 });
 
-// ⏰ Initialize new booking cron jobs (pass io for real-time socket events)
-initBookingCrons(io);
+// NOTE: Background workers/crons are intentionally NOT started here.
+// They must wait for the MongoDB connection to be ready — otherwise
+// Mongoose buffers every operation for 10s and floods the log with
+// "buffering timed out after 10000ms" errors. See startBackgroundWorkers() below.
 
 // ✅ Single JSON parser with rawBody capture (needed for payment webhooks)
 
@@ -232,6 +337,14 @@ App.use(
     },
   })
 );
+
+// 🔒 Body sanitization — MUST run after express.json() so req.body exists.
+// Without this, the NoSQL-injection/XSS protections would be a no-op.
+App.use((req, res, next) => {
+  sanitizeNoSqlPayload(req.body);
+  sanitizeStringPayload(req.body);
+  next();
+});
 
 // 🔒 Security: Helmet, NoSQL injection prevention, and XSS sanitization
 // are now applied globally via middleware above
@@ -281,16 +394,75 @@ App.use((req, res, next) => {
 
 mongoose.set("strictQuery", false);
 
-mongoose
-  .connect(process.env.MONGO_URI, {
-    serverSelectionTimeoutMS: 10000, // 10 seconds
-    socketTimeoutMS: 45000, // 45 seconds
-  })
-  .then(() => console.log("Connected to MongoDB Atlas..."))
-  .catch((err) => console.error("Could not connect to MongoDB...", err));
+// 🔌 Background workers/crons — started ONLY once Mongo is connected, so
+// their operations never buffer-timeout. Re-started on every reconnect so a
+// dropped connection doesn't leave them dead.
+let backgroundStarted = false;
+const startBackgroundWorkers = () => {
+  if (backgroundStarted) return;
+  backgroundStarted = true;
+
+  // ⏰ Initialize new booking cron jobs (pass io for real-time socket events)
+  initBookingCrons(io);
+
+  // 🚚 Dispatch queue worker — async fan-out for broadcast notifications
+  startDispatchWorker(io);
+
+  // 📤 Booking outbox worker — broadcast only AFTER booking transaction commit
+  startBookingOutboxWorker(io);
+
+  // 🗺 Redis GEO layer (best-effort — matching falls back to Mongo if absent)
+  ensureGeoConnected().catch(() => {});
+
+  // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
+  initPaymentCrons();
+
+  console.log("✅ Background workers & crons started after Mongo connection.");
+};
+
+const connectToMongo = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 10000, // 10 seconds
+      socketTimeoutMS: 45000, // 45 seconds
+    });
+    console.log("Connected to MongoDB Atlas...");
+    startBackgroundWorkers();
+  } catch (err) {
+    console.error("Could not connect to MongoDB...", err.message);
+    // Retry so a transient outage doesn't leave the process half-alive.
+    setTimeout(connectToMongo, 5000).unref?.();
+  }
+};
+
+// Mongo connection lifecycle — workers/crons self-guard via readyState, so a
+// runtime disconnect just makes them no-op until Mongo reconnects (no restart
+// needed, which also avoids double-registering cron schedules).
+mongoose.connection.on("disconnected", () => {
+  console.warn("⚠️ MongoDB disconnected — workers will pause until reconnect.");
+});
+mongoose.connection.on("reconnected", () => {
+  console.log("✅ MongoDB reconnected — workers resumed.");
+});
+mongoose.connection.on("error", (err) => {
+  console.error("MongoDB connection error:", err.message);
+});
+
+connectToMongo();
 
 App.get("/", (req, res) => {
   res.send("welcome");
+});
+
+// 🩺 Health endpoints — wire into the process supervisor / LB health checks
+App.get("/health/live", (req, res) => {
+  res.status(200).json({ status: "ok", uptime: process.uptime() });
+});
+
+App.get("/health/ready", async (req, res) => {
+  const mongoOk = mongoose.connection.readyState === 1;
+  if (mongoOk) return res.status(200).json({ status: "ready" });
+  return res.status(503).json({ status: "not_ready", mongoOk });
 });
 
 // Routes
@@ -300,6 +472,11 @@ App.use("/api/technician", TechnicianRoutes);
 App.use("/api/technician", technicianWalletRoutes);
 App.use("/api/addresses", AddressRoutes);
 App.use("/api/admin", adminWalletRoutes);
+App.use("/api/admin", operationalCityRoutes);
+App.use("/api/admin", adminZoneRoutes);
+App.use("/api/admin", adminFinanceRoutes);
+App.use("/api", userZoneRoutes);
+App.use("/api/technician", technicianFinanceRoutes);
 App.use("/api/dev", DevRoutes);
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
@@ -347,3 +524,25 @@ httpServer.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
   console.log(`🔌 Socket.IO ready for real-time notifications`);
 });
+
+// 📊 Socket metrics logger (Socket Analysis Fix #8 / B2.4)
+startSocketMetricsLogger(io, 60000);
+
+// 🛑 GRACEFUL SHUTDOWN (Crash & Recovery hardening)
+// Closes the socket layer, stops accepting HTTP, then closes Mongo — so
+// in-flight broadcasts/acks aren't cut off mid-delivery on deploys/restarts.
+const shutdown = async (signal) => {
+  console.log(`🛑 ${signal} received — shutting down gracefully...`);
+  try {
+    stopDispatchWorker();
+    io.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+    await mongoose.connection.close();
+  } catch (err) {
+    console.error("Shutdown error:", err.message);
+  }
+  process.exit(0);
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
