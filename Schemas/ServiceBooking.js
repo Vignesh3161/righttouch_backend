@@ -187,7 +187,7 @@ const serviceBookingSchema = new mongoose.Schema(
 
     paymentProvider: {
       type: String,
-      enum: ["razorpay"],
+      enum: ["razorpay", "free"],
       default: "razorpay",
     },
 
@@ -559,8 +559,13 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
-    // 🏘 CITY ZONE — resolved at booking time from customer coordinates.
-    // Used for zone-based service availability and analytics.
+    // 🏙 OPERATIONAL DISTRICT & 🏘 CITY ZONE — resolved at booking time from customer coordinates.
+    districtId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "OperationalCity",
+      default: null,
+      index: true,
+    },
     cityZoneId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "CityZone",

@@ -22,7 +22,7 @@ const getKeys = () => {
   return { keyId, keySecret };
 };
 
-export const razorpayRequest = async ({ method, path, body }) => {
+export const razorpayRequest = async ({ method, path, body, headers: extraHeaders }) => {
   const { keyId, keySecret } = getKeys();
   const payload = body ? JSON.stringify(body) : "";
 
@@ -35,6 +35,7 @@ export const razorpayRequest = async ({ method, path, body }) => {
       "Content-Length": Buffer.byteLength(payload),
       Authorization:
         "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64"),
+      ...(extraHeaders || {}),
     },
   };
 
@@ -101,6 +102,35 @@ export const fetchOrderPayments = async (orderId) =>
   razorpayRequest({
     method: "GET",
     path: `/v1/orders/${orderId}/payments`,
+  });
+
+/* ================= REFUND API (idempotent) ================= */
+
+export const createRazorpayRefund = async ({
+  paymentId,
+  amountInPaisa,
+  speed = "normal",
+  receipt,
+  idempotencyKey,
+}) => {
+  const headers = {};
+  if (idempotencyKey) headers["X-Razorpay-Idempotency"] = idempotencyKey;
+  return razorpayRequest({
+    method: "POST",
+    path: `/v1/payments/${paymentId}/refund`,
+    headers,
+    body: {
+      amount: amountInPaisa,
+      speed,
+      ...(receipt ? { receipt } : {}),
+    },
+  });
+};
+
+export const fetchRazorpayRefund = async (refundId) =>
+  razorpayRequest({
+    method: "GET",
+    path: `/v1/refunds/${refundId}`,
   });
 
 /* ================= SIGNATURE VERIFICATION ================= */

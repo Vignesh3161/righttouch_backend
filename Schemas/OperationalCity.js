@@ -1,18 +1,10 @@
 import mongoose from "mongoose";
 
 /**
- * 🏙 OPERATIONAL CITY — the polygons RightTouch actually operates in.
+ * 🏙 OPERATIONAL CITY / DISTRICT — the operational boundaries RightTouch operates in.
  *
- * A technician is only eligible for ANY broadcast if their current location
- * point-in-polygon tests against an active OperationalCity. This is
- * INDEPENDENT of the per-job 10 km radius: a tech can be inside the polygon
- * but outside a job's radius (normal), or outside the polygon entirely
- * (drove into a non-operational town) — the latter excludes them from ALL
- * matching even if geometrically within 10 km, because support/insurance/
- * pricing don't exist there.
- *
- * Queried via Mongo's $geoIntersects (2dsphere index) — never hand-rolled
- * point-in-polygon in app code.
+ * Configured per district with activation, registration, and job assignment flags.
+ * Queried via Mongo's $geoIntersects (2dsphere index).
  */
 const operationalCitySchema = new mongoose.Schema(
   {
@@ -26,6 +18,34 @@ const operationalCitySchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      index: true,
+    },
+
+    city: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
+
+    state: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
+
+    country: {
+      type: String,
+      trim: true,
+      default: "India",
+    },
+
+    code: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: null,
     },
 
     polygon: {
@@ -45,12 +65,68 @@ const operationalCitySchema = new mongoose.Schema(
       default: true,
       index: true,
     },
+
+    status: {
+      type: String,
+      enum: ["ACTIVE", "INACTIVE", "INVALID", "REVIEW_REQUIRED"],
+      default: "ACTIVE",
+      index: true,
+    },
+
+    statusReason: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    version: {
+      type: Number,
+      default: 1,
+    },
+
+    isRegistrationEnabled: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+
+    isJobEnabled: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
 
+// Virtual `isActive` getter/setter for compatibility with District prompt specs
+operationalCitySchema.virtual("isActive")
+  .get(function () {
+    return this.active;
+  })
+  .set(function (val) {
+    this.active = Boolean(val);
+  });
+
 operationalCitySchema.index({ polygon: "2dsphere" });
-operationalCitySchema.index({ active: 1, updatedAt: -1 });
+operationalCitySchema.index({ active: 1, isRegistrationEnabled: 1, isJobEnabled: 1, updatedAt: -1 });
+operationalCitySchema.index({ name: 1, state: 1 });
 
 export default mongoose.models.OperationalCity ||
   mongoose.model("OperationalCity", operationalCitySchema);

@@ -15,6 +15,7 @@ import {
   deleteTechnician,
   updateTechnicianTraining,
   uploadProfileImage,
+  registerTechnicianFcmToken,
 } from "../Controllers/technician.js";
 import { technicianLogin, verifyTechnicianOtp } from "../Controllers/User.js";
 import { respondToJob, getMyJobs } from "../Controllers/technicianBroadcastController.js";
@@ -46,7 +47,7 @@ const router = express.Router();
 /* ================= TECHNICIAN SIGNUP (TERMS REQUIRED) ================= */
 // Technician signup route - requires termsAccepted
 import { signupAndSendOtp, verifyOtp } from "../Controllers/User.js";
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 const authLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -57,6 +58,23 @@ const authLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+// 📍 Location-ping limiter — mirrors the socket cap (1 per 5s = 12/min).
+// PUT /api/technician/location used to bypass ALL socket limits; an app
+// could hammer the HTTP path. Keyed per technician (falls back to IP).
+const locationLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 12,
+  message: {
+    success: false,
+    message: "Location updates too frequent",
+    result: {},
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, res) => req.user?.technicianProfileId || ipKeyGenerator(req, res),
+  validate: { ip: false, trustProxy: false },
 });
 
 router.post("/signup/technician", authLimiter, async (req, res, next) => {
@@ -72,7 +90,8 @@ router.post("/signup/technician/verify-otp", authLimiter, verifyOtp);
 /* ================= TECHNICIAN AUTH ================= */
 router.post("/login/technician", technicianLogin);
 router.post("/login/technician/verify-otp", verifyTechnicianOtp);
-router.put("/location", Auth, isTechnician, updateTechnicianLocation);
+router.put("/location", Auth, isTechnician, locationLimiter, updateTechnicianLocation);
+router.put("/fcm-token", Auth, isTechnician, registerTechnicianFcmToken);
 router.post("/technicianData", Auth, createTechnician);
 router.get("/technicianAll", Auth, getAllTechnicians);
 router.get("/technicianById/:id", Auth, getTechnicianById);
@@ -87,9 +106,25 @@ router.delete("/technicianDelete/:id", Auth, deleteTechnician);
 
 /* ================= TECHNICIAN KYC ================= */
 
+router.post("/kyc", Auth, isTechnician, submitTechnicianKyc);
 router.post("/technician/kyc", Auth, isTechnician, submitTechnicianKyc);
-router.post("/technician/banks", Auth, isTechnician, submitTechnicianBankDetails);
 
+router.post("/banks", Auth, isTechnician, submitTechnicianBankDetails);
+router.post("/technician/banks", Auth, isTechnician, submitTechnicianBankDetails);
+router.post("/kyc/bank-details", Auth, isTechnician, submitTechnicianBankDetails);
+router.post("/technician/kyc/bank-details", Auth, isTechnician, submitTechnicianBankDetails);
+
+router.post(
+  "/kyc/upload",
+  Auth,
+  isTechnician,
+  kycUpload.fields([
+    { name: "aadhaarImage", maxCount: 2 },
+    { name: "panImage", maxCount: 2 },
+    { name: "dlImage", maxCount: 2 },
+  ]),
+  uploadTechnicianKycDocuments
+);
 router.post(
   "/technician/kyc/upload",
   Auth,
@@ -103,13 +138,18 @@ router.post(
 );
 
 // IMPORTANT: define '/me' BEFORE '/:technicianId' so 'me' doesn't get treated as an id.
+router.get("/kyc/me", Auth, isTechnician, getMyTechnicianKyc);
 router.get("/technician/kyc/me", Auth, isTechnician, getMyTechnicianKyc);
+
+router.get("/kyc", Auth, getAllTechnicianKyc);
 router.get("/technician/kyc", Auth, getAllTechnicianKyc);
 
 // 🔏 Full unmasked PII — audited access, Owner/Admin only. Define BEFORE
 // the generic /:technicianId route (explicit match wins by order).
+router.get("/kyc/:technicianId/full", Auth, getTechnicianKycFull);
 router.get("/technician/kyc/:technicianId/full", Auth, getTechnicianKycFull);
 
+router.get("/kyc/:technicianId", Auth, getTechnicianKyc);
 router.get("/technician/kyc/:technicianId", Auth, getTechnicianKyc);
 
 // 🔒 Rate-limited admin decisions — every approval/rejection is audited
@@ -125,12 +165,23 @@ const kycAdminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+router.put("/kyc/verify", Auth, kycAdminLimiter, verifyTechnicianKyc);
 router.put("/technician/kyc/verify", Auth, kycAdminLimiter, verifyTechnicianKyc);
+
+router.put("/kyc/bank/verify", Auth, kycAdminLimiter, verifyBankDetails);
 router.put("/technician/kyc/bank/verify", Auth, kycAdminLimiter, verifyBankDetails);
+
+router.delete("/deletekyc/:technicianId", Auth, deleteTechnicianKyc);
 router.delete("/technician/deletekyc/:technicianId", Auth, deleteTechnicianKyc);
+
+router.get("/kyc/orphaned/list", Auth, getOrphanedKyc);
 router.get("/technician/kyc/orphaned/list", Auth, getOrphanedKyc);
-router.delete("/technician/kyc/orphaned/:kycId", Auth, deleteOrphanedKyc);
+
+router.delete("/kyc/orphaned/cleanup/all", Auth, deleteAllOrphanedKyc);
 router.delete("/technician/kyc/orphaned/cleanup/all", Auth, deleteAllOrphanedKyc);
+
+router.delete("/kyc/orphaned/:kycId", Auth, deleteOrphanedKyc);
+router.delete("/technician/kyc/orphaned/:kycId", Auth, deleteOrphanedKyc);
 
 /* ================= JOB BROADCAST ================= */
 
@@ -169,6 +220,7 @@ router.post("/wallet/transaction", Auth, createWalletTransaction);
 router.get("/wallet/history", Auth, isTechnician, getWalletTransactions);
 
 // Technician withdrawal requests
+router.post("/wallet/withdrawal", Auth, isTechnician, requestWithdrawal);
 router.post("/wallet/withdrawal/request", Auth, isTechnician, requestWithdrawal);
 router.get("/wallet/withdrawalhistory/me", Auth, isTechnician, getMyWithdrawalRequests);
 router.put("/wallet/withdrawal/:id/cancel", Auth, isTechnician, cancelMyWithdrawal);

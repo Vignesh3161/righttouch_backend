@@ -518,16 +518,6 @@ export const getTechnicianKyc = async (req, res) => {
       });
     }
 
-    const kycDoc = await TechnicianKyc.findOne({ technicianId }).lean();
-
-    if (!kycDoc) {
-      return res.status(404).json({
-        success: false,
-        message: "KYC record not found",
-        result: {},
-      });
-    }
-
     const isPrivileged = isOwnerOrAdmin(req);
     if (!isPrivileged) {
       const technicianProfileId = req.user?.technicianProfileId;
@@ -538,6 +528,16 @@ export const getTechnicianKyc = async (req, res) => {
           result: {},
         });
       }
+    }
+
+    const kycDoc = await TechnicianKyc.findOne({ technicianId }).lean();
+
+    if (!kycDoc) {
+      return res.status(200).json({
+        success: true,
+        message: "KYC record not found",
+        result: null,
+      });
     }
 
     const technician = await TechnicianProfile.findById(technicianId)
@@ -617,15 +617,28 @@ export const getMyTechnicianKyc = async (req, res) => {
         }
       });
 
+    const eligibility = await getTechnicianJobEligibility({ technicianProfileId });
+
     if (!kyc) {
-      return res.status(404).json({
-        success: false,
-        message: "KYC record not found",
-        result: {},
+      return res.status(200).json({
+        success: true,
+        message: "KYC record not initialized",
+        result: {
+          technicianId: technicianProfileId,
+          kycVerified: false,
+          verificationStatus: "pending",
+          bankVerified: false,
+          bankVerificationStatus: "pending",
+          bankDetails: null,
+          documents: { aadhaarUrl: [], panUrl: [], dlUrl: [] },
+          eligibility: {
+            ...eligibility,
+            canWork: false,
+          },
+        },
       });
     }
 
-    const eligibility = await getTechnicianJobEligibility({ technicianProfileId });
     const dek = await getDekForKycDoc(kyc);
     const kycObj = kyc.toObject();
 
@@ -715,10 +728,10 @@ export const getTechnicianKycFull = async (req, res) => {
     const kycDoc = await TechnicianKyc.findOne({ technicianId }).lean();
 
     if (!kycDoc) {
-      return res.status(404).json({
-        success: false,
+      return res.status(200).json({
+        success: true,
         message: "KYC record not found",
-        result: {},
+        result: null,
       });
     }
 
@@ -820,12 +833,13 @@ export const verifyTechnicianKyc = async (req, res) => {
       if (!plainIdentity.drivingLicenseNumber) missingFields.push("Driving License Number");
       if (!kyc.documents?.dlUrl || kyc.documents.dlUrl.length === 0) missingFields.push("Driving License Images");
 
-      // Check Bank Details
+      // Check Bank Details & UPI ID (Both Bank Account and UPI ID required)
       if (!plainBank?.accountHolderName) missingFields.push("Account Holder Name");
       if (!plainBank?.bankName) missingFields.push("Bank Name");
       if (!plainBank?.accountNumber) missingFields.push("Account Number");
       if (!plainBank?.ifscCode) missingFields.push("IFSC Code");
       if (!plainBank?.branchName) missingFields.push("Branch Name");
+      if (!plainBank?.upiId) missingFields.push("UPI ID");
 
       // If any required field is missing, reject the approval
       if (missingFields.length > 0) {
@@ -834,7 +848,7 @@ export const verifyTechnicianKyc = async (req, res) => {
           message: "Cannot approve KYC. Missing required fields",
           result: {
             missingFields: missingFields,
-            details: "Please ensure all documents (Aadhaar, PAN, Driving License with images) and bank details (Account Holder Name, Bank Name, Account Number, IFSC Code, Branch Name) are complete before approval."
+            details: "Please ensure all documents (Aadhaar, PAN, Driving License with images), Bank details (Account Holder Name, Bank Name, Account Number, IFSC Code, Branch Name) AND UPI ID are complete before approval."
           },
         });
       }
@@ -955,11 +969,14 @@ export const verifyBankDetails = async (req, res) => {
     const dek = await getDekForKycDoc(kyc);
     const plainBank = decryptBankDetails(kyc.bankDetails, dek);
 
-    if (!plainBank?.accountNumber) {
+    if (!plainBank?.accountNumber || !plainBank?.upiId) {
       return res.status(400).json({
         success: false,
-        message: "No bank details found for this technician",
-        result: {},
+        message: "Incomplete details: Both Bank Account details and UPI ID are required for verification",
+        result: {
+          hasAccountNumber: Boolean(plainBank?.accountNumber),
+          hasUpiId: Boolean(plainBank?.upiId),
+        },
       });
     }
 
@@ -1170,5 +1187,193 @@ export const deleteAllOrphanedKyc = async (req, res) => {
       message: "Server error",
       result: { error: error.message },
     });
+  }
+};
+
+/* ================= ADMIN UPDATE TECHNICIAN KYC DETAILS ================= */
+// Admin/Owner can correct a technician's identity KYC fields (Aadhaar/PAN/DL).
+// Any change resets the KYC verification to pending so it is re-approved.
+export const adminUpdateTechnicianKycDetails = async (req, res) => {
+  try {
+    const { technicianId } = req.params;
+    const { aadhaarNumber, panNumber, drivingLicenseNumber } = req.body;
+
+    if (!isOwnerOrAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Owner/Admin access only", result: {} });
+    }
+    if (!technicianId || !isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Valid technicianId is required", result: {} });
+    }
+    if (
+      aadhaarNumber === undefined &&
+      panNumber === undefined &&
+      drivingLicenseNumber === undefined
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Provide at least one of aadhaarNumber, panNumber, drivingLicenseNumber",
+        result: {},
+      });
+    }
+
+    const kyc = await TechnicianKyc.findOne({ technicianId });
+    if (!kyc) {
+      return res.status(404).json({ success: false, message: "KYC record not found", result: {} });
+    }
+
+    const dek = await getOrCreateDekForKycDoc(kyc);
+    const existing = decryptIdentityFields(kyc, dek);
+    const merged = {
+      aadhaarNumber: aadhaarNumber !== undefined ? aadhaarNumber : existing.aadhaarNumber,
+      panNumber: panNumber !== undefined ? panNumber : existing.panNumber,
+      drivingLicenseNumber:
+        drivingLicenseNumber !== undefined ? drivingLicenseNumber : existing.drivingLicenseNumber,
+    };
+
+    kyc.set(encryptIdentityFields(merged.aadhaarNumber, merged.panNumber, merged.drivingLicenseNumber, dek));
+    // Identity changed → reset verification (must be re-approved by admin).
+    kyc.verificationStatus = "pending";
+    kyc.kycVerified = false;
+    kyc.rejectionReason = null;
+    await kyc.save();
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "KYC_DETAILS_UPDATED_BY_ADMIN",
+      targetType: "TechnicianKyc",
+      targetId: kyc._id,
+      after: { technicianId, fields: Object.keys(req.body) },
+      metadata: { technicianId },
+    });
+
+    const kycObj = await maskKycPii(kyc.toObject());
+    kycObj.documents = signKycDocuments(kycObj.documents);
+
+    return res.status(200).json({
+      success: true,
+      message: "KYC details updated successfully",
+      result: kycObj,
+    });
+  } catch (error) {
+    console.error("adminUpdateTechnicianKycDetails error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Server error", result: {} });
+  }
+};
+
+/* ================= ADMIN UPDATE TECHNICIAN BANK DETAILS ================= */
+// Admin/Owner can correct a technician's bank/UPI details. Re-encrypts,
+// recomputes the verification fingerprint, resets bank verification to pending,
+// and clears the cached RazorpayX fund account (bound to old details).
+export const adminUpdateTechnicianBankDetails = async (req, res) => {
+  try {
+    const { technicianId } = req.params;
+    const bankDetails = req.body || {};
+
+    if (!isOwnerOrAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Owner/Admin access only", result: {} });
+    }
+    if (!technicianId || !isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Valid technicianId is required", result: {} });
+    }
+
+    const validation = validateBankDetails(bankDetails);
+    if (!validation.valid) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid bank details",
+        result: { errors: validation.errors },
+      });
+    }
+
+    const kyc = await TechnicianKyc.findOne({ technicianId });
+    if (!kyc) {
+      return res.status(404).json({ success: false, message: "KYC record not found", result: {} });
+    }
+
+    const dek = await getDekForKycDoc(kyc);
+    const existingBank = decryptBankDetails(kyc.bankDetails, dek) || {};
+
+    // Merge provided fields over the existing ones (partial updates allowed).
+    const merged = {
+      accountHolderName: bankDetails.accountHolderName ?? existingBank.accountHolderName,
+      bankName: bankDetails.bankName ?? existingBank.bankName,
+      accountNumber: bankDetails.accountNumber ?? existingBank.accountNumber,
+      ifscCode: bankDetails.ifscCode ?? existingBank.ifscCode,
+      branchName: bankDetails.branchName ?? existingBank.branchName,
+      upiId: bankDetails.upiId ?? existingBank.upiId,
+    };
+
+    const trimmedAccountNumber = merged.accountNumber ? String(merged.accountNumber).trim() : null;
+    const accountNumberHash = trimmedAccountNumber ? hashAccountNumber(trimmedAccountNumber) : null;
+
+    // Duplicate account guard (exclude the technician being updated).
+    if (trimmedAccountNumber) {
+      const duplicate = await TechnicianKyc.findOne({
+        $or: [
+          { "bankDetails.accountNumberHash": accountNumberHash },
+          { "bankDetails.accountNumber": trimmedAccountNumber },
+        ],
+        technicianId: { $ne: technicianId },
+      });
+      if (duplicate) {
+        return res.status(400).json({
+          success: false,
+          message: "Account number already registered with another technician",
+          result: { field: "accountNumber" },
+        });
+      }
+    }
+
+    const processedBankDetails = {
+      accountHolderName: merged.accountHolderName
+        ? titleCase(String(merged.accountHolderName).trim())
+        : merged.accountHolderName,
+      bankName: merged.bankName ? String(merged.bankName).trim() : merged.bankName,
+      accountNumber: trimmedAccountNumber,
+      accountNumberHash,
+      ifscCode: merged.ifscCode ? String(merged.ifscCode).toUpperCase().trim() : merged.ifscCode,
+      branchName: merged.branchName ? String(merged.branchName).trim() : merged.branchName,
+      upiId: merged.upiId ? String(merged.upiId).toLowerCase().trim() : merged.upiId,
+    };
+
+    kyc.set({
+      bankDetails: encryptBankDetails(processedBankDetails, dek),
+      bankVerificationStatus: "pending",
+      bankRejectionReason: null,
+      bankVerified: false,
+      bankUpdateRequired: false,
+      bankEditableUntil: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      bankDetailsFingerprint: null,
+    });
+    await kyc.save();
+
+    // Cached RazorpayX fund account is bound to the old bank/UPI — invalidate it.
+    await TechnicianProfile.updateOne(
+      { _id: technicianId },
+      { $unset: { razorpayFundAccountId: 1 } }
+    );
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "BANK_DETAILS_UPDATED_BY_ADMIN",
+      targetType: "TechnicianKyc",
+      targetId: kyc._id,
+      after: { technicianId, fields: Object.keys(req.body) },
+      metadata: { technicianId },
+    });
+
+    const kycObj = await maskKycPii(kyc.toObject());
+    kycObj.documents = signKycDocuments(kycObj.documents);
+
+    return res.status(200).json({
+      success: true,
+      message: "Bank details updated successfully",
+      result: kycObj,
+    });
+  } catch (error) {
+    console.error("adminUpdateTechnicianBankDetails error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Server error", result: {} });
   }
 };

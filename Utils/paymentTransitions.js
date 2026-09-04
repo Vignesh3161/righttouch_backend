@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import Payment from "../Schemas/Payment.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import ProductBooking from "../Schemas/ProductBooking.js";
+import Quotation from "../Schemas/Quotation.js";
 import ReconciliationException from "../Schemas/ReconciliationException.js";
 import { settleBookingEarningsIfEligible } from "./settlement.js";
 import { writeAuditLog } from "./audit.js";
@@ -104,6 +105,10 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
     paidAmountPaise: toPaise(payment.totalAmountPaise ?? (payment.totalAmount || 0) * 100),
   };
   if (providerPaymentId) updatePayload.paymentProviderPaymentId = providerPaymentId;
+  if (payment.providerOrderId) updatePayload.paymentOrderId = payment.providerOrderId;
+  if (payment._id) updatePayload.paymentId = payment._id;
+  if (payment.provider) updatePayload.paymentProvider = payment.provider;
+  if (payment.mode) updatePayload.paymentMode = payment.mode;
 
   const sResult = await ServiceBooking.updateOne(
     { _id: payment.bookingId },
@@ -111,11 +116,44 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
     session ? { session } : {}
   );
   if (sResult.matchedCount === 0) {
-    await ProductBooking.updateOne(
+    const pbResult = await ProductBooking.updateOne(
       { _id: payment.bookingId },
-      { $set: { paymentStatus: "paid" } },
+      { $set: updatePayload },
       session ? { session } : {}
     );
+
+    if (pbResult.matchedCount > 0) {
+      // Also update linked Quotation if this ProductBooking has a quotationId
+      const pb = await ProductBooking.findById(payment.bookingId).select("quotationId paymentGroupId").session(session || undefined);
+      if (pb?.quotationId) {
+        await Quotation.updateOne(
+          { _id: pb.quotationId },
+          { $set: { paymentStatus: "paid" } },
+          session ? { session } : {}
+        );
+        // Sync any sibling ProductBookings sharing the same quotationId
+        await ProductBooking.updateMany(
+          { quotationId: pb.quotationId, _id: { $ne: pb._id } },
+          { $set: updatePayload },
+          session ? { session } : {}
+        );
+      }
+    } else {
+      // Direct quotation payment fallback: payment.bookingId is a Quotation._id
+      const qResult = await Quotation.updateOne(
+        { _id: payment.bookingId },
+        { $set: { paymentStatus: "paid" } },
+        session ? { session } : {}
+      );
+      if (qResult.matchedCount > 0) {
+        // Update all ProductBookings linked to this Quotation
+        await ProductBooking.updateMany(
+          { quotationId: payment.bookingId },
+          { $set: updatePayload },
+          session ? { session } : {}
+        );
+      }
+    }
   }
 
   // 🏦 Platform ledger — idempotent per payment

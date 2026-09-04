@@ -16,19 +16,47 @@ import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
 dotenv.config();
 
 import { socketAuth } from "./Middleware/socketAuth.js";
+import { Auth, authorizeRoles } from "./Middleware/Auth.js";
+import isTechnician from "./Middleware/isTechnician.js";
 import { createHandshakeLimiter } from "./Middleware/socketRateLimiter.js";
-import { startSocketMetricsLogger } from "./Utils/socketMetrics.js";
+import { startSocketMetricsLogger, recordLocationDrop } from "./Utils/socketMetrics.js";
 import TechnicianProfile from "./Schemas/TechnicianProfile.js";
-import UserRoutes from "./Routes/User.js";
-import TechnicianRoutes from "./Routes/technician.js";
-import AddressRoutes from "./Routes/address.js";
+
+/* ================= ROUTE IMPORTS ================= */
+// Admin Route Imports
 import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
-import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
+import adminKycRoutes from "./Routes/adminKycRoutes.js";
+import adminPaymentRoutes from "./Routes/adminPaymentRoutes.js";
 import operationalCityRoutes from "./Routes/operationalCityRoutes.js";
+import adminTechnicianDistrictRoutes from "./Routes/adminTechnicianDistrictRoutes.js";
 import adminZoneRoutes from "./Routes/adminZones.js";
+import adminPermissionRoutes from "./Routes/adminPermissionRoutes.js";
+import adminProductDashboardRoutes from "./Routes/adminProductDashboardRoutes.js";
+import adminServiceAvailabilityRoutes from "./Routes/adminServiceAvailabilityRoutes.js";
+import adminZoneGeofenceRoutes from "./Routes/adminZoneGeofenceRoutes.js";
+import adminRefundsRoutes from "./Routes/adminRefunds.js";
+import adminQuotationRoutes from "./Routes/adminQuotationRoutes.js";
+
+// Technician Route Imports
+import TechnicianRoutes from "./Routes/technician.js";
+import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
+import technicianRefundsRoutes from "./Routes/technicianRefunds.js";
+
+// Customer / User Route Imports
+import UserRoutes from "./Routes/User.js";
+import AddressRoutes from "./Routes/address.js";
+import customerPaymentsRoutes from "./Routes/customerPayments.js";
 import userZoneRoutes from "./Routes/userZones.js";
-import DevRoutes from "./Routes/dev.js";
+import userReportsRoutes from "./Routes/userReports.js";
+import productQuoteRoutes from "./Routes/productQuoteRoutes.js";
+
+// Shared / System Route Imports
 import { adminFinanceRoutes, technicianFinanceRoutes } from "./Routes/financeRoutes.js";
+import { makePermissionRouter } from "./Routes/permissionRoutes.js";
+import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
+import notificationRoutes from "./Routes/notificationRoutes.js";
+import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
+import DevRoutes from "./Routes/dev.js";
 
 // 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
 const activeSocketByUser = new Map(); // userId -> socket.id
@@ -54,27 +82,13 @@ const sanitizeNoSqlPayload = (value) => {
   }
 };
 
-const sanitizeStringPayload = (value) => {
-  if (typeof value === "string") {
-    // Basic escaping for common XSS vectors in user-provided strings.
-    return value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  if (!value || typeof value !== "object") return value;
-
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i += 1) {
-      value[i] = sanitizeStringPayload(value[i]);
-    }
-    return value;
-  }
-
-  for (const key of Object.keys(value)) {
-    value[key] = sanitizeStringPayload(value[key]);
-  }
-
-  return value;
-};
+// 🔒 Input handling policy: we ONLY strip NoSQL-prototype keys ($ / dotted).
+// We deliberately do NOT blanket HTML-escape every request string — that silently
+// corrupts legitimate data (names, notes, addresses, product descriptions that
+// contain "<" or ">") and is not real XSS protection. Output encoding must be
+// context-aware and is the responsibility of the rendering/client layer. The
+// verify() hook above captures req.rawBody BEFORE any mutation so webhook HMACs
+// remain valid.
 
 // Global Middlewares (None - consolidated downstream)
 
@@ -91,9 +105,6 @@ App.use((req, res, next) => {
   // body sanitization is re-applied AFTER the JSON parser below.
   sanitizeNoSqlPayload(req.params);
   sanitizeNoSqlPayload(req.query);
-
-  sanitizeStringPayload(req.params);
-  sanitizeStringPayload(req.query);
 
   next();
 });
@@ -141,6 +152,10 @@ const io = new Server(httpServer, {
   },
   maxHttpBufferSize: 5e5, // 500 KB
 });
+
+// 🔌 Hand the io instance to background workers (crons, auto-payout) —
+// consumed lazily via getIo() to avoid circular imports.
+setIo(io);
 
 // 🔌 Redis Adapter Setup for Scaling (Required for multi-instance production)
 // const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
@@ -206,6 +221,43 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     }
     activeSocketByUser.set(userId, socket.id);
   }
+
+  // 🛡 PER-TECH LOCATION LIMITER (Location Pipeline — Layer 2a).
+  // Promoted from the inline handler check to socket.use() so junk pings are
+  // dropped BEFORE the handler body runs (no parse/sanitize/Mongo cost).
+  // Keyed by techProfileId — survives connectionStateRecovery socket-id
+  // changes, and single-active-session makes per-socket ≈ per-tech anyway.
+  // Cadence kept at 1 per 5s (12/min) — identical to the old inline check.
+  const locLimiter = new Map();
+  const LOC_LIMIT = { max: 12, windowMs: 60000 };
+  socket.use((packet, next) => {
+    if (!Array.isArray(packet) || packet[0] !== SOCKET_EVENTS.TECH_LOCATION_UPDATE) {
+      return next();
+    }
+    if (role !== "Technician" || !techProfileId) return next(); // role gate already applied by socketAuth
+
+    const now = Date.now();
+    const stamps = (locLimiter.get(techProfileId) || []).filter((t) => now - t < LOC_LIMIT.windowMs);
+    if (stamps.length >= LOC_LIMIT.max) {
+      // Silent drop + telemetry. Do NOT next(new Error(...)) — that fires the
+      // client's error handler and can crash unguarded app builds.
+      recordLocationDrop();
+      return;
+    }
+    stamps.push(now);
+    locLimiter.set(techProfileId, stamps);
+    next();
+  });
+
+  // Periodic sweep instead of delete-on-disconnect — recovery reuses sessions.
+  setInterval(() => {
+    const cutoff = Date.now() - LOC_LIMIT.windowMs;
+    for (const [techId, stamps] of locLimiter) {
+      const kept = stamps.filter((t) => t > cutoff);
+      if (kept.length) locLimiter.set(techId, kept);
+      else locLimiter.delete(techId);
+    }
+  }, 60000).unref?.();
 
   // 🛡 RATE LIMITER for Socket Events (simple memory-based)
   const socketRateLimit = new Map();
@@ -313,9 +365,24 @@ import { handleLocationUpdate } from "./Utils/technicianLocation.js";
 import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
 import { initBookingCrons } from "./Utils/bookingCron.js";
 import { initPaymentCrons } from "./Utils/paymentCrons.js";
+import { setIo } from "./Utils/ioAccess.js";
 import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
 import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
+import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
+import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
 import { ensureConnected as ensureGeoConnected } from "./Utils/technicianGeo.js";
+import { processQuotationDeliveries } from "./Services/quotationDeliveryService.js";
+import { expireQuotations } from "./Services/quotationService.js";
+import { startNotificationWorker } from "./Utils/notificationWorker.js";
+import {
+  refundWorker,
+  reconcileRefunds,
+  classARefundScanner,
+  complaintSlaEscalation,
+} from "./Utils/refundEngine.js";
+import { releaseExpiredHolds } from "./Utils/complaintFreeze.js";
+import { getRefundPolicy } from "./Utils/refundPolicy.js";
+import { validateSecrets } from "./Utils/secretValidation.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -339,15 +406,11 @@ App.use(
 );
 
 // 🔒 Body sanitization — MUST run after express.json() so req.body exists.
-// Without this, the NoSQL-injection/XSS protections would be a no-op.
+// Only NoSQL-prototype keys are stripped; values are left intact.
 App.use((req, res, next) => {
   sanitizeNoSqlPayload(req.body);
-  sanitizeStringPayload(req.body);
   next();
 });
-
-// 🔒 Security: Helmet, NoSQL injection prevention, and XSS sanitization
-// are now applied globally via middleware above
 
 // 🔒 General API Rate Limiter (applies to all routes)
 const getClientIp = (req) => {
@@ -398,7 +461,7 @@ mongoose.set("strictQuery", false);
 // their operations never buffer-timeout. Re-started on every reconnect so a
 // dropped connection doesn't leave them dead.
 let backgroundStarted = false;
-const startBackgroundWorkers = () => {
+const startBackgroundWorkers = async () => {
   if (backgroundStarted) return;
   backgroundStarted = true;
 
@@ -414,10 +477,32 @@ const startBackgroundWorkers = () => {
   // 🗺 Redis GEO layer (best-effort — matching falls back to Mongo if absent)
   ensureGeoConnected().catch(() => {});
 
-  // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
+   // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
   initPaymentCrons();
 
-  console.log("✅ Background workers & crons started after Mongo connection.");
+  // 💳 Customer payment-management: attempt expiry sweeper + real-time status worker
+  startAttemptExpirySweeper();
+  startPaymentNotificationWorker();
+
+   // 🧾 Refund / complaint engine crons
+   const refundPolicy = await getRefundPolicy();
+   setInterval(() => refundWorker(25).catch((e) => console.error("[RefundWorker]", e.message)), 30 * 1000).unref?.();
+   setInterval(() => reconcileRefunds().catch((e) => console.error("[RefundReconcile]", e.message)), 5 * 60 * 1000).unref?.();
+   setInterval(() => classARefundScanner().catch((e) => console.error("[ClassAScanner]", e.message)), 2 * 60 * 1000).unref?.();
+   setInterval(() => complaintSlaEscalation().catch((e) => console.error("[ComplaintSLA]", e.message)), 60 * 60 * 1000).unref?.();
+   setInterval(
+     () => releaseExpiredHolds(refundPolicy.COMPLAINT_HOLD_MAX_HOURS).catch((e) => console.error("[ReserveFreezeExpiry]", e.message)),
+     15 * 60 * 1000
+   ).unref?.();
+
+   // 🔔 Central notification system (outbox → socket + FCM push; SMS for OTP)
+   startNotificationWorker(5000);
+
+   // 📝 Quotation delivery worker (outbox → in_app + WhatsApp) + expiry sweeper
+   setInterval(() => processQuotationDeliveries(25).catch((e) => console.error("[QuotationDelivery]", e.message)), 30 * 1000).unref?.();
+   setInterval(() => expireQuotations().catch((e) => console.error("[QuotationExpiry]", e.message)), 60 * 60 * 1000).unref?.();
+
+   console.log("✅ Background workers & crons started after Mongo connection.");
 };
 
 const connectToMongo = async () => {
@@ -448,6 +533,9 @@ mongoose.connection.on("error", (err) => {
   console.error("MongoDB connection error:", err.message);
 });
 
+// 🔒 Fail fast on weak/placeholder secrets before accepting traffic.
+validateSecrets();
+
 connectToMongo();
 
 App.get("/", (req, res) => {
@@ -465,18 +553,56 @@ App.get("/health/ready", async (req, res) => {
   return res.status(503).json({ status: "not_ready", mongoOk });
 });
 
-// Routes
-App.use("/api/user", UserRoutes);
-App.use("/api/technician", TechnicianRoutes);
-//sk
-App.use("/api/technician", technicianWalletRoutes);
-App.use("/api/addresses", AddressRoutes);
+/* ==========================================================================
+   API ROUTE REGISTRATION (ORGANIZED BY ROLE & DOMAIN)
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. ADMIN & OWNER MANAGEMENT ROUTES (/api/admin)
+   -------------------------------------------------------------------------- */
 App.use("/api/admin", adminWalletRoutes);
 App.use("/api/admin", operationalCityRoutes);
+App.use("/api/admin", adminTechnicianDistrictRoutes);
 App.use("/api/admin", adminZoneRoutes);
 App.use("/api/admin", adminFinanceRoutes);
-App.use("/api", userZoneRoutes);
+App.use("/api/admin", adminRefundsRoutes);
+App.use("/api/admin", adminQuotationRoutes);
+App.use("/api/admin", adminProductDashboardRoutes);
+App.use("/api/admin", adminServiceAvailabilityRoutes);
+App.use("/api/admin/zone-geofence", adminZoneGeofenceRoutes);
+App.use("/api/admin", adminKycRoutes);
+App.use("/api/admin/payments", adminPaymentRoutes);
+App.use("/api/admin/notifications", Auth, authorizeRoles("Admin", "Owner"), notificationRoutes);
+App.use("/api/admin/permissions", adminPermissionRoutes);
+
+/* --------------------------------------------------------------------------
+   2. TECHNICIAN ROUTES (/api/technician)
+   -------------------------------------------------------------------------- */
+App.use("/api/technician", TechnicianRoutes);
+App.use("/api/technician", technicianWalletRoutes);
 App.use("/api/technician", technicianFinanceRoutes);
+App.use("/api/technician", technicianRefundsRoutes);
+App.use("/api/technician/notifications", Auth, isTechnician, notificationRoutes);
+App.use("/api/technician/permissions", Auth, makePermissionRouter("Technician"));
+App.use("/api/technician/device-token", Auth, makeDeviceRouter("Technician"));
+
+/* --------------------------------------------------------------------------
+   3. CUSTOMER / USER ROUTES (/api/user)
+   -------------------------------------------------------------------------- */
+App.use("/api/user", UserRoutes);
+App.use("/api/user/payments", customerPaymentsRoutes);
+App.use("/api/user/reports", userReportsRoutes);
+App.use("/api/user", productQuoteRoutes);
+App.use("/api/user/notifications", Auth, notificationRoutes);
+App.use("/api/user/permissions", Auth, makePermissionRouter("Customer"));
+App.use("/api/user/device-token", Auth, makeDeviceRouter("Customer"));
+App.use("/api/addresses", AddressRoutes);
+App.use("/api", userZoneRoutes);
+
+/* --------------------------------------------------------------------------
+   4. SHARED, SYSTEM & WEBHOOK ROUTES
+   -------------------------------------------------------------------------- */
+App.use("/api", razorpayXWebhookRoutes);
 App.use("/api/dev", DevRoutes);
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
@@ -535,6 +661,8 @@ const shutdown = async (signal) => {
   console.log(`🛑 ${signal} received — shutting down gracefully...`);
   try {
     stopDispatchWorker();
+    stopAttemptExpirySweeper();
+    stopPaymentNotificationWorker();
     io.close();
     await new Promise((resolve) => httpServer.close(resolve));
     await mongoose.connection.close();
@@ -546,3 +674,4 @@ const shutdown = async (signal) => {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+// Reloaded district routes mapping

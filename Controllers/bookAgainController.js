@@ -3,7 +3,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import Service from "../Schemas/Service.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
-import { paiseToRupees } from "../Utils/money.js";
+import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { toBookingCreatedDTO } from "../Utils/socketDTO.js";
 import {
@@ -428,6 +428,16 @@ export const rebookService = async (req, res) => {
       cityZoneId: zoneCheck.zoneId,
     });
     doc.radius = radiusInput;
+
+    // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+    const docTotalPaise = toPaise(doc.financialSnapshot?.totalAmountPaise);
+    if (!isPayableTotalPaise(docTotalPaise)) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum payable amount is ₹1 (booking total is ₹${(docTotalPaise / 100).toFixed(2)})`,
+        result: {},
+      });
+    }
 
     const session = await mongoose.startSession();
     let newBooking;

@@ -25,6 +25,9 @@ export const SOCKET_EVENTS = {
     // 📋 Job/Booking Events
     JOB_NEW: "job:new",
     JOB_TAKEN: "job_taken",
+    // 🛰 Offer expired (cron expiry / OTW timeout / travel no-show) — client
+    // drops the card instantly instead of waiting for a refetch.
+    JOB_EXPIRED: "job:expired",
 
     // 📍 Location Events
     LOCATION_UPDATE_EMIT: "location_update", // Emitted to customer
@@ -35,9 +38,31 @@ export const SOCKET_EVENTS = {
     BOOKING_REBROADCAST: "booking:rebroadcast",
     BOOKING_CANCELLED: "booking_cancelled",
 
+    // 💸 Payments / Payouts
+    // 🔔 System-initiated auto-payout sent to the technician's bank/UPI
+    AUTO_PAYOUT_PAID: "auto_payout_paid",
+    // 🔔 Customer-facing payment status push (observed from persisted transitions)
+    PAYMENT_STATUS: "payment:status",
+
     // 🔐 Session Control
     SESSION_REVOKED: "session:revoked",   // forced logout (status change)
     SESSION_REPLACED: "session:replaced", // another device took over
+
+    // 🧾 Refunds / Complaints (observed from persisted transitions)
+    COMPLAINT_RECEIVED: "complaint:received",
+    COMPLAINT_UNDER_REVIEW: "complaint:under_review",
+    COMPLAINT_REJECTED: "complaint:rejected",
+    COMPLAINT_FILED_AGAINST_YOU: "complaint:filed_against_you",
+    REFUND_INITIATED: "refund:initiated",
+    REFUND_PROCESSED: "refund:processed",
+    REFUND_FAILED: "refund:failed",
+    CLAWBACK_APPLIED: "clawback:applied",
+    CLAWBACK_TO_DUES: "clawback:to_dues",
+    HOLD_RELEASED: "hold:released",
+    COMPLAINT_RESOLVED_IN_FAVOUR: "complaint:resolved_in_favour",
+    COMPLAINT_STATUS_UPDATED: "complaint:status_updated",
+    REFUND_MANUAL_REVIEW: "refund:manual_review",
+    CREDIT_NOTE_DEADLINE_APPROACHING: "credit_note:deadline_approaching",
 };
 
 /**

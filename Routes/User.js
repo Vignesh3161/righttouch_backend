@@ -41,9 +41,10 @@ import {
   userRating,
   getAllRatings,
   getRatingById,
-  updateRating,
-  deleteRating,
+  updateRatingController,
+  deleteRatingController,
   getMyRatings,
+  rebuildAggregateController,
 } from "../Controllers/ratingController.js";
 
 import {
@@ -78,6 +79,8 @@ import {
   cancelBooking,
   getCancellationReasons,
   deleteAllCustomerBookings,
+  deleteServiceBooking,
+  deleteBookingAsAdmin,
   getOwnerAllBookings,
   getOwnerBookingById,
   getCompletedServices,
@@ -97,10 +100,10 @@ import {
 } from "../Controllers/productController.js";
 
 import {
-  productBooking,
   getAllProductBooking,
   productBookingUpdate,
   productBookingCancel,
+  adminCompleteProductBooking,
 } from "../Controllers/productBooking.js";
 
 import {
@@ -300,6 +303,8 @@ router.put("/booking/cancel/:id", Auth, cancelBooking);
 router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
+router.delete("/booking/:id", Auth, deleteServiceBooking);
+router.delete("/booking/admin/:id", Auth, authorizeRoles("Admin", "Owner"), deleteBookingAsAdmin);
 
 /* ================= BOOK AGAIN ================= */
 router.get("/booking/completed-services", Auth, getCompletedServices);
@@ -314,10 +319,30 @@ router.get("/booking/getBookingById/:id", Auth, authorizeRoles("Admin", "Owner")
 router.post("/rating", Auth, userRating);
 // 🔒 Authenticated browsing only — no anonymous scraping of user ratings
 router.get("/getAllRatings", Auth, getAllRatings);
+
+// Customer rating history + read (architecture §45)
+router.get("/ratings", Auth, getMyRatings);
+router.get("/ratings/:id", Auth, getRatingById);
+
 router.get("/getRatingById/:id", Auth, getRatingById);
-router.put("/updateRating/:id", Auth, updateRating);
-router.delete("/deleteRating/:id", Auth, deleteRating);
+router.put("/updateRating/:id", Auth, updateRatingController);
+router.delete("/deleteRating/:id", Auth, deleteRatingController);
 router.get("/get-my-ratings", Auth, getMyRatings);
+
+// Admin/owner reconciliation — rebuild a stale aggregate (architecture §23)
+router.post(
+  "/admin/ratings/rebuild/:targetType/:targetId",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  rebuildAggregateController
+);
+// Admin/owner filtered rating view (architecture §46)
+router.get(
+  "/admin/ratings",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  getAllRatings
+);
 
 /* ================= PRODUCT ================= */
 router.post("/product", Auth, authorizeRoles("Admin", "Owner"), createProduct);
@@ -351,6 +376,14 @@ router.delete("/deleteProduct/:id", Auth, authorizeRoles("Admin", "Owner"), dele
 router.get("/getAllProductBooking", Auth, getAllProductBooking);
 router.put("/productBookingUpdate/:id", Auth, productBookingUpdate);
 router.put("/productBookingCancel/:id", Auth, productBookingCancel);
+// 🔒 Completion (active → completed) is admin/owner-only — the rating gate.
+// Customers can never mark a product booking completed themselves.
+router.put(
+  "/admin/productBooking/:id/complete",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  adminCompleteProductBooking
+);
 
 /* ================= PAYMENT ================= */
 router.post("/payment/order", Auth, createPaymentOrder);

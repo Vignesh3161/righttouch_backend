@@ -7,7 +7,7 @@ import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
 import User from "../Schemas/User.js";
 import sendSms from "./sendSMS.js";
-import { notifyTechnicianWithFallback, emitJobsChanged } from "./sendNotification.js";
+import { notifyTechnicianWithFallback, emitJobsChanged, emitJobExpired } from "./sendNotification.js";
 import { toBookingCancelledDTO } from "./socketDTO.js";
 import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendReminder.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
@@ -56,7 +56,7 @@ const notifyCustomer = async (booking, message, io) => {
             title: "Booking Update",
             body: message,
             data: { bookingId: booking._id.toString(), type: "BOOKING_UPDATE" }
-        });
+        }, { recipientType: "customer" });
 
         // Socket for real-time — room-scoped DTO only (never global io.emit)
         if (io) {
@@ -109,6 +109,42 @@ const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
     );
   }
   return booking;
+};
+
+/**
+ * 🛰 Expire every broadcast + offer for a booking, bump the affected
+ * technicians' feed cursors, then notify them live:
+ *   - technician:jobs_changed (refetch once)
+ *   - job:expired (drop the card instantly — Location Pipeline P1.5)
+ * Shared by ALL expiry paths (auto-cancel, OTW timeout, travel no-show).
+ */
+const expireBroadcastsForBooking = async (io, bookingId, reason, expiresAt = new Date()) => {
+  try {
+    await JobBroadcast.updateMany(
+      { bookingId },
+      { $set: { status: "expired" } }
+    );
+    await TechnicianBookingOffer.updateMany(
+      { bookingId, decision: "offered" },
+      { $set: { decision: "expired" } }
+    );
+
+    const affectedTechs = await JobBroadcast.find({ bookingId }).distinct("technicianId");
+    if (affectedTechs.length > 0) {
+      await TechnicianProfile.updateMany(
+        { _id: { $in: affectedTechs } },
+        { $set: { lastJobsChangeAt: new Date() } }
+      );
+      affectedTechs.forEach((techId) => {
+        emitJobsChanged(io, techId);
+        emitJobExpired(io, techId, { bookingId, expiresAt, reason });
+      });
+    }
+    return affectedTechs;
+  } catch (err) {
+    console.error(`[Cron:Expiry] expireBroadcastsForBooking failed for ${bookingId}:`, err.message);
+    return [];
+  }
 };
 
 export const initBookingCrons = (io) => {
@@ -165,29 +201,10 @@ export const initBookingCrons = (io) => {
                       }
                     );
 
-                    // Batch: expire all broadcasts + offers for this booking
-                    await JobBroadcast.updateMany(
-                        { bookingId: _id },
-                        { $set: { status: "expired" } }
-                    );
-                    await TechnicianBookingOffer.updateMany(
-                        { bookingId: _id, decision: "offered" },
-                        { $set: { decision: "expired" } }
-                    );
-
-                    // Bump feed cursors for affected technicians
-                    try {
-                        const affectedTechs = await JobBroadcast.find({ bookingId: _id }).distinct("technicianId");
-                        if (affectedTechs.length > 0) {
-                            await TechnicianProfile.updateMany(
-                                { _id: { $in: affectedTechs } },
-                                { $set: { lastJobsChangeAt: new Date() } }
-                            );
-                            affectedTechs.forEach((techId) => emitJobsChanged(io, techId));
-                        }
-                    } catch (cursorErr) {
-                        console.error("[Cron:Expiry] Feed cursor bump failed:", cursorErr.message);
-                    }
+                    // Batch: expire all broadcasts + offers for this booking,
+                    // bump cursors, and tell live techs the offer died
+                    // (jobs_changed + job:expired).
+                    await expireBroadcastsForBooking(io, _id, "no_technician_accept", now);
 
                     const message = fresh.bookingType === "instant"
                         ? "We couldn't find a technician for your immediate booking. It has expired. Please try again later."
@@ -289,14 +306,7 @@ export const initBookingCrons = (io) => {
                             $inc: { version: 1 },
                           }
                         );
-                        await JobBroadcast.updateMany(
-                          { bookingId: _id },
-                          { $set: { status: "expired" } }
-                        );
-                        await TechnicianBookingOffer.updateMany(
-                          { bookingId: _id, decision: "offered" },
-                          { $set: { decision: "expired" } }
-                        );
+                        await expireBroadcastsForBooking(io, _id, "technician_no_action");
                         await notifyCustomer(
                           claimed,
                           "The technician did not start the job in time, so your booking was cancelled. Please book again.",
@@ -329,14 +339,7 @@ export const initBookingCrons = (io) => {
                         $inc: { version: 1 },
                       }
                     );
-                    await JobBroadcast.updateMany(
-                      { bookingId: _id },
-                      { $set: { status: "expired" } }
-                    );
-                    await TechnicianBookingOffer.updateMany(
-                      { bookingId: _id, decision: "offered" },
-                      { $set: { decision: "expired" } }
-                    );
+                    await expireBroadcastsForBooking(io, _id, "on_the_way_timeout", now);
                     await matchAndBroadcastBooking(_id, io);
                     await notifyCustomer(
                       claimed,
@@ -457,8 +460,7 @@ export const initBookingCrons = (io) => {
                             // −10 min: reassign if feasible; otherwise manual escalation.
                             const released = await releaseTechnicianAssignment(b._id, "schedule_travel_no_show");
                             if (released) {
-                                await JobBroadcast.updateMany({ bookingId: b._id }, { $set: { status: "expired" } });
-                                await TechnicianBookingOffer.updateMany({ bookingId: b._id, decision: "offered" }, { $set: { decision: "expired" } });
+                                await expireBroadcastsForBooking(io, b._id, "schedule_travel_no_show");
                                 await matchAndBroadcastBooking(b._id, io);
                                 await notifyCustomer(claimed, "Your technician hasn't started travel. We are finding a replacement.", io);
                             } else {

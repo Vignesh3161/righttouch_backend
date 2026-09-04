@@ -7,6 +7,9 @@ import Address from "../Schemas/Address.js";
 import User from "../Schemas/User.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
+import { generateRequestNumber } from "../Utils/quotationNumber.js";
+import { writeAuditLog } from "../Utils/audit.js";
 import mongoose from "mongoose";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
@@ -19,7 +22,7 @@ import {
     PAYMENT_STATUS,
 } from "../Utils/constants.js";
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
-import { paiseToRupees } from "../Utils/money.js";
+import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import {
   resolveScheduleInput,
   buildServiceBookingDoc,
@@ -960,7 +963,9 @@ export const checkout = async (req, res) => {
             },
             serviceBookings: [],
             productBookings: [],
+            productQuoteRequests: [],
             totalAmount: 0,
+            totalAmountPaise: 0,
         };
 
         const serviceBroadcastTasks = [];
@@ -1037,6 +1042,17 @@ export const checkout = async (req, res) => {
                 cityZoneId: resolvedZoneId,
             });
 
+            // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+            const docTotalPaise = toPaise(doc.financialSnapshot?.totalAmountPaise);
+            if (!isPayableTotalPaise(docTotalPaise)) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    message: `Minimum payable amount is ₹1 (booking total is ₹${(docTotalPaise / 100).toFixed(2)})`,
+                    result: {},
+                });
+            }
+
             const { booking } = await createBookingAndOutbox({ doc, session });
 
             // Always broadcast immediately for both Instant and Scheduled in new flow
@@ -1051,68 +1067,93 @@ export const checkout = async (req, res) => {
                 status: "pending",
             });
 
-            bookingResults.totalAmount += doc.baseAmount;
+            // Accumulate the GST-inclusive, paise-based total from the canonical
+            // financial snapshot (base + GST + tip) — NOT the ex-GST baseAmount,
+            // so service and product lines reconcile to the same definition.
+            bookingResults.totalAmountPaise += toPaise(doc.financialSnapshot?.totalAmountPaise);
         }
 
-        // Create Product Bookings
-        for (const cartItem of validProductItems) {
-            const product = await Product.findById(cartItem.itemId).session(session);
+        // Create ProductQuoteRequest instead of ProductBooking for product items
+        if (validProductItems.length > 0) {
+            const firstCartItem = validProductItems[0];
+            const primaryProduct = await Product.findById(firstCartItem.itemId).session(session);
+            const userProfile = await User.findById(customerId).select("fname lname mobileNumber email").session(session);
 
-            // Calculate amount with discount and GST
-            // Use estimatedPriceFrom or productPrice as fallback (Product schema has no productPrice)
-            const basePrice = (product.productPrice || product.estimatedPriceFrom || 0) * cartItem.quantity;
-            const discountAmount =
-                (basePrice * (product.productDiscountPercentage || 0)) / 100;
-            const discountedPrice = basePrice - discountAmount;
-            const gstAmount = (discountedPrice * (product.productGst || 0)) / 100;
-            const finalAmount = discountedPrice + gstAmount;
+            const requestNumber = await generateRequestNumber();
+            const quoteItems = validProductItems.map(item => ({
+                productId: item.itemId,
+                quantity: item.quantity || 1
+            }));
 
-            const productBookingDoc = {
-                productId: cartItem.itemId,
-                customerId, // Field renamed in schema to match consistency
-                amount: isNaN(finalAmount) ? 0 : finalAmount,
-                quantity: cartItem.quantity,
-                paymentStatus: PAYMENT_STATUS.PENDING,
-                status: PRODUCT_BOOKING_STATUS.ACTIVE,
+            const totalProductQty = validProductItems.reduce((acc, item) => acc + (item.quantity || 1), 0);
 
-                locationType: resolvedLocation.locationType,
+            const reqDesc = [
+                req.body?.requirementDescription,
+                req.body?.requirements,
+                req.body?.productRequirements,
+                req.body?.capacity ? `Capacity: ${req.body.capacity}` : null,
+                req.body?.usage ? `Usage: ${req.body.usage}` : null,
+            ].filter(Boolean).join(" | ");
+
+            const quoteReqDoc = {
+                requestNumber,
+                customerId,
+                productId: firstCartItem.itemId,
+                items: quoteItems,
+                customerSnapshot: {
+                    name: addressSnapshot.name || [userProfile?.fname, userProfile?.lname].filter(Boolean).join(" ").trim(),
+                    phone: addressSnapshot.phone || userProfile?.mobileNumber,
+                    email: userProfile?.email || undefined,
+                },
+                productSnapshot: {
+                    productName: primaryProduct?.productName || "Requested Product",
+                    productType: primaryProduct?.productType || "Appliance",
+                    imageUrl: primaryProduct?.productImages?.[0] || null,
+                },
+                quantity: totalProductQty,
+                locationType: resolvedLocation.locationType || "saved",
                 addressSnapshot: addressSnapshot,
+                requirementDescription: reqDesc ? reqDesc.slice(0, 5000) : undefined,
+                additionalNotes: req.body?.additionalNotes ? String(req.body.additionalNotes).slice(0, 2000) : undefined,
+                preferredContactMethod: req.body?.preferredContactMethod || "whatsapp",
+                status: "quote_requested",
             };
 
-            // Only add location if coordinates are valid numbers
             if (resolvedLocation.longitude !== null && resolvedLocation.latitude !== null) {
-                productBookingDoc.location = {
+                quoteReqDoc.location = {
                     type: "Point",
                     coordinates: [resolvedLocation.longitude, resolvedLocation.latitude],
                 };
             }
 
-            const productBooking = await ProductBooking.create([productBookingDoc], { session });
+            const createdQuoteReqs = await ProductQuoteRequest.create([quoteReqDoc], { session });
+            const quoteRequest = createdQuoteReqs[0];
 
-            bookingResults.productBookings.push({
-                bookingId: productBooking[0]._id,
-                productId: cartItem.itemId,
-                productName: product.productName,
-                quantity: cartItem.quantity,
-                basePrice,
-                discount: discountAmount,
-                gst: gstAmount,
-                finalAmount: isNaN(finalAmount) ? 0 : finalAmount,
-                paymentStatus: PAYMENT_STATUS.PENDING,
+            bookingResults.productQuoteRequests.push({
+                requestId: quoteRequest._id,
+                requestNumber: quoteRequest.requestNumber,
+                status: quoteRequest.status,
+                itemsCount: validProductItems.length,
             });
+            bookingResults.productQuoteRequest = quoteRequest;
 
-            bookingResults.totalAmount += (isNaN(finalAmount) ? 0 : finalAmount);
+            await writeAuditLog({
+                actor: customerId,
+                actorRole: "customer",
+                action: "QUOTE_REQUEST_CREATED_VIA_CHECKOUT",
+                targetType: "ProductQuoteRequest",
+                targetId: quoteRequest._id,
+                after: { requestNumber, itemsCount: validProductItems.length, status: "quote_requested" },
+            });
         }
 
-        // Clear the cart only after all bookings are created successfully
+        // Clear the cart only after all items are processed successfully
         await Cart.deleteMany({ customerId }).session(session);
 
         await session.commitTransaction();
 
         // 7️⃣ Post-Transaction: Broadcast Jobs (Safe & Smart)
-        // We do this OUTSIDE the transaction because it involves heavy logic/sockets
         if (serviceBroadcastTasks.length > 0) {
-            // Run in background (fire & forget) or await if you want to report status
             (async () => {
                 for (const task of serviceBroadcastTasks) {
                     await matchAndBroadcastBooking(task.bookingId, req.io);
@@ -1120,17 +1161,29 @@ export const checkout = async (req, res) => {
             })();
         }
 
-        const firstBookingId =
+        let responseMessage = "Order placed successfully";
+        if (validServiceItems.length > 0 && validProductItems.length > 0) {
+            responseMessage = "Service booking confirmed and product quotation request submitted successfully";
+        } else if (validProductItems.length > 0) {
+            responseMessage = "Product quotation request submitted successfully. Admin will review and send your quotation.";
+        } else if (validServiceItems.length > 0) {
+            responseMessage = "Service booking confirmed successfully";
+        }
+
+        const firstId =
             bookingResults.serviceBookings?.[0]?.bookingId ||
-            bookingResults.productBookings?.[0]?.bookingId;
+            bookingResults.productQuoteRequests?.[0]?.requestId;
+
+        bookingResults.totalAmount = bookingResults.totalAmountPaise / 100;
 
         return res.status(200).json({
             success: true,
-            message: "Order placed successfully",
+            message: responseMessage,
             result: {
                 ...bookingResults,
-                _id: firstBookingId, // 👈 For frontend compatibility
-                bookingId: firstBookingId,
+                _id: firstId,
+                bookingId: firstId,
+                requestId: bookingResults.productQuoteRequests?.[0]?.requestId,
             },
         });
     } catch (error) {

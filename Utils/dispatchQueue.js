@@ -13,6 +13,7 @@
  */
 
 import DispatchOutbox from "../Schemas/DispatchOutbox.js";
+import ServiceBooking from "../Schemas/ServiceBooking.js";
 import { notifyTechnicianOfNewJob } from "./sendNotification.js";
 import mongoose from "mongoose";
 
@@ -59,6 +60,19 @@ const claimOne = async () => {
 const processRow = async (row) => {
   const { bookingId, technicianId, kind, broadcastId, version, payload } = row;
   try {
+    // 🛡 Pre-send booking status check: if booking was cancelled, accepted, or expired
+    // while this outbox row was pending/inflight, skip notification entirely.
+    if (bookingId) {
+      const booking = await ServiceBooking.findById(bookingId).select("status").lean();
+      if (booking && !["pending", "broadcasted"].includes(booking.status)) {
+        await DispatchOutbox.updateOne(
+          { _id: row._id },
+          { $set: { status: "done", completedAt: new Date(), lastError: `booking_${booking.status}` } }
+        );
+        return;
+      }
+    }
+
     const broadcast = broadcastId
       ? { _id: broadcastId, version: version ?? 1 }
       : null;

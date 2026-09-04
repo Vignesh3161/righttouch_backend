@@ -2,6 +2,10 @@ import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { checkTechnicianActivation } from "./technicianActivation.js";
 import { recordAck } from "./socketMetrics.js";
+import { sendFcmMulticast } from "./firebase.js";
+import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import User from "../Schemas/User.js";
+import { deactivateTokenByValue } from "./permissionService.js";
 
 /**
  * 📢 NOTIFICATION UTILITY
@@ -56,32 +60,80 @@ export const emitJobsChanged = (io, technicianProfileId) => {
 };
 
 /**
- * Send push notification to technician
- * @param {String} technicianId - Technician profile ID
- * @param {Object} payload - Notification payload
+ * 🛰 JOB-EXPIRED PUSH — tells a technician their offer on a booking just died
+ * (broadcast expired: no_technician_accept, OTW timeout, travel no-show) so
+ * the client drops the card instantly instead of waiting for a refetch.
+ * Fire-and-forget: never throws.
  */
-export const sendPushNotification = async (technicianId, payload) => {
+export const emitJobExpired = (io, technicianProfileId, { bookingId, expiresAt, reason } = {}) => {
   try {
-    // TODO: Integrate with Firebase Cloud Messaging (FCM) or similar service
-    // For now, just log the notification
-    console.log(`📱 Push Notification to Technician ${technicianId}:`, {
-      title: payload.title,
-      body: payload.body,
-      data: payload.data,
-    });
+    if (!io || !technicianProfileId || !bookingId) return;
+    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
+      SOCKET_EVENTS.JOB_EXPIRED,
+      {
+        bookingId: String(bookingId),
+        expiresAt: expiresAt ? new Date(expiresAt).toISOString() : new Date().toISOString(),
+        reason: reason || "offer_expired",
+      }
+    );
+  } catch (err) {
+    console.error("emitJobExpired error:", err.message);
+  }
+};
 
-    // Example FCM implementation:
-    // const message = {
-    //   notification: {
-    //     title: payload.title,
-    //     body: payload.body,
-    //   },
-    //   data: payload.data,
-    //   token: deviceToken, // Get from TechnicianProfile or separate DeviceTokens collection
-    // };
-    // await admin.messaging().send(message);
+/**
+ * Send push notification via FCM (real delivery — was a log-only stub).
+ * @param {String} recipientId - TechnicianProfile _id (default) or User _id
+ * @param {Object} payload - { title, body, data }
+ * @param {Object} [options] - { recipientType: "technician" | "customer" }
+ * @returns {Object} result
+ */
+const INVALID_TOKEN_RE = /not-registered|invalid-argument|unregistered/i;
 
-    return { success: true, message: "Push notification sent" };
+const pruneInvalidTokens = async (recipientId, recipientType, tokens) => {
+  if (!tokens.length) return;
+  const $pull = { fcmTokens: { $in: tokens } };
+  if (recipientType === "customer") {
+    await User.updateOne({ _id: recipientId }, { $pull });
+  } else {
+    await TechnicianProfile.updateOne({ _id: recipientId }, { $pull });
+  }
+};
+
+export const sendPushNotification = async (recipientId, payload, options = {}) => {
+  const recipientType = options.recipientType === "customer" ? "customer" : "technician";
+  try {
+    // Pick up the recipient's registered FCM tokens (multi-device array).
+    let tokens = [];
+    if (recipientType === "customer") {
+      const user = await User.findById(recipientId).select("fcmTokens").lean();
+      tokens = user?.fcmTokens || [];
+    } else {
+      const tech = await TechnicianProfile.findById(recipientId).select("fcmTokens").lean();
+      tokens = tech?.fcmTokens || [];
+    }
+    tokens = (tokens || []).filter((t) => typeof t === "string" && t.length > 10);
+    if (!tokens.length) {
+      return { success: true, skipped: true, reason: "no_fcm_token" };
+    }
+
+    const result = await sendFcmMulticast(tokens, payload);
+
+    // 🧹 Prune tokens FCM rejected as dead (device-not-registered / malformed).
+    const invalid = (result.failedTokens || [])
+      .filter((f) => INVALID_TOKEN_RE.test(String(f.error)))
+      .map((f) => f.token)
+      .filter(Boolean);
+    if (invalid.length) {
+      await pruneInvalidTokens(recipientId, recipientType, invalid).catch((e) =>
+        console.warn(`⚠️ FCM token prune failed for ${recipientId}:`, e.message)
+      );
+      // Keep the DeviceToken store consistent (section 14): mark dead tokens inactive.
+      await Promise.all(invalid.map((t) => deactivateTokenByValue(t))).catch(() => {});
+      console.log(`🧹 Pruned ${invalid.length} invalid FCM token(s) for ${recipientType} ${recipientId}`);
+    }
+
+    return { success: true, ...result };
   } catch (error) {
     console.error("❌ Push notification error:", error.message);
     return { success: false, error: error.message };
@@ -155,6 +207,12 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
     if (!activation.isActive) {
       console.log(`⚠️ Skipped job:new for ineligible technician ${technicianId} (${activation.message})`);
       return { success: false, skipped: true, reason: activation.message };
+    }
+
+    const techProfile = await TechnicianProfile.findById(technicianId).select("availability.isOnline").lean();
+    if (!techProfile?.availability?.isOnline) {
+      console.log(`⚠️ Skipped job:new for offline technician ${technicianId}`);
+      return { success: false, skipped: true, reason: "technician_offline" };
     }
 
     const jobDTO = toJobNewDTO(jobData, broadcast);

@@ -10,6 +10,7 @@ import { handleLocationUpdate } from "../Utils/technicianLocation.js";
 import { revokeSocketSession } from "../Utils/socketSessionControl.js";
 import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
+import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
@@ -24,7 +25,7 @@ export const updateTechnicianLocation = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid coordinates", result: {} });
     }
 
-    const result = await handleLocationUpdate(technicianProfileId, latitude, longitude, req.io);
+    const result = await handleLocationUpdate(technicianProfileId, latitude, longitude, req.io, "http");
 
     return res.json({
       success: true,
@@ -34,6 +35,53 @@ export const updateTechnicianLocation = async (req, res) => {
   } catch (error) {
     console.error("updateTechnicianLocation Error:", error);
     return res.status(500).json({ success: false, message: error.message, result: { error: error.message } });
+  }
+};
+
+const MAX_FCM_TOKENS = 5;
+
+// ================= REGISTER / UNREGISTER FCM PUSH TOKEN =================
+// Called by the app on login/foreground. `unregister: true` removes the token
+// (logout / device removed). Keeps a small per-device cap; tokens are also
+// pruned automatically when FCM reports device-not-registered on send.
+export const registerTechnicianFcmToken = async (req, res) => {
+  try {
+    const technicianProfileId = req.user?.technicianProfileId;
+    const { token, unregister } = req.body || {};
+
+    if (!technicianProfileId || !mongoose.Types.ObjectId.isValid(technicianProfileId)) {
+      return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
+    }
+    if (!token || typeof token !== "string" || token.length < 10 || token.length > 4096) {
+      return res.status(400).json({ success: false, message: "Invalid FCM token", result: {} });
+    }
+
+    if (unregister) {
+      await TechnicianProfile.updateOne(
+        { _id: technicianProfileId },
+        { $pull: { fcmTokens: token } }
+      );
+      console.log(`📴 FCM token unregistered for tech ${technicianProfileId}`);
+    } else {
+      // Register with dedupe + cap: keep newest MAX_FCM_TOKENS tokens.
+      const profile = await TechnicianProfile.findById(technicianProfileId)
+        .select("fcmTokens")
+        .lean();
+      let tokens = (profile?.fcmTokens || []).filter((t) => t !== token);
+      tokens.push(token);
+      if (tokens.length > MAX_FCM_TOKENS) tokens = tokens.slice(-MAX_FCM_TOKENS);
+
+      await TechnicianProfile.updateOne(
+        { _id: technicianProfileId },
+        { $set: { fcmTokens: tokens } }
+      );
+      console.log(`📱 FCM token registered for tech ${technicianProfileId} (${tokens.length}/${MAX_FCM_TOKENS})`);
+    }
+
+    return res.json({ success: true, message: "FCM token updated" });
+  } catch (error) {
+    console.error("registerTechnicianFcmToken Error:", error);
+    return res.status(500).json({ success: false, message: error.message, result: {} });
   }
 };
 
@@ -61,21 +109,41 @@ const normalizeServiceIdsInput = (body) => {
   return Array.from(new Set(normalized));
 };
 
-/* ================= HELPER: ENRICH TECHNICIAN WITH ACTIVATION STATUS ================= */
+/* ================= HELPER: ENRICH TECHNICIAN WITH ACTIVATION STATUS & BANK DETAILS ================= */
 const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
   try {
     if (!technicianDoc) return null;
 
     const techObj = technicianDoc.toObject ? technicianDoc.toObject() : technicianDoc;
 
-    // Check KYC approval
+    // Check KYC approval & bank details
     const kyc = await TechnicianKyc.findOne({
       technicianId: technicianDoc._id,
-    }).select("verificationStatus bankVerified");
+    });
 
     const isKycApproved = kyc && kyc.verificationStatus === "approved";
-    const isBankVerified = kyc && kyc.bankVerified === true;
+    const isBankVerified = kyc && (kyc.bankVerified === true || kyc.bankVerificationStatus === "approved");
     const isTrainingCompleted = technicianDoc.trainingCompleted === true;
+
+    // Decrypt & populate bank details on technician object if present on KYC
+    if (kyc && kyc.bankDetails) {
+      try {
+        const dek = await getDekForKycDoc(kyc);
+        const plainBank = decryptBankDetails(kyc.bankDetails, dek) || {};
+        techObj.bankDetails = {
+          accountHolderName: plainBank.accountHolderName || techObj.bankDetails?.accountName || techObj.bankDetails?.accountHolderName || null,
+          accountNumber: plainBank.accountNumber || techObj.bankDetails?.accountNumber || null,
+          bankName: plainBank.bankName || techObj.bankDetails?.bankName || null,
+          branchName: plainBank.branchName || techObj.bankDetails?.branchName || null,
+          ifscCode: plainBank.ifscCode || techObj.bankDetails?.ifscCode || null,
+          upiId: plainBank.upiId || techObj.bankDetails?.upiId || null,
+        };
+        techObj.isBankVerified = isBankVerified;
+        techObj.bankVerified = isBankVerified;
+      } catch (decErr) {
+        console.error("Error decrypting bank details for tech:", technicianDoc._id, decErr.message);
+      }
+    }
 
     // Active = KYC + Bank + Training all approved
     techObj.isActiveTechnician = isKycApproved && isBankVerified && isTrainingCompleted;

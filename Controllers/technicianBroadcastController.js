@@ -10,6 +10,7 @@ import { ensureTechnician } from "../Utils/ensureTechnician.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import { evaluateJobFeasibility, loadCommittedQueues } from "../Utils/technicianMatching.js";
 import { canArriveBy, computeLatestArrival, estimateTravelMinutes } from "../Utils/feasibility.js";
+import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
 const DISPATCH_LOCK_MS = 3000;
 
@@ -161,9 +162,16 @@ export const respondToJob = async (req, res) => {
     // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
     if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
       await session.abortTransaction();
+      // Richer 410 (Location Pipeline P1.6): give the client the expiry facts
+      // so it can show "Expired — pull to refresh" with a countdown. The
+      // rebroadcast cron runs every 10 min, so the next attempt hint is the
+      // next 10-minute boundary.
       return res.status(410).json({
         success: false,
         message: "This job offer has expired. Pull to refresh your job list.",
+        reason: "offer_expired",
+        expiresAt: broadcast.expiresAt,
+        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000),
       });
     }
 
@@ -182,10 +190,26 @@ export const respondToJob = async (req, res) => {
     // ⏱ Candidate booking snapshot (pre-claim, same transaction)
     const candidate = await ServiceBooking.findById(id)
       .session(session)
-      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts");
+      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId");
     if (!candidate) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    // 🎯 RE-VALIDATE ELIGIBILITY (District Permission, Service Availability, 10km Radius) AT ACCEPT TIME
+    const eligibility = await checkTechnicianEligibility({
+      technician: technicianProfileId,
+      booking: candidate,
+    });
+
+    if (!eligibility.eligible) {
+      await session.abortTransaction();
+      return res.status(403).json({
+        success: false,
+        message: "You are no longer eligible to accept this job.",
+        reasons: eligibility.reasons,
+        details: eligibility.details,
+      });
     }
 
     const bookingAttemptCount = Array.isArray(candidate.assignmentAttempts)

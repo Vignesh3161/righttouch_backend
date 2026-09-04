@@ -1,10 +1,20 @@
 import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import WalletTransaction from "../Schemas/WalletTransaction.js";
 import WithdrawalRequest from "../Schemas/WithdrawalRequest.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { toPaise, rupeesToPaise, paiseToRupees } from "../Utils/money.js";
+import {
+  getAutoPayoutConfig,
+  resolveTechPayoutSettings,
+  computeAutoPayoutForTech,
+} from "../Utils/autoPayout.js";
+import { executeWithdrawalPayout, releaseFailedWithdrawalReserve } from "../Utils/withdrawalPayoutEngine.js";
+import { hasActivePayoutBlock } from "../Utils/complaintFreeze.js";
+import { atomicWalletDebit } from "../Utils/walletDebit.js";
+import { getIo } from "../Utils/ioAccess.js";
 
 const isValidObjectId = mongoose.Types.ObjectId.isValid;
 
@@ -17,7 +27,7 @@ const getConfig = () => {
   const envMinWithdrawal = toMoney(process.env.MIN_WITHDRAWAL_AMOUNT);
   const minWithdrawal =
     envMinWithdrawal != null && envMinWithdrawal > 0 ? envMinWithdrawal : 100;
-  const cooldownDays = toMoney(process.env.WITHDRAWAL_COOLDOWN_DAYS) ?? 7;
+  const cooldownDays = toMoney(process.env.WITHDRAWAL_COOLDOWN_DAYS) ?? 0;
   return {
     minWithdrawal,
     cooldownMs: Math.max(0, cooldownDays) * 24 * 60 * 60 * 1000,
@@ -28,7 +38,11 @@ const getConfig = () => {
 // Add Wallet Transaction (Owner only)
 export const createWalletTransaction = async (req, res) => {
   try {
-    const { technicianId, bookingId, amount, amountPaise, type, source } = req.body;
+    const { technicianId, bookingId: rawBookingId, amount, amountPaise, type, source } = req.body;
+
+    // Normalize empty bookingId (admin UI sends "") to null — a raw "" fails
+    // ObjectId casting inside the ledger and produces a 500.
+    const bookingId = rawBookingId ? rawBookingId : null;
 
     if (req.user?.role !== "Owner") {
       return res.status(403).json({
@@ -107,44 +121,62 @@ export const createWalletTransaction = async (req, res) => {
     let transaction;
     try {
       await session.withTransaction(async () => {
-        // Re-check balance inside the txn for debits
-        if (type === "debit") {
-          const fresh = await TechnicianProfile.findById(technicianId)
-            .select("availableBalancePaise")
-            .session(session);
-          if (!fresh || (fresh.availableBalancePaise ?? 0) < amountPaiseNum) {
-            const err = new Error("Insufficient balance for manual debit");
-            err.statusCode = 400;
-            throw err;
+        if (type === "debit" && source === "penalty") {
+          // Penalties leverage atomicWalletDebit: deducts from available balance, and any
+          // uncollected remainder is added to outstandingDuesPaise to be recovered from future job earnings.
+          await atomicWalletDebit({
+            technicianId,
+            amountPaise: amountPaiseNum,
+            reason: `Manual penalty by ${req.user.role} ${req.user.userId}`,
+            idempotencyKey: `manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}`,
+            session,
+            allowDues: true,
+          });
+
+          [transaction] = await WalletTransaction.find({
+            technicianId,
+            idempotencyKey: { $regex: `^manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}` },
+          }).session(session);
+        } else {
+          // Re-check balance inside the txn for other debits
+          if (type === "debit") {
+            const fresh = await TechnicianProfile.findById(technicianId)
+              .select("availableBalancePaise")
+              .session(session);
+            if (!fresh || (fresh.availableBalancePaise ?? 0) < amountPaiseNum) {
+              const err = new Error("Insufficient balance for manual debit");
+              err.statusCode = 400;
+              throw err;
+            }
           }
+
+          const inc =
+            type === "credit"
+              ? { availableBalancePaise: amountPaiseNum, lifetimeEarnedPaise: amountPaiseNum }
+              : { availableBalancePaise: -amountPaiseNum };
+
+          await TechnicianProfile.updateOne(
+            { _id: technicianId },
+            { $inc: inc },
+            { session }
+          );
+
+          [transaction] = await WalletTransaction.create(
+            [
+              {
+                technicianId,
+                bookingId,
+                amountPaise: amountPaiseNum,
+                amount: paiseToRupees(amountPaiseNum),
+                type,
+                source,
+                idempotencyKey: `manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}`,
+                note: `Manual ${type} by ${req.user.role} ${req.user.userId}`,
+              },
+            ],
+            { session }
+          );
         }
-
-        const inc =
-          type === "credit"
-            ? { availableBalancePaise: amountPaiseNum, lifetimeEarnedPaise: amountPaiseNum }
-            : { availableBalancePaise: -amountPaiseNum };
-
-        await TechnicianProfile.updateOne(
-          { _id: technicianId },
-          { $inc: inc },
-          { session }
-        );
-
-        [transaction] = await WalletTransaction.create(
-          [
-            {
-              technicianId,
-              bookingId,
-              amountPaise: amountPaiseNum,
-              amount: paiseToRupees(amountPaiseNum),
-              type,
-              source,
-              idempotencyKey: `manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}`,
-              note: `Manual ${type} by ${req.user.role} ${req.user.userId}`,
-            },
-          ],
-          { session }
-        );
       });
     } finally {
       session.endSession();
@@ -258,24 +290,202 @@ export const getTechnicianWallet = async (req, res) => {
       pendingCount: 0
     };
 
+    // 💸 Auto-payout context — effective settings, in-flight auto payout and
+    // the next-run estimate (or how much more must be earned to trigger).
+    const [autoConfig, pendingAuto] = await Promise.all([
+      getAutoPayoutConfig(),
+      WithdrawalRequest.findOne({
+        technicianId: tech._id,
+        type: "auto",
+        status: { $in: ["pending", "requested", "approved", "processing"] },
+      })
+        .select("amountPaise status autoApprovedAt autoApprovedReason")
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
+    const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
+    const autoEstimate = computeAutoPayoutForTech(tech, autoConfig);
+
+    const activeWithdrawal = await WithdrawalRequest.findOne({
+      technicianId: tech._id,
+      status: { $in: ["pending", "requested", "approved", "processing", "manual_review"] },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const currentAvailablePaise = tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0);
+    const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise;
+    const availableToWithdrawPaise = Math.max(0, currentAvailablePaise - maintenanceFloorPaise);
+    const config = getConfig();
+
+    let payoutDestination = null;
+    if (tech.bankDetails) {
+      if (tech.bankDetails.accountNumber) {
+        const acc = String(tech.bankDetails.accountNumber);
+        payoutDestination = `Bank Account (****${acc.slice(-4)})`;
+      } else if (tech.bankDetails.upiId) {
+        payoutDestination = `UPI (${tech.bankDetails.upiId})`;
+      }
+    }
+
     res.json({
       success: true,
       // Four explicit balances (paise) + legacy rupee mirrors
-      availableBalancePaise: tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0),
+      availableBalancePaise: currentAvailablePaise,
       reservedBalancePaise: tech?.reservedBalancePaise ?? 0,
       lifetimeEarnedPaise: tech?.lifetimeEarnedPaise ?? 0,
       lifetimeWithdrawnPaise: tech?.lifetimeWithdrawnPaise ?? 0,
-      balance: paiseToRupees(tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0)),
-      walletBalance: paiseToRupees(tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0)),
+      maintenanceFloorPaise,
+      maintenanceFloor: paiseToRupees(maintenanceFloorPaise),
+      availableToWithdrawPaise,
+      availableToWithdraw: paiseToRupees(availableToWithdrawPaise),
+      balance: paiseToRupees(currentAvailablePaise),
+      walletBalance: paiseToRupees(currentAvailablePaise),
+      payoutDestination,
+      activeWithdrawal: activeWithdrawal
+        ? {
+            withdrawalId: activeWithdrawal._id,
+            status: activeWithdrawal.status,
+            amount: activeWithdrawal.amount,
+            amountPaise: activeWithdrawal.amountPaise,
+            origin: activeWithdrawal.origin,
+            createdAt: activeWithdrawal.createdAt,
+          }
+        : null,
+      payoutLimits: {
+        minWithdrawal: config.minWithdrawal,
+        maxWithdrawal: toMoney(process.env.MAX_WITHDRAWAL_AMOUNT) || 50000,
+      },
       totalEarnings,
       totalJobEarnings,
       totalTips,
       totalBonuses,
-      stats
+      stats,
+      payoutSettings: {
+        autoPayoutEnabled: payoutSettings.autoPayoutEnabled,
+        autoPayoutThreshold: paiseToRupees(payoutSettings.autoPayoutThresholdPaise),
+        autoPayoutThresholdPaise: payoutSettings.autoPayoutThresholdPaise,
+        minimumMaintenance: paiseToRupees(payoutSettings.minimumMaintenancePaise),
+        minimumMaintenancePaise: payoutSettings.minimumMaintenancePaise,
+        preferredPayoutMode: payoutSettings.preferredPayoutMode,
+        global: {
+          autoPayoutEnabled: autoConfig.autoPayoutEnabled,
+          autoPayoutThresholdPaise: autoConfig.autoPayoutThresholdPaise,
+          minimumMaintenancePaise: autoConfig.minimumMaintenancePaise,
+        },
+      },
+      pendingAutoPayoutPaise: toPaise(pendingAuto?.amountPaise ?? 0),
+      pendingAutoPayout: paiseToRupees(toPaise(pendingAuto?.amountPaise ?? 0)),
+      pendingAutoPayoutStatus: pendingAuto?.status || null,
+      nextAutoPayoutEstimate: autoEstimate.eligible
+        ? {
+            eligible: true,
+            amount: paiseToRupees(autoEstimate.amountPaise),
+            amountPaise: autoEstimate.amountPaise,
+            message: "You are eligible for auto-payout",
+          }
+        : {
+            eligible: false,
+            remainingToThreshold: paiseToRupees(autoEstimate.remainingToThresholdPaise),
+            remainingToThresholdPaise: autoEstimate.remainingToThresholdPaise,
+            message:
+              autoEstimate.reason === "auto_payout_disabled"
+                ? "Auto-payout is disabled for your account"
+                : `Earn ₹${paiseToRupees(autoEstimate.remainingToThresholdPaise).toFixed(2)} more to trigger auto-payout`,
+          },
     });
   } catch (error) {
     console.error("Error in getTechnicianWallet:", error);
     res.status(500).json({ success: false, message: "Internal Server Error", error: error.message });
+  }
+};
+
+/**
+ * 💸 UPDATE MY PAYOUT SETTINGS — per-technician auto-payout overrides.
+ * Body (all optional):
+ *   { autoPayoutEnabled?: boolean,
+ *     autoPayoutThreshold?: number (₹),      // >= ₹100
+ *     minimumMaintenance?: number (₹),       // >= 0
+ *     preferredPayoutMode?: "UPI"|"IMPS"|"NEFT" }
+ */
+export const updateMyPayoutSettings = async (req, res) => {
+  try {
+    const tech = req.technician;
+    const { autoPayoutEnabled, autoPayoutThreshold, minimumMaintenance, preferredPayoutMode } =
+      req.body || {};
+
+    const updates = { ...(tech.payoutSettings || {}) };
+
+    if (autoPayoutEnabled !== undefined) {
+      if (typeof autoPayoutEnabled !== "boolean") {
+        return res.status(400).json({ success: false, message: "autoPayoutEnabled must be a boolean" });
+      }
+      updates.autoPayoutEnabled = autoPayoutEnabled;
+    }
+
+    if (autoPayoutThreshold !== undefined) {
+      const thresholdPaise = toPaise(rupeesToPaise(autoPayoutThreshold));
+      if (thresholdPaise < 10000) {
+        return res.status(400).json({ success: false, message: "autoPayoutThreshold must be at least ₹100" });
+      }
+      updates.autoPayoutThresholdPaise = thresholdPaise;
+    }
+
+    if (minimumMaintenance !== undefined) {
+      const maintenancePaise = toPaise(rupeesToPaise(minimumMaintenance));
+      if (maintenancePaise < 0) {
+        return res.status(400).json({ success: false, message: "minimumMaintenance must be >= 0" });
+      }
+      updates.minimumMaintenancePaise = maintenancePaise;
+    }
+
+    // Maintenance floor can never exceed the threshold — otherwise the
+    // payout would be below ₹0 and auto-payout would never fire.
+    const thresholdPaise = updates.autoPayoutThresholdPaise ?? 500000;
+    const maintenancePaise = updates.minimumMaintenancePaise ?? 10000;
+    if (maintenancePaise >= thresholdPaise) {
+      return res.status(400).json({
+        success: false,
+        message: "minimumMaintenance must be lower than autoPayoutThreshold",
+      });
+    }
+
+    if (preferredPayoutMode !== undefined) {
+      if (!["UPI", "IMPS", "NEFT"].includes(preferredPayoutMode)) {
+        return res.status(400).json({ success: false, message: "preferredPayoutMode must be UPI, IMPS or NEFT" });
+      }
+      updates.preferredPayoutMode = preferredPayoutMode;
+    }
+
+    const before = { ...(tech.payoutSettings || {}) };
+    tech.payoutSettings = updates;
+    await tech.save();
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "PAYOUT_SETTINGS_UPDATED",
+      targetType: "TechnicianProfile",
+      targetId: tech._id,
+      before,
+      after: updates,
+      reason: req.body.reason || null,
+    });
+
+    res.json({
+      success: true,
+      message: "Payout settings updated",
+      result: {
+        autoPayoutEnabled: updates.autoPayoutEnabled,
+        autoPayoutThreshold: paiseToRupees(updates.autoPayoutThresholdPaise),
+        autoPayoutThresholdPaise: updates.autoPayoutThresholdPaise,
+        minimumMaintenance: paiseToRupees(updates.minimumMaintenancePaise),
+        minimumMaintenancePaise: updates.minimumMaintenancePaise,
+        preferredPayoutMode: updates.preferredPayoutMode,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };
 
@@ -316,12 +526,22 @@ export const getWalletTransactions = async (req, res) => {
 export const requestWithdrawal = async (req, res) => {
   const session = await mongoose.startSession();
   try {
-    const { amount, amountPaise } = req.body;
+    const { amount, amountRupees: bodyAmountRupees, withdrawalAmount, amountPaise, clientIdempotencyKey } = req.body || {};
     const config = getConfig(); // Get config
 
-    const amountPaiseNum = toPaise(amountPaise ?? rupeesToPaise(amount));
+    const rawRupees = bodyAmountRupees ?? amount ?? withdrawalAmount;
+    let amountPaiseNum = null;
+
+    if (amountPaise != null && amountPaise !== "" && Number.isFinite(Number(amountPaise))) {
+      const p = Number(amountPaise);
+      if (p > 0) amountPaiseNum = Math.round(p);
+    } else if (rawRupees != null && rawRupees !== "" && Number.isFinite(Number(rawRupees))) {
+      const r = Number(rawRupees);
+      if (r > 0) amountPaiseNum = rupeesToPaise(r);
+    }
+
     if (amountPaiseNum == null || amountPaiseNum <= 0) {
-      return res.status(400).json({ success: false, message: "Invalid amount" });
+      return res.status(400).json({ success: false, message: "Invalid withdrawal amount provided" });
     }
     const amountRupees = paiseToRupees(amountPaiseNum);
     if (amountRupees < config.minWithdrawal) {
@@ -331,14 +551,105 @@ export const requestWithdrawal = async (req, res) => {
       });
     }
 
-    const tech = req.technician;
-    if ((tech.availableBalancePaise ?? toPaise(tech.walletBalance ?? 0)) < amountPaiseNum) {
-      return res.status(400).json({ success: false, message: "Insufficient balance" });
+    const maxWithdrawalRupees = toMoney(process.env.MAX_WITHDRAWAL_AMOUNT) || 50000;
+    if (amountRupees > maxWithdrawalRupees) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum withdrawal limit per request is ₹${maxWithdrawalRupees}`
+      });
     }
 
-    // Cooldown — one withdrawal per cooldown window (default 7 days)
+    const tech = req.technician;
+    if (tech.status === "blocked" || tech.workStatus === "blocked" || tech.workStatus === "suspended") {
+      return res.status(403).json({ success: false, message: "Technician account is blocked or suspended from performing withdrawals" });
+    }
+
+    // 🏦 Bank Verification Withdrawal Guard — prevent withdrawal if bank account is unverified or under review
+    const kycDoc = await TechnicianKyc.findOne({ technicianId: tech._id }).select("bankVerified bankVerificationStatus").lean();
+    const isBankApproved = Boolean(
+      kycDoc &&
+      (kycDoc.bankVerified === true ||
+       kycDoc.bankVerificationStatus === "approved" ||
+       kycDoc.bankVerificationStatus === "VERIFIED")
+    );
+    if (!isBankApproved) {
+      return res.status(403).json({
+        success: false,
+        message: "Withdrawal blocked: Your bank account details are unverified or under review. Please wait for Admin bank verification approval before requesting payouts.",
+        result: {
+          bankVerified: kycDoc?.bankVerified || false,
+          bankVerificationStatus: kycDoc?.bankVerificationStatus || "pending"
+        }
+      });
+    }
+
+    // Idempotency check: return existing request if key already used
+    if (clientIdempotencyKey) {
+      const existingKey = await WithdrawalRequest.findOne({ clientIdempotencyKey, technicianId: tech._id }).lean();
+      if (existingKey) {
+        return res.status(200).json({
+          success: true,
+          message: "Withdrawal request already submitted (idempotent)",
+          result: {
+            withdrawalId: existingKey._id,
+            status: existingKey.status,
+            amount: existingKey.amount,
+            amountPaise: existingKey.amountPaise,
+            payoutMode: existingKey.payoutMode,
+          },
+        });
+      }
+    }
+
+    // Resolve maintenance floor
+    const autoConfig = await getAutoPayoutConfig();
+    const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
+    const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise || 10000;
+    const availableBalancePaise = tech.availableBalancePaise ?? toPaise(tech.walletBalance ?? 0);
+    const maxPayoutPaise = Math.max(0, availableBalancePaise - maintenanceFloorPaise);
+
+    if (amountPaiseNum > maxPayoutPaise) {
+      return res.status(400).json({
+        success: false,
+        message: `Requested amount ₹${amountRupees.toFixed(2)} exceeds maximum withdrawable balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}. Maintenance floor of ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain in wallet.`
+      });
+    }
+
+    if ((tech.outstandingDuesPaise || 0) > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Payout blocked: you have outstanding dues of ₹${paiseToRupees(tech.outstandingDuesPaise).toFixed(2)}. Dues are recovered automatically from future earnings before withdrawals.`
+      });
+    }
+
+    if (await hasActivePayoutBlock(tech._id)) {
+      return res.status(409).json({
+        success: false,
+        message: "Payout blocked: you have an active dispute or complaint on a booking. Please resolve open issues before requesting withdrawals."
+      });
+    }
+
+    // Block any in-progress OR under-review payout.
+    const inProgress = await WithdrawalRequest.findOne({
+      technicianId: tech._id,
+      status: {
+        $in: ["pending", "requested", "approved", "processing", "manual_review"],
+      },
+    })
+      .select("_id status")
+      .lean();
+    if (inProgress) {
+      return res.status(409).json({
+        success: false,
+        message: "You already have a payout in progress or under review. Please wait for it to complete.",
+        result: { withdrawalId: inProgress._id, status: inProgress.status },
+      });
+    }
+
+    // Cooldown check (default 7 days)
     const lastPaid = await WithdrawalRequest.findOne({
       technicianId: tech._id,
+      origin: "technician_request",
       status: { $in: ["paid", "approved"] },
     })
       .sort({ createdAt: -1 })
@@ -357,16 +668,17 @@ export const requestWithdrawal = async (req, res) => {
 
     let withdrawal;
     await session.withTransaction(async () => {
-      // Re-check balance inside the txn to prevent concurrent overspend
+      // Re-check balance inside transaction
       const fresh = await TechnicianProfile.findById(tech._id).session(session);
       const freshAvailable = fresh.availableBalancePaise ?? toPaise(fresh.walletBalance ?? 0);
-      if (freshAvailable < amountPaiseNum) {
-        const err = new Error("Insufficient balance");
+      const freshMaxPayout = Math.max(0, freshAvailable - maintenanceFloorPaise);
+      if (amountPaiseNum > freshMaxPayout) {
+        const err = new Error("Insufficient withdrawable balance (maintenance floor required)");
         err.statusCode = 400;
         throw err;
       }
 
-      // Atomically move available → reserved. Reserved funds are NOT spendable.
+      // Atomically move available → reserved
       await TechnicianProfile.updateOne(
         { _id: tech._id },
         {
@@ -378,13 +690,20 @@ export const requestWithdrawal = async (req, res) => {
         { session }
       );
 
+      // Create WithdrawalRequest in "processing" status
       withdrawal = await WithdrawalRequest.create(
         [
           {
             technicianId: tech._id,
             amount: amountRupees,
             amountPaise: amountPaiseNum,
-            status: "pending",
+            requestedAmountPaise: amountPaiseNum,
+            netPayoutAmountPaise: amountPaiseNum,
+            status: "processing",
+            origin: "technician_request",
+            requiresApproval: false,
+            initiatedBy: { actorType: "technician", actorId: tech._id },
+            clientIdempotencyKey: clientIdempotencyKey || null,
           },
         ],
         { session }
@@ -413,19 +732,53 @@ export const requestWithdrawal = async (req, res) => {
       action: "WITHDRAWAL_REQUESTED",
       targetType: "WithdrawalRequest",
       targetId: withdrawal[0]._id,
-      after: { amountPaise: amountPaiseNum, status: "pending", reserved: true },
+      after: { amountPaise: amountPaiseNum, status: "processing", origin: "technician_request", reserved: true },
     });
 
-    res.status(201).json({
-      success: true,
-      message: "Withdrawal request sent",
-      result: {
+    // ── AUTOMATIC payout processing: single shared engine, no Admin approval ──
+    const io = getIo();
+    try {
+      const payout = await executeWithdrawalPayout({
         withdrawalId: withdrawal[0]._id,
-        status: "pending",
-        amount: paiseToRupees(amountPaiseNum),
+        actor: { userId: req.user.userId, role: req.user.role },
+        narration: "RightTouch Technician Withdrawal",
+        io,
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: payout.message || "Withdrawal initiated successfully",
+        result: {
+          withdrawalId: withdrawal[0]._id,
+          status: payout.withdrawalStatus || "processing",
+          amount: payout.amount,
+          amountPaise: payout.amountPaise,
+          payoutId: payout.payoutId,
+          mode: payout.mode,
+          payoutDestination: payout.payoutDestination,
+        },
+      });
+    } catch (payErr) {
+      const w = await WithdrawalRequest.findById(withdrawal[0]._id).lean();
+      if (w && w.status === "manual_review") {
+        return res.status(202).json({
+          success: false,
+          message: "Payout outcome is being verified with your bank. We'll notify you shortly.",
+          result: { withdrawalId: withdrawal[0]._id, status: "manual_review" },
+        });
+      }
+      await releaseFailedWithdrawalReserve({
+        withdrawalId: withdrawal[0]._id,
         amountPaise: amountPaiseNum,
-      },
-    });
+        technicianId: tech._id,
+        reason: payErr?.message,
+      });
+      return res.status(400).json({
+        success: false,
+        message: payErr?.message || "Payout failed. Your balance has been restored.",
+        result: { withdrawalId: withdrawal[0]._id, status: "failed" },
+      });
+    }
   } catch (error) {
     res.status(error.statusCode || 500).json({ success: false, message: error.message });
   } finally {
@@ -462,13 +815,21 @@ export const cancelMyWithdrawal = async (req, res) => {
     const withdrawal = await WithdrawalRequest.findOne({
       _id: id,
       technicianId: req.technician._id,
-      status: { $in: ["pending", "requested"] }
     });
 
     if (!withdrawal) {
       return res.status(404).json({
         success: false,
-        message: "Pending withdrawal request not found"
+        message: "Withdrawal request not found"
+      });
+    }
+
+    if (!["pending", "requested"].includes(withdrawal.status)) {
+      return res.status(400).json({
+        success: false,
+        message: withdrawal.status === "processing"
+          ? "Withdrawal is currently processing with RazorpayX and cannot be cancelled."
+          : `Withdrawal request cannot be cancelled in status "${withdrawal.status}"`
       });
     }
 
@@ -542,5 +903,81 @@ export const cancelMyWithdrawal = async (req, res) => {
     });
   } finally {
     session.endSession();
+  }
+};
+
+/* GET WITHDRAWAL RECEIPT */
+export const getWithdrawalReceipt = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isTech = req.user?.role === "Technician";
+    const isAdm = ["Admin", "SuperAdmin", "Owner"].includes(req.user?.role);
+
+    if (!isTech && !isAdm) {
+      return res.status(403).json({ success: false, message: "Unauthorized access" });
+    }
+
+    const query = { _id: id };
+    if (isTech && req.technician) {
+      query.technicianId = req.technician._id;
+    }
+
+    const withdrawal = await WithdrawalRequest.findOne(query)
+      .populate({
+        path: "technicianId",
+        select: "userId bankDetails",
+        populate: { path: "userId", select: "fname lname mobileNumber email" },
+      })
+      .lean();
+
+    if (!withdrawal) {
+      return res.status(404).json({ success: false, message: "Receipt not found for specified payout" });
+    }
+
+    const techUser = withdrawal.technicianId?.userId || {};
+    const requestedPaise = withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount);
+    const netPayoutPaise = withdrawal.netPayoutAmountPaise ?? requestedPaise;
+
+    res.json({
+      success: true,
+      receipt: {
+        receiptId: `RCP-${withdrawal._id.toString().slice(-8).toUpperCase()}`,
+        issuer: "RightTouch Technologies Private Limited",
+        withdrawalId: withdrawal._id,
+        status: withdrawal.status,
+        origin: withdrawal.origin,
+        payoutMode: withdrawal.payoutMode || "UPI/IMPS",
+        payoutDestination: withdrawal.payoutDestination || "Bank Account / UPI",
+        payoutReference: withdrawal.payoutReference || null,
+        utr: withdrawal.utr || null,
+        financials: {
+          requestedAmount: paiseToRupees(requestedPaise),
+          requestedAmountPaise: requestedPaise,
+          commissionDeduction: paiseToRupees(withdrawal.commissionDeductionPaise || 0),
+          commissionDeductionPaise: withdrawal.commissionDeductionPaise || 0,
+          penaltyDeduction: paiseToRupees(withdrawal.penaltyDeductionPaise || 0),
+          penaltyDeductionPaise: withdrawal.penaltyDeductionPaise || 0,
+          penaltyReason: withdrawal.penaltyReason || null,
+          otherDeductions: paiseToRupees(withdrawal.otherDeductionsPaise || 0),
+          otherDeductionsPaise: withdrawal.otherDeductionsPaise || 0,
+          netPayoutAmount: paiseToRupees(netPayoutPaise),
+          netPayoutAmountPaise: netPayoutPaise,
+        },
+        technician: {
+          technicianId: withdrawal.technicianId?._id || withdrawal.technicianId,
+          name: `${techUser.fname || ""} ${techUser.lname || ""}`.trim() || "Technician",
+          mobileNumber: techUser.mobileNumber || null,
+          email: techUser.email || null,
+        },
+        timestamps: {
+          createdAt: withdrawal.createdAt,
+          decidedAt: withdrawal.decidedAt,
+          paidAt: withdrawal.paidAt,
+          failedAt: withdrawal.failedAt,
+        },
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };

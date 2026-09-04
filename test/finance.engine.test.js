@@ -101,9 +101,9 @@ test("service default commission: split + GST + tip on server", async () => {
   // commission on the BASE amount only (GST and tip never pay commission)
   assert.equal(snapshot.commissionAmountPaise, 9980);
   assert.equal(snapshot.commissionRuleSource, "service_default");
-  // Invariant: commission + technician === total (technician absorbs GST + tip)
+  // Invariant: commission + technician + GST === total (technician receives tip & base net, GST pass-through)
   assert.equal(
-    snapshot.commissionAmountPaise + snapshot.technicianAmountPaise,
+    snapshot.commissionAmountPaise + snapshot.technicianAmountPaise + snapshot.gstAmountPaise,
     snapshot.totalAmountPaise
   );
   assertSplit(snapshot);

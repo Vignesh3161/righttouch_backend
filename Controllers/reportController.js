@@ -1,9 +1,12 @@
-import mongoose from "mongoose";
-import Report from "../Schemas/Report.js";
-import ServiceBooking from "../Schemas/ServiceBooking.js";
-import ProductBooking from "../Schemas/ProductBooking.js";
+import {
+  createComplaintInternal,
+  getMyReportsInternal,
+  resolveLegacyReportInternal,
+  adminListComplaintsInternal,
+  adminGetComplaintInternal,
+} from "../Services/complaintService.js";
 
-// ✅ Create Report (Secure & Schema Compliant)
+// ✅ Create Report (Legacy endpoint `/api/report`, backwards-compatible contract)
 export const userReport = async (req, res) => {
   try {
     const customerId = req.user?.userId;
@@ -13,144 +16,104 @@ export const userReport = async (req, res) => {
 
     const {
       bookingId,
-      bookingType,
+      bookingType = "service",
       technicianId,
       serviceId,
       productId,
       complaint,
-      image
-    } = req.body;
+      image,
+      category,
+    } = req.body || {};
 
-    // 1️⃣ Basic Validation
-    if (!bookingId || !bookingType || !complaint) {
-      return res.status(400).json({
-        success: false,
-        message: "bookingId, bookingType, and complaint are required",
-        result: {}
-      });
-    }
-
-    // 2️⃣ Verify Booking Ownership & Fetch context
-    let booking;
-    if (bookingType === "service") {
-      booking = await ServiceBooking.findOne({ _id: bookingId, customerId });
-      if (!booking) return res.status(404).json({ success: false, message: "Service booking not found", result: {} });
-    } else if (bookingType === "product") {
-      booking = await ProductBooking.findOne({ _id: bookingId, customerId });
-      if (!booking) return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
-    } else {
-      return res.status(400).json({ success: false, message: "Invalid bookingType", result: {} });
-    }
-
-    // 3️⃣ Create Report
-    const reportData = await Report.create({
+    const reportData = await createComplaintInternal({
+      customerId,
       bookingId,
       bookingType,
-      technicianId: technicianId || booking.technicianId || null,
-      serviceId: serviceId || booking.serviceId || null,
-      productId: productId || booking.productId || null,
-      customerId,
       complaint,
       image,
+      category,
+      technicianId,
+      serviceId,
+      productId,
     });
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Report sent successfully. Our team will look into it.",
-      result: reportData
+      result: reportData,
     });
   } catch (error) {
-    console.error("userReport Error:", error);
-    res.status(500).json({ success: false, message: "Server error", result: { error: error.message } });
+    const status = error.statusCode || 500;
+    return res.status(status).json({
+      success: false,
+      message: error.message || "Server error",
+      result: {},
+    });
   }
 };
 
-// ✅ Get My Reports (For Customers)
+// ✅ Get My Reports (Legacy endpoint `/api/get-my-reports`)
 export const getMyReports = async (req, res) => {
   try {
     const customerId = req.user?.userId;
     if (!customerId) return res.status(401).json({ success: false, message: "Unauthorized" });
 
-    const reports = await Report.find({ customerId })
-      .populate("serviceId", "serviceName")
-      .populate("productId", "productName")
-      .populate({
-        path: "technicianId",
-        populate: { path: "userId", select: "fname lname mobileNumber" },
-      })
-      .sort({ createdAt: -1 });
-
-    res.status(200).json({ success: true, result: reports });
+    const reports = await getMyReportsInternal(customerId);
+    return res.status(200).json({ success: true, result: reports });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };
 
-// ✅ Resolve Report (For Admin)
+// ✅ Resolve Report (Legacy endpoint `/api/report/resolve/:id`, fixes "resolved" enum bug)
 export const resolveReport = async (req, res) => {
   try {
     const { id } = req.params;
-    const report = await Report.findByIdAndUpdate(
-      id,
-      { status: "resolved" },
-      { new: true }
-    );
+    const { status, resolutionNote, refundId } = req.body || {};
 
-    if (!report) return res.status(404).json({ success: false, message: "Report not found" });
-
-    res.status(200).json({ success: true, message: "Report marked as resolved", result: report });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ✅ Get All Reports (For Admin)
-export const getAllReports = async (req, res) => {
-  try {
-    const { search, status } = req.query;
-    let query = {};
-    if (status) query.status = status;
-
-    if (search) {
-      query.$or = [{ complaint: { $regex: search, $options: "i" } }];
-    }
-
-    const reports = await Report.find(query)
-      .populate("serviceId", "serviceName")
-      .populate("productId", "productName")
-      .populate("customerId", "fname lname email mobileNumber")
-      .populate({
-        path: "technicianId",
-        populate: { path: "userId", select: "fname lname mobileNumber" },
-      })
-      .sort({ createdAt: -1 });
+    const report = await resolveLegacyReportInternal({
+      reportId: id,
+      inputStatus: status,
+      resolutionNote,
+      refundId,
+      adminUser: req.user,
+    });
 
     return res.status(200).json({
       success: true,
-      result: reports
+      message: "Report marked as resolved",
+      result: report,
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    return res.status(status).json({ success: false, message: error.message });
+  }
+};
+
+// ✅ Get All Reports (Legacy endpoint `/api/getAllReports`)
+export const getAllReports = async (req, res) => {
+  try {
+    const { search, status } = req.query;
+    const reports = await adminListComplaintsInternal({ status, search });
+
+    return res.status(200).json({
+      success: true,
+      result: reports,
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ✅ Get Report by ID
+// ✅ Get Report by ID (Legacy endpoint `/api/getReportById/:id`)
 export const getReportById = async (req, res) => {
   try {
     const { id } = req.params;
-    const report = await Report.findById(id)
-      .populate("serviceId", "serviceName")
-      .populate("productId", "productName")
-      .populate("customerId", "fname lname email mobileNumber")
-      .populate({
-        path: "technicianId",
-        populate: { path: "userId", select: "fname lname mobileNumber" },
-      });
-
-    if (!report) return res.status(404).json({ success: false, message: "Report not found" });
+    const { report } = await adminGetComplaintInternal(id);
 
     return res.status(200).json({ success: true, result: report });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    const status = error.statusCode || 500;
+    return res.status(status).json({ success: false, message: error.message });
   }
 };

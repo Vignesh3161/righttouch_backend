@@ -1,20 +1,21 @@
 import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
-import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import WithdrawalRequest from "../Schemas/WithdrawalRequest.js";
 import WalletTransaction from "../Schemas/WalletTransaction.js";
-import PayoutOutbox from "../Schemas/PayoutOutbox.js";
 import Payment from "../Schemas/Payment.js";
-import {
-  createRazorpayContact,
-  createFundAccount,
-  createPayout,
-} from "./razorpayXController.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { fingerprintBankDetails } from "../Utils/kycPrivacy.js";
-import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 import { toPaise, rupeesToPaise, paiseToRupees } from "../Utils/money.js";
-import { postPayoutLedgerEntry } from "../Utils/ledger.js";
+import { getIo } from "../Utils/ioAccess.js";
+import { executeWithdrawalPayout, releaseFailedWithdrawalReserve } from "../Utils/withdrawalPayoutEngine.js";
+import {
+  getAutoPayoutConfig,
+  setAutoPayoutConfig,
+} from "../Utils/autoPayout.js";
+import PayoutOutbox from "../Schemas/PayoutOutbox.js";
+import AuditLog from "../Schemas/AuditLog.js";
+import GlobalSetting from "../Schemas/GlobalSetting.js";
+import { adminResolveManualReview } from "../Utils/paymentCrons.js";
+import { hasActivePayoutBlock } from "../Utils/complaintFreeze.js";
 
 const getStartOfDay = (date) => {
   const d = new Date(date);
@@ -29,8 +30,70 @@ const getEndOfDay = (date) => {
 };
 
 const buildRangeFromQuery = (query = {}) => {
-  const type = String(query.type || "").toLowerCase();
+  const type = String(query.type || query.period || query.preset || "").toLowerCase();
   const now = new Date();
+
+  // Presets
+  if (["today"].includes(type)) {
+    return { type: "today", start: getStartOfDay(now), end: getEndOfDay(now) };
+  }
+
+  if (["yesterday"].includes(type)) {
+    const y = new Date(now);
+    y.setDate(y.getDate() - 1);
+    return { type: "yesterday", start: getStartOfDay(y), end: getEndOfDay(y) };
+  }
+
+  if (["last7days", "last_7_days", "last7"].includes(type)) {
+    const s = new Date(now);
+    s.setDate(s.getDate() - 7);
+    return { type: "last7days", start: getStartOfDay(s), end: getEndOfDay(now) };
+  }
+
+  if (["last30days", "last_30_days", "last30"].includes(type)) {
+    const s = new Date(now);
+    s.setDate(s.getDate() - 30);
+    return { type: "last30days", start: getStartOfDay(s), end: getEndOfDay(now) };
+  }
+
+  if (["thismonth", "this_month"].includes(type)) {
+    const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const end = getEndOfDay(now);
+    return { type: "thisMonth", start, end };
+  }
+
+  if (["lastmonth", "last_month"].includes(type)) {
+    const start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+    const end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+    return { type: "lastMonth", start, end };
+  }
+
+  if (query.startDate || query.endDate || type === "custom") {
+    const s = query.startDate ? new Date(query.startDate) : null;
+    const e = query.endDate ? new Date(query.endDate) : null;
+
+    if (s && Number.isNaN(s.getTime())) {
+      const err = new Error("Invalid startDate format");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    if (e && Number.isNaN(e.getTime())) {
+      const err = new Error("Invalid endDate format");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    if (s && e && s > e) {
+      const err = new Error("startDate cannot be after endDate");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const start = s ? getStartOfDay(s) : new Date(0);
+    const end = e ? getEndOfDay(e) : getEndOfDay(now);
+    return { type: "custom", start, end };
+  }
 
   if (type === "day" && query.date) {
     const date = new Date(`${query.date}T00:00:00`);
@@ -160,20 +223,41 @@ export const getAdminWalletSummary = async (req, res) => {
       return { $facet: facet };
     };
 
-    const [paymentAgg, withdrawalAgg, statusCounts] = await Promise.all([
-      Payment.aggregate([
-        { $match: { status: "success" } },
-        paymentsBucket(filterRange ? { createdAt: { $gte: filterRange.start, $lte: filterRange.end } } : null),
-      ]),
-      WithdrawalRequest.aggregate([
-        { $match: { status: "paid" } },
-        withdrawalBucket(filterRange ? { createdAt: { $gte: filterRange.start, $lte: filterRange.end } } : null),
-      ]),
-      WithdrawalRequest.aggregate([
-        { $match: { status: { $in: ["pending", "requested", "approved", "rejected", "processing"] } } },
-        { $group: { _id: "$status", sum: { $sum: "$amount" }, count: { $sum: 1 } } },
-      ]),
-    ]);
+    const [paymentAgg, withdrawalAgg, statusCounts, walletAgg, originAgg, todayAgg] =
+      await Promise.all([
+        Payment.aggregate([
+          { $match: { status: "success" } },
+          paymentsBucket(filterRange ? { createdAt: { $gte: filterRange.start, $lte: filterRange.end } } : null),
+        ]),
+        WithdrawalRequest.aggregate([
+          { $match: { status: "paid" } },
+          withdrawalBucket(filterRange ? { createdAt: { $gte: filterRange.start, $lte: filterRange.end } } : null),
+        ]),
+        // All-status counts + sums → dashboard status buckets
+        WithdrawalRequest.aggregate([
+          { $group: { _id: "$status", sum: { $sum: "$amount" }, count: { $sum: 1 } } },
+        ]),
+        // Total technician wallet balance (available + reserved)
+        TechnicianProfile.aggregate([
+          {
+            $group: {
+              _id: null,
+              available: { $sum: "$availableBalancePaise" },
+              reserved: { $sum: "$reservedBalancePaise" },
+            },
+          },
+        ]),
+        // Paid payouts split by origin (automatic vs manual admin send)
+        WithdrawalRequest.aggregate([
+          { $match: { status: "paid" } },
+          { $group: { _id: "$origin", sum: { $sum: "$amount" }, count: { $sum: 1 } } },
+        ]),
+        // Today's withdrawals (any status) — for "Today's Withdrawals"
+        WithdrawalRequest.aggregate([
+          { $match: { createdAt: { $gte: startToday, $lte: endToday } } },
+          { $group: { _id: "$status", sum: { $sum: "$amount" }, count: { $sum: 1 } } },
+        ]),
+      ]);
 
     const p = paymentAgg[0] || {};
     const w = withdrawalAgg[0] || {};
@@ -199,14 +283,33 @@ export const getAdminWalletSummary = async (req, res) => {
     const totalTechnicianPayable = rangeBucketP?.technicianPayable ?? allTimeTechnicianPayable;
     const totalWithdrawn = rangeBucketW?.withdrawn ?? allTimeWithdrawn;
 
+    // ── Withdrawal status buckets ──
     const statusMap = new Map(statusCounts.map((s) => [s._id, s]));
     const sumOf = (...keys) => keys.reduce((acc, k) => acc + (statusMap.get(k)?.sum || 0), 0);
     const countOf = (...keys) => keys.reduce((acc, k) => acc + (statusMap.get(k)?.count || 0), 0);
 
-    const totalPendingWithdrawals = sumOf("pending", "requested");
-    const approvedWithdrawCount = countOf("approved");
-    const rejectedWithdrawCount = countOf("rejected");
-    const processingWithdrawCount = countOf("processing");
+    const allStatusRows = [...statusMap.values()];
+    const totalWithdrawalCount = allStatusRows.reduce((a, v) => a + v.count, 0);
+    const totalWithdrawalAmount = allStatusRows.reduce((a, v) => a + v.sum, 0);
+
+    // ── Today's withdrawals by status ──
+    const todayMap = new Map(todayAgg.map((t) => [t._id, t]));
+    const todayCount = [...todayMap.values()].reduce((a, v) => a + v.count, 0);
+    const todayPaid = todayMap.get("paid") || { sum: 0, count: 0 };
+
+    // ── Origin split (automatic vs manual admin send) ──
+    const originMap = new Map(originAgg.map((o) => [o._id, o]));
+    const autoOrigin = originMap.get("auto") || { sum: 0, count: 0 };
+    const techReqOrigin = originMap.get("technician_request") || { sum: 0, count: 0 };
+    const adminDirectOrigin = originMap.get("admin_direct") || { sum: 0, count: 0 };
+    const automaticWithdrawals = {
+      count: autoOrigin.count + techReqOrigin.count,
+      amount: Math.round(autoOrigin.sum + techReqOrigin.sum),
+    };
+    const manualWithdrawals = {
+      count: adminDirectOrigin.count,
+      amount: Math.round(adminDirectOrigin.sum),
+    };
 
     res.json({
       success: true,
@@ -221,15 +324,44 @@ export const getAdminWalletSummary = async (req, res) => {
         totalPayableToTechnician: Math.round(totalTechnicianPayable),
         // Platform net revenue = commission (GST is a pass-through liability)
         platformRevenue: Math.round(totalCommission),
-        // NOTE: platform cash available — does NOT include gateway fees or
-        // settled-but-unpaid technician liabilities (those are reserved in
-        // technician wallets at request time).
         availableBalance: Math.round(allTimeCollected - allTimeWithdrawn),
+
+        /* ── Technician wallet + withdrawal monitoring (spec §8/§9) ── */
+        totalTechnicianWalletBalance: Math.round(walletAgg[0]?.available || 0),
+        totalReservedBalance: Math.round(walletAgg[0]?.reserved || 0),
+        totalWithdrawals: totalWithdrawalCount,
+        totalWithdrawalsAmount: Math.round(totalWithdrawalAmount),
+        totalAmountPaid: Math.round(sumOf("paid")),
+        todayWithdrawals: { count: todayCount, paidAmount: Math.round(todayPaid.sum) },
+        processingWithdrawals: {
+          count: countOf("processing"),
+          amount: Math.round(sumOf("processing")),
+        },
+        successfulWithdrawals: {
+          count: countOf("paid"),
+          amount: Math.round(sumOf("paid")),
+        },
+        failedWithdrawals: {
+          count: countOf("failed"),
+          amount: Math.round(sumOf("failed")),
+        },
+        manualReviewWithdrawals: {
+          count: countOf("manual_review"),
+          amount: Math.round(sumOf("manual_review")),
+        },
+        pendingWithdrawals: {
+          count: countOf("pending", "requested"),
+          amount: Math.round(sumOf("pending", "requested")),
+        },
+        automaticWithdrawals,
+        manualWithdrawals,
+
+        // (kept for backwards-compatible dashboard widgets)
         totalWithdrawn: Math.round(totalWithdrawn),
-        totalPendingWithdrawals: Math.round(totalPendingWithdrawals),
-        approvedWithdrawCount,
-        rejectedWithdrawCount,
-        processingWithdrawCount,
+        totalPendingWithdrawals: Math.round(sumOf("pending", "requested")),
+        approvedWithdrawCount: countOf("approved"),
+        rejectedWithdrawCount: countOf("rejected"),
+        processingWithdrawCount: countOf("processing"),
         todayCollected: Math.round(todayCollected),
         todayCommission: Math.round(todayCommission),
         todayGst: Math.round(pick(p.today, "gst")),
@@ -255,20 +387,87 @@ export const getAdminWalletSummary = async (req, res) => {
   }
 };
 
+const buildWithdrawalFilterQuery = (queryObj) => {
+  const query = {};
+
+  if (queryObj.status && String(queryObj.status).trim()) {
+    query.status = String(queryObj.status).trim();
+  }
+
+  const payoutType = queryObj.payoutType || queryObj.type || queryObj.origin;
+  if (payoutType && ["manual", "automatic", "auto", "technician_request", "admin_direct"].includes(String(payoutType))) {
+    const pt = String(payoutType);
+    if (pt === "manual" || pt === "admin_direct") {
+      query.origin = "admin_direct";
+    } else if (pt === "technician_request") {
+      query.origin = "technician_request";
+    } else {
+      query.origin = { $in: ["technician_request", "auto"] };
+    }
+  }
+
+  if (queryObj.payoutMode && String(queryObj.payoutMode).trim()) {
+    query.payoutMode = String(queryObj.payoutMode).trim().toUpperCase();
+  }
+
+  if (queryObj.technicianId && mongoose.isValidObjectId(queryObj.technicianId)) {
+    query.technicianId = queryObj.technicianId;
+  }
+
+  const minAmount = Number(queryObj.minAmount);
+  const maxAmount = Number(queryObj.maxAmount);
+  if (Number.isFinite(minAmount) && Number.isFinite(maxAmount) && minAmount > maxAmount) {
+    const err = new Error("minAmount cannot be greater than maxAmount");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (Number.isFinite(minAmount) && minAmount > 0) {
+    query.amount = { ...(query.amount || {}), $gte: minAmount };
+  }
+  if (Number.isFinite(maxAmount) && maxAmount > 0) {
+    query.amount = { ...(query.amount || {}), $lte: maxAmount };
+  }
+
+  if (queryObj.destination && String(queryObj.destination).trim()) {
+    query.payoutDestination = {
+      $regex: String(queryObj.destination).trim(),
+      $options: "i",
+    };
+  }
+
+  if (queryObj.utr && String(queryObj.utr).trim()) {
+    query.utr = {
+      $regex: String(queryObj.utr).trim(),
+      $options: "i",
+    };
+  }
+
+  if (queryObj.withdrawalId && String(queryObj.withdrawalId).trim()) {
+    const idv = String(queryObj.withdrawalId).trim();
+    if (mongoose.isValidObjectId(idv)) {
+      query._id = idv;
+    } else {
+      query.payoutReference = idv;
+    }
+  }
+
+  const filterRange = buildRangeFromQuery(queryObj);
+  if (filterRange) {
+    const dateField = ["createdAt", "decidedAt", "paidAt", "failedAt"].includes(queryObj.dateField)
+      ? queryObj.dateField
+      : "createdAt";
+    query[dateField] = { $gte: filterRange.start, $lte: filterRange.end };
+  }
+
+  return query;
+};
+
 /* ALL WITHDRAWALS (optional ?status= filter, paginated) */
 export const getAllWithdrawalRequests = async (req, res) => {
   try {
     ensureAdmin(req);
-
-    const filterRange = buildRangeFromQuery(req.query);
-    const query = {};
-
-    if (req.query.status && String(req.query.status).trim()) {
-      query.status = String(req.query.status).trim();
-    }
-    if (filterRange) {
-      query.createdAt = { $gte: filterRange.start, $lte: filterRange.end };
-    }
+    const query = buildWithdrawalFilterQuery(req.query);
 
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
@@ -278,8 +477,8 @@ export const getAllWithdrawalRequests = async (req, res) => {
       WithdrawalRequest.find(query)
         .populate({
           path: "technicianId",
-          select: "walletBalance",
-          populate: { path: "userId", select: "fname lname mobileNumber" }
+          select: "walletBalance availableBalancePaise bankDetails decryptedBankDetails kycDetails isBankVerified status workStatus bankName accountNumber accountHolderName ifscCode branchName upiId payoutBlocked payoutBlockedReason",
+          populate: { path: "userId", select: "fname lname mobileNumber email" }
         })
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -301,6 +500,79 @@ export const getAllWithdrawalRequests = async (req, res) => {
   }
 };
 
+/* EXPORT WITHDRAWAL REQUESTS (CSV) */
+export const exportWithdrawalRequests = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const query = buildWithdrawalFilterQuery(req.query);
+
+    const withdrawals = await WithdrawalRequest.find(query)
+      .populate({
+        path: "technicianId",
+        select: "userId bankDetails",
+        populate: { path: "userId", select: "fname lname mobileNumber email" },
+      })
+      .sort({ createdAt: -1 })
+      .limit(5000)
+      .lean();
+
+    const headers = [
+      "Withdrawal ID",
+      "Technician Name",
+      "Technician Phone",
+      "Technician Email",
+      "Requested Amount (INR)",
+      "Net Payout Amount (INR)",
+      "Commission Deduction (INR)",
+      "Penalty Deduction (INR)",
+      "Penalty Reason",
+      "Status",
+      "Origin",
+      "Payout Mode",
+      "Payout Destination",
+      "Razorpay Payout ID",
+      "UTR",
+      "Requested Date",
+      "Paid Date",
+    ];
+
+    const rows = withdrawals.map((w) => {
+      const user = w.technicianId?.userId || {};
+      const requestedPaise = w.requestedAmountPaise ?? w.amountPaise ?? rupeesToPaise(w.amount);
+      const netPaise = w.netPayoutAmountPaise ?? requestedPaise;
+
+      return [
+        String(w._id),
+        `"${(`${user.fname || ""} ${user.lname || ""}`).trim() || "N/A"}"`,
+        `"${user.mobileNumber || "N/A"}"`,
+        `"${user.email || "N/A"}"`,
+        paiseToRupees(requestedPaise).toFixed(2),
+        paiseToRupees(netPaise).toFixed(2),
+        paiseToRupees(w.commissionDeductionPaise || 0).toFixed(2),
+        paiseToRupees(w.penaltyDeductionPaise || 0).toFixed(2),
+        `"${w.penaltyReason || "N/A"}"`,
+        w.status,
+        w.origin,
+        w.payoutMode || "N/A",
+        `"${w.payoutDestination || "N/A"}"`,
+        w.payoutReference || "N/A",
+        w.utr || "N/A",
+        w.createdAt ? new Date(w.createdAt).toISOString() : "N/A",
+        w.paidAt ? new Date(w.paidAt).toISOString() : "N/A",
+      ].join(",");
+    });
+
+    const csvContent = [headers.join(","), ...rows].join("\n");
+    const filename = `RightTouch_Payouts_${new Date().toISOString().slice(0, 10)}.csv`;
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.status(200).send(csvContent);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
 /**
  * @desc    Approve Withdrawal — status only, NO money movement.
  *          (Balance is reserved at request time; debited ledger entry exists.)
@@ -310,16 +582,68 @@ export const approveWithdrawal = async (req, res) => {
     ensureAdmin(req);
 
     const withdrawal = await WithdrawalRequest.findById(req.params.id);
-    if (!withdrawal || !["pending", "requested"].includes(withdrawal.status)) {
+    if (!withdrawal) {
+      return res.status(404).json({ success: false, message: "Withdrawal request not found" });
+    }
+
+    if (withdrawal.origin === "technician_request") {
+      return res.status(400).json({
+        success: false,
+        message: "Admin approval is not allowed or required for technician withdrawal requests. Technician payouts are processed automatically.",
+      });
+    }
+
+    if (!["pending", "requested"].includes(withdrawal.status)) {
       return res.status(400).json({ success: false, message: "Invalid or non-pending request" });
     }
+
+    const {
+      penaltyAmount,
+      penaltyPaise,
+      penaltyReason,
+      commissionAmount,
+      commissionPaise,
+      otherDeductions,
+      otherDeductionsPaise,
+      adminNote,
+    } = req.body || {};
+
+    const requestedAmountPaise = toPaise(
+      withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount)
+    );
+
+    const pPaise = penaltyPaise != null ? toPaise(penaltyPaise) : (penaltyAmount != null ? rupeesToPaise(penaltyAmount) : 0);
+    const cPaise = commissionPaise != null ? toPaise(commissionPaise) : (commissionAmount != null ? rupeesToPaise(commissionAmount) : 0);
+    const oPaise = otherDeductionsPaise != null ? toPaise(otherDeductionsPaise) : (otherDeductions != null ? rupeesToPaise(otherDeductions) : 0);
+
+    if (pPaise > 0 && (!penaltyReason || !String(penaltyReason).trim())) {
+      return res.status(400).json({
+        success: false,
+        message: "Penalty reason is required when applying a penalty reduction.",
+      });
+    }
+
+    if (pPaise + cPaise + oPaise > requestedAmountPaise) {
+      return res.status(400).json({
+        success: false,
+        message: "Total deductions cannot exceed requested withdrawal amount.",
+      });
+    }
+
+    const netPaise = Math.max(0, requestedAmountPaise - pPaise - cPaise - oPaise);
 
     const before = withdrawal.toObject();
     withdrawal.status = "approved";
     withdrawal.approvedAt = new Date();
     withdrawal.decidedAt = new Date();
     withdrawal.decidedBy = req.user.userId;
-    withdrawal.adminNote = req.body.adminNote || "Approved by Admin";
+    withdrawal.adminNote = adminNote || "Approved by Admin";
+    withdrawal.requestedAmountPaise = requestedAmountPaise;
+    withdrawal.penaltyDeductionPaise = pPaise;
+    withdrawal.penaltyReason = penaltyReason ? String(penaltyReason).trim() : null;
+    withdrawal.commissionDeductionPaise = cPaise;
+    withdrawal.otherDeductionsPaise = oPaise;
+    withdrawal.netPayoutAmountPaise = netPaise;
     await withdrawal.save();
 
     await writeAuditLog({
@@ -329,11 +653,29 @@ export const approveWithdrawal = async (req, res) => {
       targetType: "WithdrawalRequest",
       targetId: withdrawal._id,
       before: { status: before.status },
-      after: { status: "approved" },
-      reason: req.body.adminNote || null,
+      after: {
+        status: "approved",
+        requestedAmountPaise,
+        penaltyDeductionPaise: pPaise,
+        penaltyReason,
+        commissionDeductionPaise: cPaise,
+        netPayoutAmountPaise: netPaise,
+      },
+      reason: adminNote || null,
     });
 
-    res.json({ success: true, message: "Withdrawal approved successfully" });
+    res.json({
+      success: true,
+      message: "Withdrawal approved successfully",
+      result: {
+        withdrawalId: withdrawal._id,
+        requestedAmount: paiseToRupees(requestedAmountPaise),
+        penaltyDeduction: paiseToRupees(pPaise),
+        penaltyReason: withdrawal.penaltyReason,
+        commissionDeduction: paiseToRupees(cPaise),
+        netPayoutAmount: paiseToRupees(netPaise),
+      },
+    });
   } catch (error) {
     res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
@@ -350,7 +692,18 @@ export const rejectWithdrawal = async (req, res) => {
     ensureAdmin(req);
 
     const withdrawal = await WithdrawalRequest.findById(req.params.id);
-    if (!withdrawal || !["pending", "requested", "approved"].includes(withdrawal.status)) {
+    if (!withdrawal) {
+      return res.status(404).json({ success: false, message: "Withdrawal request not found" });
+    }
+
+    if (withdrawal.status === "processing") {
+      return res.status(400).json({
+        success: false,
+        message: "Withdrawal is processing with RazorpayX and cannot be manually rejected.",
+      });
+    }
+
+    if (!["pending", "requested", "approved"].includes(withdrawal.status)) {
       return res.status(400).json({ success: false, message: "Invalid or non-rejectable request (only pending/approved)" });
     }
 
@@ -430,327 +783,858 @@ export const rejectWithdrawal = async (req, res) => {
 
 /**
  * @desc  Pay Withdrawal via Razorpay X — OUTBOX pattern.
+ *        Thin HTTP wrapper over the shared payout engine
+ *        (Utils/withdrawalPayoutEngine.js), which both admin-initiated
+ *        and auto-payouts run through:
+ *          1. [txn] Withdrawal → processing; PayoutOutbox → initiated (idempotencyKey = withdrawalId)
+ *          2. Contact + Fund Account created/reused (cached on TechnicianProfile)
+ *          3. Razorpay X POST /v1/payouts (X-Payout-Idempotency: withdrawalId)
+ *          4. [txn] success → withdrawal paid, (legacy) debit ledger, outbox completed
+ *                  failure → withdrawal reverted to approved (retryable), outbox failed
  *
- *  1. [txn] Withdrawal → processing; PayoutOutbox → initiated (idempotencyKey = withdrawalId)
- *  2. Contact + Fund Account created/reused (cached on TechnicianProfile)
- *  3. Razorpay X POST /v1/payouts (X-Payout-Idempotency: withdrawalId)
- *  4. [txn] success → withdrawal paid, (legacy) debit ledger, outbox completed
- *          failure → withdrawal reverted to approved (retryable), outbox failed
- *
- *  Reconciliation cron reconciles stuck "initiated" entries against Razorpay.
+ *        Reconciliation cron reconciles stuck "initiated" entries against Razorpay.
  */
 export const payWithdrawal = async (req, res) => {
-  const session = await mongoose.startSession();
-  let outboxId = null;
   try {
     ensureAdmin(req);
 
-    /* ── 1. Load withdrawal ── */
     const withdrawal = await WithdrawalRequest.findById(req.params.id);
     if (!withdrawal) {
       return res.status(404).json({ success: false, message: "Withdrawal request not found" });
     }
-    if (!["pending", "requested", "approved"].includes(withdrawal.status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot pay a withdrawal with status "${withdrawal.status}"`,
-      });
-    }
 
-    /* ── 2. Load technician profile + user ── */
-    const techProfile = await TechnicianProfile.findById(withdrawal.technicianId).populate(
-      "userId",
-      "fname lname mobileNumber email"
-    );
-    if (!techProfile) {
-      return res.status(404).json({ success: false, message: "Technician profile not found" });
-    }
+    const {
+      penaltyAmount,
+      penaltyPaise,
+      penaltyReason,
+      commissionAmount,
+      commissionPaise,
+      otherDeductions,
+      otherDeductionsPaise,
+    } = req.body || {};
 
-    const user = techProfile.userId;
-    const technicianKyc = await TechnicianKyc.findOne({
-      technicianId: withdrawal.technicianId,
-    });
-
-    // Payouts may only use KYC-tracked bank details. The legacy
-    // techProfile.bankDetails field is NOT a valid payout source —
-    // it was never subject to the verification workflow.
-    // KYC bank fields are encrypted at rest — decrypt in memory for the
-    // fingerprint guard and the Razorpay fund-account creation.
-    const dek = await getDekForKycDoc(technicianKyc);
-    const bankDetails = decryptBankDetails(technicianKyc?.bankDetails, dek) || {};
-    const hasBank = bankDetails.accountNumber && bankDetails.ifscCode;
-    const hasUpi = !!bankDetails.upiId;
-
-    if (!hasBank && !hasUpi) {
-      return res.status(422).json({
-        success: false,
-        message: "No bank/UPI on file for technician. Update bankDetails in TechnicianKYC before paying.",
-      });
-    }
-
-    /* ── 3. KYC gate: verified bank/UPI required before payout ── */
-    const bankVerified =
-      technicianKyc?.bankVerified === true ||
-      technicianKyc?.bankVerificationStatus === "approved";
-    if (!bankVerified) {
-      return res.status(422).json({
-        success: false,
-        message: "Technician bank/UPI details are not verified. Verify them before paying.",
-      });
-    }
-
-    // Fingerprint guard: verification is tied to the EXACT details that were
-    // approved. If they drifted (updated outside the KYC flow, legacy records,
-    // tampering), invalidate the approval and block the payout until the
-    // account is re-verified by an admin.
-    const currentFingerprint = fingerprintBankDetails(bankDetails);
-    const storedFingerprint = technicianKyc?.bankDetailsFingerprint;
-    if (!storedFingerprint || !currentFingerprint || storedFingerprint !== currentFingerprint) {
-      await TechnicianKyc.updateOne(
-        { technicianId: withdrawal.technicianId },
-        {
-          $set: {
-            bankVerified: false,
-            bankVerificationStatus: "pending",
-            bankUpdateRequired: true,
-            bankDetailsFingerprint: null,
-          },
-        }
+    if (
+      penaltyAmount != null ||
+      penaltyPaise != null ||
+      commissionAmount != null ||
+      commissionPaise != null ||
+      otherDeductions != null ||
+      otherDeductionsPaise != null
+    ) {
+      const requestedAmountPaise = toPaise(
+        withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount)
       );
-      return res.status(422).json({
-        success: false,
-        message: "Bank details changed since verification (or legacy record without fingerprint). Please re-verify the technician's bank details before paying.",
-      });
-    }
+      const pPaise =
+        penaltyPaise != null
+          ? toPaise(penaltyPaise)
+          : penaltyAmount != null
+          ? rupeesToPaise(penaltyAmount)
+          : withdrawal.penaltyDeductionPaise || 0;
+      const cPaise =
+        commissionPaise != null
+          ? toPaise(commissionPaise)
+          : commissionAmount != null
+          ? rupeesToPaise(commissionAmount)
+          : withdrawal.commissionDeductionPaise || 0;
+      const oPaise =
+        otherDeductionsPaise != null
+          ? toPaise(otherDeductionsPaise)
+          : otherDeductions != null
+          ? rupeesToPaise(otherDeductions)
+          : withdrawal.otherDeductionsPaise || 0;
 
-    /* ── 4. Outbox init [txn] ── */
-    let outbox;
-    await session.withTransaction(async () => {
-      const fresh = await WithdrawalRequest.findById(withdrawal._id).session(session);
-      if (!["pending", "requested", "approved"].includes(fresh.status)) {
-        const err = new Error(`Withdrawal is no longer payable (status: ${fresh.status})`);
-        err.statusCode = 409;
-        throw err;
+      const reason = penaltyReason !== undefined ? penaltyReason : withdrawal.penaltyReason;
+
+      if (pPaise > 0 && (!reason || !String(reason).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: "Penalty reason is required when applying a penalty reduction.",
+        });
       }
 
-      fresh.status = "processing";
-      fresh.decidedAt = new Date();
-      fresh.decidedBy = req.user.userId;
-      await fresh.save({ session });
+      if (pPaise + cPaise + oPaise > requestedAmountPaise) {
+        return res.status(400).json({
+          success: false,
+          message: "Total deductions cannot exceed requested withdrawal amount.",
+        });
+      }
 
-      outbox = await PayoutOutbox.findOneAndUpdate(
-        { withdrawalId: withdrawal._id },
-        {
-          $set: {
-            status: "initiated",
-            initiatedAt: new Date(),
-            completedAt: null,
-            failedAt: null,
-            lastError: null,
-          },
-          $inc: { attempts: 1 },
-        },
-        { upsert: true, new: true, session }
-      );
+      const netPaise = Math.max(0, requestedAmountPaise - pPaise - cPaise - oPaise);
 
-      fresh.payoutOutboxId = outbox._id;
-      await fresh.save({ session });
-      outboxId = String(outbox._id);
-    });
-
-    /* ── 5. Get or create Razorpay Contact ── */
-    let contactId = techProfile.razorpayContactId;
-    if (!contactId) {
-      contactId = await createRazorpayContact({
-        name: user ? `${user.fname || ""} ${user.lname || ""}`.trim() : "Technician",
-        email: user?.email || undefined,
-        contact: user?.mobileNumber || undefined,
-        referenceId: String(techProfile._id),
-      });
-      techProfile.razorpayContactId = contactId;
-      await techProfile.save();
+      withdrawal.requestedAmountPaise = requestedAmountPaise;
+      withdrawal.penaltyDeductionPaise = pPaise;
+      withdrawal.penaltyReason = reason ? String(reason).trim() : null;
+      withdrawal.commissionDeductionPaise = cPaise;
+      withdrawal.otherDeductionsPaise = oPaise;
+      withdrawal.netPayoutAmountPaise = netPaise;
+      await withdrawal.save();
     }
 
-    /* ── 6. Get or create Razorpay Fund Account ── */
-    let fundAccountId = techProfile.razorpayFundAccountId;
-    if (!fundAccountId) {
-      fundAccountId = await createFundAccount({ contactId, bankDetails });
-      techProfile.razorpayFundAccountId = fundAccountId;
-      await techProfile.save();
-    }
-
-    /* ── 7. Determine payout mode ── */
-    const payoutMode = hasUpi ? "UPI" : "IMPS";
-
-    /* ── 8. Initiate Razorpay X Payout (idempotent) ── */
-    const amountPaiseNum = toPaise(withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount));
-    const rzpPayout = await createPayout({
-      fundAccountId,
-      amountInPaisa: amountPaiseNum,
-      mode: payoutMode,
-      referenceId: String(withdrawal._id),
+    const result = await executeWithdrawalPayout({
+      withdrawalId: req.params.id,
+      actor: { userId: req.user.userId, role: req.user.role },
       narration: req.body.narration || "RightTouch Technician Payout",
-    });
-
-    /* ── 9. Complete [txn]: paid + reserve release + ledger + outbox ── */
-    await session.withTransaction(async () => {
-      const fresh = await WithdrawalRequest.findById(withdrawal._id).session(session);
-      fresh.status = "paid";
-      fresh.paidAt = new Date();
-      fresh.decidedAt = new Date();
-      fresh.decidedBy = req.user.userId;
-      fresh.payoutProvider = "razorpay_x";
-      fresh.payoutReference = rzpPayout.id;
-      fresh.adminNote = req.body.adminNote || `Paid via Razorpay X (${payoutMode})`;
-      await fresh.save({ session });
-
-      // Legacy/edge: if the reserve debit was never recorded
-      // (pre-reserve-model requests), deduct + record it now.
-      const reserveDebit = await WalletTransaction.findOne(
-        { withdrawalId: fresh._id, type: "debit", source: "withdraw" },
-        null,
-        { session }
-      );
-      if (!reserveDebit) {
-        await TechnicianProfile.updateOne(
-          { _id: fresh.technicianId },
-          { $inc: { availableBalancePaise: -amountPaiseNum } },
-          { session }
-        );
-        await WalletTransaction.create(
-          [
-            {
-              technicianId: fresh.technicianId,
-              amountPaise: amountPaiseNum,
-              amount: paiseToRupees(amountPaiseNum),
-              type: "debit",
-              source: "withdraw",
-              withdrawalId: fresh._id,
-              idempotencyKey: `withdrawal:${fresh._id}`,
-              note: `Razorpay X payout ${rzpPayout.id} (${payoutMode}) – withdrawal #${fresh._id}`,
-            },
-          ],
-          { session }
-        );
-      }
-
-      // Release the reserve + record lifetime withdrawn (reserve model)
-      await TechnicianProfile.updateOne(
-        { _id: fresh.technicianId },
-        {
-          $inc: {
-            reservedBalancePaise: -amountPaiseNum,
-            lifetimeWithdrawnPaise: amountPaiseNum,
-          },
-        },
-        { session }
-      );
-
-      // 🏦 Platform ledger — real money left the platform
-      const ledger = await postPayoutLedgerEntry({
-        withdrawal: fresh,
-        providerReference: rzpPayout.id,
-        session,
-      });
-      if (!ledger.created) {
-        console.warn(`[Payout] ledger entry already posted for withdrawal ${fresh._id}`);
-      }
-
-      outbox.status = "completed";
-      outbox.razorpayPayoutId = rzpPayout.id;
-      outbox.payoutPayload = { mode: payoutMode, razorpayStatus: rzpPayout.status, ledgerKey: ledger.entry?.idempotencyKey };
-      outbox.completedAt = new Date();
-      await outbox.save({ session });
-    });
-
-    await writeAuditLog({
-      actor: req.user.userId,
-      actorRole: req.user.role,
-      action: "PAYOUT_EXECUTED",
-      targetType: "WithdrawalRequest",
-      targetId: withdrawal._id,
-      after: {
-        amountPaise: amountPaiseNum,
-        payoutId: rzpPayout.id,
-        mode: payoutMode,
-        status: "paid",
-      },
-      reason: req.body.adminNote || null,
+      adminNote: req.body.adminNote || null,
+      io: req.io || null,
     });
 
     return res.json({
       success: true,
       message: "Payout initiated successfully",
       result: {
-        payoutId: rzpPayout.id,
-        payoutStatus: rzpPayout.status,
-        mode: payoutMode,
-        amount: withdrawal.amount,
-        withdrawalStatus: "paid",
+        payoutId: result.payoutId,
+        payoutStatus: result.payoutStatus,
+        mode: result.mode,
+        amount: result.amount,
+        withdrawalStatus: result.withdrawalStatus,
       },
     });
   } catch (error) {
     console.error("payWithdrawal Error:", error);
-
-    // Mark outbox + withdrawal failed so the admin can retry (approved).
-    // IMPORTANT: the outbox stays "initiated" (NOT "failed") — if the payout
-    // actually succeeded at Razorpay before the response was lost, the
-    // reconciliation cron must still reconcile it (retry with the same
-    // reference id also returns the original payout). A "failed" status here
-    // would orphan a potentially-sent payout, risking a DOUBLE payout.
-    //
-    // Ambiguous outcomes (timeouts/network errors) go to MANUAL_REVIEW — we
-    // never retry blindly without knowing the provider status.
-    const errMsg = String(error?.message || error?.error?.description || "");
-    const ambiguous =
-      /timeout|ETIMEDOUT|ECONNRESET|socket|network|ECONNREFUSED|EAI_AGAIN/i.test(errMsg);
-
-    if (outboxId || withdrawal?._id) {
-      const session2 = await mongoose.startSession();
-      try {
-        await session2.withTransaction(async () => {
-          const outboxDoc = outboxId
-            ? await PayoutOutbox.findById(outboxId).session(session2)
-            : await PayoutOutbox.findOne({ withdrawalId: withdrawal._id }).session(session2);
-
-          if (outboxDoc && outboxDoc.status === "initiated") {
-            outboxDoc.lastError = errMsg || "Payout failed";
-            outboxDoc.failedAt = new Date(); // informational; status stays initiated for reconcile
-            if (ambiguous) outboxDoc.status = "manual_review";
-            await outboxDoc.save({ session2 });
-          }
-
-          const w = await WithdrawalRequest.findById(withdrawal._id).session(session2);
-          if (w && w.status === "processing") {
-            w.status = ambiguous ? "manual_review" : "approved"; // retryable only when failure is certain
-            w.decisionNote = `Payout ${ambiguous ? "outcome unknown" : "failed"}: ${errMsg || "unknown"}`;
-            w.failedAt = new Date();
-            await w.save({ session2 });
-          }
-        });
-
-        await writeAuditLog({
-          actor: req.user.userId,
-          actorRole: req.user.role,
-          action: "PAYOUT_FAILED",
-          targetType: "WithdrawalRequest",
-          targetId: withdrawal._id,
-          after: { status: ambiguous ? "manual_review" : "approved", error: errMsg || "unknown", ambiguous },
-          reason: ambiguous
-            ? "Payout outcome unknown (timeout/network) — manual review required before retry"
-            : "Payout failed; withdrawal reverted to approved for retry",
-        });
-      } catch (auditErr) {
-        console.error("payWithdrawal revert error:", auditErr.message);
-      } finally {
-        await session2.endSession();
-      }
-    }
-
     const message =
       error?.error?.description || error?.message || "Payout failed";
     return res.status(error.statusCode || 500).json({ success: false, message });
+  }
+};
+
+/**
+ * @desc  Auto-payout monitoring summary — counts + amounts for the admin
+ *        dashboard (all-time / today / in-flight).
+ */
+export const getAutoPayoutSummary = async (req, res) => {
+  try {
+    ensureAdmin(req);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const inFlightStatuses = ["pending", "requested", "approved", "processing"];
+
+    const [totalAutoPayouts, todayAutoPayouts, pendingAutoPayouts, paidAgg, todayPaidAgg, totalAutoAmountAgg] =
+      await Promise.all([
+        WithdrawalRequest.countDocuments({ type: "auto" }),
+        WithdrawalRequest.countDocuments({ type: "auto", createdAt: { $gte: today } }),
+        WithdrawalRequest.countDocuments({ type: "auto", status: { $in: inFlightStatuses } }),
+        WithdrawalRequest.aggregate([
+          { $match: { type: "auto", status: "paid" } },
+          {
+            $group: {
+              _id: null,
+              totalPaise: { $sum: { $ifNull: ["$amountPaise", { $multiply: ["$amount", 100] }] } },
+            },
+          },
+        ]),
+        WithdrawalRequest.aggregate([
+          { $match: { type: "auto", status: "paid", createdAt: { $gte: today } } },
+          {
+            $group: {
+              _id: null,
+              totalPaise: { $sum: { $ifNull: ["$amountPaise", { $multiply: ["$amount", 100] }] } },
+            },
+          },
+        ]),
+        WithdrawalRequest.aggregate([
+          { $match: { type: "auto", status: { $in: ["paid", ...inFlightStatuses] } } },
+          {
+            $group: {
+              _id: null,
+              totalPaise: { $sum: { $ifNull: ["$amountPaise", { $multiply: ["$amount", 100] }] } },
+            },
+          },
+        ]),
+      ]);
+
+    const totalAmountPaidPaise = paidAgg[0]?.totalPaise || 0;
+    const todayAmountPaidPaise = todayPaidAgg[0]?.totalPaise || 0;
+    const totalAutoAmountPaise = totalAutoAmountAgg[0]?.totalPaise || 0;
+
+    const config = await getAutoPayoutConfig();
+
+    res.json({
+      success: true,
+      result: {
+        totalAutoPayouts,
+        todayAutoPayouts,
+        pendingAutoPayouts,
+        totalAmountPaid: paiseToRupees(totalAmountPaidPaise),
+        totalAmountPaidPaise,
+        todayAmountPaid: paiseToRupees(todayAmountPaidPaise),
+        todayAmountPaidPaise,
+        totalAutoAmount: paiseToRupees(totalAutoAmountPaise),
+        totalAutoAmountPaise,
+        config: {
+          autoPayoutEnabled: config.autoPayoutEnabled,
+          autoPayoutThreshold: paiseToRupees(config.autoPayoutThresholdPaise),
+          autoPayoutThresholdPaise: config.autoPayoutThresholdPaise,
+          minimumMaintenance: paiseToRupees(config.minimumMaintenancePaise),
+          minimumMaintenancePaise: config.minimumMaintenancePaise,
+          autoPayoutCronExpression: config.autoPayoutCronExpression,
+        },
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @desc  Read global auto-payout configuration (GlobalSetting + env fallbacks).
+ */
+export const getAutoPayoutSettings = async (req, res) => {
+  try {
+    ensureAdmin(req);
+
+    const config = await getAutoPayoutConfig();
+
+    res.json({
+      success: true,
+      result: {
+        autoPayoutEnabled: config.autoPayoutEnabled,
+        autoPayoutThreshold: paiseToRupees(config.autoPayoutThresholdPaise),
+        autoPayoutThresholdPaise: config.autoPayoutThresholdPaise,
+        minimumMaintenance: paiseToRupees(config.minimumMaintenancePaise),
+        minimumMaintenancePaise: config.minimumMaintenancePaise,
+        autoPayoutCronExpression: config.autoPayoutCronExpression,
+        minWithdrawalAmount: paiseToRupees(config.minWithdrawalAmountPaise),
+        minWithdrawalAmountPaise: config.minWithdrawalAmountPaise,
+        withdrawalCooldownDays: config.withdrawalCooldownDays,
+        dualApprovalThreshold: paiseToRupees(config.dualApprovalThresholdPaise),
+        dualApprovalThresholdPaise: config.dualApprovalThresholdPaise,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @desc  Update global auto-payout configuration.
+ *        Body: { enabled?, threshold?, minimumMaintenance?, autoPayoutCronExpression?, minWithdrawalAmount?, withdrawalCooldownDays?, dualApprovalThreshold? }
+ *        Values persist in GlobalSetting and take effect live.
+ */
+export const updateAutoPayoutSettings = async (req, res) => {
+  try {
+    ensureAdmin(req);
+
+    const {
+      enabled,
+      threshold,
+      minimumMaintenance,
+      autoPayoutCronExpression,
+      minWithdrawalAmount,
+      withdrawalCooldownDays,
+      dualApprovalThreshold,
+    } = req.body || {};
+
+    const updates = {};
+    if (enabled !== undefined) {
+      if (typeof enabled !== "boolean") {
+        return res.status(400).json({ success: false, message: "enabled must be a boolean" });
+      }
+      updates.autoPayoutEnabled = enabled;
+    }
+    if (threshold !== undefined) {
+      const thresholdPaise = toPaise(threshold * 100);
+      if (!Number.isFinite(thresholdPaise) || thresholdPaise < 10000) {
+        return res.status(400).json({ success: false, message: "threshold must be at least ₹100" });
+      }
+      updates.autoPayoutThresholdPaise = thresholdPaise;
+    }
+    if (minimumMaintenance !== undefined) {
+      const maintenancePaise = toPaise(minimumMaintenance * 100);
+      if (!Number.isFinite(maintenancePaise) || maintenancePaise < 0) {
+        return res.status(400).json({ success: false, message: "minimumMaintenance must be >= 0" });
+      }
+      updates.minimumMaintenancePaise = maintenancePaise;
+    }
+    if (autoPayoutCronExpression !== undefined && String(autoPayoutCronExpression).trim()) {
+      updates.autoPayoutCronExpression = String(autoPayoutCronExpression).trim();
+    }
+    if (minWithdrawalAmount !== undefined) {
+      const minPaise = toPaise(minWithdrawalAmount * 100);
+      if (!Number.isFinite(minPaise) || minPaise < 0) {
+        return res.status(400).json({ success: false, message: "minWithdrawalAmount must be >= 0" });
+      }
+      updates.minWithdrawalAmountPaise = minPaise;
+    }
+    if (withdrawalCooldownDays !== undefined) {
+      const days = Number(withdrawalCooldownDays);
+      if (!Number.isFinite(days) || days < 0) {
+        return res.status(400).json({ success: false, message: "withdrawalCooldownDays must be >= 0" });
+      }
+      updates.withdrawalCooldownDays = days;
+    }
+    if (dualApprovalThreshold !== undefined) {
+      const dualPaise = toPaise(dualApprovalThreshold * 100);
+      if (!Number.isFinite(dualPaise) || dualPaise < 0) {
+        return res.status(400).json({ success: false, message: "dualApprovalThreshold must be >= 0" });
+      }
+      updates.dualApprovalThresholdPaise = dualPaise;
+    }
+
+    const config = await setAutoPayoutConfig(updates, req.user);
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "AUTO_PAYOUT_SETTINGS_UPDATED",
+      targetType: "GlobalSetting",
+      targetId: null,
+      after: updates,
+      reason: req.body.reason || null,
+    });
+
+    res.json({
+      success: true,
+      message: "Payout settings updated successfully",
+      result: {
+        autoPayoutEnabled: config.autoPayoutEnabled,
+        autoPayoutThreshold: paiseToRupees(config.autoPayoutThresholdPaise),
+        autoPayoutThresholdPaise: config.autoPayoutThresholdPaise,
+        minimumMaintenance: paiseToRupees(config.minimumMaintenancePaise),
+        minimumMaintenancePaise: config.minimumMaintenancePaise,
+        autoPayoutCronExpression: config.autoPayoutCronExpression,
+        minWithdrawalAmount: paiseToRupees(config.minWithdrawalAmountPaise),
+        minWithdrawalAmountPaise: config.minWithdrawalAmountPaise,
+        withdrawalCooldownDays: config.withdrawalCooldownDays,
+        dualApprovalThreshold: paiseToRupees(config.dualApprovalThresholdPaise),
+        dualApprovalThresholdPaise: config.dualApprovalThresholdPaise,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * 🔧 Admin manual "Send Money" — configurable dual-approval threshold.
+ * Below the threshold the payout is released immediately via the shared
+ * engine (no second admin needed). At/above the threshold it is parked in
+ * status `requested` with `requiresApproval:true` and must be confirmed by a
+ * second admin via `approveAdminManualPayout`.
+ *
+ * The threshold lives in GlobalSetting (key
+ * `payout.adminManualDualApprovalPaise`) so it is tunable without a deploy.
+ * Default: ₹10,000 (1,000,000 paise).
+ */
+const getAdminManualDualApprovalPaise = async () => {
+  const doc = await GlobalSetting.findOne({
+    key: "payout.adminManualDualApprovalPaise",
+  }).lean();
+  const v = doc?.value;
+  if (v == null) return 1000000; // default ₹10,000
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? toPaise(n) : 1000000;
+};
+
+export const adminManualPayoutToTechnician = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    ensureAdmin(req);
+    const {
+      technicianId: bodyTechnicianId,
+      amount,
+      amountPaise,
+      reason,
+      clientIdempotencyKey,
+    } = req.body || {};
+    const technicianId = req.params.technicianId || bodyTechnicianId;
+
+    if (!technicianId || !isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Valid technicianId is required" });
+    }
+    const amountPaiseNum = toPaise(amountPaise ?? rupeesToPaise(amount));
+    if (amountPaiseNum == null || amountPaiseNum <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid amount" });
+    }
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ success: false, message: "A reason/note is required for manual payouts" });
+    }
+
+    const tech = await TechnicianProfile.findById(technicianId);
+    if (!tech) {
+      return res.status(404).json({ success: false, message: "Technician not found" });
+    }
+    if ((tech.availableBalancePaise ?? 0) < amountPaiseNum) {
+      return res.status(400).json({ success: false, message: "Insufficient technician balance" });
+    }
+
+    // No other active payout (unique partial index backs this up too).
+    const inProgress = await WithdrawalRequest.findOne({
+      technicianId,
+      status: {
+        $in: ["pending", "requested", "approved", "processing", "manual_review"],
+      },
+    })
+      .select("_id status")
+      .lean();
+    if (inProgress) {
+      return res.status(409).json({
+        success: false,
+        message: "Technician already has a payout in progress or under review.",
+        result: { withdrawalId: inProgress._id, status: inProgress.status },
+      });
+    }
+
+    const dualThreshold = await getAdminManualDualApprovalPaise();
+    const needsDual = amountPaiseNum >= dualThreshold;
+
+    // Atomic reserve (available → reserved) so the engine's release logic
+    // matches the technician-initiated flow exactly.
+    const reserved = await TechnicianProfile.findOneAndUpdate(
+      { _id: technicianId, availableBalancePaise: { $gte: amountPaiseNum } },
+      { $inc: { availableBalancePaise: -amountPaiseNum, reservedBalancePaise: amountPaiseNum } },
+      { new: true, session }
+    ).lean();
+    if (!reserved) {
+      return res.status(400).json({ success: false, message: "Insufficient technician balance" });
+    }
+
+    let withdrawal;
+    try {
+      [withdrawal] = await WithdrawalRequest.create(
+        [
+          {
+            technicianId,
+            amount: paiseToRupees(amountPaiseNum),
+            amountPaise: amountPaiseNum,
+            status: needsDual ? "requested" : "pending",
+            origin: "admin_direct",
+            requiresApproval: needsDual,
+            initiatedBy: { actorType: "admin", actorId: req.user.userId },
+            clientIdempotencyKey: clientIdempotencyKey || null,
+            adminNote: reason,
+          },
+        ],
+        { session }
+      );
+
+      await WalletTransaction.create(
+        [
+          {
+            technicianId,
+            amountPaise: amountPaiseNum,
+            amount: paiseToRupees(amountPaiseNum),
+            type: "debit",
+            source: "withdraw",
+            withdrawalId: withdrawal._id,
+            idempotencyKey: `withdrawal:${withdrawal._id}`,
+            note: `Admin manual payout reserve #${withdrawal._id}`,
+          },
+        ],
+        { session }
+      );
+    } catch (createErr) {
+      // Roll back the reserve if the request can't be created (e.g. a
+      // concurrent active payout tripped the unique partial index) so the
+      // technician's balance is never left frozen.
+      await TechnicianProfile.updateOne(
+        { _id: technicianId },
+        { $inc: { availableBalancePaise: amountPaiseNum, reservedBalancePaise: -amountPaiseNum } },
+        { session }
+      );
+      if (createErr?.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: "Technician already has a payout in progress or under review.",
+        });
+      }
+      throw createErr;
+    }
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "ADMIN_MANUAL_PAYOUT_REQUESTED",
+      targetType: "WithdrawalRequest",
+      targetId: withdrawal._id,
+      after: {
+        amountPaise: amountPaiseNum,
+        origin: "admin_direct",
+        needsDualApproval: needsDual,
+        reason,
+      },
+    });
+
+    // High-value → wait for a second admin's approval.
+    if (needsDual) {
+      return res.status(200).json({
+        success: true,
+        message: "High-value manual payout requires a second admin approval.",
+        result: {
+          withdrawalId: withdrawal._id,
+          status: "requested",
+          needsSecondApproval: true,
+        },
+      });
+    }
+
+    // Below threshold → release immediately via the shared engine.
+    const io = req.io || getIo();
+    try {
+      const payout = await executeWithdrawalPayout({
+        withdrawalId: withdrawal._id,
+        actor: { userId: req.user.userId, role: req.user.role },
+        narration: reason || "RightTouch Admin Manual Payout",
+        adminNote: reason,
+        io,
+      });
+      return res.status(201).json({
+        success: true,
+        message: "Manual payout sent to technician.",
+        result: {
+          withdrawalId: withdrawal._id,
+          status: payout.withdrawalStatus,
+          amount: payout.amount,
+          amountPaise: payout.amountPaise,
+          payoutId: payout.payoutId,
+          mode: payout.mode,
+        },
+      });
+    } catch (payErr) {
+      const w = await WithdrawalRequest.findById(withdrawal._id).lean();
+      if (w && w.status === "manual_review") {
+        return res.status(202).json({
+          success: false,
+          message: "Payout outcome is being verified with the bank. We'll notify you shortly.",
+          result: { withdrawalId: withdrawal._id, status: "manual_review" },
+        });
+      }
+      await releaseFailedWithdrawalReserve({
+        withdrawalId: withdrawal._id,
+        amountPaise: amountPaiseNum,
+        technicianId,
+        reason: payErr?.message,
+      });
+      return res.status(400).json({
+        success: false,
+        message: payErr?.message || "Payout failed. Balance restored.",
+        result: { withdrawalId: withdrawal._id, status: "failed" },
+      });
+    }
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   } finally {
     session.endSession();
+  }
+};
+
+/**
+ * 🛠️ Admin resolution of an ambiguous (`manual_review`) payout. The
+ * reconciliation cron auto-resolves reviewable outboxes that captured a
+ * Razorpay id; this endpoint handles the rest (no id captured) — admin
+ * decides "complete" (force paid) or "revert" (refund reserve).
+ */
+export const resolveManualReviewPayout = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const { id } = req.params;
+    const { decision } = req.body;
+    if (!["complete", "revert"].includes(decision)) {
+      return res.status(400).json({
+        success: false,
+        message: "decision must be 'complete' or 'revert'",
+      });
+    }
+    const result = await adminResolveManualReview({
+      withdrawalId: id,
+      decision,
+      admin: { userId: req.user.userId, role: req.user.role },
+    });
+    return res.status(200).json({
+      success: true,
+      message: `Manual review payout ${decision}ed`,
+      result,
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * ✅ Second-admin approval for a high-value (dual-approval) admin_direct payout parked in
+ * `requested`. Executes the single shared payout engine — identical risk
+ * gates (KYC / dues / complaint block) as every other flow.
+ */
+export const approveAdminManualPayout = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const { id } = req.params;
+
+    const w = await WithdrawalRequest.findById(id);
+    if (!w) {
+      return res.status(404).json({ success: false, message: "Withdrawal not found" });
+    }
+    if (w.origin !== "admin_direct" || !w.requiresApproval) {
+      return res.status(400).json({ success: false, message: "This payout is not a dual-approval request" });
+    }
+    if (w.status !== "requested") {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot approve a payout in status '${w.status}'`,
+        result: { withdrawalId: id, status: w.status },
+      });
+    }
+
+    // Dual control: the approving admin must not be the one who initiated it.
+    if (String(w.initiatedBy?.actorId) === String(req.user.userId)) {
+      return res.status(403).json({
+        success: false,
+        message: "The admin who initiated this payout cannot also approve it.",
+      });
+    }
+
+    const io = req.io || getIo();
+    try {
+      const payout = await executeWithdrawalPayout({
+        withdrawalId: id,
+        actor: { userId: req.user.userId, role: req.user.role },
+        narration: w.adminNote || "RightTouch Admin Manual Payout",
+        adminNote: w.adminNote,
+        io,
+      });
+
+      await writeAuditLog({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "ADMIN_MANUAL_PAYOUT_APPROVED",
+        targetType: "WithdrawalRequest",
+        targetId: id,
+        after: { approvedBy: req.user.userId, payoutId: payout.payoutId },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "Manual payout approved and sent.",
+        result: {
+          withdrawalId: id,
+          status: payout.withdrawalStatus,
+          payoutId: payout.payoutId,
+          mode: payout.mode,
+        },
+      });
+    } catch (payErr) {
+      const after = await WithdrawalRequest.findById(id).lean();
+      if (after && after.status === "manual_review") {
+        return res.status(202).json({
+          success: false,
+          message: "Payout outcome is being verified with the bank. We'll notify you shortly.",
+          result: { withdrawalId: id, status: "manual_review" },
+        });
+      }
+      await releaseFailedWithdrawalReserve({
+        withdrawalId: id,
+        amountPaise: toPaise(w.amountPaise ?? rupeesToPaise(w.amount)),
+        technicianId: w.technicianId,
+        reason: payErr?.message,
+      });
+      return res.status(400).json({
+        success: false,
+        message: payErr?.message || "Payout failed. Balance restored.",
+        result: { withdrawalId: id, status: "failed" },
+      });
+    }
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * 🔄 Admin retry failed payout — re-initiates execution via the shared payout engine.
+ */
+export const retryFailedWithdrawal = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const { id } = req.params;
+    const { reason } = req.body || {};
+
+    const withdrawal = await WithdrawalRequest.findById(id);
+    if (!withdrawal) {
+      return res.status(404).json({ success: false, message: "Withdrawal request not found" });
+    }
+
+    if (withdrawal.status !== "failed") {
+      return res.status(400).json({
+        success: false,
+        message: `Only failed payouts can be retried. Current status is '${withdrawal.status}'`,
+      });
+    }
+
+    if (await hasActivePayoutBlock(withdrawal.technicianId)) {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot retry payout: active dispute or complaint block on technician.",
+      });
+    }
+
+    withdrawal.status = "approved";
+    withdrawal.adminNote = reason ? `Retry initiated by Admin: ${reason}` : "Payout retry initiated by Admin";
+    await withdrawal.save();
+
+    const io = req.io || getIo();
+    const payout = await executeWithdrawalPayout({
+      withdrawalId: withdrawal._id,
+      actor: { userId: req.user.userId, role: req.user.role },
+      narration: withdrawal.adminNote,
+      adminNote: withdrawal.adminNote,
+      io,
+    });
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "WITHDRAWAL_RETRIED_BY_ADMIN",
+      targetType: "WithdrawalRequest",
+      targetId: id,
+      after: { newStatus: payout.withdrawalStatus, payoutId: payout.payoutId },
+      reason: reason || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Payout retry initiated successfully",
+      result: {
+        withdrawalId: id,
+        status: payout.withdrawalStatus,
+        payoutId: payout.payoutId,
+        mode: payout.mode,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * 🔒 Admin Freeze / Unfreeze technician payouts (Legal / Risk hold).
+ */
+export const toggleTechnicianPayoutFreeze = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const { technicianId } = req.params;
+    const { freeze, reason } = req.body || {};
+
+    if (typeof freeze !== "boolean") {
+      return res.status(400).json({ success: false, message: "'freeze' must be a boolean (true or false)" });
+    }
+
+    if (freeze && (!reason || !reason.trim())) {
+      return res.status(400).json({ success: false, message: "A reason is required to freeze technician payouts" });
+    }
+
+    const tech = await TechnicianProfile.findById(technicianId);
+    if (!tech) {
+      return res.status(404).json({ success: false, message: "Technician not found" });
+    }
+
+    tech.payoutBlocked = freeze;
+    tech.payoutBlockedReason = freeze ? reason.trim() : null;
+    await tech.save();
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: freeze ? "TECHNICIAN_PAYOUT_FROZEN" : "TECHNICIAN_PAYOUT_UNFROZEN",
+      targetType: "TechnicianProfile",
+      targetId: technicianId,
+      after: { payoutBlocked: freeze, reason: tech.payoutBlockedReason },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: freeze ? "Technician payouts have been frozen" : "Technician payouts have been unfrozen",
+      result: {
+        technicianId,
+        payoutBlocked: tech.payoutBlocked,
+        payoutBlockedReason: tech.payoutBlockedReason,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * 🔍 Detailed Payout Audit & Status View (Admin)
+ */
+export const getWithdrawalDetails = async (req, res) => {
+  try {
+    ensureAdmin(req);
+    const { id } = req.params;
+
+    const withdrawal = await WithdrawalRequest.findById(id)
+      .populate({
+        path: "technicianId",
+        select: "userId bankDetails kycDetails isBankVerified status payoutBlocked payoutBlockedReason",
+        populate: { path: "userId", select: "fname lname mobileNumber email" },
+      })
+      .lean();
+
+    if (!withdrawal) {
+      return res.status(404).json({ success: false, message: "Withdrawal request not found" });
+    }
+
+    const outbox = await PayoutOutbox.findOne({ withdrawalId: id }).lean();
+    const walletTx = await WalletTransaction.findOne({ withdrawalId: id, source: "withdraw" }).lean();
+    const auditLogs = await AuditLog.find({ targetId: String(id) }).sort({ createdAt: -1 }).lean();
+
+    const techUser = withdrawal.technicianId?.userId || {};
+    const requestedPaise = withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount);
+    const netPayoutPaise = withdrawal.netPayoutAmountPaise ?? requestedPaise;
+
+    return res.status(200).json({
+      success: true,
+      result: {
+        withdrawalId: withdrawal._id,
+        technician: {
+          technicianId: withdrawal.technicianId?._id,
+          name: `${techUser.fname || ""} ${techUser.lname || ""}`.trim() || "N/A",
+          mobileNumber: techUser.mobileNumber || "N/A",
+          email: techUser.email || "N/A",
+          payoutBlocked: withdrawal.technicianId?.payoutBlocked || false,
+          payoutBlockedReason: withdrawal.technicianId?.payoutBlockedReason || null,
+        },
+        financials: {
+          requestedAmount: paiseToRupees(requestedPaise),
+          requestedAmountPaise: requestedPaise,
+          commissionDeduction: paiseToRupees(withdrawal.commissionDeductionPaise || 0),
+          commissionDeductionPaise: withdrawal.commissionDeductionPaise || 0,
+          penaltyDeduction: paiseToRupees(withdrawal.penaltyDeductionPaise || 0),
+          penaltyDeductionPaise: withdrawal.penaltyDeductionPaise || 0,
+          penaltyReason: withdrawal.penaltyReason || null,
+          otherDeductions: paiseToRupees(withdrawal.otherDeductionsPaise || 0),
+          otherDeductionsPaise: withdrawal.otherDeductionsPaise || 0,
+          netPayoutAmount: paiseToRupees(netPayoutPaise),
+          netPayoutAmountPaise: netPayoutPaise,
+        },
+        origin: withdrawal.origin,
+        status: withdrawal.status,
+        payoutMode: withdrawal.payoutMode || "UPI/IMPS",
+        payoutDestination: withdrawal.payoutDestination || "N/A",
+        payoutReference: withdrawal.payoutReference || null,
+        utr: withdrawal.utr || null,
+        timestamps: {
+          createdAt: withdrawal.createdAt,
+          processingAt: withdrawal.processingAt || null,
+          paidAt: withdrawal.paidAt || null,
+          failedAt: withdrawal.failedAt || null,
+          decidedAt: withdrawal.decidedAt || null,
+        },
+        identifiers: {
+          walletTransactionId: walletTx?._id || null,
+          payoutOutboxId: outbox?._id || null,
+        },
+        gatewayDetails: {
+          gatewayResponse: outbox?.payoutPayload || null,
+          failureReason: withdrawal.failureReason || outbox?.lastError || null,
+          lastError: outbox?.lastError || null,
+          retryCount: outbox?.attempts || 0,
+          webhookEvents: outbox?.webhookEvents || [],
+        },
+        auditHistory: auditLogs,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };

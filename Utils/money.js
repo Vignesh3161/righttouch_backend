@@ -13,6 +13,9 @@ export const toPaise = (v) => {
   return Math.round(n);
 };
 
+/** Round to the nearest integer paise (alias used by the quotation engine). */
+export const roundPaise = (v) => toPaise(v);
+
 export const rupeesToPaise = (rupees) => {
   if (rupees == null || rupees === "") return 0;
   const n = Number(rupees);
@@ -73,18 +76,34 @@ export const splitWithCommission = (totalAmountPaise, commissionPercentage, ceil
   return { ok: true, commissionAmountPaise, technicianAmountPaise };
 };
 
-/** Assert a money object satisfies the additive invariant. Throws otherwise. */
-export const assertSplit = ({ totalAmountPaise, commissionAmountPaise, technicianAmountPaise }) => {
+/** Assert a money object satisfies the additive invariant. Throws otherwise.
+ *  GST is a pass-through liability, so the correct identity is
+ *  commission + technician + gst === total. */
+export const assertSplit = ({ totalAmountPaise, commissionAmountPaise, technicianAmountPaise, gstAmountPaise = 0 }) => {
   const total = toPaise(totalAmountPaise);
   const c = toPaise(commissionAmountPaise);
   const t = toPaise(technicianAmountPaise);
-  if (c < 0 || t < 0) throw new Error(`negative split component (commission=${c}, technician=${t})`);
-  if (c + t !== total) {
+  const g = toPaise(gstAmountPaise);
+  if (c < 0 || t < 0 || g < 0) throw new Error(`negative split component (commission=${c}, technician=${t}, gst=${g})`);
+  if (c + t + g !== total) {
     throw new Error(
-      `split invariant violated: commission(${c}) + technician(${t}) !== total(${total})`
+      `split invariant violated: commission(${c}) + technician(${t}) + gst(${g}) !== total(${total})`
     );
   }
   return true;
+};
+
+/** Minimum payable amount for an online payment (Razorpay enforces ₹1). */
+export const MIN_PAYABLE_PAISE = 100;
+
+/**
+ * A booking is payable online only when its total is exactly ₹0 (free) or at
+ * least ₹1. Amounts between ₹0.01–₹0.99 can never be charged via Razorpay.
+ * @returns {boolean}
+ */
+export const isPayableTotalPaise = (totalPaise) => {
+  const t = toPaise(totalPaise);
+  return t === 0 || t >= MIN_PAYABLE_PAISE;
 };
 
 export const CALCULATION_VERSION = 2;

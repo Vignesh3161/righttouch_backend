@@ -9,6 +9,58 @@ import { postLedgerEntry, postPaymentLedgerEntries } from "./ledger.js";
 import { toPaise } from "./money.js";
 
 /**
+ * O2 — Credit technician earnings but FIRST recover any outstanding dues.
+ * `recovery` (min(dues, credit)) is pulled from the wallet liability back toward
+ * the previously-uncollectable shortfall; the remainder is spendable available.
+ * Returns { recovery, credited }.
+ */
+const creditEarningsRecoverDues = async ({ technicianId, credit, session = null, bookingId = null }) => {
+  const opts = session ? { session } : {};
+  const tech = await TechnicianProfile.findById(technicianId)
+    .select("outstandingDuesPaise")
+    .lean();
+  const dues = tech?.outstandingDuesPaise || 0;
+  const recovery = Math.min(dues, credit);
+  const remaining = credit - recovery;
+
+  await TechnicianProfile.updateOne(
+    { _id: technicianId },
+    {
+      $inc: {
+        availableBalancePaise: remaining,
+        lifetimeEarnedPaise: credit,
+        outstandingDuesPaise: -recovery,
+      },
+    },
+    opts
+  );
+
+  if (recovery > 0) {
+    const recoveryRow = {
+      technicianId,
+      bookingId: bookingId || null,
+      amountPaise: recovery,
+      amount: paiseToRupees(recovery),
+      type: "debit",
+      source: "penalty",
+      idempotencyKey: `due-recovery:${bookingId || technicianId + ":" + Date.now()}`,
+      note: "Outstanding penalty/due recovered from job earnings",
+    };
+    try {
+      if (session) {
+        await WalletTransaction.create([recoveryRow], opts);
+      } else {
+        await WalletTransaction.create(recoveryRow);
+      }
+    } catch (e) {
+      if (e?.code !== 11000) throw e; // idempotent — if retried, duplicate key is ignored
+    }
+  }
+
+  return { recovery, credited: credit };
+};
+
+/**
  * 💰 PHASE 2 — SETTLEMENT: internal transfer of the technician's earning from
  * the platform financial position into the technician WALLET LIABILITY.
  *
@@ -141,12 +193,7 @@ const performSettlement = async ({ booking, payment, session = null }) => {
 
     const credit = toPaise((createdJob ? jobAmountPaise : 0) + (createdTip ? tipAmountPaise : 0));
     if (credit > 0) {
-      await TechnicianProfile.updateOne(
-        { _id: booking.technicianId },
-        {
-          $inc: { availableBalancePaise: credit, lifetimeEarnedPaise: credit },
-        }
-      );
+      await creditEarningsRecoverDues({ technicianId: booking.technicianId, credit, bookingId: booking._id });
     }
 
     await postLedgerEntry({
@@ -203,13 +250,7 @@ const performSettlement = async ({ booking, payment, session = null }) => {
   // Only credit for rows created in THIS run (duplicate → already credited).
   const credit = toPaise((createdJob ? jobAmountPaise : 0) + (createdTip ? tipAmountPaise : 0));
   if (credit > 0) {
-    await TechnicianProfile.updateOne(
-      { _id: booking.technicianId },
-      {
-        $inc: { availableBalancePaise: credit, lifetimeEarnedPaise: credit },
-      },
-      opts
-    );
+    await creditEarningsRecoverDues({ technicianId: booking.technicianId, credit, session, bookingId: booking._id });
   }
 
   await postLedgerEntry({

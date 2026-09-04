@@ -42,6 +42,17 @@ const productSchema = new mongoose.Schema({
     max: 100,
   },
 
+  // Quotation support — products can be bought directly or require a quote.
+  quoteRequired: {
+    type: Boolean,
+    default: false,
+  },
+
+  // Prefer paise for new estimate fields (kept separate from legacy rupee
+  // estimatedPriceFrom/To to avoid float drift; convert at the boundary).
+  estimatedPriceFromPaise: { type: Number, min: 0 },
+  estimatedPriceToPaise: { type: Number, min: 0 },
+
   siteInspectionRequired: {
     type: Boolean,
     default: true,
@@ -91,6 +102,19 @@ const productSchema = new mongoose.Schema({
     default: [],
   },
 
+  faqs: [
+    {
+      question: {
+        type: String,
+        trim: true,
+      },
+      answer: {
+        type: String,
+        trim: true,
+      },
+    },
+  ],
+
   isActive: {
     type: Boolean,
     default: true,
@@ -112,6 +136,18 @@ const productSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+});
+
+// ── Indexes (architecture §21) ──
+productSchema.index({ categoryId: 1, isActive: 1 });
+productSchema.index({ isActive: 1 });
+productSchema.index({ productName: 1 });
+// Text index powers DB-level search across name/description/features (§4/§21).
+productSchema.index({
+  productName: "text",
+  description: "text",
+  whatIncluded: "text",
+  complianceCertificates: "text",
 });
 
 export default mongoose.models.Product || mongoose.model("Product", productSchema);

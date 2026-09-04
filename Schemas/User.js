@@ -73,6 +73,13 @@ const userSchema = new mongoose.Schema(
 
     lastLoginAt: Date,
 
+    // 📱 FCM push tokens (multi-device). Registered on app login/foreground;
+    // invalid tokens are pruned on FCM error responses (device-not-registered).
+    fcmTokens: {
+      type: [String],
+      default: [],
+    },
+
     // Terms and Conditions
     termsAndServices: {
       type: Boolean,

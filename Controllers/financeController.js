@@ -6,6 +6,7 @@ import WithdrawalRequest from "../Schemas/WithdrawalRequest.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import PlatformLedgerEntry from "../Schemas/PlatformLedgerEntry.js";
 import { toPaise, paiseToRupees } from "../Utils/money.js";
+import { buildPaymentDetailsSummary } from "../Utils/paymentReadModel.js";
 
 /**
  * 💹 FINANCE TRACKING API
@@ -62,6 +63,28 @@ export const getFinanceSummary = async (req, res) => {
           count: { $sum: 1 },
         },
       },
+    ]);
+
+    // Service booking payment status breakdown (paid vs unpaid/pending)
+    const bookingPaymentsFacet = await ServiceBooking.aggregate([
+      {
+        $group: {
+          _id: { $ifNull: ["$paymentStatus", "pending"] },
+          count: { $sum: 1 },
+          totalAmountPaise: {
+            $sum: { $ifNull: ["$totalAmountPaise", { $multiply: [{ $ifNull: ["$totalAmount", 0] }, 100] }] }
+          },
+          baseAmountPaise: {
+            $sum: { $ifNull: ["$baseAmountPaise", { $multiply: [{ $ifNull: ["$baseAmount", 0] }, 100] }] }
+          },
+          gstAmountPaise: {
+            $sum: { $ifNull: ["$gstAmountPaise", { $multiply: [{ $ifNull: ["$gstAmount", 0] }, 100] }] }
+          },
+          commissionAmountPaise: {
+            $sum: { $ifNull: ["$commissionAmountPaise", { $multiply: [{ $ifNull: ["$commissionAmount", 0] }, 100] }] }
+          }
+        }
+      }
     ]);
 
     const withdrawalsFacet = await WithdrawalRequest.aggregate([
@@ -123,6 +146,14 @@ export const getFinanceSummary = async (req, res) => {
     const sumOf = (...keys) => keys.reduce((acc, k) => acc + (statusMap.get(k)?.sumPaise || 0), 0);
     const countOf = (...keys) => keys.reduce((acc, k) => acc + (statusMap.get(k)?.count || 0), 0);
 
+    const bookingStatusMap = new Map(bookingPaymentsFacet.map((b) => [b._id, b]));
+    const paidBooking = bookingStatusMap.get("paid") || {};
+    const pendingBooking = bookingStatusMap.get("pending") || bookingStatusMap.get("unpaid") || {};
+    const failedBooking = bookingStatusMap.get("failed") || {};
+
+    const paidServicesPaise = paidBooking.totalAmountPaise || 0;
+    const unpaidServicesPaise = pendingBooking.totalAmountPaise || 0;
+
     const p = paymentsFacet[0] || {};
     const collectedPaise = toPaise(p.collectedPaise ?? 0);
     const servicePaise = toPaise(p.servicePaise ?? 0);
@@ -136,6 +167,28 @@ export const getFinanceSummary = async (req, res) => {
     res.json({
       success: true,
       result: {
+        services: {
+          paid: {
+            count: paidBooking.count || 0,
+            totalAmountPaise: paidServicesPaise,
+            totalAmount: paiseToRupees(paidServicesPaise),
+            baseAmount: paiseToRupees(paidBooking.baseAmountPaise || 0),
+            gstAmount: paiseToRupees(paidBooking.gstAmountPaise || 0),
+            commissionAmount: paiseToRupees(paidBooking.commissionAmountPaise || 0),
+          },
+          unpaid: {
+            count: pendingBooking.count || 0,
+            totalAmountPaise: unpaidServicesPaise,
+            totalAmount: paiseToRupees(unpaidServicesPaise),
+            baseAmount: paiseToRupees(pendingBooking.baseAmountPaise || 0),
+            gstAmount: paiseToRupees(pendingBooking.gstAmountPaise || 0),
+            commissionAmount: paiseToRupees(pendingBooking.commissionAmountPaise || 0),
+          },
+          failed: {
+            count: failedBooking.count || 0,
+            totalAmount: paiseToRupees(failedBooking.totalAmountPaise || 0),
+          },
+        },
         summary: {
           totalCollectedPaise: collectedPaise,                       // money in (all payments)
           totalCollected: paiseToRupees(collectedPaise),
@@ -241,6 +294,7 @@ export const getFinanceBreakdown = async (req, res) => {
         .select(
           "_id customerId serviceId technicianId baseAmount gstPercentage gstAmount tipAmount " +
           "commissionPercentage commissionAmount technicianAmount totalAmount paymentStatus status " +
+          "paymentProvider paymentMode paymentProviderPaymentId paidAmount paidAmountPaise " +
           "settlementStatus settledAt paymentId createdAt"
         )
         .populate("serviceId", "serviceName serviceType")
@@ -248,6 +302,10 @@ export const getFinanceBreakdown = async (req, res) => {
           path: "technicianId",
           select: "userId",
           populate: { path: "userId", select: "fname lname mobileNumber" },
+        })
+        .populate({
+          path: "paymentId",
+          select: "provider mode providerPaymentId offlineDetails verifiedAt status"
         })
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -258,26 +316,41 @@ export const getFinanceBreakdown = async (req, res) => {
 
     res.json({
       success: true,
-      result: rows.map((b) => ({
-        bookingId: b._id,
-        service: b.serviceId?.serviceName || null,
-        technician: b.technicianId?.userId
-          ? `${b.technicianId.userId.fname || ""} ${b.technicianId.userId.lname || ""}`.trim()
-          : null,
-        status: b.status,
-        paymentStatus: b.paymentStatus,
-        settlementStatus: b.settlementStatus,
-        settledAt: b.settledAt,
-        serviceAmount: round2(b.baseAmount),
-        gstPercentage: b.gstPercentage || 0,
-        gstAmount: round2(b.gstAmount || 0),
-        tipAmount: round2(b.tipAmount || 0),
-        commissionPercentage: b.commissionPercentage || 0,
-        commissionAmount: round2(b.commissionAmount || 0),
-        technicianAmount: round2(b.technicianAmount || 0),
-        paidAmount: round2(b.paidAmount || 0),
-        createdAt: b.createdAt,
-      })),
+      result: rows.map((b) => {
+        const paymentDoc = b.paymentId || null;
+        const provider = b.paymentProvider || paymentDoc?.provider || (b.paymentStatus === "paid" ? "razorpay" : null);
+        const mode = b.paymentMode || paymentDoc?.mode || (b.paymentStatus === "paid" ? "online" : null);
+        const ref = b.paymentProviderPaymentId || paymentDoc?.providerPaymentId || paymentDoc?.offlineDetails?.transactionReference || null;
+        const summary = paymentDoc
+          ? buildPaymentDetailsSummary(paymentDoc)
+          : (b.paymentStatus === "paid" ? `Paid via ${mode ? mode.toUpperCase() : "Online"}${ref ? ` (Ref: ${ref})` : ""}` : null);
+
+        return {
+          bookingId: b._id,
+          service: b.serviceId?.serviceName || null,
+          technician: b.technicianId?.userId
+            ? `${b.technicianId.userId.fname || ""} ${b.technicianId.userId.lname || ""}`.trim()
+            : null,
+          status: b.status,
+          paymentStatus: b.paymentStatus,
+          paymentProvider: provider,
+          paymentMode: mode,
+          paymentReference: ref,
+          paymentDetailsSummary: summary,
+          offlineDetails: paymentDoc?.offlineDetails || null,
+          settlementStatus: b.settlementStatus,
+          settledAt: b.settledAt,
+          serviceAmount: round2(b.baseAmount),
+          gstPercentage: b.gstPercentage || 0,
+          gstAmount: round2(b.gstAmount || 0),
+          tipAmount: round2(b.tipAmount || 0),
+          commissionPercentage: b.commissionPercentage || 0,
+          commissionAmount: round2(b.commissionAmount || 0),
+          technicianAmount: round2(b.technicianAmount || 0),
+          paidAmount: round2(b.paidAmount || 0),
+          createdAt: b.createdAt,
+        };
+      }),
       meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 },
     });
   } catch (error) {
@@ -312,9 +385,9 @@ export const getPaymentsLedger = async (req, res) => {
     const [rows, total] = await Promise.all([
       Payment.find(query)
         .select(
-          "_id bookingId itemType status serviceAmount baseAmount gstPercentage gstAmount tipAmount " +
+          "_id bookingId itemType provider mode status serviceAmount baseAmount gstPercentage gstAmount tipAmount " +
           "totalAmount commissionAmount technicianAmount commissionRuleSource providerOrderId " +
-          "providerPaymentId verifiedAt createdAt"
+          "providerPaymentId offlineDetails verifiedAt createdAt"
         )
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -329,6 +402,8 @@ export const getPaymentsLedger = async (req, res) => {
         paymentId: p._id,
         bookingId: p.bookingId,
         itemType: p.itemType,
+        provider: p.provider || "razorpay",
+        mode: p.mode || "online",
         status: p.status,
         serviceAmount: round2(p.serviceAmount ?? p.baseAmount ?? 0),
         gstPercentage: p.gstPercentage || 0,
@@ -340,6 +415,8 @@ export const getPaymentsLedger = async (req, res) => {
         commissionRuleSource: p.commissionRuleSource,
         providerOrderId: p.providerOrderId,
         providerPaymentId: p.providerPaymentId,
+        paymentDetailsSummary: buildPaymentDetailsSummary(p),
+        offlineDetails: p.offlineDetails || null,
         paidAt: p.verifiedAt,
         createdAt: p.createdAt,
       })),

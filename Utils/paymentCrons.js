@@ -18,6 +18,8 @@ import { writeAuditLog } from "./audit.js";
 import { toPaise, rupeesToPaise, paiseToRupees } from "./money.js";
 import { postPayoutLedgerEntry, postLedgerEntry } from "./ledger.js";
 import { raiseReconciliationException } from "./paymentTransitions.js";
+import { processAutoPayouts } from "./autoPayout.js";
+import { releaseFailedWithdrawalReserve } from "./withdrawalPayoutEngine.js";
 
 /**
  * ⏰ PAYMENT RECONCILIATION CRONS
@@ -339,6 +341,98 @@ export const reconcileStuckPayouts = async () => {
       );
     }
   });
+
+  // 🔍 Ambiguous payouts parked in `manual_review` (timeout/network at
+  // RazorpayX). If we recorded a Razorpay id, we CAN reconcile with the
+  // provider; otherwise they stay for an admin to resolve manually.
+  const reviewable = await PayoutOutbox.find({
+    status: "manual_review",
+    razorpayPayoutId: { $exists: true, $ne: null },
+    updatedAt: { $lt: cutoff },
+    attempts: { $lt: MAX_PAYOUT_ATTEMPTS },
+  }).limit(50);
+
+  await runBatched(reviewable, async (outbox) => {
+    try {
+      const payout = await fetchPayout(outbox.razorpayPayoutId);
+      const status = payout?.status;
+
+      if (PAYOUT_SUCCESS_STATUSES.includes(status)) {
+        // Money left the platform — complete (release reserve + ledger).
+        await completePayout(outbox, payout);
+      } else if (PAYOUT_FINAL_FAILURE_STATUSES.includes(status)) {
+        // Provider says it failed — refund the held reserve (no double pay).
+        const w = await WithdrawalRequest.findById(outbox.withdrawalId).lean();
+        if (w) {
+          await releaseFailedWithdrawalReserve({
+            withdrawalId: outbox.withdrawalId,
+            amountPaise: w.amountPaise,
+            technicianId: w.technicianId,
+            reason: `Razorpay status: ${status}`,
+          });
+        }
+      } else {
+        // Still processing at provider — leave for the next run.
+        await PayoutOutbox.updateOne(
+          { _id: outbox._id },
+          { $inc: { attempts: 1 } }
+        );
+      }
+    } catch (err) {
+      await PayoutOutbox.updateOne(
+        { _id: outbox._id },
+        { $inc: { attempts: 1 }, $set: { lastError: err.message } }
+      );
+    }
+  });
+};
+
+/**
+ * 🛠️ Admin manual resolution of an ambiguous (`manual_review`) payout.
+ * `decision` = "complete" (force mark paid — money confirmed sent) or
+ * "revert" (refund the held reserve). The platform cannot auto-decide when
+ * no Razorpay id was captured, so a human resolves it (spec §6F).
+ */
+export const adminResolveManualReview = async ({ withdrawalId, decision, admin }) => {
+  const withdrawal = await WithdrawalRequest.findById(withdrawalId);
+  if (!withdrawal) throw new Error("Withdrawal not found");
+  if (withdrawal.status !== "manual_review") {
+    throw new Error(`Only manual_review payouts can be resolved here (current: ${withdrawal.status})`);
+  }
+  const outbox = await PayoutOutbox.findOne({ withdrawalId });
+
+  if (decision === "complete") {
+    await completePayout(outbox, null);
+    await writeAuditLog({
+      actor: admin?.userId,
+      actorRole: admin?.role || "Admin",
+      action: "MANUAL_REVIEW_COMPLETED",
+      targetType: "WithdrawalRequest",
+      targetId: withdrawalId,
+      reason: "Admin force-completed ambiguous payout after provider confirmation",
+    });
+    return { status: "paid" };
+  }
+
+  if (decision === "revert") {
+    await releaseFailedWithdrawalReserve({
+      withdrawalId,
+      amountPaise: withdrawal.amountPaise,
+      technicianId: withdrawal.technicianId,
+      reason: "Reverted by admin during manual review",
+    });
+    await writeAuditLog({
+      actor: admin?.userId,
+      actorRole: admin?.role || "Admin",
+      action: "MANUAL_REVIEW_REVERTED",
+      targetType: "WithdrawalRequest",
+      targetId: withdrawalId,
+      reason: "Admin reverted ambiguous payout (refund reserved balance)",
+    });
+    return { status: "failed" };
+  }
+
+  throw new Error("decision must be 'complete' or 'revert'");
 };
 
 /* =====================================================
@@ -380,7 +474,15 @@ export const reconcileDailyLedger = async () => {
   summary.checked += snapBookings.length;
   for (const b of snapBookings) {
     const s = b.financialSnapshot;
-    if (toPaise(s.commissionAmountPaise) + toPaise(s.technicianAmountPaise) !== toPaise(s.totalAmountPaise)) {
+    // Invariant (commission.js / money.js assertSplit): commission + technician + gst === total.
+    // GST is a pass-through liability, so omitting it here raised a false SNAPSHOT_SPLIT_BROKEN
+    // on every GST-bearing booking.
+    if (
+      toPaise(s.commissionAmountPaise) +
+        toPaise(s.technicianAmountPaise) +
+        toPaise(s.gstAmountPaise || 0) !==
+      toPaise(s.totalAmountPaise)
+    ) {
       await raiseReconciliationException({
         code: "SNAPSHOT_SPLIT_BROKEN",
         severity: "critical",
@@ -582,6 +684,19 @@ export const initPaymentCrons = () => {
       await reconcileStuckPayouts();
     } catch (err) {
       console.error("[PaymentCron] reconcileStuckPayouts error:", err.message);
+    }
+  });
+
+  // 💸 Auto-payout cron — every 6 hours (override via AUTO_PAYOUT_CRON_EXPRESSION).
+  // Scans high-balance technicians and pays out balance − maintenance floor
+  // automatically. Individual payout failures never abort the run, and the
+  // 10-min reconcileStuckPayouts above recovers any ambiguous payout.
+  cron.schedule(process.env.AUTO_PAYOUT_CRON_EXPRESSION || "0 */6 * * *", async () => {
+    if (!dbReady()) return;
+    try {
+      await processAutoPayouts();
+    } catch (err) {
+      console.error("[PaymentCron] processAutoPayouts error:", err.message);
     }
   });
 

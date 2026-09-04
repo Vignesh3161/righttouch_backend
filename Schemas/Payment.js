@@ -11,8 +11,20 @@ const paymentSchema = new mongoose.Schema(
 
     itemType: {
       type: String,
-      enum: ["service", "product"],
+      enum: ["service", "product", "quotation"],
       default: "service",
+    },
+
+    paymentType: {
+      type: String,
+      enum: ["SERVICE", "PRODUCT", "QUOTATION"],
+      default: "SERVICE",
+    },
+
+    settlementType: {
+      type: String,
+      enum: ["TECHNICIAN_COMMISSION", "COMPANY_REVENUE"],
+      default: "TECHNICIAN_COMMISSION",
     },
 
     provider: {
@@ -22,8 +34,18 @@ const paymentSchema = new mongoose.Schema(
 
     mode: {
       type: String,
-      enum: ["online"],
+      enum: ["online", "offline", "cash", "bank_transfer", "upi_direct", "cheque", "other"],
       default: "online",
+    },
+
+    offlineDetails: {
+      transactionReference: String,
+      receivedAt: Date,
+      recordedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+      notes: String,
     },
 
     currency: {
@@ -64,6 +86,11 @@ const paymentSchema = new mongoose.Schema(
     // Provider-captured amount in paise — set at success time and compared
     // against totalAmountPaise. Any mismatch flags the payment for review.
     capturedAmountPaise: { type: Number, default: null },
+
+    // ── Additive fields for the customer payment-management surface ──
+    // (do not affect commission/settlement/payout math)
+    lastAttemptId: { type: mongoose.Schema.Types.ObjectId, ref: "PaymentAttempt", default: null },
+    amountRefundedPaise: { type: Number, default: 0, min: 0 },
 
     // Legacy rupee mirrors (migration window only; new code writes paise)
     baseAmount: Number,

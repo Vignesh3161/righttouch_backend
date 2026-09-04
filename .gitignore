@@ -12,6 +12,9 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
+# Service Accounts & Credentials
+serverAccount.json
+
 # Logs
 logs
 *.log
@@ -40,12 +43,16 @@ Thumbs.db
 *.njsproj
 *.sln
 
+# Temporary & Scratch Files
+scratch_*.js
+*.scratch.js
+*.tmp
+*.tmp.js
+
 # Runtime data
 *.tgz
 .cache/
 .temporary/
-
-# Debugger
 node_modules/.cache/
 .vercel
 .env*.local
@@ -53,6 +60,9 @@ node_modules/.cache/
 # lock file
 package-lock.json
 
-serverAccount.json
+postman/
+docs/
 
-/postman/
+scripts/
+Scripts/
+test/

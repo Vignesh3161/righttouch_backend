@@ -6,6 +6,7 @@ import { normalizeBookingStatus } from "./bookingStatus.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
+import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
 import { findNearbyTechnicians } from "./findNearbyTechnicians.js";
@@ -13,6 +14,8 @@ import { emitJobsChanged } from "./sendNotification.js";
 import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibility.js";
 import { geoSearch } from "./technicianGeo.js";
 import { enqueueJobNewNotifications } from "./dispatchQueue.js";
+import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
+import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -54,6 +57,156 @@ export const invalidateOperationalPolygonCache = () => {
   polygonCache = { geometry: null, fetchedAt: 0 };
 };
 
+/**
+ * 🏙 RESOLVE OPERATIONAL CITY (DISTRICT) FROM COORDINATES
+ * Given a lat/lng point, finds the OperationalCity whose GeoJSON polygon contains it.
+ */
+export const resolveOperationalCityFromCoordinates = async (latitude, longitude) => {
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  const city = await OperationalCity.findOne({
+    active: true,
+    polygon: {
+      $geoIntersects: {
+        $geometry: { type: "Point", coordinates: [lng, lat] },
+      },
+    },
+  })
+    .select("_id name cityId")
+    .lean();
+
+  return city;
+};
+
+/**
+ * 🏙 GET ALL ALLOWED OPERATIONAL CITY (DISTRICT) IDS FOR A TECHNICIAN
+ * Returns array of string ObjectIds: [primaryCityId, ...allowedCityIds]
+ * Auto-heals legacy profiles without primaryCityId set.
+ */
+export const getAllowedDistrictIdsForTechnician = async (techProfile) => {
+  if (!techProfile) return [];
+
+  let primaryId = techProfile.primaryDistrictId || techProfile.primaryCityId;
+  const allowedProfile = [
+    ...(techProfile.enabledDistrictIds || []),
+    ...(techProfile.allowedCityIds || []),
+  ].map((d) => String(d._id || d));
+
+  // Auto-heal legacy profiles if primaryCityId is not set
+  if (!primaryId) {
+    if (techProfile.cityZoneId) {
+      const zone = await CityZone.findById(techProfile.cityZoneId).select("operationalCityId").lean();
+      if (zone?.operationalCityId) {
+        primaryId = zone.operationalCityId;
+        await TechnicianProfile.updateOne({ _id: techProfile._id }, { $set: { primaryDistrictId: primaryId, primaryCityId: primaryId } }).catch(() => {});
+      }
+    } else if (techProfile.city) {
+      const matchedCity = await OperationalCity.findOne({
+        name: new RegExp(`^${escapeRegExp(String(techProfile.city).trim())}$`, "i"),
+        active: true,
+      })
+        .select("_id")
+        .lean();
+      if (matchedCity?._id) {
+        primaryId = matchedCity._id;
+        await TechnicianProfile.updateOne({ _id: techProfile._id }, { $set: { primaryDistrictId: primaryId, primaryCityId: primaryId } }).catch(() => {});
+      }
+    }
+  }
+
+  const allIds = [primaryId, ...allowedProfile].filter(Boolean).map((id) => String(id._id || id));
+  return Array.from(new Set(allIds));
+};
+
+/**
+ * 1. District Permission Check
+ */
+export const hasDistrictAccess = (technician, districtId) => {
+  if (!districtId) return true;
+  if (!technician) return false;
+
+  const targetDistStr = String(districtId._id || districtId);
+  const primaryDistStr = technician.primaryDistrictId
+    ? String(technician.primaryDistrictId._id || technician.primaryDistrictId)
+    : technician.primaryCityId
+    ? String(technician.primaryCityId._id || technician.primaryCityId)
+    : null;
+
+  if (primaryDistStr && primaryDistStr === targetDistStr) {
+    return true;
+  }
+
+  const enabledDistricts = [
+    ...(technician.enabledDistrictIds || []),
+    ...(technician.allowedCityIds || []),
+  ].map((d) => String(d._id || d));
+
+  return enabledDistricts.includes(targetDistStr);
+};
+
+/**
+ * 3. City Zone Permission Check
+ */
+export const hasCityZoneAccess = (technician, cityZoneId) => {
+  if (!cityZoneId) return true;
+  if (!technician) return false;
+
+  const targetZoneStr = String(cityZoneId._id || cityZoneId);
+  const enabledZoneIds = (technician.enabledCityZoneIds || []).map((z) => String(z._id || z));
+
+  if (enabledZoneIds.length > 0) {
+    return enabledZoneIds.includes(targetZoneStr);
+  }
+
+  if (technician.cityZoneId) {
+    return String(technician.cityZoneId._id || technician.cityZoneId) === targetZoneStr;
+  }
+
+  return true;
+};
+
+/**
+ * 8. Final Matching & Job Eligibility Engine
+ * Checks District Permission -> Current District -> City Zone Permission -> Current City Zone
+ */
+export const isTechnicianEligible = (technician, booking) => {
+  if (!technician || !booking) return false;
+
+  // 1. District permission
+  if (!hasDistrictAccess(technician, booking.districtId)) {
+    return false;
+  }
+
+  // 2. Physical current district
+  if (
+    technician.currentDistrictId &&
+    booking.districtId &&
+    String(technician.currentDistrictId._id || technician.currentDistrictId) !==
+      String(booking.districtId._id || booking.districtId)
+  ) {
+    return false;
+  }
+
+  // 3. City zone permission
+  if (!hasCityZoneAccess(technician, booking.cityZoneId)) {
+    return false;
+  }
+
+  // 4. Physical current city zone
+  if (
+    technician.currentCityZoneId &&
+    booking.cityZoneId &&
+    String(technician.currentCityZoneId._id || technician.currentCityZoneId) !==
+      String(booking.cityZoneId._id || booking.cityZoneId)
+  ) {
+    return false;
+  }
+
+  return true;
+};
+
 /** Drop technicians whose last ping is older than the staleness threshold. */
 export const filterStaleTechnicians = (techs) => {
   const cutoff = stalenessCutoff();
@@ -82,30 +235,35 @@ export const filterByOperationalPolygon = async (techIds) => {
   return inside.map((t) => t._id);
 };
 
-/**
- * 🏘 ZONE FILTER — keep only technicians whose registered cityZoneId matches
- * the booking's cityZoneId, OR whose zone has the service approved.
- * No zone on booking → no filtering (backward compatible).
- * No zone on tech → excluded (tech must register for a zone to receive jobs).
- */
 export const filterByBookingZone = async (techIds, bookingId) => {
   if (!techIds.length) return techIds;
 
   const booking = await ServiceBooking.findById(bookingId)
-    .select("cityZoneId serviceId")
+    .select("districtId cityZoneId serviceId")
     .lean();
 
   if (!booking?.cityZoneId) return techIds;
 
-  // Technicians registered in the same zone as the booking are eligible
-  const sameZoneTechs = await TechnicianProfile.find({
+  const eligibleTechs = await TechnicianProfile.find({
     _id: { $in: techIds },
-    cityZoneId: booking.cityZoneId,
+    $or: [
+      { enabledCityZoneIds: booking.cityZoneId },
+      { cityZoneId: booking.cityZoneId },
+      { enabledCityZoneIds: { $exists: false } },
+      { enabledCityZoneIds: { $size: 0 } },
+    ],
   })
-    .select("_id")
+    .select("_id primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds currentDistrictId currentCityZoneId")
     .lean();
 
-  return sameZoneTechs.map((t) => t._id);
+  const finalTechIds = [];
+  for (const tech of eligibleTechs) {
+    if (isTechnicianEligible(tech, booking)) {
+      finalTechIds.push(tech._id);
+    }
+  }
+
+  return finalTechIds;
 };
 
 /* =====================================================
@@ -260,30 +418,46 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       return { success: false, message: "Technician location is stale — pings not received" };
     }
 
-    // 🏙 Operational polygon — tech outside every active city is not dispatchable.
-    const inPolygon = await filterByOperationalPolygon([tech._id]);
-    if (inPolygon.length === 0) {
-      return { success: false, message: "Technician is outside the operational area" };
+    // 🏙 DISTRICT-BASED RESTRICTION (CORE RULE: District Permission -> Nearby/Radius Check -> Job Assignment)
+    // 1. Get technician's allowed working districts (primary + admin-enabled)
+    const allowedDistrictIds = await getAllowedDistrictIdsForTechnician(tech);
+    if (allowedDistrictIds.length === 0) {
+      console.log(`⚠️ broadcastPendingJobsToTechnician: Tech ${technicianProfileId} has no assigned/enabled district`);
+      return { success: false, message: "Technician has no assigned/enabled working district" };
     }
 
-    // 🏘 Zone check — tech must be registered in a zone to receive jobs.
-    if (!tech.cityZoneId) {
-      return { success: false, message: "Technician has no registered zone" };
-    }
-
+    // 2. Physical GPS Location Check (Requirements 3 & 5):
+    // If technician is physically located in a district that is NOT enabled for them,
+    // they MUST NOT receive jobs from that district!
     const [lng, lat] = tech.location.coordinates;
+    const currentGpsDistrict = await resolveOperationalCityFromCoordinates(lat, lng);
+    if (currentGpsDistrict?._id) {
+      const currentDistrictIdStr = String(currentGpsDistrict._id);
+      if (!allowedDistrictIds.includes(currentDistrictIdStr)) {
+        console.log(`⚠️ broadcastPendingJobsToTechnician: Tech ${technicianProfileId} is in district "${currentGpsDistrict.name}" (${currentDistrictIdStr}), which is NOT enabled for them. Allowed: [${allowedDistrictIds.join(", ")}]`);
+        return { success: true, count: 0, message: "Technician is physically located in an un-enabled district" };
+      }
+    }
 
     // Support both unpopulated (ID) and populated (Object) skills
     const technicianServiceIds = tech.skills
       .map(s => (s.serviceId?._id ? s.serviceId._id : s.serviceId))
       .filter(Boolean);
 
-    console.log(`🔍 broadcastPendingJobsToTechnician: Tech ${technicianProfileId} has ${technicianServiceIds.length} skills`);
-
     if (technicianServiceIds.length === 0) {
       console.log(`⚠️ broadcastPendingJobsToTechnician: Tech ${technicianProfileId} has no valid skills`);
       return { success: false, message: "Technician has no valid skills linked to services" };
     }
+
+    // 3. Filter pending bookings to only include jobs in technician's allowed districts
+    const allowedCityObjectIds = allowedDistrictIds.map((id) => new mongoose.Types.ObjectId(id));
+    const allowedZones = await CityZone.find({
+      operationalCityId: { $in: allowedCityObjectIds },
+      active: true,
+    })
+      .select("_id")
+      .lean();
+    const allowedZoneIds = allowedZones.map((z) => z._id);
 
     const bookingQuery = {
       serviceId: { $in: technicianServiceIds },
@@ -297,8 +471,10 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       },
     };
 
-    // If returning from a job, we could optionally filter by time, 
-    // but showing all nearby available jobs is generally better for UX.
+    if (allowedZoneIds.length > 0) {
+      bookingQuery.cityZoneId = { $in: allowedZoneIds };
+    }
+
     if (createdAfter) {
       bookingQuery.createdAt = { $gt: createdAfter };
     }
@@ -329,6 +505,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
     for (const booking of eligibleBookings) {
       try {
         if (booking.technicianId) {
+          continue;
+        }
+
+        if (!isTechnicianEligible(tech, booking)) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — failed district/city zone permission or physical location check`);
           continue;
         }
 
@@ -383,9 +564,6 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         if (broadcast) {
           newlyBroadcastedCount++;
 
-          // Send Real-time Alert via the dispatch outbox queue — never block
-          // the ping handler on push/socket delivery (dedup+version preserved
-          // by the same notifyTechnicianOfNewJob the worker calls).
           const service = serviceById.get(String(booking.serviceId));
           const bm = new Map([[String(tech._id), { _id: broadcast._id, version: broadcast.version }]]);
           await enqueueJobNewNotifications({
@@ -410,13 +588,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         if (err.code !== 11000) {
           console.error(`❌ Error broadcasting job ${booking._id} to tech ${tech._id}:`, err);
         }
-        // Duplicate is fine - means they already got the job
       }
     }
 
     console.log(`✅ broadcastPendingJobsToTechnician: Notified tech ${tech._id} of ${newlyBroadcastedCount} new jobs`);
 
-    // 🤝 Offer audit rows — single bulkWrite for every offer made this cycle
     if (offerRows.length > 0) {
       const byBooking = new Map();
       for (const row of offerRows) {
@@ -428,15 +604,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       }
     }
 
-    // 📍 Cursor bump: the technician's job feed changed — the get_jobs
-    // cursor (lastJobsChangeAt) must advance so poll clients can cheaply
-    // detect "nothing changed" (Socket Analysis Fix #5).
     if (newlyBroadcastedCount > 0) {
       await TechnicianProfile.updateOne(
         { _id: tech._id },
         { $set: { lastJobsChangeAt: new Date() } }
       );
-      // 🛰 Push: tell this technician their feed changed (anti-polling fix).
       emitJobsChanged(io, tech._id);
     }
 
@@ -449,8 +621,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
 
 /**
  * Find eligible technicians for a given service + customer location.
- * Rules:
- * - Role = Technician
+ * Enforces District Permission FIRST, then Nearby Radius / Geo / Feasibility filters.
  */
 export const findEligibleTechniciansForService = async ({
   serviceId,
@@ -460,16 +631,12 @@ export const findEligibleTechniciansForService = async ({
   limit = 50,
   session,
 } = {}) => {
-  // REMOVED ALL VALIDATIONS: KYC, Online Status, Skills, workStatus, etc.
-  // Any technician profile in the system is now "eligible".
-
-
   const serviceObjectId = new mongoose.Types.ObjectId(serviceId);
   const serviceIdString = String(serviceId);
 
   let approvedKycQuery = TechnicianKyc.find({
     verificationStatus: "approved",
-    bankVerified: true
+    bankVerified: true,
   }).select("technicianId");
   if (session) approvedKycQuery = approvedKycQuery.session(session);
   const approvedKyc = await approvedKycQuery;
@@ -503,7 +670,6 @@ export const findEligibleTechniciansForService = async ({
     ],
   };
 
-  // ⏱ Staleness gate — drop techs whose last ping is older than the threshold
   if (STALENESS_SECONDS > 0) {
     baseQuery.locationUpdatedAt = { $gte: stalenessCutoff() };
   }
@@ -519,12 +685,32 @@ export const findEligibleTechniciansForService = async ({
     lng >= -180 &&
     lng <= 180;
 
-  // 1) Prefer geo query when possible (requires technicians to have `location`)
+  // 🏙 DISTRICT-BASED RESTRICTION (CORE RULE: District Permission -> Nearby/Radius Check -> Job Assignment)
+  let jobDistrictId = null;
+  if (hasCoords) {
+    const jobCity = await resolveOperationalCityFromCoordinates(lat, lng);
+    if (jobCity?._id) {
+      jobDistrictId = jobCity._id;
+    }
+  }
+
+  if (!jobDistrictId && address?.cityZoneId) {
+    const zone = await CityZone.findById(address.cityZoneId).select("operationalCityId").lean();
+    if (zone?.operationalCityId) jobDistrictId = zone.operationalCityId;
+  }
+
+  if (jobDistrictId) {
+    const jobDistrictObjId = new mongoose.Types.ObjectId(jobDistrictId);
+    baseQuery.$and = baseQuery.$and || [];
+    baseQuery.$and.push({
+      $or: [
+        { primaryCityId: jobDistrictObjId },
+        { allowedCityIds: jobDistrictObjId },
+      ],
+    });
+  }
+
   if (enableGeo && hasCoords) {
-    // 🗺 Redis GEO hot path — sub-ms radius pre-filter, then ONE indexed
-    // _id query for the remaining filters (staleness/skills/online/KYC).
-    // If Redis is unavailable or returns nothing, fall through to the
-    // Mongo $nearSphere path (identical semantics, just slower).
     const redisNearby = await geoSearch(lng, lat, radiusMeters, limit);
     if (redisNearby?.length) {
       const candidateIds = redisNearby.map((r) => r.technicianId);
@@ -534,13 +720,10 @@ export const findEligibleTechniciansForService = async ({
       if (session) redisQuery = redisQuery.session(session);
       const redisMatches = await redisQuery;
       if (redisMatches.length > 0) {
-        // 🏙 Operational polygon — one indexed $geoIntersects on the candidates
         return filterByOperationalPolygon(redisMatches.map((t) => t._id));
       }
     }
 
-    // Only match technicians who actually have a valid GeoJSON Point.
-    // Many profiles may have latitude/longitude strings but no GeoJSON `location`.
     const geoQuery = {
       ...baseQuery,
       $and: [
@@ -566,12 +749,10 @@ export const findEligibleTechniciansForService = async ({
     const nearby = await nearbyQuery;
 
     if (nearby.length > 0) {
-      // 🏙 Operational polygon — one indexed $geoIntersects on the candidate ids
       return filterByOperationalPolygon(nearby.map((t) => t._id));
     }
   }
 
-  // 2) Fallback: pincode / city matching (no coordinates available or no geo matches)
   const fallbackQuery = { ...baseQuery };
 
   if (address?.pincode) {
@@ -633,6 +814,26 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
     if ((latitude === undefined || latitude === null) || (longitude === undefined || longitude === null)) {
       console.error(`❌ matchAndBroadcastBooking: No coordinates for booking ${bookingId}. Location:`, JSON.stringify(booking.location), "Snapshot:", JSON.stringify(booking.addressSnapshot));
       return { success: false, message: "No coordinates for booking" };
+    }
+
+    // 0. Check Service Availability at Customer Location
+    let targetDistrictId = booking.districtId;
+    if (!targetDistrictId && Number.isFinite(latitude) && Number.isFinite(longitude)) {
+      const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
+      if (city?._id) targetDistrictId = city._id;
+    }
+
+    if (targetDistrictId) {
+      const avail = await resolveServiceAvailability({
+        serviceId: booking.serviceId,
+        districtId: targetDistrictId,
+        cityId: booking.cityZoneId,
+      });
+
+      if (!avail.available) {
+        console.log(`⚠️ matchAndBroadcastBooking: Service ${booking.serviceId} unavailable at customer location (${avail.reason})`);
+        return { success: true, count: 0, message: `Service unavailable at customer location (${avail.reason})` };
+      }
     }
 
     // 1. Find Technicians
@@ -806,4 +1007,3 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
     return { success: false, error: error.message };
   }
 };
-

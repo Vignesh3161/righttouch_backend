@@ -16,10 +16,12 @@ import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
+import BookingOutbox from "../Schemas/BookingOutbox.js";
+import DispatchOutbox from "../Schemas/DispatchOutbox.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import { canTransition, normalizeBookingStatus } from "../Utils/bookingStatus.js";
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
-import { paiseToRupees, percentageOf } from "../Utils/money.js";
+import { paiseToRupees, percentageOf, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import { toBookingCreatedDTO, toBookingCancelledDTO } from "../Utils/socketDTO.js";
 import { notifyCustomerOfRebroadcast } from "../Utils/sendReminder.js";
 import {
@@ -222,6 +224,16 @@ export const createBooking = async (req, res) => {
     const commissionAmt = paiseToRupees(snapshot.commissionAmountPaise);
     const techAmt = paiseToRupees(snapshot.technicianAmountPaise);
 
+    // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+    const snapshotTotalPaise = toPaise(snapshot.totalAmountPaise);
+    if (!isPayableTotalPaise(snapshotTotalPaise)) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum payable amount is ₹1 (booking total is ₹${(snapshotTotalPaise / 100).toFixed(2)})`,
+        result: {},
+      });
+    }
+
     // Determine initial status (Production Atomic Flow)
     const now = new Date();
     let autoCancelAt = null;
@@ -374,6 +386,16 @@ export const storeBookingSchedule = async (req, res) => {
       cityZoneId: zoneCheck.zoneId,
     });
 
+    // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+    const docTotalPaise = toPaise(doc.financialSnapshot?.totalAmountPaise);
+    if (!isPayableTotalPaise(docTotalPaise)) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum payable amount is ₹1 (booking total is ₹${(docTotalPaise / 100).toFixed(2)})`,
+        result: {},
+      });
+    }
+
     // ─── Booking + outbox in one transaction ──────────────────────────────
     const session = await mongoose.startSession();
     try {
@@ -446,6 +468,27 @@ export const getBookingSchedule = async (req, res) => {
 /* =====================================================
    GET BOOKINGS (ROLE BASED)
 ===================================================== */
+
+// Customers must NEVER see the platform margin or technician earnings.
+// Strip commission/technician-amount fields from a booking before it goes
+// to a Customer (technicians & admins legitimately need them).
+const stripSensitiveFinancials = (booking) => {
+  const o = booking.toObject ? booking.toObject() : { ...booking };
+  if (o.financialSnapshot) {
+    delete o.financialSnapshot.commissionAmountPaise;
+    delete o.financialSnapshot.commissionPercentage;
+    delete o.financialSnapshot.commissionRuleSource;
+    delete o.financialSnapshot.commissionRuleId;
+    delete o.financialSnapshot.commissionOverridden;
+  }
+  delete o.technicianAmount;
+  delete o.technicianAmountPaise;
+  delete o.commissionAmount;
+  delete o.commissionPercentage;
+  delete o.commissionOverridden;
+  return o;
+};
+
 export const getBookings = async (req, res) => {
   try {
     let filter = {};
@@ -465,8 +508,8 @@ export const getBookings = async (req, res) => {
       filter.technicianId = technicianProfileId;
     }
 
-    // For Admin: no filter, shows all bookings
-    // For Customer/Technician: filtered by their ID
+    // For Admin/Owner: no filter, shows all bookings (intended — admins see all).
+    // For Customer/Technician: filtered by their ID (data isolation).
 
     const bookings = await ServiceBooking.find(filter)
       .populate("customerId", "fname lname mobileNumber email")
@@ -481,10 +524,15 @@ export const getBookings = async (req, res) => {
       })
       .sort({ createdAt: -1 });
 
+    const result =
+      req.user.role === "Customer"
+        ? bookings.map(stripSensitiveFinancials)
+        : bookings;
+
     return res.status(200).json({
       success: true,
       message: "Bookings fetched successfully",
-      result: bookings,
+      result,
     });
   } catch (error) {
     console.error("getBookings:", error);
@@ -642,7 +690,10 @@ export const getCustomerBookings = async (req, res) => {
 
     const totalCount = await ServiceBooking.countDocuments(filter);
 
-    return envelope(true, totalCount > 0 ? "Customer booking history" : "No bookings found", bookings, {
+    // Never expose platform commission / technician earnings to the customer.
+    const safeBookings = bookings.map(stripSensitiveFinancials);
+
+    return envelope(true, totalCount > 0 ? "Customer booking history" : "No bookings found", safeBookings, {
       totalCount,
       page: pageNum,
       limit: limitNum,
@@ -1207,16 +1258,35 @@ export const updateBookingStatus = async (req, res) => {
       }
     }
 
-    booking.status = status;
+    // 🔒 Optimistic concurrency: bump version atomically and key the update on
+    // the version we loaded. A concurrent status write changes the version and
+    // makes this a no-op (modifiedCount 0) instead of silently overwriting a
+    // newer state. The caller must reload and retry.
+    // Legacy documents created before the `version` field existed have no
+    // version — we match those via $exists:false so the update still works
+    // (best-effort; fully safe only for versioned documents).
+    const statusSet = { status };
     if (status === "on_the_way") {
-      booking.autoCancelAt = null; // Disable auto-cancel once technician starts moving
+      statusSet.autoCancelAt = null; // Disable auto-cancel once technician starts moving
     }
     if (status === "completed") {
-      booking.completedAt = new Date();
-      booking.assignmentStatus = "released";
+      statusSet.completedAt = new Date();
+      statusSet.assignmentStatus = "released";
     }
-    booking.version = (booking.version || 0) + 1;
-    await booking.save();
+    const versionPredicate = booking.version == null
+      ? { _id: booking._id, version: { $exists: false } }
+      : { _id: booking._id, version: booking.version };
+    const statusUpdate = await ServiceBooking.updateOne(versionPredicate, {
+      $set: statusSet,
+      $inc: { version: 1 },
+    });
+    if (statusUpdate.modifiedCount !== 1) {
+      return res.status(409).json({
+        success: false,
+        message: "Booking was updated by another request. Please reload and retry.",
+        result: {},
+      });
+    }
     if (status === "completed") {
       // If payment is already verified, credit technician wallet (idempotent)
       await settleBookingEarningsIfEligible(booking._id);
@@ -1229,7 +1299,7 @@ export const updateBookingStatus = async (req, res) => {
             title: "Service Completed",
             body: "Your service is complete. Please complete the payment for your booking.",
             data: { bookingId: booking._id.toString(), type: "BOOKING_COMPLETED" },
-          });
+          }, { recipientType: "customer" });
         } catch (notifyErr) {
           console.error("notifyCustomerCompleted error:", notifyErr.message);
         }
@@ -2219,4 +2289,125 @@ export const deleteAllCustomerBookings = async (req, res) => {
 
 // 🔄 Re-export Book Again endpoints for modular accessibility
 export { getCompletedServices, rebookService } from "./bookAgainController.js";
+
+/* =====================================================
+   DELETE A SINGLE SERVICE BOOKING (CUSTOMER)
+   - Customer can only delete their own booking.
+   - Deletion is blocked once money is involved (paid) or a
+     technician is engaged/completed to protect financial integrity
+     and audit trail. Allowed states: pending / broadcasted /
+     cancelled / expired (i.e. technicianId === null and not paid).
+   - Cascades to the booking's broadcast / offer / outbox rows.
+   ===================================================== */
+const DELETABLE_BOOKING_STATUSES = ["pending", "broadcasted", "cancelled", "expired"];
+
+export const deleteServiceBooking = async (req, res) => {
+  try {
+    if (req.user?.role !== "Customer") {
+      return res.status(403).json({ success: false, message: "Customer access only", result: {} });
+    }
+
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, message: "Booking id is required", result: {} });
+    }
+
+    const booking = await ServiceBooking.findOne({ _id: id, customerId: req.user.userId });
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found", result: {} });
+    }
+
+    // 🔒 Guard: protect paid / in-progress / technician-engaged bookings
+    if (booking.paymentStatus === "paid") {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot delete a booking that has been paid. Cancel it instead.",
+        result: {},
+      });
+    }
+    if (booking.technicianId) {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot delete a booking assigned to a technician. Cancel it instead.",
+        result: {},
+      });
+    }
+    if (!DELETABLE_BOOKING_STATUSES.includes(booking.status)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot delete a booking in '${booking.status}' state. Cancel it instead.`,
+        result: {},
+      });
+    }
+
+    const session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      await ServiceBooking.deleteOne({ _id: booking._id }).session(session);
+      await JobBroadcast.deleteMany({ bookingId: booking._id }).session(session);
+      await TechnicianBookingOffer.deleteMany({ bookingId: booking._id }).session(session);
+      await BookingOutbox.deleteMany({ bookingId: booking._id }).session(session);
+      await DispatchOutbox.deleteMany({ bookingId: booking._id }).session(session);
+    });
+    session.endSession();
+
+    console.log(`🗑️ Customer ${req.user.userId} deleted booking ${booking._id}`);
+
+    return res.status(200).json({
+      success: true,
+      message: "Booking deleted successfully",
+      result: { deletedBookingId: String(booking._id) },
+    });
+  } catch (error) {
+    console.error("deleteServiceBooking Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while deleting booking",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* =====================================================
+   DELETE A SERVICE BOOKING (ADMIN / OWNER)
+   - Privileged hard delete of ANY booking by id, with full
+     cascade cleanup. Use with care — this erases the record.
+   ===================================================== */
+export const deleteBookingAsAdmin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, message: "Booking id is required", result: {} });
+    }
+
+    const booking = await ServiceBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found", result: {} });
+    }
+
+    const session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      await ServiceBooking.deleteOne({ _id: booking._id }).session(session);
+      await JobBroadcast.deleteMany({ bookingId: booking._id }).session(session);
+      await TechnicianBookingOffer.deleteMany({ bookingId: booking._id }).session(session);
+      await BookingOutbox.deleteMany({ bookingId: booking._id }).session(session);
+      await DispatchOutbox.deleteMany({ bookingId: booking._id }).session(session);
+    });
+    session.endSession();
+
+    console.log(`🗑️ Admin ${req.user?.userId} deleted booking ${booking._id}`);
+
+    return res.status(200).json({
+      success: true,
+      message: "Booking deleted successfully (admin)",
+      result: { deletedBookingId: String(booking._id) },
+    });
+  } catch (error) {
+    console.error("deleteBookingAsAdmin Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while deleting booking",
+      result: { error: error.message },
+    });
+  }
+};
 

@@ -328,7 +328,7 @@ export const replaceServiceImages = async (req, res) => {
 
 export const getAllServices = async (req, res) => {
   try {
-    const { search, categoryId, latitude, longitude, zoneId } = req.query;
+    const { search, categoryId, latitude, longitude, zoneId, districtId, cityId } = req.query;
 
     let query = { isActive: true };
 
@@ -353,9 +353,6 @@ export const getAllServices = async (req, res) => {
     }
 
     // 🏘 ZONE FILTER — services that are NOT zone-restricted are always shown.
-    // Zone-restricted services are shown ONLY when the caller's zone is known
-    // (via zoneId, or coordinates resolved against CityZone polygons) AND an
-    // active ZoneServiceMapping exists for that zone.
     let zoneRestrictedIds = null;
     let knownZoneId = zoneId || null;
     if (!knownZoneId && latitude && longitude) {
@@ -375,7 +372,6 @@ export const getAllServices = async (req, res) => {
       const mappedServiceIds = mappings.map((m) => m.serviceId);
 
       if (mappedServiceIds.length > 0) {
-        // Any service that is zone-restricted is shown only if mapped in this zone.
         const restrictedServices = await Service.find({
           isActive: true,
           zoneRestricted: true,
@@ -386,13 +382,11 @@ export const getAllServices = async (req, res) => {
           .map((s) => s._id.toString())
           .filter((id) => !mappedServiceIds.some((m) => m.toString() === id));
       }
-      // If the zone has NO mappings at all, restricted services are hidden.
     }
 
     if (zoneRestrictedIds !== null) {
       query._id = { $nin: zoneRestrictedIds };
-    } else if (!knownZoneId) {
-      // Location unknown — hide zone-restricted services entirely.
+    } else if (!knownZoneId && !districtId) {
       query.zoneRestricted = { $ne: true };
     }
 
@@ -401,11 +395,45 @@ export const getAllServices = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    let filteredServices = services;
+    // 🗺 DISTRICT / CITY SERVICE AVAILABILITY RESOLUTION
+    let resolvedDistrictId = districtId || null;
+    if (!resolvedDistrictId && latitude && longitude) {
+      const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
+      const resolvedCity = await resolveOperationalCityFromCoordinates(Number(latitude), Number(longitude));
+      if (resolvedCity?._id) resolvedDistrictId = String(resolvedCity._id);
+    }
+
+    const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
+
+    let filteredServices = [];
+    for (const s of services) {
+      if (resolvedDistrictId) {
+        const avail = await resolveServiceAvailability({
+          serviceId: s._id,
+          districtId: resolvedDistrictId,
+          cityId,
+        });
+        if (avail.available) {
+          filteredServices.push({
+            ...s,
+            availabilityMetadata: avail,
+          });
+        }
+      } else {
+        filteredServices.push({
+          ...s,
+          availabilityMetadata: {
+            available: true,
+            scope: "DEFAULT",
+            reason: "NO_ADDRESS_SELECTED",
+          },
+        });
+      }
+    }
 
     // Hide pricing fields for technicians
     if (req.user?.role === "Technician") {
-      filteredServices = services.map(
+      filteredServices = filteredServices.map(
         ({
           serviceCost,
           commissionPercentage,
@@ -425,6 +453,7 @@ export const getAllServices = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Services fetched successfully",
+      availabilityPrompt: resolvedDistrictId ? null : "Select an address to check exact service availability.",
       result: filteredServices,
     });
 

@@ -189,7 +189,7 @@ export const resolveCommissionSnapshot = async ({
     tipAmountPaise: tipPaise,
     commissionPercentage: Math.round(commissionPercentage * 100) / 100,
     commissionAmountPaise,
-    technicianAmountPaise: toPaise(baseAmountPaise + gstAmountPaise + tipPaise - commissionAmountPaise),
+    technicianAmountPaise: toPaise(baseAmountPaise - commissionAmountPaise + tipPaise),
     commissionRuleSource: ruleSource,
     commissionRuleId: ruleId,
     calculationVersion: CALCULATION_VERSION,
@@ -197,11 +197,13 @@ export const resolveCommissionSnapshot = async ({
     financialSnapshotAt: new Date(),
   };
 
-  // technicianAmountPaise must satisfy: commission + technician === total
+  // commission + technician + gst must reconcile to total (GST is a
+  // pass-through liability, not part of the commission/technician split).
   assertSplit({
     totalAmountPaise,
     commissionAmountPaise: snapshot.commissionAmountPaise,
     technicianAmountPaise: snapshot.technicianAmountPaise,
+    gstAmountPaise: snapshot.gstAmountPaise,
   });
 
   return snapshot;
