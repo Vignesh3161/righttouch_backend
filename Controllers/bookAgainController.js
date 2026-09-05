@@ -2,7 +2,18 @@ import mongoose from "mongoose";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import Service from "../Schemas/Service.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
+import { resolveCommissionSnapshot } from "../Utils/commission.js";
+import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
+import { toBookingCreatedDTO } from "../Utils/socketDTO.js";
+import {
+  resolveScheduleInput,
+  resolveServiceZoneAvailability,
+  buildServiceBookingDoc,
+  createBookingAndOutbox,
+  broadcastCreatedBooking,
+} from "../Utils/bookingService.js";
+import { validateScheduledAtUtc } from "../Utils/slots.js";
 
 const toFiniteNumber = (val) => {
   if (val === null || val === undefined || val === "") return null;
@@ -297,24 +308,38 @@ export const rebookService = async (req, res) => {
       });
     }
 
-    const commissionPct = typeof service.commissionPercentage === "number" ? service.commissionPercentage : 0;
-    const commissionAmt = Math.round((latestBaseAmount * commissionPct) / 100);
-    const techAmt = latestBaseAmount - commissionAmt;
+        // 💰 SERVER-SIDE SPLIT — commission on service amount only; GST separate;
+    // tip (optional) passes through 100% to the technician.
+    const snapshot = await resolveCommissionSnapshot({
+      booking: { baseAmount: latestBaseAmount, itemType: "service" },
+      service,
+      tipAmountRupees: toFiniteNumber(req.body?.tipAmount) || 0,
+    });
+    const commissionPct = snapshot.commissionPercentage;
+    const commissionAmt = paiseToRupees(snapshot.commissionAmountPaise);
+    const techAmt = paiseToRupees(snapshot.technicianAmountPaise);
 
-    // ⏰ Determine Booking Type & Schedule Timing
+    // ⏰ Determine Booking Type & Schedule Timing (timezone-safe, shared utility)
     const bookingTypeInput = req.body?.bookingType || previousBooking.bookingType;
     const isScheduled = bookingTypeInput === "scheduled" || bookingTypeInput === "schedule";
-    const bookingType = isScheduled ? "schedule" : "instant";
 
-    let finalScheduledAt = null;
-
+    let schedule;
     if (isScheduled) {
       const { scheduledDate, scheduledTime, scheduledAt } = req.body;
 
       if (scheduledDate && scheduledTime) {
-        finalScheduledAt = new Date(`${scheduledDate}T${scheduledTime}:00`);
+        schedule = resolveScheduleInput({ bookingType: "scheduled", scheduledDate, scheduledTime });
       } else if (scheduledAt) {
-        finalScheduledAt = new Date(scheduledAt);
+        const check = validateScheduledAtUtc(new Date(scheduledAt));
+        schedule = check.valid
+          ? {
+              bookingType: "schedule",
+              scheduledAt: check.scheduledAt,
+              timezone: check.timezone,
+              scheduledDateLocal: check.scheduledDateLocal,
+              scheduledTimeLocal: check.scheduledTimeLocal,
+            }
+          : { bookingType: "schedule", error: check.error };
       } else {
         return res.status(400).json({
           success: false,
@@ -323,45 +348,15 @@ export const rebookService = async (req, res) => {
         });
       }
 
-      if (isNaN(finalScheduledAt.getTime())) {
+      if (schedule.error) {
         return res.status(400).json({
           success: false,
-          message: "Invalid scheduled date or time format",
+          message: schedule.error,
           result: {},
-        });
-      }
-
-      // Schedule window check (minimum 30 mins in future, window: Tomorrow or Day After Tomorrow)
-      const now = new Date();
-      const minFuture = new Date(now.getTime() + 30 * 60 * 1000);
-      if (finalScheduledAt < minFuture) {
-        return res.status(400).json({
-          success: false,
-          message: "Scheduled time must be at least 30 minutes in the future",
-          result: {},
-        });
-      }
-
-      const tomorrowStart = new Date(now);
-      tomorrowStart.setDate(tomorrowStart.getDate() + 1);
-      tomorrowStart.setHours(0, 0, 0, 0);
-
-      const dayAfterEnd = new Date(now);
-      dayAfterEnd.setDate(dayAfterEnd.getDate() + 2);
-      dayAfterEnd.setHours(23, 59, 59, 999);
-
-      if (finalScheduledAt < tomorrowStart || finalScheduledAt > dayAfterEnd) {
-        return res.status(400).json({
-          success: false,
-          message: "Scheduled bookings are only allowed for Tomorrow or Day after Tomorrow",
-          result: {
-            tomorrow: tomorrowStart.toISOString().split("T")[0],
-            dayAfter: dayAfterEnd.toISOString().split("T")[0],
-          },
         });
       }
     } else {
-      finalScheduledAt = req.body?.scheduledAt ? new Date(req.body.scheduledAt) : null;
+      schedule = { bookingType: "instant", scheduledAt: null, timezone: null, scheduledDateLocal: null, scheduledTimeLocal: null };
     }
 
     // 📍 Location Resolution (Use body overrides if provided, else fallback to previous booking address)
@@ -408,61 +403,66 @@ export const rebookService = async (req, res) => {
       });
     }
 
-    // 🕒 Auto-Cancellation Window setup
-    const now = new Date();
-    const autoCancelAt = isScheduled
-      ? new Date(now.getTime() + 5 * 60 * 60 * 1000)
-      : new Date(now.getTime() + 1 * 60 * 60 * 1000);
+    // 🏘 ZONE AVAILABILITY — zone-restricted services need an active mapping
+    const zoneCheck = await resolveServiceZoneAvailability({
+      service,
+      latitude: resolvedLocation.latitude,
+      longitude: resolvedLocation.longitude,
+    });
+    if (!zoneCheck.ok) {
+      return res.status(400).json({ success: false, message: zoneCheck.error, result: {} });
+    }
 
     const radiusInput = toFiniteNumber(req.body?.radius) ?? previousBooking.radius ?? 500;
     const faultProblemInput = typeof req.body?.faultProblem === "string" ? req.body.faultProblem.trim() : previousBooking.faultProblem || null;
 
-    // 🆕 Create Brand-New Booking Document (No old payment data carried over)
-    const newBookingDoc = {
+    // 🆕 Build brand-new booking via the SHARED creation pipeline
+    // (immutable snapshot, server-side pricing, outbox row, canonical statuses)
+    const doc = await buildServiceBookingDoc({
+      service,
+      resolvedLocation,
+      schedule,
+      tipAmountRupees: toFiniteNumber(req.body?.tipAmount) || 0,
       customerId,
-      serviceId: service._id,
-      bookingType,
-      baseAmount: latestBaseAmount,
-      commissionPercentage: commissionPct,
-      commissionAmount: commissionAmt,
-      technicianAmount: techAmt,
-      locationType: resolvedLocation.locationType,
-      addressSnapshot: resolvedLocation.addressSnapshot,
-      address: resolvedLocation.addressSnapshot.addressLine || previousBooking.address || "Pinned Location",
-      addressId: resolvedLocation.addressId || null,
-      scheduledAt: finalScheduledAt,
-      status: "pending",
-      paymentStatus: "pending",
-      paidAmount: 0,
-      paymentOrderId: null,
-      paymentProviderPaymentId: null,
-      paymentId: null,
-      settlementStatus: "pending",
-      settledAt: null,
-      technicianId: null,
-      technicianSnapshot: { name: null, mobile: null, deleted: false },
-      radius: radiusInput,
       faultProblem: faultProblemInput,
-      location: {
-        type: "Point",
-        coordinates: [resolvedLocation.longitude, resolvedLocation.latitude],
-      },
-      broadcastStartedAt: now,
-      autoCancelAt,
-      retryCount: 0,
-      technicianRejectCount: 0,
-    };
+      cityZoneId: zoneCheck.zoneId,
+    });
+    doc.radius = radiusInput;
 
-    const newBooking = await ServiceBooking.create(newBookingDoc);
+    // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+    const docTotalPaise = toPaise(doc.financialSnapshot?.totalAmountPaise);
+    if (!isPayableTotalPaise(docTotalPaise)) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum payable amount is ₹1 (booking total is ₹${(docTotalPaise / 100).toFixed(2)})`,
+        result: {},
+      });
+    }
 
-    // 🚀 Socket.IO Emission
-    req.io.emit("new_booking", newBooking);
+    const session = await mongoose.startSession();
+    let newBooking;
+    try {
+      session.startTransaction();
+      const created = await createBookingAndOutbox({ doc, session });
+      newBooking = created.booking;
+      await session.commitTransaction();
+    } catch (txError) {
+      await session.abortTransaction();
+      throw txError;
+    } finally {
+      session.endSession();
+    }
 
-    // 🚀 Technician Broadcast Trigger
-    const broadcastResult = await matchAndBroadcastBooking(newBooking._id, req.io);
+    // 🚀 Socket.IO Emission — room-scoped DTO ONLY (Socket Analysis B1.1).
+    if (req.io) {
+      req.io.to("admin_dashboard").emit("new_booking", toBookingCreatedDTO(newBooking));
+    }
+
+    // 🚀 Technician Broadcast Trigger (only after commit; outbox retries)
+    const broadcastResult = await broadcastCreatedBooking(newBooking._id, req.io);
 
     const message = isScheduled
-      ? `Rebooked successfully! Scheduled for ${finalScheduledAt.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true })}`
+      ? `Rebooked successfully! Scheduled for ${schedule.scheduledAt.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true })}`
       : (broadcastResult.count > 0 ? "Booking recreated & broadcasted to nearby technicians" : "Booking recreated (no technicians available in range)");
 
     return res.status(201).json({

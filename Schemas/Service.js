@@ -61,6 +61,15 @@ const serviceSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // ================= TAX =================
+    // GST percentage charged ON TOP of the service price (default 0 = not applicable)
+    gstPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+
     // ================= COMMISSION =================
     commissionPercentage: {
       type: Number,
@@ -180,11 +189,41 @@ const serviceSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+
+    /**
+     * 🎯 ZONE RESTRICTED — when true, the service is ONLY visible and bookable
+     * in zones where an active ZoneServiceMapping exists for it (per city zone).
+     * When false, the service is available everywhere (no restriction).
+     * Admin toggles this per service.
+     */
+    zoneRestricted: {
+      type: Boolean,
+      default: false,
+    },
+
+    /**
+     * 🎯 SERVICE COVERAGE POLYGON (GeoJSON Polygon/MultiPolygon).
+     * When set by the admin, this service can ONLY be booked from locations
+     * inside the polygon, and ONLY technicians inside the polygon are matched
+     * for its jobs. Absent/null → service available everywhere (backward
+     * compatible until polygons are seeded).
+     */
+    coveragePolygon: {
+      type: {
+        type: String,
+        enum: ["Polygon", "MultiPolygon"],
+      },
+      coordinates: {
+        type: [[[Number]]],
+      },
+    },
   },
   {
     timestamps: true,
   }
 );
+
+serviceSchema.index({ coveragePolygon: "2dsphere" });
 
 // ================= AUTO CALCULATIONS =================
 serviceSchema.pre("save", function (next) {

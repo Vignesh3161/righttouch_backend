@@ -41,9 +41,10 @@ import {
   userRating,
   getAllRatings,
   getRatingById,
-  updateRating,
-  deleteRating,
+  updateRatingController,
+  deleteRatingController,
   getMyRatings,
+  rebuildAggregateController,
 } from "../Controllers/ratingController.js";
 
 import {
@@ -63,6 +64,10 @@ import {
   getServiceById,
   updateService,
   deleteService,
+  getServicePolygon,
+  setServicePolygon,
+  removeServicePolygon,
+  toggleZoneRestriction,
 } from "../Controllers/serviceController.js";
 
 import {
@@ -74,6 +79,8 @@ import {
   cancelBooking,
   getCancellationReasons,
   deleteAllCustomerBookings,
+  deleteServiceBooking,
+  deleteBookingAsAdmin,
   getOwnerAllBookings,
   getOwnerBookingById,
   getCompletedServices,
@@ -93,10 +100,10 @@ import {
 } from "../Controllers/productController.js";
 
 import {
-  productBooking,
   getAllProductBooking,
   productBookingUpdate,
   productBookingCancel,
+  adminCompleteProductBooking,
 } from "../Controllers/productBooking.js";
 
 import {
@@ -105,6 +112,7 @@ import {
   razorpayWebhook,
   updatePaymentStatus,
   retryPaymentSettlement,
+  getPaymentByBooking,
 } from "../Controllers/paymentController.js";
 
 import {
@@ -177,6 +185,7 @@ router.post("/login", authLimiter, login);
 /* ================= CUSTOMER SIGNUP (TERMS REQUIRED) ================= */
 // Customer signup route - requires termsAccepted
 router.post("/signup/customer", authLimiter, async (req, res, next) => {
+  req.body = req.body || {};
   req.body.role = "Customer";
   // termsAccepted must be sent in body
   return signupAndSendOtp(req, res, next);
@@ -188,6 +197,7 @@ router.post("/signup/customer/verify-otp", authLimiter, verifyOtp);
 /* ================= USER LOGIN ROUTES (Role-specific) ================= */
 // Customer login (default, only allows Customer role)
 router.post("/login/customer", authLimiter, async (req, res, next) => {
+  req.body = req.body || {};
   req.body.role = "Customer";
   return login(req, res, next);
 });
@@ -202,6 +212,7 @@ router.post("/login/owner", authLimiter, ownerLogin);
 // ---------------- Owner-specific registration/login routes ----------------
 // Owner: request signup OTP (role pre-filled)
 router.post("/owner/signup", authLimiter, async (req, res, next) => {
+  req.body = req.body || {};
   req.body.role = "Owner";
   return signupAndSendOtp(req, res, next);
 });
@@ -228,50 +239,61 @@ router.get("/debug/check-user/:identifier", Auth, authorizeRoles("Owner", "Admin
 router.get("/me", Auth, getMyProfile);
 router.post("/complete-profile", Auth, completeProfile);
 router.put("/me", Auth, updateMyProfile);
-router.get("/users/:role/:id", getUserById);
-router.get("/users/:role", getAllUsers);
-router.delete("/users/:id", deleteUserById);
+// 🔒 Admin/Owner only — user PII & account management
+router.get("/users/:role/:id", Auth, authorizeRoles("Admin", "Owner"), getUserById);
+router.get("/users/:role", Auth, authorizeRoles("Admin", "Owner"), getAllUsers);
+router.delete("/users/:id", Auth, authorizeRoles("Owner"), deleteUserById);
 
 /* ================= CATEGORY ================= */
-router.post("/category", Auth, serviceCategory);
+router.post("/category", Auth, authorizeRoles("Admin", "Owner"), serviceCategory);
 router.post(
   "/category/upload-image",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.single("image"),
   uploadCategoryImage
 );
-router.delete("/category/remove-image", Auth, removeCategoryImage);
+router.delete("/category/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeCategoryImage);
 router.get("/getAllcategory", getAllCategory);
 router.get("/getByIdcategory/:id", getByIdCategory);
-router.put("/updatecategory/:id", Auth, updateCategory);
-router.delete("/deletecategory/:id", Auth, deleteCategory);
+router.put("/updatecategory/:id", Auth, authorizeRoles("Admin", "Owner"), updateCategory);
+router.delete("/deletecategory/:id", Auth, authorizeRoles("Admin", "Owner"), deleteCategory);
 
 /* ================= REPORT ================= */
 router.post("/report", Auth, userReport);
-router.get("/getAllReports", getAllReports);
+router.get("/getAllReports", Auth, authorizeRoles("Admin", "Owner"), getAllReports);
 router.get("/get-my-reports", Auth, getMyReports);
 router.get("/getReportById/:id", Auth, getReportById);
-router.put("/report/resolve/:id", Auth, resolveReport);
+router.put("/report/resolve/:id", Auth, authorizeRoles("Admin", "Owner"), resolveReport);
 
 /* ================= SERVICE ================= */
-router.post("/service", Auth, createService);
+router.post("/service", Auth, authorizeRoles("Admin", "Owner"), createService);
 router.post(
   "/services/upload-images",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.array("serviceImages", 5),
   uploadServiceImages
 );
-router.delete("/services/remove-image", removeServiceImage);
+router.delete("/services/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeServiceImage);
 router.put(
   "/services/replace-images",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.array("serviceImages", 5),
   replaceServiceImages
 );
 router.get("/getAllServices", getAllServices);
 router.get("/getServiceById/:id", getServiceById);
-router.put("/updateService/:id", Auth, updateService);
-router.delete("/services/:id", Auth, deleteService);
+router.put("/updateService/:id", Auth, authorizeRoles("Admin", "Owner"), updateService);
+router.put("/service/:id/zone-restriction", Auth, authorizeRoles("Admin", "Owner"), toggleZoneRestriction);
+router.delete("/services/:id", Auth, authorizeRoles("Admin", "Owner"), deleteService);
+
+/* ================= SERVICE COVERAGE POLYGON (Admin/Owner) ================= */
+// Polygon = where the service can be booked + where technicians get matched
+router.get("/service/:id/polygon", Auth, getServicePolygon);
+router.put("/service/:id/polygon", Auth, setServicePolygon);
+router.delete("/service/:id/polygon", Auth, removeServicePolygon);
 
 /* ================= SERVICE BOOKING ================= */
 router.get("/service/booking", Auth, getBookings);
@@ -281,6 +303,8 @@ router.put("/booking/cancel/:id", Auth, cancelBooking);
 router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
+router.delete("/booking/:id", Auth, deleteServiceBooking);
+router.delete("/booking/admin/:id", Auth, authorizeRoles("Admin", "Owner"), deleteBookingAsAdmin);
 
 /* ================= BOOK AGAIN ================= */
 router.get("/booking/completed-services", Auth, getCompletedServices);
@@ -288,29 +312,52 @@ router.post("/booking/book-again", Auth, rebookService);
 
 
 /* ================= OWNER BOOKING MANAGEMENT ================= */
-router.get("/booking/getAllBookings", getOwnerAllBookings);
-router.get("/booking/getBookingById/:id", getOwnerBookingById);
+router.get("/booking/getAllBookings", Auth, authorizeRoles("Admin", "Owner"), getOwnerAllBookings);
+router.get("/booking/getBookingById/:id", Auth, authorizeRoles("Admin", "Owner"), getOwnerBookingById);
 
 /* ================= RATING ================= */
 router.post("/rating", Auth, userRating);
-router.get("/getAllRatings", getAllRatings);
-router.get("/getRatingById/:id", getRatingById);
-router.put("/updateRating/:id", Auth, updateRating);
-router.delete("/deleteRating/:id", Auth, deleteRating);
+// 🔒 Authenticated browsing only — no anonymous scraping of user ratings
+router.get("/getAllRatings", Auth, getAllRatings);
+
+// Customer rating history + read (architecture §45)
+router.get("/ratings", Auth, getMyRatings);
+router.get("/ratings/:id", Auth, getRatingById);
+
+router.get("/getRatingById/:id", Auth, getRatingById);
+router.put("/updateRating/:id", Auth, updateRatingController);
+router.delete("/deleteRating/:id", Auth, deleteRatingController);
 router.get("/get-my-ratings", Auth, getMyRatings);
 
+// Admin/owner reconciliation — rebuild a stale aggregate (architecture §23)
+router.post(
+  "/admin/ratings/rebuild/:targetType/:targetId",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  rebuildAggregateController
+);
+// Admin/owner filtered rating view (architecture §46)
+router.get(
+  "/admin/ratings",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  getAllRatings
+);
+
 /* ================= PRODUCT ================= */
-router.post("/product", Auth, createProduct);
+router.post("/product", Auth, authorizeRoles("Admin", "Owner"), createProduct);
 router.post(
   "/product/upload-images",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.array("productImages", 5),
   uploadProductImages
 );
-router.delete("/product/remove-image", Auth, removeProductImage);
+router.delete("/product/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeProductImage);
 router.put(
   "/product/replace-images",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.array("productImages", 5),
   replaceProductImages
 );
@@ -319,23 +366,34 @@ router.get("/getOneProduct/:id", getOneProduct);
 router.put(
   "/updateProduct/:id",
   Auth,
+  authorizeRoles("Admin", "Owner"),
   upload.array("productImages", 5),
   updateProduct
 );
-router.delete("/deleteProduct/:id", Auth, deleteProduct);
+router.delete("/deleteProduct/:id", Auth, authorizeRoles("Admin", "Owner"), deleteProduct);
 
 /* ================= PRODUCT BOOKING ================= */
 router.get("/getAllProductBooking", Auth, getAllProductBooking);
 router.put("/productBookingUpdate/:id", Auth, productBookingUpdate);
 router.put("/productBookingCancel/:id", Auth, productBookingCancel);
+// 🔒 Completion (active → completed) is admin/owner-only — the rating gate.
+// Customers can never mark a product booking completed themselves.
+router.put(
+  "/admin/productBooking/:id/complete",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  adminCompleteProductBooking
+);
 
 /* ================= PAYMENT ================= */
 router.post("/payment/order", Auth, createPaymentOrder);
 router.post("/payment/verify", Auth, verifyPayment);
 router.post("/payment/webhook/razorpay", razorpayWebhook);
-router.put("/payment/:id/status", Auth, updatePaymentStatus);
+// RBAC: only Admin/Owner may mutate payment state by hand (audited)
+router.put("/payment/:id/status", Auth, authorizeRoles("Admin", "Owner"), updatePaymentStatus);
+router.get("/payment/:bookingId", Auth, getPaymentByBooking);
 
-// ✅ New: Manual retry for stuck settlements (Admin/Owner)
+// ✅ Manual retry for stuck settlements (Admin/Owner)
 router.post("/payment/retry-settlement", Auth, retryPaymentSettlement);
 
 /* ================= CART ================= */
@@ -347,8 +405,10 @@ router.put("/cart/:id", Auth, updateCartById);
 router.post("/cart/set-schedule", Auth, setCartItemSchedule);
 router.delete("/cart/remove/:id", Auth, removeFromCart);
 
-router.get("/carts/:id", getCartByIdUnrestricted);
-router.delete("/cart/removed/:id", removeFromCartUnrestricted);
+// 🔒 Any logged-in user may read/delete a cart item — but only their OWN cart.
+// Ownership enforced inside the controllers (cart.customerId === req.user.userId).
+router.get("/carts/:id", Auth, getCartByIdUnrestricted);
+router.delete("/cart/removed/:id", Auth, removeFromCartUnrestricted);
 
 /* ================= CHECKOUT ================= */
 router.post("/checkout", Auth, checkout);

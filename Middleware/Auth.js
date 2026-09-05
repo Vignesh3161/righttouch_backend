@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import User from "../Schemas/User.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import { verifyTokenOptions } from "../Utils/token.js";
 
 export const Auth = async (req, res, next) => {
   try {
@@ -15,9 +16,7 @@ export const Auth = async (req, res, next) => {
       return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
-      algorithms: ["HS256"],
-    });
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, verifyTokenOptions());
 
     // 🔒 DB check: block deleted/blocked users even if token is still valid
     const user = await User.findById(decoded.userId).select("status role").lean();
@@ -43,6 +42,7 @@ export const Auth = async (req, res, next) => {
     }
 
     req.user = {
+      _id: decoded.userId,
       userId: decoded.userId,
       role: decoded.role,
       email: decoded.email,
@@ -51,7 +51,7 @@ export const Auth = async (req, res, next) => {
 
     next();
   } catch (err) {
-    console.error("Auth Middleware - Error:", err.message, "Secret used:", process.env.JWT_SECRET ? `[length: ${process.env.JWT_SECRET.length}]` : "undefined");
+    console.error("Auth Middleware - Error:", err.message);
     return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
   }
 };

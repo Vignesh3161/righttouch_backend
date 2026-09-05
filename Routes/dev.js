@@ -1,12 +1,22 @@
 import express from "express";
 import { Auth } from "../Middleware/Auth.js";
+import { findEligibleTechniciansForService } from "../Utils/technicianMatching.js";
+import { SOCKET_EVENTS } from "../Utils/socketConstants.js";
+import { toJobNewDTO } from "../Utils/socketDTO.js";
 
 const router = express.Router();
 
-// @route   POST /api/dev/test-redis
-// @desc    Test Redis Adapter Broadcast (Targets YOU based on your token)
-// @access  Private (Auth required)
-router.post("/test-redis", Auth, (req, res) => {
+// 🔒 Dev-only socket routes — locked behind a DEDICATED opt-in flag
+// (Socket Analysis B1.6: NODE_ENV alone is not a safe gate — a single
+// misconfigured deployment exposes these). Defaults to CLOSED.
+const devSocketRoutesEnabled = process.env.ENABLE_DEV_SOCKET_ROUTES === "true";
+
+if (devSocketRoutesEnabled) {
+
+  // @route   POST /api/dev/test-redis
+  // @desc    Test Socket Broadcast (Targets YOU based on your token)
+  // @access  Private (Auth required)
+  router.post("/test-redis", Auth, (req, res) => {
     try {
         const { event, message } = req.body;
 
@@ -24,39 +34,36 @@ router.post("/test-redis", Auth, (req, res) => {
 
         // ROOM is derived ONLY from the login token
         const targetRoom = `technician_${req.user.technicianProfileId}`;
-        const targetEvent = event || "job:new";
+        const targetEvent = event || SOCKET_EVENTS.JOB_NEW;
 
-        const payload = message || {
-            heading: "Live Test Notification",
-            timestamp: new Date(),
-            technicianId: req.user.technicianProfileId,
-            verified: true
-        };
+        // Build payload through the SAME DTO used by production emitters
+        // (Fix #4: dev emits must match the real job:new contract)
+        const payload = toJobNewDTO(
+            {
+                ...(typeof message === "object" && message ? message : {}),
+                bookingId: message?.bookingId || "dev-test-booking",
+                serviceName: message?.serviceName || "Live Test Notification",
+            },
+            { _id: `dev-${Date.now()}`, version: 1 }
+        );
 
-        // Emit via Redis-enabled Socket.io
-        // This will be broadcast across all server instances via Redis
+        // Emit via Socket.io
         req.io.to(targetRoom).emit(targetEvent, payload);
 
         return res.status(200).json({
             success: true,
-            message: "Broadcast sent via Redis successfully",
-            details: {
-                room: targetRoom,
-                event: targetEvent,
-                payload
-            }
+            message: "Socket test event emitted",
+            details: { room: targetRoom, event: targetEvent, payload }
         });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
-});
+  });
 
-// @route   POST /api/dev/find-techs
-// @desc    Find Eligible Techs for Service & Broadcast
-// @access  Private
-import { findEligibleTechniciansForService } from "../Utils/technicianMatching.js";
-
-router.post("/find-techs", Auth, async (req, res) => {
+  // @route   POST /api/dev/find-techs
+  // @desc    Find Eligible Techs for Service & Broadcast
+  // @access  Private
+  router.post("/find-techs", Auth, async (req, res) => {
     try {
         const { serviceId, message } = req.body;
 
@@ -65,7 +72,6 @@ router.post("/find-techs", Auth, async (req, res) => {
         }
 
         // 1. Find matches (Live check: Online + Skills + KYC)
-        // We pass a dummy lat/lng (0,0) and enableGeo: false to just get skill matches if no location provided
         const technicians = await findEligibleTechniciansForService({
             serviceId,
             enableGeo: false
@@ -73,14 +79,19 @@ router.post("/find-techs", Auth, async (req, res) => {
 
         const technicianIds = technicians.map(t => t._id.toString());
 
-        // 2. Broadcast to them
+        // 2. Broadcast to them (Fix #4: same DTO + same eligibility path as prod)
         if (req.io && technicianIds.length > 0) {
-            technicianIds.forEach(techId => {
-                req.io.to(`technician_${techId}`).emit("job:new", message || {
-                    heading: "New Job Opportunity",
-                    serviceId,
-                    timestamp: new Date()
-                });
+            const { broadcastJobToTechnicians } = await import("../Utils/sendNotification.js");
+            await broadcastJobToTechnicians(req.io, technicianIds, {
+                bookingId: message?.bookingId || `dev-${Date.now()}`,
+                serviceId,
+                serviceName: message?.serviceName || "Dev Test Job",
+                description: message?.description || "",
+                duration: message?.duration || 60,
+                customerName: message?.customerName || "Dev Customer",
+                baseAmount: message?.baseAmount || 0,
+                address: message?.address || "",
+                scheduledAt: message?.scheduledAt || null,
             });
         }
 
@@ -94,6 +105,7 @@ router.post("/find-techs", Auth, async (req, res) => {
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
-});
+  });
+}
 
 export default router;

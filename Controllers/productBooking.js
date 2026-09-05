@@ -1,9 +1,17 @@
 import mongoose from "mongoose";
 import ProductBooking from "../Schemas/ProductBooking.js";
 import Product from "../Schemas/Product.js";
+import { buildProductFinancialSnapshot, validateProductAmountAgainstCatalog } from "../Utils/productPricing.js";
+import { buildPaymentDetailsSummary } from "../Utils/paymentReadModel.js";
 
-const PAYMENT_STATUSES = ["pending", "paid", "refunded", "completed"];
-const BOOKING_STATUSES = ["active", "completed", "cancelled"];
+const ensureAdminOrOwner = (req) => {
+  const role = (req.user?.role || "").toLowerCase();
+  if (role !== "admin" && role !== "owner") {
+    const err = new Error("Admin or Owner access only");
+    err.statusCode = 403;
+    throw err;
+  }
+};
 
 const toNumber = value => {
   const num = Number(value);
@@ -24,77 +32,13 @@ const ensureCustomer = (req) => {
   }
 };
 
-// Create A new ProductBooking
-export const productBooking = async (req, res) => {
-  try {
-    ensureCustomer(req);
-    const customerId = req.user.userId; // Ensure customerId is used consistently
-
-    const { productId, amount, quantity = 1, paymentStatus } = req.body;
-
-    if (!productId || amount === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: "productId and amount are required",
-        result: {},
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(productId)) {
-      return res.status(400).json({ success: false, message: "Invalid productId", result: {} });
-    }
-
-    const product = await Product.findById(productId);
-    if (!product || !product.isActive) {
-      return res.status(404).json({ success: false, message: "Product not found or inactive", result: {} });
-    }
-
-    const amountNum = toNumber(amount);
-    const quantityNum = toNumber(quantity);
-
-    if (Number.isNaN(amountNum) || amountNum < 0) {
-      return res.status(400).json({ success: false, message: "amount must be a non-negative number", result: {} });
-    }
-
-    if (!Number.isInteger(quantityNum) || quantityNum < 1) {
-      return res.status(400).json({ success: false, message: "quantity must be an integer >= 1", result: {} });
-    }
-
-    let paymentStatusValue = paymentStatus || "pending";
-    if (!PAYMENT_STATUSES.includes(paymentStatusValue)) {
-      return res.status(400).json({ success: false, message: "Invalid paymentStatus", result: {} });
-    }
-
-    const productData = await ProductBooking.create({
-      customerId,
-      productId,
-      status: "active",
-      amount: amountNum,
-      quantity: quantityNum,
-      paymentStatus: paymentStatusValue,
-    });
-
-    res.status(201).json({
-      success: true,
-      message: "Product booking created successfully",
-      result: productData,
-    });
-  } catch (error) {
-    res.status(error?.statusCode || 500).json({
-      success: false,
-      message: "Server error",
-      result: { error: error.message },
-    });
-  }
-};
-
 export const getAllProductBooking = async (req, res) => {
   try {
     const role = req.user?.role?.toLowerCase();
     const { status } = req.query;
 
     let filter = {};
-    if (role !== "admin") {
+    if (role !== "admin" && role !== "owner") {
       filter.customerId = req.user.userId;
     }
 
@@ -108,12 +52,34 @@ export const getAllProductBooking = async (req, res) => {
     const getAllBooking = await ProductBooking.find(filter)
       .populate("customerId", "fname lname gender mobileNumber")
       .populate("productId", "productName pricingModel estimatedPriceFrom estimatedPriceTo")
+      .populate({
+        path: "paymentId",
+        select: "provider mode providerPaymentId offlineDetails verifiedAt status"
+      })
       .sort({ createdAt: -1 });
+
+    const result = getAllBooking.map((b) => {
+      const o = b.toObject ? b.toObject() : { ...b };
+      if (role !== "admin" && role !== "owner" && o.financialSnapshot) {
+        delete o.financialSnapshot.commissionPercentage;
+        delete o.financialSnapshot.commissionAmountPaise;
+        delete o.financialSnapshot.technicianAmountPaise;
+        delete o.commissionAmount;
+        delete o.commissionAmountPaise;
+        delete o.technicianAmount;
+        delete o.technicianAmountPaise;
+      }
+      const paymentDoc = o.paymentId || null;
+      o.paymentDetailsSummary = paymentDoc
+        ? buildPaymentDetailsSummary(paymentDoc)
+        : (o.paymentStatus === "paid" ? `Paid via ${o.paymentMode ? o.paymentMode.toUpperCase() : "Online"}${o.paymentProviderPaymentId ? ` (Ref: ${o.paymentProviderPaymentId})` : ""}` : null);
+      return o;
+    });
 
     res.status(200).json({
       success: true,
       message: "Data fetched successfully",
-      result: getAllBooking,
+      result,
     });
   } catch (error) {
     res.status(500).json({
@@ -121,6 +87,48 @@ export const getAllProductBooking = async (req, res) => {
       message: "Error fetching product bookings",
       result: { error: error.message },
     });
+  }
+};
+
+export const getProductBookingById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID format", result: {} });
+    }
+    const role = req.user?.role?.toLowerCase();
+    const filter = { _id: id };
+    if (role !== "admin" && role !== "owner") {
+      filter.customerId = req.user.userId;
+    }
+    const booking = await ProductBooking.findOne(filter)
+      .populate("customerId", "fname lname mobileNumber email")
+      .populate("productId", "productName productType productImages")
+      .populate("quoteRequestId")
+      .populate("quotationId")
+      .populate({
+        path: "paymentId",
+        select: "provider mode providerPaymentId offlineDetails verifiedAt status"
+      });
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
+    }
+
+    const obj = booking.toObject ? booking.toObject() : { ...booking };
+    if (role !== "admin" && role !== "owner" && obj.financialSnapshot) {
+      delete obj.financialSnapshot.commissionPercentage;
+      delete obj.financialSnapshot.commissionAmountPaise;
+      delete obj.financialSnapshot.technicianAmountPaise;
+    }
+    const paymentDoc = obj.paymentId || null;
+    obj.paymentDetailsSummary = paymentDoc
+      ? buildPaymentDetailsSummary(paymentDoc)
+      : (obj.paymentStatus === "paid" ? `Paid via ${obj.paymentMode ? obj.paymentMode.toUpperCase() : "Online"}${obj.paymentProviderPaymentId ? ` (Ref: ${obj.paymentProviderPaymentId})` : ""}` : null);
+
+    res.status(200).json({ success: true, message: "Booking fetched successfully", result: obj });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error fetching product booking", result: { error: error.message } });
   }
 };
 
@@ -142,36 +150,54 @@ export const productBookingUpdate = async (req, res) => {
       });
     }
 
+    // 🔒 SECURITY: a product order's money fields and payment status are
+    // server-derived. `amount`, `quantity`, and `paymentStatus` are NOT
+    // customer-editable — changing the amount/quantity would let a customer
+    // lower the payable amount, and setting `paymentStatus: "paid"` would let
+    // them bypass payment entirely. An order can only be marked paid through
+    // the verified Razorpay pipeline (order → capture → webhook/verify).
+    const booking = await ProductBooking.findOne({ _id: id, customerId }).select("paymentStatus status");
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found", result: {} });
+    }
+
+    // 🔒 SECURITY: completion (active → completed) is an ADMIN/SYSTEM-only
+    // transition. A customer must never be able to flip a product booking to
+    // "completed" themselves — otherwise they could rate a product without it
+    // actually being delivered/fulfilled. Likewise `paymentStatus` and `amount`
+    // are server-derived via the Razorpay pipeline. The only customer-editable
+    // field is `quantity`, and only while the booking is unpaid.
     const update = {};
 
-    if (amount !== undefined) {
-      const amountNum = toNumber(amount);
-      if (Number.isNaN(amountNum) || amountNum < 0) {
-        return res.status(400).json({ success: false, message: "amount must be a non-negative number", result: {} });
-      }
-      update.amount = amountNum;
+    if (status !== undefined) {
+      return res.status(403).json({
+        success: false,
+        message: "Product booking status is server-controlled and cannot be changed by the customer",
+        result: {},
+      });
+    }
+
+    if (paymentStatus !== undefined || amount !== undefined) {
+      return res.status(403).json({
+        success: false,
+        message: "Payment status and amount are server-controlled",
+        result: {},
+      });
     }
 
     if (quantity !== undefined) {
-      const quantityNum = toNumber(quantity);
-      if (!Number.isInteger(quantityNum) || quantityNum < 1) {
-        return res.status(400).json({ success: false, message: "quantity must be an integer >= 1", result: {} });
+      if (booking.paymentStatus === "paid") {
+        return res.status(409).json({
+          success: false,
+          message: "Cannot modify a booking that is already paid",
+          result: {},
+        });
       }
-      update.quantity = quantityNum;
+      update.quantity = quantity;
     }
 
-    if (paymentStatus !== undefined) {
-      if (!PAYMENT_STATUSES.includes(paymentStatus)) {
-        return res.status(400).json({ success: false, message: "Invalid paymentStatus", result: {} });
-      }
-      update.paymentStatus = paymentStatus;
-    }
-
-    if (status !== undefined) {
-      if (!BOOKING_STATUSES.includes(status)) {
-        return res.status(400).json({ success: false, message: "Invalid status", result: {} });
-      }
-      update.status = status;
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: "Nothing to update", result: {} });
     }
 
     const updateBooking = await ProductBooking.findOneAndUpdate(
@@ -226,13 +252,8 @@ export const productBookingCancel = async (req, res) => {
       });
     }
 
-    const cancelBooking = await ProductBooking.findOneAndUpdate(
-      { _id: id, customerId },
-      { status: "cancelled" },
-      { new: true }
-    );
-
-    if (!cancelBooking) {
+    const booking = await ProductBooking.findOne({ _id: id, customerId });
+    if (!booking) {
       return res.status(404).json({
         success: false,
         message: "Your booking was not found",
@@ -240,10 +261,75 @@ export const productBookingCancel = async (req, res) => {
       });
     }
 
+    if (["ready_for_delivery", "out_for_delivery", "completed"].includes(booking.status)) {
+      return res.status(409).json({
+        success: false,
+        message: `Order cannot be cancelled in '${booking.status}' status. Please contact customer support.`,
+        result: {}
+      });
+    }
+
+    booking.status = "cancelled";
+    await booking.save();
+
     res.status(200).json({
       success: true,
       message: "Your booking has been cancelled successfully",
-      result: cancelBooking
+      result: booking
+    });
+  } catch (error) {
+    res.status(error?.statusCode || 500).json({
+      success: false,
+      message: "Server error",
+      result: { error: error.message }
+    });
+  }
+};
+
+/* ===============================
+   ADMIN / OWNER — MARK PRODUCT BOOKING COMPLETED
+   Completion (active → completed) is the rating gate. It is strictly
+   server-controlled: a product can only be rated once it is actually
+   delivered/fulfilled, never merely because payment succeeded.
+   Cancelled bookings can never be completed.
+   =============================== */
+export const adminCompleteProductBooking = async (req, res) => {
+  try {
+    ensureAdminOrOwner(req);
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID format", result: {} });
+    }
+
+    const booking = await ProductBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
+    }
+
+    if (booking.status === "cancelled") {
+      return res.status(409).json({
+        success: false,
+        message: "Cancelled product bookings cannot be completed",
+        result: {},
+      });
+    }
+
+    if (booking.status === "completed") {
+      return res.status(200).json({
+        success: true,
+        message: "Product booking is already completed",
+        result: booking,
+      });
+    }
+
+    booking.status = "completed";
+    await booking.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Product booking marked as completed",
+      result: booking,
     });
   } catch (error) {
     res.status(error?.statusCode || 500).json({

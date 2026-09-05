@@ -7,6 +7,10 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
 import { handleLocationUpdate } from "../Utils/technicianLocation.js";
+import { revokeSocketSession } from "../Utils/socketSessionControl.js";
+import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
+import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
@@ -21,7 +25,7 @@ export const updateTechnicianLocation = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid coordinates", result: {} });
     }
 
-    const result = await handleLocationUpdate(technicianProfileId, latitude, longitude, req.io);
+    const result = await handleLocationUpdate(technicianProfileId, latitude, longitude, req.io, "http");
 
     return res.json({
       success: true,
@@ -31,6 +35,53 @@ export const updateTechnicianLocation = async (req, res) => {
   } catch (error) {
     console.error("updateTechnicianLocation Error:", error);
     return res.status(500).json({ success: false, message: error.message, result: { error: error.message } });
+  }
+};
+
+const MAX_FCM_TOKENS = 5;
+
+// ================= REGISTER / UNREGISTER FCM PUSH TOKEN =================
+// Called by the app on login/foreground. `unregister: true` removes the token
+// (logout / device removed). Keeps a small per-device cap; tokens are also
+// pruned automatically when FCM reports device-not-registered on send.
+export const registerTechnicianFcmToken = async (req, res) => {
+  try {
+    const technicianProfileId = req.user?.technicianProfileId;
+    const { token, unregister } = req.body || {};
+
+    if (!technicianProfileId || !mongoose.Types.ObjectId.isValid(technicianProfileId)) {
+      return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
+    }
+    if (!token || typeof token !== "string" || token.length < 10 || token.length > 4096) {
+      return res.status(400).json({ success: false, message: "Invalid FCM token", result: {} });
+    }
+
+    if (unregister) {
+      await TechnicianProfile.updateOne(
+        { _id: technicianProfileId },
+        { $pull: { fcmTokens: token } }
+      );
+      console.log(`📴 FCM token unregistered for tech ${technicianProfileId}`);
+    } else {
+      // Register with dedupe + cap: keep newest MAX_FCM_TOKENS tokens.
+      const profile = await TechnicianProfile.findById(technicianProfileId)
+        .select("fcmTokens")
+        .lean();
+      let tokens = (profile?.fcmTokens || []).filter((t) => t !== token);
+      tokens.push(token);
+      if (tokens.length > MAX_FCM_TOKENS) tokens = tokens.slice(-MAX_FCM_TOKENS);
+
+      await TechnicianProfile.updateOne(
+        { _id: technicianProfileId },
+        { $set: { fcmTokens: tokens } }
+      );
+      console.log(`📱 FCM token registered for tech ${technicianProfileId} (${tokens.length}/${MAX_FCM_TOKENS})`);
+    }
+
+    return res.json({ success: true, message: "FCM token updated" });
+  } catch (error) {
+    console.error("registerTechnicianFcmToken Error:", error);
+    return res.status(500).json({ success: false, message: error.message, result: {} });
   }
 };
 
@@ -58,21 +109,41 @@ const normalizeServiceIdsInput = (body) => {
   return Array.from(new Set(normalized));
 };
 
-/* ================= HELPER: ENRICH TECHNICIAN WITH ACTIVATION STATUS ================= */
+/* ================= HELPER: ENRICH TECHNICIAN WITH ACTIVATION STATUS & BANK DETAILS ================= */
 const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
   try {
     if (!technicianDoc) return null;
 
     const techObj = technicianDoc.toObject ? technicianDoc.toObject() : technicianDoc;
 
-    // Check KYC approval
+    // Check KYC approval & bank details
     const kyc = await TechnicianKyc.findOne({
       technicianId: technicianDoc._id,
-    }).select("verificationStatus bankVerified");
+    });
 
     const isKycApproved = kyc && kyc.verificationStatus === "approved";
-    const isBankVerified = kyc && kyc.bankVerified === true;
+    const isBankVerified = kyc && (kyc.bankVerified === true || kyc.bankVerificationStatus === "approved");
     const isTrainingCompleted = technicianDoc.trainingCompleted === true;
+
+    // Decrypt & populate bank details on technician object if present on KYC
+    if (kyc && kyc.bankDetails) {
+      try {
+        const dek = await getDekForKycDoc(kyc);
+        const plainBank = decryptBankDetails(kyc.bankDetails, dek) || {};
+        techObj.bankDetails = {
+          accountHolderName: plainBank.accountHolderName || techObj.bankDetails?.accountName || techObj.bankDetails?.accountHolderName || null,
+          accountNumber: plainBank.accountNumber || techObj.bankDetails?.accountNumber || null,
+          bankName: plainBank.bankName || techObj.bankDetails?.bankName || null,
+          branchName: plainBank.branchName || techObj.bankDetails?.branchName || null,
+          ifscCode: plainBank.ifscCode || techObj.bankDetails?.ifscCode || null,
+          upiId: plainBank.upiId || techObj.bankDetails?.upiId || null,
+        };
+        techObj.isBankVerified = isBankVerified;
+        techObj.bankVerified = isBankVerified;
+      } catch (decErr) {
+        console.error("Error decrypting bank details for tech:", technicianDoc._id, decErr.message);
+      }
+    }
 
     // Active = KYC + Bank + Training all approved
     techObj.isActiveTechnician = isKycApproved && isBankVerified && isTrainingCompleted;
@@ -185,6 +256,33 @@ export const addTechnicianSkills = async (req, res) => {
         message: "Technician profile not found",
         result: {},
       });
+    }
+
+    // 🏘 ZONE-SERVICE CHECK — technician can only add skills for services approved in their zone
+    if (technician.cityZoneId) {
+      const approvedMappings = await ZoneServiceMapping.find({
+        zoneId: technician.cityZoneId,
+        serviceId: { $in: serviceObjectIds },
+        active: true,
+      })
+        .select("serviceId")
+        .lean();
+
+      const approvedServiceIds = new Set(
+        approvedMappings.map((m) => String(m.serviceId))
+      );
+
+      const blockedIds = serviceObjectIds.filter(
+        (sid) => !approvedServiceIds.has(String(sid))
+      );
+
+      if (blockedIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Some services are not available in your zone",
+          result: { blockedServiceIds: blockedIds.map(String) },
+        });
+      }
     }
 
     // Filter out serviceIds that the technician already has
@@ -336,7 +434,6 @@ export const createTechnician = async (req, res) => {
     if (locality !== undefined) profileUpdate.locality = locality;
     if (experienceYears !== undefined) profileUpdate.experienceYears = experienceYears;
     if (specialization !== undefined) profileUpdate.specialization = specialization;
-    if (profileComplete !== undefined) profileUpdate.profileComplete = profileComplete;
 
     const userUpdate = {};
     const u = req.body.user || {};
@@ -344,7 +441,6 @@ export const createTechnician = async (req, res) => {
     const finalFname = fname !== undefined ? fname : u.fname;
     const finalLname = lname !== undefined ? lname : u.lname;
     const finalGender = gender !== undefined ? gender : u.gender;
-    const finalProfileComplete = profileComplete !== undefined ? profileComplete : u.profileComplete;
 
     let existingUser = null;
     if (finalFname === undefined || finalLname === undefined) {
@@ -363,12 +459,23 @@ export const createTechnician = async (req, res) => {
       typeof effectiveLname === "string" &&
       effectiveLname.trim().length > 0;
 
-    if (hasCompleteName) profileUpdate.profileComplete = true;
+    // 🔒 profileComplete is ALWAYS computed server-side — never accepted
+    // from the client. A forged `profileComplete: true` previously bypassed
+    // the activation gate.
+    const isComplete = Boolean(
+      hasCompleteName &&
+      (address || "").trim() &&
+      (city || "").trim() &&
+      (specialization || "").trim() &&
+      (locality || "").trim() &&
+      Array.isArray(skills) &&
+      skills.length > 0
+    );
+    profileUpdate.profileComplete = isComplete;
 
     if (finalFname !== undefined) userUpdate.fname = finalFname;
     if (finalLname !== undefined) userUpdate.lname = finalLname;
     if (finalGender !== undefined) userUpdate.gender = finalGender;
-    if (finalProfileComplete !== undefined) userUpdate.profileComplete = finalProfileComplete;
 
     if (Object.keys(userUpdate).length > 0) {
       await mongoose.model("User").findByIdAndUpdate(req.user?.userId, userUpdate, {
@@ -682,19 +789,11 @@ export const updateTechnician = async (req, res) => {
       if (finalEmail !== undefined) { userUpdate.email = finalEmail; userUpdated = true; }
       if (finalGender !== undefined) { userUpdate.gender = finalGender; userUpdated = true; }
 
-      if (profileComplete !== undefined || u.profileComplete !== undefined || req.body.profileComplete !== undefined) {
-        userUpdate.profileComplete = profileComplete !== undefined ? profileComplete
-          : (u.profileComplete !== undefined ? u.profileComplete : req.body.profileComplete);
-        userUpdated = true;
-      }
-
       // phone number updates are ignored as per requirement
 
-      if (userUpdated) {
-        await mongoose.model("User").findByIdAndUpdate(userId, userUpdate, { session, runValidators: true });
-      }
-
       // 4. Calculate Profile Completion
+      // 🔒 ALWAYS server-computed — client-supplied profileComplete is ignored
+      // (a forged `true` previously bypassed the activation gate).
       const isComplete = Boolean(
         technician.address &&
         technician.city &&
@@ -702,16 +801,61 @@ export const updateTechnician = async (req, res) => {
         technician.locality &&
         technician.skills?.length > 0
       );
-      technician.profileComplete = profileComplete !== undefined ? profileComplete : isComplete;
+      technician.profileComplete = isComplete;
+      userUpdate.profileComplete = isComplete;
+      userUpdated = true;
+
+      if (userUpdated) {
+        await mongoose.model("User").findByIdAndUpdate(userId, userUpdate, { session, runValidators: true });
+      }
 
       await technician.save({ session });
     });
 
-    // 5. Proactive Broadcast if technician went online
+    // 5. Proactive Broadcast if technician went online; remove from GEO if offline
     if (availability?.isOnline === true) {
       broadcastPendingJobsToTechnician(technicianProfileId, req.io).catch(err =>
         console.error("Proactive broadcast error:", err)
       );
+    } else if (availability?.isOnline === false) {
+      // Remove from Redis GEO set so matching doesn't find stale positions
+      const { geoRemove } = await import("../Utils/technicianGeo.js");
+      geoRemove(technicianProfileId).catch(() => {});
+    }
+
+    // 🏘 ZONE RESOLUTION — assign technician to a city zone based on their location.
+    // Runs after every profile update so zone is always fresh.
+    try {
+      const freshProfile = await TechnicianProfile.findById(technicianProfileId)
+        .select("location cityZoneId")
+        .lean();
+
+      if (freshProfile?.location?.coordinates) {
+        const [lng, lat] = freshProfile.location.coordinates;
+        const { zone } = await resolveZoneFromCoordinates(lat, lng);
+        const newZoneId = zone ? zone._id : null;
+        const currentZoneId = freshProfile.cityZoneId
+          ? String(freshProfile.cityZoneId)
+          : null;
+        const newZoneIdStr = newZoneId ? String(newZoneId) : null;
+
+        if (currentZoneId !== newZoneIdStr) {
+          await TechnicianProfile.updateOne(
+            { _id: technicianProfileId },
+            {
+              $set: {
+                cityZoneId: newZoneId,
+                zoneMismatch: false,
+                zoneMismatchSince: null,
+              },
+            }
+          );
+          console.log(`🏘 Tech ${technicianProfileId} assigned to zone ${newZoneId || "none"}`);
+        }
+      }
+    } catch (zoneErr) {
+      // Zone resolution is best-effort
+      console.error("Zone resolution error:", zoneErr.message);
     }
 
     const updatedProfile = await TechnicianProfile.findById(technicianProfileId)
@@ -794,6 +938,13 @@ export const updateTechnicianStatus = async (req, res) => {
     }
 
     await technician.save();
+
+    // 🔐 Session invalidation (Socket Analysis B1.5): a suspended/deleted
+    // technician's connected sockets must be revoked NOW — their JWT claims
+    // are frozen until re-auth, so only a forced disconnect stops alerts.
+    if (workStatus === "suspended" || workStatus === "deleted") {
+      revokeSocketSession(req.io, technicianId, `workStatus: ${workStatus}`);
+    }
 
     const result = technician.toObject();
     delete result.password;
@@ -968,6 +1119,12 @@ export const updateTechnicianTraining = async (req, res) => {
     }
 
     await technician.save();
+
+    // 🔐 Session invalidation: training revocation must kill the live socket
+    // so the tech stops receiving job alerts until re-approval.
+    if (!trainingCompleted) {
+      revokeSocketSession(req.io, technicianId, "trainingCompleted: false");
+    }
 
     return res.status(200).json({
       success: true,

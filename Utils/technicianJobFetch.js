@@ -12,7 +12,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     const activeJob = await ServiceBooking.findOne({
         technicianId: techId,
-        status: { $in: ["accepted", "ACCEPTED", "on_the_way", "reached", "in_progress"] },
+        status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
     }).select("_id status");
 
     if (activeJob) return [];
@@ -35,7 +35,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     const bookings = await ServiceBooking.find({
         _id: { $in: bookingIds },
-        status: { $in: ["pending", "PENDING", "SEARCHING", "requested", "broadcasted"] },
+        status: { $in: ["pending", "broadcasted"] },
         technicianId: null,
     })
         .populate([

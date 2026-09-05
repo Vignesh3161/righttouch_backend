@@ -55,6 +55,13 @@ const ratingSchema = new mongoose.Schema(
 
 );
 
+// ── Indexes (architecture §24/§51) ──
+// Single rating per booking is enforced by the unique bookingId index.
+// Compound indexes keep rollups efficient and isolated per bookingType.
+ratingSchema.index({ technicianId: 1, bookingType: 1 });
+ratingSchema.index({ serviceId: 1, bookingType: 1 });
+ratingSchema.index({ productId: 1, bookingType: 1 });
+
 // auto label
 ratingSchema.pre("save", function (next) {
   if (this.rates >= 4) this.content = "Excellent";

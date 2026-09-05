@@ -1,39 +1,18 @@
 import mongoose from "mongoose";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
-import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
 import User from "../Schemas/User.js";
-import { notifyCustomerJobAccepted, notifyJobTaken } from "../Utils/sendNotification.js";
+import { notifyCustomerJobAccepted, notifyJobTaken, emitJobsChanged } from "../Utils/sendNotification.js";
 import { fetchTechnicianJobsInternal } from "../Utils/technicianJobFetch.js";
 import { ensureTechnician } from "../Utils/ensureTechnician.js";
+import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
+import { evaluateJobFeasibility, loadCommittedQueues } from "../Utils/technicianMatching.js";
+import { canArriveBy, computeLatestArrival, estimateTravelMinutes } from "../Utils/feasibility.js";
+import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
-/* ================= TECHNICIAN ACTIVATION CHECK ================= */
-const checkTechnicianActivation = async (technicianProfileId) => {
-  try {
-    const profile = await TechnicianProfile.findById(technicianProfileId).select("workStatus trainingCompleted profileComplete");
-    
-    if (!profile) return { isActive: false, message: "Technician profile not found" };
-
-    if (!profile.profileComplete) return { isActive: false, message: "Please complete your profile details to start receiving jobs." };
-    if (profile.workStatus !== "approved") return { isActive: false, message: `Your account status is '${profile.workStatus}'. Please wait for admin approval.` };
-    if (!profile.trainingCompleted) return { isActive: false, message: "You must complete the mandatory training before you can accept jobs." };
-
-    const kyc = await TechnicianKyc.findOne({ technicianId: technicianProfileId }).select("verificationStatus bankVerified kycVerified");
-
-    if (!kyc || (kyc.verificationStatus !== "approved" && !kyc.kycVerified)) {
-      return { isActive: false, message: "KYC verification is pending. Please check your document status." };
-    }
-
-    if (!kyc.bankVerified) {
-      return { isActive: false, message: "Bank account verification is required for job payouts." };
-    }
-
-    return { isActive: true, message: "Technician account is active" };
-  } catch (error) {
-    return { isActive: false, message: `Activation check failed: ${error.message}` };
-  }
-};
+const DISPATCH_LOCK_MS = 3000;
 
 /* ================= GET MY JOBS (LIVE FEED) ================= */
 export const getMyJobs = async (req, res) => {
@@ -105,12 +84,49 @@ export const getMyJobs = async (req, res) => {
 export const respondToJob = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
+  let dispatchLockAt = null;
   try {
     ensureTechnician(req);
     const { id } = req.params;
     const { status, response } = req.body;
     const finalStatus = (status || response || "").toLowerCase();
     const technicianProfileId = req.user.technicianProfileId;
+
+    // 🛡 Activation gate — suspended/unapproved/KYC-incomplete technicians
+    // must not accept jobs, even with a lingering "sent" broadcast record.
+    const activation = await checkTechnicianActivation(technicianProfileId);
+    if (!activation.isActive) {
+      await session.abortTransaction();
+      return res.status(403).json({
+        success: false,
+        message: activation.message,
+      });
+    }
+
+    // 🔒 Per-technician dispatch mutex (self-expiring) — serializes
+    // concurrent accept requests for the SAME technician (e.g. two
+    // schedule accepts racing through different notification channels).
+    // Auto-expires after 3s so a crashed handler can never deadlock the tech.
+    dispatchLockAt = new Date(Date.now() + DISPATCH_LOCK_MS);
+    const locked = await TechnicianProfile.findOneAndUpdate(
+      {
+        _id: technicianProfileId,
+        $or: [
+          { dispatchLockUntil: null },
+          { dispatchLockUntil: { $lte: new Date() } },
+        ],
+      },
+      { $set: { dispatchLockUntil: dispatchLockAt } },
+      { new: true, projection: { _id: 1 } }
+    ).lean();
+
+    if (!locked) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        success: false,
+        message: "Another request is being processed, please try again.",
+      });
+    }
 
     const activeJob = await ServiceBooking.findOne({
       technicianId: technicianProfileId,
@@ -143,15 +159,197 @@ export const respondToJob = async (req, res) => {
       return res.status(403).json({ success: false, message: "Job not assigned to you or already closed" });
     }
 
+    // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
+    if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
+      await session.abortTransaction();
+      // Richer 410 (Location Pipeline P1.6): give the client the expiry facts
+      // so it can show "Expired — pull to refresh" with a countdown. The
+      // rebroadcast cron runs every 10 min, so the next attempt hint is the
+      // next 10-minute boundary.
+      return res.status(410).json({
+        success: false,
+        message: "This job offer has expired. Pull to refresh your job list.",
+        reason: "offer_expired",
+        expiresAt: broadcast.expiresAt,
+        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000),
+      });
+    }
+
     if (finalStatus !== "accepted" && finalStatus !== "accept") {
       await session.abortTransaction();
       return res.status(400).json({ success: false, message: "Invalid response status" });
     }
 
+    // 📡 Version the technician is claiming — client may pass the DTO's
+    // broadcast version; otherwise use the broadcast row's version.
+    const requestedVersion =
+      Number.isInteger(req.body?.version) && req.body.version > 0
+        ? req.body.version
+        : broadcast.version || 1;
+
+    // ⏱ Candidate booking snapshot (pre-claim, same transaction)
+    const candidate = await ServiceBooking.findById(id)
+      .session(session)
+      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId");
+    if (!candidate) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    // 🎯 RE-VALIDATE ELIGIBILITY (District Permission, Service Availability, 10km Radius) AT ACCEPT TIME
+    const eligibility = await checkTechnicianEligibility({
+      technician: technicianProfileId,
+      booking: candidate,
+    });
+
+    if (!eligibility.eligible) {
+      await session.abortTransaction();
+      return res.status(403).json({
+        success: false,
+        message: "You are no longer eligible to accept this job.",
+        reasons: eligibility.reasons,
+        details: eligibility.details,
+      });
+    }
+
+    const bookingAttemptCount = Array.isArray(candidate.assignmentAttempts)
+      ? candidate.assignmentAttempts.length
+      : 0;
+
+    // ⏱ The claim must reference the current broadcast cycle.
+    if ((candidate.activeBroadcastVersion || 1) !== requestedVersion) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        success: false,
+        message: "This job was updated. Please refresh and try again.",
+      });
+    }
+
+    // ⏱ Accept-time feasibility re-check — the offer-time snapshot is stale
+    // by the time the tech taps accept (queue/location may have changed).
+    //   instant candidate + pending scheduled appointment → travel chain check
+    //   schedule candidate                        → window overlap check
+    const [techQueueMap, techProfileForCheck] = await Promise.all([
+      loadCommittedQueues([technicianProfileId]),
+      TechnicianProfile.findById(technicianProfileId)
+        .session(session)
+        .select("location"),
+    ]);
+    const techQueue = techQueueMap.get(String(technicianProfileId));
+
+    if (candidate.bookingType === "schedule") {
+      // Schedule-vs-schedule: run forward-pass travel chain (not just ±30min overlap)
+      // to ensure the technician can physically travel between slots.
+      const candidateSlot = new Date(candidate.scheduledAt).getTime();
+      const existingSchedules = (techQueue?.schedules || []).filter(
+        (s) => String(s._id) !== String(id)
+      );
+
+      if (existingSchedules.length > 0 && techProfileForCheck?.location) {
+        // Sort existing schedules by slot time
+        const sorted = [...existingSchedules].sort(
+          (a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
+        );
+
+        // Build committed queue: all existing accepted schedules
+        const committedQueue = sorted.map((s) => ({
+          location: s.location,
+          scheduledAt: s.scheduledAt,
+          estimatedDurationMinutes: 60, // default service duration
+        }));
+
+        // Check if tech can arrive at candidate after the preceding schedule
+        // and still make the following schedule
+        const candidateDeadline = computeLatestArrival(candidate.scheduledAt);
+        const techLocation = techProfileForCheck.location;
+
+        // Find the schedule that comes just before the candidate slot
+        const preceding = sorted.filter(
+          (s) => new Date(s.scheduledAt).getTime() < candidateSlot
+        );
+        const following = sorted.filter(
+          (s) => new Date(s.scheduledAt).getTime() > candidateSlot
+        );
+
+        // Feasibility: can the tech arrive at candidate by its deadline?
+        // Build a chain: [preceding schedules] -> candidate -> [following schedules]
+        const chainQueue = [...preceding.map((s) => ({
+          location: s.location,
+          scheduledAt: s.scheduledAt,
+          estimatedDurationMinutes: 60,
+        })), {
+          location: candidate.location,
+          scheduledAt: candidate.scheduledAt,
+          estimatedDurationMinutes: 60,
+        }];
+
+        // Check travel from tech to first stop, then through the chain
+        let cursor = Date.now();
+        let lastLocation = techLocation;
+
+        for (const stop of chainQueue) {
+          const travelMin = estimateTravelMinutes(lastLocation, stop.location);
+          if (travelMin == null) continue;
+          cursor += travelMin * 60 * 1000;
+
+          // Must arrive before the slot (with grace)
+          const deadline = computeLatestArrival(stop.scheduledAt);
+          if (deadline && cursor > deadline.getTime()) {
+            await session.abortTransaction();
+            return res.status(409).json({
+              success: false,
+              message: "This time slot conflicts with an appointment you already accepted.",
+            });
+          }
+
+          // Move cursor past the job duration
+          cursor += (stop.estimatedDurationMinutes || 60) * 60 * 1000;
+          lastLocation = stop.location;
+        }
+
+        // Also check that after the candidate, tech can reach following schedules
+        if (following.length > 0) {
+          for (const stop of following) {
+            const travelMin = estimateTravelMinutes(lastLocation, stop.location);
+            if (travelMin == null) continue;
+            cursor += travelMin * 60 * 1000;
+
+            const deadline = computeLatestArrival(stop.scheduledAt);
+            if (deadline && cursor > deadline.getTime()) {
+              await session.abortTransaction();
+              return res.status(409).json({
+                success: false,
+                message: "Accepting this job would make you late for a later appointment.",
+              });
+            }
+            cursor += (stop.estimatedDurationMinutes || 60) * 60 * 1000;
+            lastLocation = stop.location;
+          }
+        }
+      }
+    } else {
+      const feasibility = evaluateJobFeasibility({
+        techLocation: techProfileForCheck?.location || null,
+        candidateJob: candidate,
+        queue: techQueue,
+      });
+      if (!feasibility.feasible) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This job would make you late for your scheduled appointment.",
+          result: {
+            projectedArrival: feasibility.projectedArrival,
+            slackMinutes: feasibility.slackMinutes,
+          },
+        });
+      }
+    }
+
     // Fetch technician profile and user data for snapshot
     const technicianProfile = await TechnicianProfile.findById(technicianProfileId)
       .session(session)
-      .select("userId");
+      .select("userId location");
 
     if (!technicianProfile) {
       await session.abortTransaction();
@@ -173,15 +371,42 @@ export const respondToJob = async (req, res) => {
       deleted: false,
     };
 
-    const booking = await ServiceBooking.findOneAndUpdate(
-      { _id: id, status: { $in: ["pending", "SEARCHING", "requested", "broadcasted"] }, technicianId: null },
-      {
-        technicianId: technicianProfileId,
-        status: "ACCEPTED",
-        assignedAt: new Date(),
-        autoCancelAt: new Date(Date.now() + 30 * 60 * 1000), // 30 min window to click "On the Way"
-        technicianSnapshot
+    // 🎯 ATOMIC CLAIM — status in [pending, broadcasted], technicianId null,
+    // and the exact broadcast version the technician was offered. If the claim
+    // fails, the booking was taken or re-broadcast concurrently: conflict, no
+    // partial state changes.
+    const acceptUpdate = {
+      technicianId: technicianProfileId,
+      status: "accepted",
+      assignmentStatus: "assigned",
+      assignedAt: new Date(),
+      technicianSnapshot,
+      $push: {
+        assignmentAttempts: {
+          technicianId: technicianProfileId,
+          attemptNumber: (bookingAttemptCount || 0) + 1,
+          status: "assigned",
+          acceptedAt: new Date(),
+          feasibilitySnapshot: null,
+        },
       },
+      $inc: { version: 1 },
+    };
+
+    if (candidate.bookingType === "instant") {
+      // Instant: technician must click On The Way within 30 minutes.
+      acceptUpdate.autoCancelAt = new Date(Date.now() + 30 * 60 * 1000);
+    }
+    // Schedule: keep the slot-driven lifecycle (reminders, escalation).
+
+    const booking = await ServiceBooking.findOneAndUpdate(
+      {
+        _id: id,
+        status: { $in: ["pending", "broadcasted"] },
+        technicianId: null,
+        activeBroadcastVersion: requestedVersion,
+      },
+      acceptUpdate,
       { new: true, session }
     ).populate("customerId").populate({
       path: "serviceId",
@@ -193,7 +418,7 @@ export const respondToJob = async (req, res) => {
       return res.status(409).json({ success: false, message: "Too late! Booking already taken" });
     }
 
-    await JobBroadcast.updateOne({ bookingId: id, technicianId: technicianProfileId }, { status: "ACCEPTED" }, { session });
+    await JobBroadcast.updateOne({ bookingId: id, technicianId: technicianProfileId }, { status: "accepted" }, { session });
 
     const otherBroadcasts = await JobBroadcast.find({
       bookingId: id,
@@ -204,6 +429,29 @@ export const respondToJob = async (req, res) => {
 
     await JobBroadcast.updateMany({ bookingId: id, technicianId: { $ne: technicianProfileId } }, { status: "expired" }, { session });
 
+    // 🤝 Offer audit — accepted for this tech, superseded for everyone else (INSIDE transaction)
+    const acceptedOffer = await TechnicianBookingOffer.findOneAndUpdate(
+      { bookingId: id, technicianId: technicianProfileId },
+      { $set: { decision: "accepted", respondedAt: new Date() } },
+      { new: true, session }
+    );
+    if (acceptedOffer) {
+      await TechnicianBookingOffer.updateOne(
+        { _id: acceptedOffer._id },
+        {
+          $set: {
+            responseLatencyMs: Date.now() - new Date(acceptedOffer.offeredAt).getTime(),
+          },
+        },
+        { session }
+      );
+    }
+    await TechnicianBookingOffer.updateMany(
+      { bookingId: id, technicianId: { $ne: technicianProfileId }, decision: "offered" },
+      { $set: { decision: "superseded" } },
+      { session }
+    );
+
     await session.commitTransaction();
 
     if (req.io) {
@@ -211,10 +459,23 @@ export const respondToJob = async (req, res) => {
         notifyCustomerJobAccepted(req.io, booking.customerId._id, {
           bookingId: booking._id,
           technicianId: technicianProfileId,
-          status: "ACCEPTED"
+          status: "accepted"
         });
       }
       if (otherTechIds.length > 0) notifyJobTaken(req.io, otherTechIds, booking._id);
+
+      // Invalidate other technicians' job feed cursor (Fix #5):
+      // their lastJobsChangeAt must now exceed our get_jobs cursor so the
+      // requesting tech stops seeing this job. The NEW accepted tech's cursor
+      // is not bumped — they instead move to the accepted phase queue.
+      if (otherTechIds.length > 0) {
+        await TechnicianProfile.updateMany(
+          { _id: { $in: otherTechIds } },
+          { $set: { lastJobsChangeAt: new Date() } }
+        );
+        // 🛰 Push: other techs' feed changed (anti-polling fix)
+        otherTechIds.forEach((techId) => emitJobsChanged(req.io, techId));
+      }
     }
 
     // Remove baseAmount and include technicianAmount from service
@@ -228,6 +489,14 @@ export const respondToJob = async (req, res) => {
     console.error("respondToJob Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   } finally {
+    // 🔓 Release the dispatch mutex (only if we still own it — a queued
+    // request may have already re-acquired the lock).
+    if (dispatchLockAt) {
+      TechnicianProfile.updateOne(
+        { _id: req.user?.technicianProfileId, dispatchLockUntil: dispatchLockAt },
+        { $set: { dispatchLockUntil: new Date() } }
+      ).catch(() => {});
+    }
     session.endSession();
   }
 };

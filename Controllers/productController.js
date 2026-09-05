@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import Product from "../Schemas/Product.js";
 import Category from "../Schemas/Category.js";
+import ProductBooking from "../Schemas/ProductBooking.js";
 
 const ALLOWED_PRICING_MODELS = ["fixed", "starting_from", "after_inspection"];
 
@@ -38,6 +39,7 @@ export const createProduct = async (req, res) => {
       amcAvailable,
       amcPricePerYear,
       complianceCertificates,
+      faqs,
     } = req.body;
 
     if (!categoryId || !productName || !productType || !description) {
@@ -128,6 +130,15 @@ export const createProduct = async (req, res) => {
     const siteInspection = toBooleanOrUndefined(siteInspectionRequired);
     const amcFlag = toBooleanOrUndefined(amcAvailable);
 
+    const formattedFaqs = Array.isArray(faqs)
+      ? faqs
+          .filter((f) => f && typeof f === "object" && (f.question || f.answer))
+          .map((f) => ({
+            question: String(f.question || "").trim(),
+            answer: String(f.answer || "").trim(),
+          }))
+      : [];
+
     const product = await Product.create({
       categoryId,
       productName,
@@ -146,6 +157,7 @@ export const createProduct = async (req, res) => {
       amcAvailable: amcFlag,
       amcPricePerYear,
       complianceCertificates,
+      faqs: formattedFaqs,
       productImages: [], // 👈 images added later
     });
 
@@ -349,8 +361,14 @@ export const replaceProductImages = async (req, res) => {
 /* ================= GET ALL PRODUCTS ================= */
 export const getProduct = async (req, res) => {
   try {
-    const { search, categoryId, type, usageType, active, page = 1, limit = 20 } = req.query;
+    const { search, categoryId, type, usageType, active, page, limit } = req.query;
     let query = {};
+
+    // 🔒 Validate + normalize pagination inputs so they can't be abused with
+    // huge limits / NaN and are actually applied to the query.
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const skipNum = (pageNum - 1) * limitNum;
 
     if (categoryId !== undefined) {
       if (!mongoose.Types.ObjectId.isValid(categoryId)) {
@@ -368,21 +386,33 @@ export const getProduct = async (req, res) => {
     if (usageType) query.usageType = usageType;
 
     if (search) {
-      query.$or = [
-        { productName: { $regex: search, $options: "i" } },
-        { productType: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } },
-      ];
+      // DB-level full-text search (text index defined on the schema).
+      query.$text = { $search: search };
     }
 
+    const total = await Product.countDocuments(query);
+
     const products = await Product.find(query)
+      .select(
+        "productName productType description categoryId productImages isActive pricingModel estimatedPriceFrom estimatedPriceTo productGst usageType siteInspectionRequired createdAt faqs"
+      )
       .populate("categoryId", "category categoryType description")
-      .sort({ createdAt: -1 });
+      .sort(query.$text ? { score: { $meta: "textScore" } } : { createdAt: -1 })
+      .skip(skipNum)
+      .limit(limitNum);
 
     res.status(200).json({
       success: true,
       message: "Products fetched successfully",
-      result: products,
+      result: {
+        products,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum),
+        },
+      },
     });
   } catch (error) {
     if (res.headersSent) return;
@@ -558,6 +588,17 @@ export const updateProduct = async (req, res) => {
       updateData.amcAvailable = toBooleanOrUndefined(updateData.amcAvailable);
     }
 
+    if (updateData.hasOwnProperty("faqs")) {
+      updateData.faqs = Array.isArray(updateData.faqs)
+        ? updateData.faqs
+            .filter((f) => f && typeof f === "object" && (f.question || f.answer))
+            .map((f) => ({
+              question: String(f.question || "").trim(),
+              answer: String(f.answer || "").trim(),
+            }))
+        : [];
+    }
+
     let productImages = product.productImages;
     if (req.files && req.files.length > 0) {
       productImages = req.files.map(file => file.path);
@@ -595,6 +636,15 @@ export const deleteProduct = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid product ID format",
+        result: {},
+      });
+    }
+
+    const activeBooking = await ProductBooking.findOne({ productId: id, status: { $ne: "cancelled" } });
+    if (activeBooking) {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot delete product referenced in active bookings. Mark status as ARCHIVED or INACTIVE instead.",
         result: {},
       });
     }

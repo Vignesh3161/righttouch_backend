@@ -7,15 +7,35 @@ import Address from "../Schemas/Address.js";
 import User from "../Schemas/User.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
+import { generateRequestNumber } from "../Utils/quotationNumber.js";
+import { writeAuditLog } from "../Utils/audit.js";
 import mongoose from "mongoose";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { ensureCustomer } from "../Utils/ensureCustomer.js";
+import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import {
     SERVICE_BOOKING_STATUS,
     PRODUCT_BOOKING_STATUS,
     PAYMENT_STATUS,
 } from "../Utils/constants.js";
+import { resolveCommissionSnapshot } from "../Utils/commission.js";
+import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
+import {
+  resolveScheduleInput,
+  buildServiceBookingDoc,
+  createBookingAndOutbox,
+} from "../Utils/bookingService.js";
+import {
+  validateScheduledAtUtc,
+  validateSlot,
+  scheduleBookingWindow,
+  BUSINESS_TIMEZONE,
+  formatInBusinessTimezone,
+  localDateInBusinessTimezone,
+} from "../Utils/slots.js";
 
 
 
@@ -305,6 +325,19 @@ export const getCartByIdUnrestricted = async (req, res) => {
             });
         }
 
+        // 🔒 Ownership — a user may only read their OWN cart item
+        if (
+            req.user?.userId &&
+            cartItem.customerId &&
+            String(cartItem.customerId) !== String(req.user.userId)
+        ) {
+            return res.status(403).json({
+                success: false,
+                message: "Access denied",
+                result: {},
+            });
+        }
+
         // Populate the item (uses populate; keeps response shape the same)
         const model = cartItem.itemType === "product" ? "Product" : "Service";
         await cartItem.populate({ path: "itemId", model });
@@ -535,37 +568,29 @@ export const setCartItemSchedule = async (req, res) => {
         const rawTime = scheduledTime || timeSlot;
         const parsedTime = parseTimeString(rawTime);
 
-        // ─── Resolve Time ────────────────────────────────────────────────
+        // ─── Resolve Time (timezone-safe, same utility as GET /slots) ──────
         let finalScheduledAt = null;
+        let scheduledDateLocal = null;
+        let scheduledTimeLocal = null;
+        let timezone = null;
         if (effectiveDate && parsedTime) {
-            // Enforce Tomorrow or Day after Tomorrow
-            const now = new Date();
-
-            const tomorrow = new Date(now);
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            const tomorrowStr = tomorrow.toISOString().split("T")[0];
-
-            const dayAfter = new Date(now);
-            dayAfter.setDate(dayAfter.getDate() + 2);
-            const dayAfterStr = dayAfter.toISOString().split("T")[0];
-
-            if (effectiveDate !== tomorrowStr && effectiveDate !== dayAfterStr) {
+            const validation = validateSlot(effectiveDate, parsedTime);
+            if (!validation.valid) {
+                const { from, to } = scheduleBookingWindow();
                 return res.status(400).json({
                     success: false,
-                    message: "Scheduling is only allowed for Tomorrow or Day after Tomorrow. Please refresh slots.",
-                    result: { providedDate: effectiveDate, allowed: [tomorrowStr, dayAfterStr] },
+                    message: validation.error,
+                    result: {
+                        providedDate: effectiveDate,
+                        allowed: [from.toISOString().split("T")[0], to.toISOString().split("T")[0]],
+                    },
                 });
             }
-
-            const combined = new Date(`${effectiveDate}T${parsedTime}:00`);
-            if (isNaN(combined.getTime())) {
-                return res.status(400).json({ success: false, message: "Invalid date or time format", result: {} });
-            }
-            // Must be 30 min in future
-            if (combined <= new Date(Date.now() + 30 * 60 * 1000)) {
-                return res.status(400).json({ success: false, message: "Schedule must be at least 30 min in future", result: {} });
-            }
-            finalScheduledAt = combined;
+            finalScheduledAt = validation.scheduledAt;
+            timezone = BUSINESS_TIMEZONE;
+            const local = formatInBusinessTimezone(finalScheduledAt);
+            scheduledDateLocal = localDateInBusinessTimezone(finalScheduledAt);
+            scheduledTimeLocal = `${local.hours}:${local.minutes}`;
         } else if (scheduledAt) {
             finalScheduledAt = new Date(scheduledAt);
         }
@@ -577,7 +602,12 @@ export const setCartItemSchedule = async (req, res) => {
 
 
         const updateData = {};
-        if (finalScheduledAt) updateData.scheduledAt = finalScheduledAt;
+        if (finalScheduledAt) {
+            updateData.scheduledAt = finalScheduledAt;
+            updateData.scheduledDate = scheduledDateLocal || effectiveDate;
+            updateData.scheduledTime = scheduledTimeLocal || parsedTime;
+            updateData.timezone = timezone;
+        }
         if (faultProblem !== undefined) updateData.faultProblem = faultProblem;
 
         if (Object.keys(updateData).length === 0) {
@@ -659,7 +689,7 @@ export const removeFromCartUnrestricted = async (req, res) => {
     try {
         const { id } = req.params;
 
-        const cartItem = await Cart.findByIdAndDelete(id);
+        const cartItem = await Cart.findById(id);
 
         if (!cartItem) {
             return res.status(404).json({
@@ -668,6 +698,21 @@ export const removeFromCartUnrestricted = async (req, res) => {
                 result: {},
             });
         }
+
+        // 🔒 Ownership — a user may only delete their OWN cart item
+        if (
+            req.user?.userId &&
+            cartItem.customerId &&
+            String(cartItem.customerId) !== String(req.user.userId)
+        ) {
+            return res.status(403).json({
+                success: false,
+                message: "Access denied",
+                result: {},
+            });
+        }
+
+        await Cart.findByIdAndDelete(id);
 
         res.status(200).json({
             success: true,
@@ -742,27 +787,22 @@ export const checkout = async (req, res) => {
 
         // ─── Resolve Time ────────────────────────────────────────────────
         const now = new Date();
-        const tomorrowStart = new Date(now);
-        tomorrowStart.setDate(tomorrowStart.getDate() + 1);
-        tomorrowStart.setHours(0, 0, 0, 0);
-
-        const dayAfterEnd = new Date(now);
-        dayAfterEnd.setDate(dayAfterEnd.getDate() + 2);
-        dayAfterEnd.setHours(23, 59, 59, 999);
 
         // Use scheduledAt if provided, otherwise null (Instant)
         const finalScheduledAt = scheduledAt ? new Date(scheduledAt) : null;
 
-        // 🛡️ PRODUCTION VALIDATION: Scheduled bookings must be Tomorrow or Day after Tomorrow
+        // 🛡️ PRODUCTION VALIDATION (timezone-safe): Scheduled bookings must be
+        // Tomorrow or Day after Tomorrow in the business timezone.
         if (finalScheduledAt) {
-            if (finalScheduledAt < tomorrowStart || finalScheduledAt > dayAfterEnd) {
+            const windowCheck = validateScheduledAtUtc(finalScheduledAt, { now });
+            if (!windowCheck.valid) {
                 await session.abortTransaction();
                 return res.status(400).json({
                     success: false,
-                    message: "Scheduled bookings are only allowed for Tomorrow or Day after Tomorrow",
+                    message: windowCheck.error,
                     result: {
-                        tomorrow: tomorrowStart.toISOString().split("T")[0],
-                        dayAfter: dayAfterEnd.toISOString().split("T")[0]
+                        tomorrow: scheduleBookingWindow().from.toISOString().split("T")[0],
+                        dayAfter: scheduleBookingWindow().to.toISOString().split("T")[0]
                     },
                 });
             }
@@ -793,6 +833,18 @@ export const checkout = async (req, res) => {
                 message: locErr.message,
                 result: {},
             });
+        }
+
+        // 🏘 ZONE RESOLUTION — resolve zone from customer coordinates for service availability check.
+        let resolvedZoneId = null;
+        if (resolvedLocation.latitude && resolvedLocation.longitude) {
+            const { zone } = await resolveZoneFromCoordinates(
+                resolvedLocation.latitude,
+                resolvedLocation.longitude
+            );
+            if (zone) {
+                resolvedZoneId = zone._id;
+            }
         }
 
         // Address Snapshot for both Products and Services
@@ -849,14 +901,14 @@ export const checkout = async (req, res) => {
                     await Cart.findOneAndDelete({ _id: cartItem._id, customerId }).session(session);
                     removedItems.push({ id: cartItem.itemId, name: service?.serviceName || "Unknown Service", type: "service", reason: "not found or inactive" });
                 } else {
-                    // Check if schedule is in the past or invalid window
+                    // Check if schedule is in the past or invalid window (timezone-safe)
                     if (cartItem.scheduledAt) {
-                        const itemScheduledAt = new Date(cartItem.scheduledAt);
-                        if (itemScheduledAt < tomorrowStart || itemScheduledAt > dayAfterEnd) {
+                        const itemCheck = validateScheduledAtUtc(new Date(cartItem.scheduledAt), { now });
+                        if (!itemCheck.valid) {
                             invalidSchedules.push({
                                 id: cartItem.itemId,
                                 name: service.serviceName,
-                                currentSchedule: itemScheduledAt.toLocaleString("en-IN", {
+                                currentSchedule: new Date(cartItem.scheduledAt).toLocaleString("en-IN", {
                                     day: "2-digit", month: "short", year: "numeric",
                                     hour: "2-digit", minute: "2-digit", hour12: true
                                 })
@@ -911,7 +963,9 @@ export const checkout = async (req, res) => {
             },
             serviceBookings: [],
             productBookings: [],
+            productQuoteRequests: [],
             totalAmount: 0,
+            totalAmountPaise: 0,
         };
 
         const serviceBroadcastTasks = [];
@@ -920,132 +974,186 @@ export const checkout = async (req, res) => {
         for (const cartItem of validServiceItems) {
             const service = await Service.findById(cartItem.itemId).session(session);
 
-            // Calculate amount (using fallback to 0 to avoid NaN)
-            const baseAmount = (service.serviceCost || 0) * cartItem.quantity;
-
-            // ─── Detect scheduled vs instant per cart item ───────────────────
-            let itemScheduledAt = cartItem.scheduledAt || finalScheduledAt || null;
-            let itemBookingType = "instant";
-
-            // Classify as scheduled if > 30 min in the future
-            const minFuture = new Date(Date.now() + 30 * 60 * 1000);
-            if (itemScheduledAt && itemScheduledAt > minFuture) {
-                itemBookingType = "scheduled";
+            if (!service || !service.isActive) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    message: "Service is not active",
+                    result: {},
+                });
             }
 
-            // 🕒 PRODUCTION TIMEOUT LOGIC
-            const now = new Date();
-            let autoCancelAt = null;
-            if (itemBookingType === "instant") {
-                autoCancelAt = new Date(now.getTime() + 1 * 60 * 60 * 1000); // 1 hour for instant
-            } else if (itemScheduledAt) {
-                autoCancelAt = new Date(now.getTime() + 5 * 60 * 60 * 1000); // 5 hours after creation
+            // 🏘 ZONE-SERVICE CHECK — zone-restricted services need an active
+            // mapping in the resolved zone; non-restricted services are open.
+            if (service.zoneRestricted) {
+                if (!resolvedZoneId) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        success: false,
+                        message: `Service "${service.serviceName}" is only available in supported zones`,
+                        result: {},
+                    });
+                }
+                const mapping = await ZoneServiceMapping.findOne({
+                    zoneId: resolvedZoneId,
+                    serviceId: cartItem.itemId,
+                    active: true,
+                }).session(session).lean();
+                if (!mapping) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        success: false,
+                        message: `Service "${service?.serviceName || cartItem.itemId}" is not available in your area`,
+                        result: {},
+                    });
+                }
             }
 
-            const initialStatus = "pending"; // Atomic pending Status
-            // ─────────────────────────────────────────────────────────────────
+            // ─── Resolve schedule per item (same utility as GET /slots) ─────
+            let schedule;
+            if (cartItem.scheduledDate && cartItem.scheduledTime) {
+                schedule = resolveScheduleInput(cartItem, { now });
+            } else if (cartItem.scheduledAt) {
+                const check = validateScheduledAtUtc(new Date(cartItem.scheduledAt), { now });
+                schedule = check.valid
+                    ? { bookingType: "schedule", scheduledAt: check.scheduledAt, timezone: check.timezone, scheduledDateLocal: check.scheduledDateLocal, scheduledTimeLocal: check.scheduledTimeLocal }
+                    : { bookingType: "schedule", error: check.error };
+            } else {
+                schedule = { bookingType: "instant", scheduledAt: null, timezone: null, scheduledDateLocal: null, scheduledTimeLocal: null };
+            }
 
-            const serviceBookingDoc = {
+            if (schedule.error) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    message: schedule.error,
+                    result: {},
+                });
+            }
+
+            // 💰 SERVER-SIDE SPLIT — canonical financial snapshot per cart item.
+            const doc = await buildServiceBookingDoc({
+                service,
+                resolvedLocation,
+                schedule,
+                tipAmountRupees: Math.max(toFiniteNumber(cartItem?.tipAmount) || 0, 0),
                 customerId,
-                serviceId: cartItem.itemId,
-                bookingType: itemBookingType === "scheduled" ? "schedule" : "instant",
-                baseAmount,
-                address: addressSnapshot.addressLine,
-                addressId: resolvedLocation.addressId || null,
-                scheduledAt: itemScheduledAt,
-                faultProblem: cartItem.faultProblem || req.body.faultProblem || null,
-                status: initialStatus,
-                broadcastStartedAt: now,
-                autoCancelAt: autoCancelAt,
+                quantity: cartItem.quantity || 1,
+                cityZoneId: resolvedZoneId,
+            });
 
-                locationType: resolvedLocation.locationType,
-                addressSnapshot: addressSnapshot,
-            };
-
-            // Only add location if coordinates are valid numbers to avoid schema validation errors
-            if (resolvedLocation.longitude !== null && resolvedLocation.latitude !== null) {
-                serviceBookingDoc.location = {
-                    type: "Point",
-                    coordinates: [resolvedLocation.longitude, resolvedLocation.latitude],
-                };
+            // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.
+            const docTotalPaise = toPaise(doc.financialSnapshot?.totalAmountPaise);
+            if (!isPayableTotalPaise(docTotalPaise)) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    message: `Minimum payable amount is ₹1 (booking total is ₹${(docTotalPaise / 100).toFixed(2)})`,
+                    result: {},
+                });
             }
 
-            const serviceBooking = await ServiceBooking.create([serviceBookingDoc], { session });
+            const { booking } = await createBookingAndOutbox({ doc, session });
 
             // Always broadcast immediately for both Instant and Scheduled in new flow
-            serviceBroadcastTasks.push({ bookingId: serviceBooking[0]._id });
+            serviceBroadcastTasks.push({ bookingId: booking._id });
 
             bookingResults.serviceBookings.push({
-                bookingId: serviceBooking[0]._id,
+                bookingId: booking._id,
                 serviceId: cartItem.itemId,
                 serviceName: service.serviceName,
                 quantity: cartItem.quantity,
-                baseAmount,
-                status: initialStatus,
+                baseAmount: doc.baseAmount,
+                status: "pending",
             });
 
-            bookingResults.totalAmount += baseAmount;
+            // Accumulate the GST-inclusive, paise-based total from the canonical
+            // financial snapshot (base + GST + tip) — NOT the ex-GST baseAmount,
+            // so service and product lines reconcile to the same definition.
+            bookingResults.totalAmountPaise += toPaise(doc.financialSnapshot?.totalAmountPaise);
         }
 
-        // Create Product Bookings
-        for (const cartItem of validProductItems) {
-            const product = await Product.findById(cartItem.itemId).session(session);
+        // Create ProductQuoteRequest instead of ProductBooking for product items
+        if (validProductItems.length > 0) {
+            const firstCartItem = validProductItems[0];
+            const primaryProduct = await Product.findById(firstCartItem.itemId).session(session);
+            const userProfile = await User.findById(customerId).select("fname lname mobileNumber email").session(session);
 
-            // Calculate amount with discount and GST
-            // Use estimatedPriceFrom or productPrice as fallback (Product schema has no productPrice)
-            const basePrice = (product.productPrice || product.estimatedPriceFrom || 0) * cartItem.quantity;
-            const discountAmount =
-                (basePrice * (product.productDiscountPercentage || 0)) / 100;
-            const discountedPrice = basePrice - discountAmount;
-            const gstAmount = (discountedPrice * (product.productGst || 0)) / 100;
-            const finalAmount = discountedPrice + gstAmount;
+            const requestNumber = await generateRequestNumber();
+            const quoteItems = validProductItems.map(item => ({
+                productId: item.itemId,
+                quantity: item.quantity || 1
+            }));
 
-            const productBookingDoc = {
-                productId: cartItem.itemId,
-                customerId, // Field renamed in schema to match consistency
-                amount: isNaN(finalAmount) ? 0 : finalAmount,
-                quantity: cartItem.quantity,
-                paymentStatus: PAYMENT_STATUS.PENDING,
-                status: PRODUCT_BOOKING_STATUS.ACTIVE,
+            const totalProductQty = validProductItems.reduce((acc, item) => acc + (item.quantity || 1), 0);
 
-                locationType: resolvedLocation.locationType,
+            const reqDesc = [
+                req.body?.requirementDescription,
+                req.body?.requirements,
+                req.body?.productRequirements,
+                req.body?.capacity ? `Capacity: ${req.body.capacity}` : null,
+                req.body?.usage ? `Usage: ${req.body.usage}` : null,
+            ].filter(Boolean).join(" | ");
+
+            const quoteReqDoc = {
+                requestNumber,
+                customerId,
+                productId: firstCartItem.itemId,
+                items: quoteItems,
+                customerSnapshot: {
+                    name: addressSnapshot.name || [userProfile?.fname, userProfile?.lname].filter(Boolean).join(" ").trim(),
+                    phone: addressSnapshot.phone || userProfile?.mobileNumber,
+                    email: userProfile?.email || undefined,
+                },
+                productSnapshot: {
+                    productName: primaryProduct?.productName || "Requested Product",
+                    productType: primaryProduct?.productType || "Appliance",
+                    imageUrl: primaryProduct?.productImages?.[0] || null,
+                },
+                quantity: totalProductQty,
+                locationType: resolvedLocation.locationType || "saved",
                 addressSnapshot: addressSnapshot,
+                requirementDescription: reqDesc ? reqDesc.slice(0, 5000) : undefined,
+                additionalNotes: req.body?.additionalNotes ? String(req.body.additionalNotes).slice(0, 2000) : undefined,
+                preferredContactMethod: req.body?.preferredContactMethod || "whatsapp",
+                status: "quote_requested",
             };
 
-            // Only add location if coordinates are valid numbers
             if (resolvedLocation.longitude !== null && resolvedLocation.latitude !== null) {
-                productBookingDoc.location = {
+                quoteReqDoc.location = {
                     type: "Point",
                     coordinates: [resolvedLocation.longitude, resolvedLocation.latitude],
                 };
             }
 
-            const productBooking = await ProductBooking.create([productBookingDoc], { session });
+            const createdQuoteReqs = await ProductQuoteRequest.create([quoteReqDoc], { session });
+            const quoteRequest = createdQuoteReqs[0];
 
-            bookingResults.productBookings.push({
-                bookingId: productBooking[0]._id,
-                productId: cartItem.itemId,
-                productName: product.productName,
-                quantity: cartItem.quantity,
-                basePrice,
-                discount: discountAmount,
-                gst: gstAmount,
-                finalAmount: isNaN(finalAmount) ? 0 : finalAmount,
-                paymentStatus: PAYMENT_STATUS.PENDING,
+            bookingResults.productQuoteRequests.push({
+                requestId: quoteRequest._id,
+                requestNumber: quoteRequest.requestNumber,
+                status: quoteRequest.status,
+                itemsCount: validProductItems.length,
             });
+            bookingResults.productQuoteRequest = quoteRequest;
 
-            bookingResults.totalAmount += (isNaN(finalAmount) ? 0 : finalAmount);
+            await writeAuditLog({
+                actor: customerId,
+                actorRole: "customer",
+                action: "QUOTE_REQUEST_CREATED_VIA_CHECKOUT",
+                targetType: "ProductQuoteRequest",
+                targetId: quoteRequest._id,
+                after: { requestNumber, itemsCount: validProductItems.length, status: "quote_requested" },
+            });
         }
 
-        // Clear the cart only after all bookings are created successfully
+        // Clear the cart only after all items are processed successfully
         await Cart.deleteMany({ customerId }).session(session);
 
         await session.commitTransaction();
 
         // 7️⃣ Post-Transaction: Broadcast Jobs (Safe & Smart)
-        // We do this OUTSIDE the transaction because it involves heavy logic/sockets
         if (serviceBroadcastTasks.length > 0) {
-            // Run in background (fire & forget) or await if you want to report status
             (async () => {
                 for (const task of serviceBroadcastTasks) {
                     await matchAndBroadcastBooking(task.bookingId, req.io);
@@ -1053,17 +1161,29 @@ export const checkout = async (req, res) => {
             })();
         }
 
-        const firstBookingId =
+        let responseMessage = "Order placed successfully";
+        if (validServiceItems.length > 0 && validProductItems.length > 0) {
+            responseMessage = "Service booking confirmed and product quotation request submitted successfully";
+        } else if (validProductItems.length > 0) {
+            responseMessage = "Product quotation request submitted successfully. Admin will review and send your quotation.";
+        } else if (validServiceItems.length > 0) {
+            responseMessage = "Service booking confirmed successfully";
+        }
+
+        const firstId =
             bookingResults.serviceBookings?.[0]?.bookingId ||
-            bookingResults.productBookings?.[0]?.bookingId;
+            bookingResults.productQuoteRequests?.[0]?.requestId;
+
+        bookingResults.totalAmount = bookingResults.totalAmountPaise / 100;
 
         return res.status(200).json({
             success: true,
-            message: "Order placed successfully",
+            message: responseMessage,
             result: {
                 ...bookingResults,
-                _id: firstBookingId, // 👈 For frontend compatibility
-                bookingId: firstBookingId,
+                _id: firstId,
+                bookingId: firstId,
+                requestId: bookingResults.productQuoteRequests?.[0]?.requestId,
             },
         });
     } catch (error) {
