@@ -475,34 +475,34 @@ const startBackgroundWorkers = async () => {
   startBookingOutboxWorker(io);
 
   // 🗺 Redis GEO layer (best-effort — matching falls back to Mongo if absent)
-  ensureGeoConnected().catch(() => {});
+  ensureGeoConnected().catch(() => { });
 
-   // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
+  // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
   initPaymentCrons();
 
   // 💳 Customer payment-management: attempt expiry sweeper + real-time status worker
   startAttemptExpirySweeper();
   startPaymentNotificationWorker();
 
-   // 🧾 Refund / complaint engine crons
-   const refundPolicy = await getRefundPolicy();
-   setInterval(() => refundWorker(25).catch((e) => console.error("[RefundWorker]", e.message)), 30 * 1000).unref?.();
-   setInterval(() => reconcileRefunds().catch((e) => console.error("[RefundReconcile]", e.message)), 5 * 60 * 1000).unref?.();
-   setInterval(() => classARefundScanner().catch((e) => console.error("[ClassAScanner]", e.message)), 2 * 60 * 1000).unref?.();
-   setInterval(() => complaintSlaEscalation().catch((e) => console.error("[ComplaintSLA]", e.message)), 60 * 60 * 1000).unref?.();
-   setInterval(
-     () => releaseExpiredHolds(refundPolicy.COMPLAINT_HOLD_MAX_HOURS).catch((e) => console.error("[ReserveFreezeExpiry]", e.message)),
-     15 * 60 * 1000
-   ).unref?.();
+  // 🧾 Refund / complaint engine crons
+  const refundPolicy = await getRefundPolicy();
+  setInterval(() => refundWorker(25).catch((e) => console.error("[RefundWorker]", e.message)), 30 * 1000).unref?.();
+  setInterval(() => reconcileRefunds().catch((e) => console.error("[RefundReconcile]", e.message)), 5 * 60 * 1000).unref?.();
+  setInterval(() => classARefundScanner().catch((e) => console.error("[ClassAScanner]", e.message)), 2 * 60 * 1000).unref?.();
+  setInterval(() => complaintSlaEscalation().catch((e) => console.error("[ComplaintSLA]", e.message)), 60 * 60 * 1000).unref?.();
+  setInterval(
+    () => releaseExpiredHolds(refundPolicy.COMPLAINT_HOLD_MAX_HOURS).catch((e) => console.error("[ReserveFreezeExpiry]", e.message)),
+    15 * 60 * 1000
+  ).unref?.();
 
-   // 🔔 Central notification system (outbox → socket + FCM push; SMS for OTP)
-   startNotificationWorker(5000);
+  // 🔔 Central notification system (outbox → socket + FCM push; SMS for OTP)
+  startNotificationWorker(5000);
 
-   // 📝 Quotation delivery worker (outbox → in_app + WhatsApp) + expiry sweeper
-   setInterval(() => processQuotationDeliveries(25).catch((e) => console.error("[QuotationDelivery]", e.message)), 30 * 1000).unref?.();
-   setInterval(() => expireQuotations().catch((e) => console.error("[QuotationExpiry]", e.message)), 60 * 60 * 1000).unref?.();
+  // 📝 Quotation delivery worker (outbox → in_app + WhatsApp) + expiry sweeper
+  setInterval(() => processQuotationDeliveries(25).catch((e) => console.error("[QuotationDelivery]", e.message)), 30 * 1000).unref?.();
+  setInterval(() => expireQuotations().catch((e) => console.error("[QuotationExpiry]", e.message)), 60 * 60 * 1000).unref?.();
 
-   console.log("✅ Background workers & crons started after Mongo connection.");
+  console.log("✅ Background workers & crons started after Mongo connection.");
 };
 
 const connectToMongo = async () => {
@@ -674,4 +674,4 @@ const shutdown = async (signal) => {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-// Reloaded district routes mapping
+// Reloaded district routes mapping

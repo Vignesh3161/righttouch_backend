@@ -137,14 +137,12 @@ const ProductBookingSchema = new mongoose.Schema(
     quotationId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Quotation",
-      index: true,
     },
     // Groups the bookings produced from one (possibly multi-product) quotation
     // so they can be paid via a single payment order.
     paymentGroupId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "PaymentGroup",
-      index: true,
     },
     quoteRequestId: {
       type: mongoose.Schema.Types.ObjectId,

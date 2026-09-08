@@ -636,7 +636,6 @@ export const findEligibleTechniciansForService = async ({
 
   let approvedKycQuery = TechnicianKyc.find({
     verificationStatus: "approved",
-    bankVerified: true,
   }).select("technicianId");
   if (session) approvedKycQuery = approvedKycQuery.session(session);
   const approvedKyc = await approvedKycQuery;

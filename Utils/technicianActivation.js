@@ -37,10 +37,6 @@ export const checkTechnicianActivation = async (technicianProfileId) => {
       return { isActive: false, message: "KYC verification is pending. Please check your document status." };
     }
 
-    if (!kyc.bankVerified) {
-      return { isActive: false, message: "Bank account verification is required for job payouts." };
-    }
-
     return { isActive: true, message: "Technician account is active" };
   } catch (error) {
     return { isActive: false, message: `Activation check failed: ${error.message}` };

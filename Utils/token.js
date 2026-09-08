@@ -10,7 +10,7 @@ import jwt from "jsonwebtoken";
 //    This lets you turn on strict binding without a forced re-login of every
 //    user.
 const ALGORITHM = "HS256";
-const TOKEN_TTL = "30d";
+const TOKEN_TTL = process.env.JWT_EXPIRES_IN || "30d";
 
 const issuer = process.env.JWT_ISSUER || undefined;
 const audience = process.env.JWT_AUDIENCE || undefined;

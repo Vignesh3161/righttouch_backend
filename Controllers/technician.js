@@ -145,8 +145,8 @@ const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
       }
     }
 
-    // Active = KYC + Bank + Training all approved
-    techObj.isActiveTechnician = isKycApproved && isBankVerified && isTrainingCompleted;
+    // Active = KYC + Training approved (Bank verification is for payouts)
+    techObj.isActiveTechnician = isKycApproved && isTrainingCompleted;
 
     return techObj;
   } catch (error) {

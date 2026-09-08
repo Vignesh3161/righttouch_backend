@@ -6,11 +6,11 @@ import https from "node:https";
 ========================= */
 
 const getRazorpayXKeys = () => {
-    const key_id = process.env.RAZORPAY_X_KEY_ID;
-    const key_secret = process.env.RAZORPAY_X_KEY_SECRET;
+    const key_id = (process.env.RAZORPAY_X_KEY_ID || process.env.RAZORPAY_KEY_ID || "").trim();
+    const key_secret = (process.env.RAZORPAY_X_KEY_SECRET || process.env.RAZORPAY_KEY_SECRET || "").trim();
 
     if (!key_id || !key_secret) {
-        throw new Error("Razorpay X keys not configured");
+        throw new Error("Razorpay / RazorpayX keys not configured");
     }
 
     return { key_id, key_secret };

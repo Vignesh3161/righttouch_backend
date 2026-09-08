@@ -73,7 +73,6 @@ const withdrawalRequestSchema = new mongoose.Schema(
     clientIdempotencyKey: {
       type: String,
       default: null,
-      sparse: true,
     },
 
     // initiatedBy tracks who/what started this payout.

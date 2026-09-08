@@ -819,7 +819,7 @@ export const verifyTechnicianKyc = async (req, res) => {
     const plainIdentity = decryptIdentityFields(kyc, dek);
     const plainBank = decryptBankDetails(kyc.bankDetails, dek);
 
-    // CHECK BEFORE APPROVAL - Validate all required documents and bank details
+    // CHECK BEFORE APPROVAL - Validate all required identity documents
     if (status === "approved") {
       const missingFields = [];
 
@@ -833,22 +833,14 @@ export const verifyTechnicianKyc = async (req, res) => {
       if (!plainIdentity.drivingLicenseNumber) missingFields.push("Driving License Number");
       if (!kyc.documents?.dlUrl || kyc.documents.dlUrl.length === 0) missingFields.push("Driving License Images");
 
-      // Check Bank Details & UPI ID (Both Bank Account and UPI ID required)
-      if (!plainBank?.accountHolderName) missingFields.push("Account Holder Name");
-      if (!plainBank?.bankName) missingFields.push("Bank Name");
-      if (!plainBank?.accountNumber) missingFields.push("Account Number");
-      if (!plainBank?.ifscCode) missingFields.push("IFSC Code");
-      if (!plainBank?.branchName) missingFields.push("Branch Name");
-      if (!plainBank?.upiId) missingFields.push("UPI ID");
-
-      // If any required field is missing, reject the approval
+      // If any required identity field is missing, reject the approval
       if (missingFields.length > 0) {
         return res.status(400).json({
           success: false,
-          message: "Cannot approve KYC. Missing required fields",
+          message: "Cannot approve KYC. Missing required identity documents",
           result: {
             missingFields: missingFields,
-            details: "Please ensure all documents (Aadhaar, PAN, Driving License with images), Bank details (Account Holder Name, Bank Name, Account Number, IFSC Code, Branch Name) AND UPI ID are complete before approval."
+            details: "Please ensure all documents (Aadhaar, PAN, Driving License with images) are complete before approval."
           },
         });
       }
@@ -862,33 +854,15 @@ export const verifyTechnicianKyc = async (req, res) => {
     kyc.verifiedBy = req.user.userId;
 
     if (status === "approved") {
-      // Training is a hard prerequisite for bank auto-verification —
-      // keep this consistent with verifyBankDetails.
+      // Training is a prerequisite for KYC approval
       const technicianProfile = await TechnicianProfile.findById(technicianId).select("trainingCompleted");
       if (!technicianProfile || !technicianProfile.trainingCompleted) {
         return res.status(400).json({
           success: false,
-          message: "Technician must complete training before KYC/bank approval",
+          message: "Technician must complete training before KYC approval",
           result: { trainingCompleted: false },
         });
       }
-
-      if (plainBank && plainBank.accountNumber) {
-        kyc.bankVerified = true;
-        kyc.bankUpdateRequired = false;
-        kyc.bankVerifiedAt = new Date();
-        kyc.bankVerifiedBy = req.user.userId;
-        kyc.bankVerificationStatus = "approved";
-        kyc.bankEditableUntil = null;
-        kyc.bankRejectionReason = null;
-        // Capture the exact details that were verified — any later drift
-        // invalidates this approval (checked before every payout).
-        kyc.bankDetailsFingerprint = fingerprintBankDetails(plainBank);
-      }
-    } else {
-      kyc.bankVerified = false;
-      kyc.bankUpdateRequired = true;
-      kyc.bankVerificationStatus = "pending";
     }
 
     await kyc.save();
