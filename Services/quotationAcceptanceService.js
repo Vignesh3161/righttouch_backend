@@ -54,16 +54,16 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
     err.code = "QUOTATION_DRAFT_NOT_ACCEPTED";
     throw err;
   }
-  if (existingQuote.status === "expired" || (existingQuote.validUntil && new Date(existingQuote.validUntil) < new Date())) {
-    const err = new ConflictError("Quotation has expired");
-    err.code = "QUOTATION_EXPIRED";
-    throw err;
-  }
-  if (existingQuote.status === "accepted") {
+  if (existingQuote.status === "accepted" || existingQuote.status === "converted") {
     const existingBookings = await ProductBooking.find({ quotationId });
     if (existingBookings.length > 0) {
       return { bookings: existingBookings, paymentGroupId: existingBookings[0]?.paymentGroupId };
     }
+  }
+  if (existingQuote.status === "expired" || (existingQuote.validUntil && new Date(existingQuote.validUntil) < new Date())) {
+    const err = new ConflictError("Quotation has expired");
+    err.code = "QUOTATION_EXPIRED";
+    throw err;
   }
 
   const session = await mongoose.startSession();
@@ -71,21 +71,24 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
   try {
     await session.withTransaction(async () => {
       const now = new Date();
-      const quote = await Quotation.findOneAndUpdate(
-        {
-          _id: quotationId,
-          status: { $in: ["sent", "viewed", "accepted"] },
-        },
-        { $set: { status: "accepted", acceptedAt: now }, $inc: { version: 1 } },
-        { new: true, session }
-      );
+      const quote = await Quotation.findOne({
+        _id: quotationId,
+        status: { $in: ["sent", "viewed", "accepted"] },
+      }).session(session);
       if (!quote) throw new ConflictError("Quotation is unavailable or expired");
-      if (quote.validUntil && new Date(quote.validUntil) < now) {
-        quote.status = "expired";
+
+      if (quote.status !== "accepted") {
+        if (quote.validUntil && new Date(quote.validUntil) < now) {
+          quote.status = "expired";
+          await quote.save({ session });
+          const err = new ConflictError("Quotation has expired");
+          err.code = "QUOTATION_EXPIRED";
+          throw err;
+        }
+        quote.status = "accepted";
+        quote.acceptedAt = now;
+        quote.version = (quote.version || 0) + 1;
         await quote.save({ session });
-        const err = new ConflictError("Quotation has expired");
-        err.code = "QUOTATION_EXPIRED";
-        throw err;
       }
 
       // Multi-product: decide which items are accepted.

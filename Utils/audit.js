@@ -7,8 +7,8 @@ import AuditLog from "../Schemas/AuditLog.js";
 export const writeAuditLog = async ({
   actor = null,
   actorRole = null,
-  action,
-  targetType,
+  action = "SYSTEM_ACTION",
+  targetType = "System",
   targetId = null,
   before = null,
   after = null,
@@ -17,20 +17,22 @@ export const writeAuditLog = async ({
   session = null,
 }) => {
   try {
-    await AuditLog.create(
-      {
-        actor,
-        actorRole,
-        action,
-        targetType,
-        targetId,
-        before,
-        after,
-        reason,
-        metadata,
-      },
-      session ? { session } : {}
-    );
+    const doc = {
+      actor,
+      actorRole,
+      action: action || "SYSTEM_ACTION",
+      targetType: targetType || "System",
+      targetId,
+      before,
+      after,
+      reason,
+      metadata,
+    };
+    if (session) {
+      await AuditLog.create([doc], { session });
+    } else {
+      await AuditLog.create(doc);
+    }
   } catch (err) {
     console.error("[AuditLog] write failed:", err.message);
   }

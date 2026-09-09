@@ -12,8 +12,6 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
-# Service Accounts & Credentials
-serverAccount.json
 
 # Logs
 logs

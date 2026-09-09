@@ -89,7 +89,7 @@ const sendWhatsapp = async (delivery, quotation) => {
     return;
   }
   try {
-    const { default: sendWhatsapp } = await import("./sendWhatsapp.js");
+    const { default: sendWhatsapp } = await import("../Utils/sendWhatsapp.js");
     // sendWhatsapp util currently expects an OTP body; we send the quotation text.
     const client = (await import("twilio")).default(
       process.env.TWILIO_SID_WHATSAPP,

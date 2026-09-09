@@ -34,7 +34,7 @@ const QUOTE_REQUEST_TRANSITIONS = {
   quotation_prepared: ["under_review", "quotation_sent", "quoted", "cancelled"],
   quotation_sent: ["viewed", "accepted", "rejected", "declined", "cancelled", "expired", "under_review", "quotation_prepared"],
   viewed: ["quotation_sent", "accepted", "rejected", "declined", "cancelled", "expired", "under_review", "quotation_prepared"],
-  accepted: ["expired"], // terminal-ish; conversion is tracked on the Quotation
+  accepted: [], // terminal: once accepted, quotation lifecycle is converted to order and does not expire
   rejected: ["under_review", "quote_requested", "quotation_prepared", "quotation_sent"],
   declined: ["under_review", "quote_requested", "quotation_prepared", "quotation_sent"],
   cancelled: [],

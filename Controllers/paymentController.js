@@ -252,7 +252,7 @@ export const createPaymentOrder = async (req, res) => {
       !snapshot ||
       snapshot.totalAmountPaise == null ||
       snapshot.calculationVersion == null ||
-      toPaise(snapshot.totalAmountPaise) <= 0
+      toPaise(snapshot.totalAmountPaise) < 0
     ) {
       // Auto-reconstruct financial snapshot on the fly if valid amount exists on booking/quotation
       const rupees = toMoney(
@@ -260,12 +260,13 @@ export const createPaymentOrder = async (req, res) => {
         booking.amount ??
         booking.finalAmount ??
         booking.pricing?.totalAmount ??
-        (booking.totalAmountPaise ? booking.totalAmountPaise / 100 : null)
+        (booking.totalAmountPaise ? booking.totalAmountPaise / 100 : null) ??
+        (booking.amountPaise ? booking.amountPaise / 100 : null)
       );
 
-      if (rupees && rupees > 0) {
-        const totalPaise = toPaise(rupees);
-        const basePaise = toPaise(booking.baseAmount ?? rupees);
+      if (rupees != null && rupees >= 0) {
+        const totalPaise = toPaise(rupees * 100);
+        const basePaise = toPaise(booking.baseAmount != null ? booking.baseAmount * 100 : totalPaise);
         const gstPaise = totalPaise > basePaise ? totalPaise - basePaise : 0;
 
         snapshot = {
@@ -279,7 +280,7 @@ export const createPaymentOrder = async (req, res) => {
           totalAmountPaise: totalPaise,
           calculationVersion: 1,
           computedAt: new Date(),
-          isFree: false
+          isFree: totalPaise === 0
         };
 
         booking.financialSnapshot = snapshot;
@@ -473,10 +474,13 @@ export const createPaymentOrder = async (req, res) => {
     // Amount is returned in PAISE (as Razorpay Checkout SDK expects).
     return ok(res, 201, "Payment order created", {
       keyId: (process.env.RAZORPAY_KEY_ID || "").trim(),
+      key: (process.env.RAZORPAY_KEY_ID || "").trim(),
       orderId: payment.providerOrderId,
+      razorpayOrderId: payment.providerOrderId,
+      id: payment.providerOrderId,
       amount: snapshotTotalPaise,
       amountInRupees: snapshotTotalPaise / 100,
-      currency: payment.currency,
+      currency: payment.currency || "INR",
       paymentId: payment._id,
       split: {
         serviceAmountPaise: toPaise(snapshot.baseAmountPaise),
@@ -684,15 +688,16 @@ export const razorpayWebhook = async (req, res) => {
 
     const payment = await Payment.findOne({ providerOrderId: orderId }).lean();
 
-    if (event.event === "payment.captured") {
+    if (event.event === "payment.captured" || event.event === "order.paid") {
       if (!payment) return ok(res, 200, "Payment not found for order");
 
       // 🔒 Amount guard — never book a partial/mismatched capture as success.
       // entity.amount is in PAISE; markPaymentSucceeded compares it against
       // Payment.totalAmountPaise and flags manual_review on mismatch.
+      const providerAmount = entity?.amount_paid || entity?.amount;
       const transition = await markPaymentSucceeded(payment._id, {
         providerPaymentId,
-        providerAmountPaise: toMoney(entity?.amount),
+        providerAmountPaise: toMoney(providerAmount),
         source: "webhook",
       });
       eventRecord.eventType = `${eventRecord.eventType}:applied`;
@@ -703,7 +708,7 @@ export const razorpayWebhook = async (req, res) => {
       if (!transition.alreadyProcessed) {
         await notifyPaymentSucceeded(req, payment);
       }
-      return ok(res, 200, "Payment captured");
+      return ok(res, 200, "Payment captured and settled");
     }
 
     if (event.event === "payment.failed") {
