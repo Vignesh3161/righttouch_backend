@@ -5,6 +5,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import ProductBooking from "../Schemas/ProductBooking.js";
 import Quotation from "../Schemas/Quotation.js";
 import ReconciliationException from "../Schemas/ReconciliationException.js";
+import { acceptQuotation } from "../Services/quotationAcceptanceService.js";
 import { settleBookingEarningsIfEligible } from "./settlement.js";
 import { writeAuditLog } from "./audit.js";
 import { postPaymentLedgerEntries } from "./ledger.js";
@@ -99,6 +100,12 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
   payment.failureReason = null;
   await payment.save(session ? { session } : {});
 
+  const effectivePaymentId = providerPaymentId || payment.providerPaymentId || payment._id;
+  console.log(`[PAYMENT] source=${source}`);
+  console.log(`[PAYMENT] orderId=${payment.providerOrderId || 'N/A'}`);
+  console.log(`[PAYMENT] bookingId=${payment.bookingId}`);
+  console.log(`[PAYMENT] paymentId=${effectivePaymentId}`);
+
   const updatePayload = {
     paymentStatus: "paid",
     paidAmount: toPaise(payment.totalAmountPaise) / 100 || payment.totalAmount || 0,
@@ -123,14 +130,16 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
     );
 
     if (pbResult.matchedCount > 0) {
+      console.log("[PAYMENT] ProductBooking → paid");
       // Also update linked Quotation if this ProductBooking has a quotationId
       const pb = await ProductBooking.findById(payment.bookingId).select("quotationId paymentGroupId").session(session || undefined);
       if (pb?.quotationId) {
         await Quotation.updateOne(
           { _id: pb.quotationId },
-          { $set: { paymentStatus: "paid" } },
+          { $set: { paymentStatus: "paid", status: "accepted" } },
           session ? { session } : {}
         );
+        console.log("[PAYMENT] Quotation → paid & accepted");
         // Sync any sibling ProductBookings sharing the same quotationId
         await ProductBooking.updateMany(
           { quotationId: pb.quotationId, _id: { $ne: pb._id } },
@@ -142,16 +151,18 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
       // Direct quotation payment fallback: payment.bookingId is a Quotation._id
       const qResult = await Quotation.updateOne(
         { _id: payment.bookingId },
-        { $set: { paymentStatus: "paid" } },
+        { $set: { paymentStatus: "paid", status: "accepted" } },
         session ? { session } : {}
       );
       if (qResult.matchedCount > 0) {
-        // Update all ProductBookings linked to this Quotation
+        console.log("[PAYMENT] Quotation → paid & accepted");
+        // Update any ProductBookings linked to this Quotation
         await ProductBooking.updateMany(
           { quotationId: payment.bookingId },
           { $set: updatePayload },
           session ? { session } : {}
         );
+        console.log("[PAYMENT] ProductBooking → paid");
       }
     }
   }
@@ -292,6 +303,28 @@ export const markPaymentSucceeded = async (
       itemType: result.payment.itemType || "service",
       source,
     });
+
+    // 🔒 Quotation Acceptance (Accept after only pay): If this payment was for a Quotation, ensure ProductBooking is created
+    const payItemType = result.payment.itemType;
+    const isQuotePay = payItemType === "quotation" || (await Quotation.exists({ _id: result.payment.bookingId }));
+    if (isQuotePay) {
+      const qId = result.payment.bookingId;
+      const existingPbCount = await ProductBooking.countDocuments({ quotationId: qId });
+      if (existingPbCount === 0) {
+        const qDoc = await Quotation.findById(qId);
+        if (qDoc) {
+          try {
+            await acceptQuotation({
+              quotationId: qDoc._id,
+              customerId: qDoc.customerId,
+            });
+            console.log("[PAYMENT] Created ProductBooking via acceptQuotation after payment commit");
+          } catch (acceptErr) {
+            console.error("[PAYMENT] acceptQuotation after commit failed:", acceptErr);
+          }
+        }
+      }
+    }
   }
 
   return result;

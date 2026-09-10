@@ -86,8 +86,18 @@ const reportSchema = new mongoose.Schema(
 
     resolutionNote: { type: String, default: null },
 
+    // Technician Response & Evidence
+    technicianResponse: { type: String, default: null },
+    technicianImages: { type: [String], default: [] },
+    technicianRespondedAt: { type: Date, default: null },
+
+    // Customer Withdrawal
+    withdrawnAt: { type: Date, default: null },
+    withdrawalReason: { type: String, default: null },
+
     // SLA deadline for admin response (complaintSlaCron escalates past this).
     slaDeadline: { type: Date, default: null },
+    slaBreached: { type: Boolean, default: false },
 
     // Whether the complaint froze a reserve hold (audit trail).
     frozeReserve: { type: Boolean, default: false },

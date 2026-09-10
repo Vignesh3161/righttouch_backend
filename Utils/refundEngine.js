@@ -59,7 +59,7 @@ const getBookingParties = async (bookingId, itemType) => {
     } catch {}
   }
   const sb = await ServiceBooking.findById(bookingId).lean();
-  if (sb) return { technicianId: sb.technicianId || null, customerId: sb.userId || null };
+  if (sb) return { technicianId: sb.technicianId || null, customerId: sb.customerId || sb.userId || null };
   return { technicianId: null, customerId: null };
 };
 

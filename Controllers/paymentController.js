@@ -470,6 +470,7 @@ export const createPaymentOrder = async (req, res) => {
     }
 
     await booking.save();
+    console.log(`[Payment] Razorpay order created for booking ${bookingId}: orderId=${payment.providerOrderId}, amountPaise=${snapshotTotalPaise}`);
 
     // Amount is returned in PAISE (as Razorpay Checkout SDK expects).
     return ok(res, 201, "Payment order created", {
@@ -530,10 +531,34 @@ export const verifyPayment = async (req, res) => {
       return fail(res, 400, "Missing payment details");
     }
 
-    const payment = await Payment.findOne({ bookingId }).lean();
+    let payment = await Payment.findOne({
+      $or: [
+        { providerOrderId: razorpay_order_id },
+        { bookingId },
+      ],
+    }).lean();
+
+    if (!payment) {
+      // Fallback: Resolve bookingId if it's a Quotation ID linking to a ProductBooking or vice versa
+      let altBookingId = null;
+      const pb = await ProductBooking.findOne({ quotationId: bookingId }).lean();
+      if (pb) {
+        altBookingId = pb._id;
+      } else {
+        const q = await Quotation.findById(bookingId).lean();
+        if (q) {
+          const existingPb = await ProductBooking.findOne({ quotationId: q._id }).lean();
+          if (existingPb) altBookingId = existingPb._id;
+        }
+      }
+      if (altBookingId) {
+        payment = await Payment.findOne({ bookingId: altBookingId }).lean();
+      }
+    }
+
     if (!payment) return fail(res, 404, "Payment not found");
 
-    if (payment.providerOrderId !== razorpay_order_id) {
+    if (payment.providerOrderId && payment.providerOrderId !== razorpay_order_id) {
       return fail(res, 400, "Order mismatch");
     }
 
@@ -545,11 +570,23 @@ export const verifyPayment = async (req, res) => {
           .select("customerId")
           .lean();
         owned = pb && String(pb.customerId) === String(req.user.userId);
+        if (!owned) {
+          const q = await Quotation.findById(payment.bookingId)
+            .select("customerId")
+            .lean();
+          owned = q && String(q.customerId) === String(req.user.userId);
+        }
       } else if (payment.itemType === "quotation") {
         const q = await Quotation.findById(payment.bookingId)
           .select("customerId")
           .lean();
         owned = q && String(q.customerId) === String(req.user.userId);
+        if (!owned) {
+          const pb = await ProductBooking.findOne({ quotationId: payment.bookingId })
+            .select("customerId")
+            .lean();
+          owned = pb && String(pb.customerId) === String(req.user.userId);
+        }
       } else {
         const sb = await ServiceBooking.findById(payment.bookingId)
           .select("customerId")
@@ -841,19 +878,45 @@ export const getPaymentByBooking = async (req, res) => {
       return fail(res, 400, "Valid bookingId required");
     }
 
-    const payment = await Payment.findOne({ bookingId }).lean();
+    let payment = await Payment.findOne({ bookingId }).lean();
+
+    if (!payment) {
+      // Fallback: Resolve bookingId if it's a Quotation ID linking to a ProductBooking or vice versa
+      let altBookingId = null;
+      const pb = await ProductBooking.findOne({ quotationId: bookingId }).lean();
+      if (pb) {
+        altBookingId = pb._id;
+      } else {
+        const q = await Quotation.findById(bookingId).lean();
+        if (q) {
+          const existingPb = await ProductBooking.findOne({ quotationId: q._id }).lean();
+          if (existingPb) altBookingId = existingPb._id;
+        }
+      }
+      if (altBookingId) {
+        payment = await Payment.findOne({ bookingId: altBookingId }).lean();
+      }
+    }
+
     if (!payment) return fail(res, 404, "Payment not found");
 
     // Ownership check for customers
     if (req.user?.role === "Customer") {
       let ownerId = null;
       if (payment.itemType === "product") {
-        const pb = await ProductBooking.findById(bookingId)
-          .select("customerId")
+        const pb = await ProductBooking.findById(payment.bookingId)
+          .select("customerId userId")
           .lean();
         ownerId = pb?.customerId || pb?.userId || null;
+        if (!ownerId) {
+          const q = await Quotation.findById(payment.bookingId).select("customerId").lean();
+          ownerId = q?.customerId || null;
+        }
+      } else if (payment.itemType === "quotation") {
+        const q = await Quotation.findById(payment.bookingId).select("customerId").lean();
+        ownerId = q?.customerId || null;
       } else {
-        const booking = await ServiceBooking.findById(bookingId)
+        const booking = await ServiceBooking.findById(payment.bookingId)
           .select("customerId")
           .lean();
         ownerId = booking?.customerId || null;

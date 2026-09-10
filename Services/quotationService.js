@@ -43,6 +43,40 @@ const snapshotProduct = async (productId) => {
   };
 };
 
+const resolveUnitPaise = (source = {}, fallback = 0) => {
+  if (source.unitPricePaise != null) return Math.round(Number(source.unitPricePaise));
+  if (source.unitPrice != null) return Math.round(Number(source.unitPrice) * 100);
+  if (source.price != null) return Math.round(Number(source.price) * 100);
+  if (source.amount != null) return Math.round(Number(source.amount) * 100);
+  if (source.finalAmount != null) return Math.round(Number(source.finalAmount) * 100);
+  return fallback;
+};
+
+const resolveInstallationPaise = (source = {}, fallback = 0) => {
+  if (source.installationAmountPaise != null) return Math.round(Number(source.installationAmountPaise));
+  if (source.installationAmount != null) return Math.round(Number(source.installationAmount) * 100);
+  if (source.installationCharges != null) return Math.round(Number(source.installationCharges) * 100);
+  return fallback;
+};
+
+const resolveAdditionalPaise = (source = {}, fallback = 0) => {
+  if (source.additionalChargesPaise != null) return Math.round(Number(source.additionalChargesPaise));
+  if (source.additionalCharges != null) return Math.round(Number(source.additionalCharges) * 100);
+  return fallback;
+};
+
+const resolveDiscountPaise = (source = {}, fallback = 0) => {
+  if (source.discountPaise != null) return Math.round(Number(source.discountPaise));
+  if (source.discount != null) return Math.round(Number(source.discount) * 100);
+  return fallback;
+};
+
+const resolveGstPercent = (source = {}, fallback = 0) => {
+  if (source.gstPercent != null) return Number(source.gstPercent);
+  if (source.gstPercentage != null) return Number(source.gstPercentage);
+  return fallback;
+};
+
 export const createQuotationDraft = async ({ adminId, body = {} }) => {
   const { quoteRequestId } = body;
   const request = await loadRequest(quoteRequestId);
@@ -52,13 +86,20 @@ export const createQuotationDraft = async ({ adminId, body = {} }) => {
     throw err;
   }
 
+  const topUnitPaise = resolveUnitPaise(body, 0);
+  const topQuantity = body.quantity || request.quantity || 1;
+  const topInstPaise = resolveInstallationPaise(body, 0);
+  const topAddPaise = resolveAdditionalPaise(body, 0);
+  const topDiscPaise = resolveDiscountPaise(body, 0);
+  const topGst = resolveGstPercent(body, 0);
+
   const { financialSnapshot, totalAmountPaise } = calculateQuotationTotals({
-    unitPricePaise: body.unitPricePaise,
-    quantity: body.quantity || request.quantity,
-    installationAmountPaise: body.installationAmountPaise,
-    additionalChargesPaise: body.additionalChargesPaise,
-    discountPaise: body.discountPaise,
-    gstPercent: body.gstPercent ?? 0,
+    unitPricePaise: topUnitPaise,
+    quantity: topQuantity,
+    installationAmountPaise: topInstPaise,
+    additionalChargesPaise: topAddPaise,
+    discountPaise: topDiscPaise,
+    gstPercent: topGst,
   });
   validateQuotationTotals(financialSnapshot);
 
@@ -70,35 +111,53 @@ export const createQuotationDraft = async ({ adminId, body = {} }) => {
   let topFinancialSnapshot = financialSnapshot;
   if (Array.isArray(body.items) && body.items.length > 0) {
     quotationItems = [];
-    let aggBase = 0, aggGst = 0, aggTotal = 0;
+    let aggBase = 0, aggGst = 0, aggTotal = 0, aggInst = 0, aggAdd = 0, aggDisc = 0;
     for (const it of body.items) {
+      const itUnit = resolveUnitPaise(it, topUnitPaise);
+      const itQty = it.quantity || 1;
+      const itInst = resolveInstallationPaise(it, 0);
+      const itAdd = resolveAdditionalPaise(it, 0);
+      const itDisc = resolveDiscountPaise(it, 0);
+      const itGst = resolveGstPercent(it, topGst);
+
       const itemTotals = calculateQuotationTotals({
-        unitPricePaise: it.unitPricePaise,
-        quantity: it.quantity || 1,
-        installationAmountPaise: it.installationAmountPaise,
-        additionalChargesPaise: it.additionalChargesPaise,
-        discountPaise: it.discountPaise,
-        gstPercent: it.gstPercent ?? 0,
+        unitPricePaise: itUnit,
+        quantity: itQty,
+        installationAmountPaise: itInst,
+        additionalChargesPaise: itAdd,
+        discountPaise: itDisc,
+        gstPercent: itGst,
       });
       validateQuotationTotals(itemTotals.financialSnapshot);
       const snap = await snapshotProduct(it.productId);
       quotationItems.push({
         productId: it.productId,
         productSnapshot: snap,
-        quantity: it.quantity || 1,
+        quantity: itQty,
         financialSnapshot: itemTotals.financialSnapshot,
         status: "pending",
       });
       aggBase += itemTotals.financialSnapshot.baseAmountPaise || 0;
+      aggInst += itemTotals.financialSnapshot.installationAmountPaise || 0;
+      aggAdd += itemTotals.financialSnapshot.additionalChargesPaise || 0;
+      aggDisc += itemTotals.financialSnapshot.discountPaise || 0;
       aggGst += itemTotals.financialSnapshot.gstAmountPaise || 0;
       aggTotal += itemTotals.financialSnapshot.totalAmountPaise || 0;
     }
     topFinancialSnapshot = {
-      ...financialSnapshot,
+      currency: "INR",
+      unitPricePaise: quotationItems.length === 1 ? quotationItems[0].financialSnapshot.unitPricePaise : topUnitPaise,
       baseAmountPaise: aggBase,
+      installationAmountPaise: aggInst,
+      additionalChargesPaise: aggAdd,
+      discountPaise: aggDisc,
+      taxableAmountPaise: aggBase + aggInst + aggAdd - aggDisc,
+      gstPercent: topGst,
       gstAmountPaise: aggGst,
       totalAmountPaise: aggTotal,
+      calculationVersion: financialSnapshot.calculationVersion,
     };
+    validateQuotationTotals(topFinancialSnapshot);
   }
 
   const revision = (await Quotation.countDocuments({ quoteRequestId })) + 1;
@@ -169,22 +228,83 @@ export const updateQuotationDraft = async ({ adminId, quotationId, body = {} }) 
     throw err;
   }
 
+  const existingFs = quotation.financialSnapshot || {};
+  const topUnitPaise = resolveUnitPaise(body, existingFs.unitPricePaise || 0);
+  const topQuantity = body.quantity ?? quotation.quantity;
+  const topInstPaise = resolveInstallationPaise(body, existingFs.installationAmountPaise || 0);
+  const topAddPaise = resolveAdditionalPaise(body, existingFs.additionalChargesPaise || 0);
+  const topDiscPaise = resolveDiscountPaise(body, existingFs.discountPaise || 0);
+  const topGst = resolveGstPercent(body, existingFs.gstPercent || 0);
+
   const { financialSnapshot, totalAmountPaise } = calculateQuotationTotals({
-    unitPricePaise: body.unitPricePaise ?? quotation.financialSnapshot.unitPricePaise,
-    quantity: body.quantity ?? quotation.quantity,
-    installationAmountPaise: body.installationAmountPaise ?? quotation.financialSnapshot.installationAmountPaise,
-    additionalChargesPaise: body.additionalChargesPaise ?? quotation.financialSnapshot.additionalChargesPaise,
-    discountPaise: body.discountPaise ?? quotation.financialSnapshot.discountPaise,
-    gstPercent: body.gstPercent ?? quotation.financialSnapshot.gstPercent,
+    unitPricePaise: topUnitPaise,
+    quantity: topQuantity,
+    installationAmountPaise: topInstPaise,
+    additionalChargesPaise: topAddPaise,
+    discountPaise: topDiscPaise,
+    gstPercent: topGst,
   });
   validateQuotationTotals(financialSnapshot);
+
+  let topFinancialSnapshot = financialSnapshot;
+  if (Array.isArray(body.items) && body.items.length > 0) {
+    const updatedItems = [];
+    let aggBase = 0, aggGst = 0, aggTotal = 0, aggInst = 0, aggAdd = 0, aggDisc = 0;
+    for (const it of body.items) {
+      const itUnit = resolveUnitPaise(it, topUnitPaise);
+      const itQty = it.quantity || 1;
+      const itInst = resolveInstallationPaise(it, 0);
+      const itAdd = resolveAdditionalPaise(it, 0);
+      const itDisc = resolveDiscountPaise(it, 0);
+      const itGst = resolveGstPercent(it, topGst);
+
+      const itemTotals = calculateQuotationTotals({
+        unitPricePaise: itUnit,
+        quantity: itQty,
+        installationAmountPaise: itInst,
+        additionalChargesPaise: itAdd,
+        discountPaise: itDisc,
+        gstPercent: itGst,
+      });
+      validateQuotationTotals(itemTotals.financialSnapshot);
+      const snap = await snapshotProduct(it.productId);
+      updatedItems.push({
+        productId: it.productId,
+        productSnapshot: snap,
+        quantity: itQty,
+        financialSnapshot: itemTotals.financialSnapshot,
+        status: it.status || "pending",
+      });
+      aggBase += itemTotals.financialSnapshot.baseAmountPaise || 0;
+      aggInst += itemTotals.financialSnapshot.installationAmountPaise || 0;
+      aggAdd += itemTotals.financialSnapshot.additionalChargesPaise || 0;
+      aggDisc += itemTotals.financialSnapshot.discountPaise || 0;
+      aggGst += itemTotals.financialSnapshot.gstAmountPaise || 0;
+      aggTotal += itemTotals.financialSnapshot.totalAmountPaise || 0;
+    }
+    topFinancialSnapshot = {
+      currency: "INR",
+      unitPricePaise: updatedItems.length === 1 ? updatedItems[0].financialSnapshot.unitPricePaise : topUnitPaise,
+      baseAmountPaise: aggBase,
+      installationAmountPaise: aggInst,
+      additionalChargesPaise: aggAdd,
+      discountPaise: aggDisc,
+      taxableAmountPaise: aggBase + aggInst + aggAdd - aggDisc,
+      gstPercent: topGst,
+      gstAmountPaise: aggGst,
+      totalAmountPaise: aggTotal,
+      calculationVersion: financialSnapshot.calculationVersion,
+    };
+    validateQuotationTotals(topFinancialSnapshot);
+    quotation.items = updatedItems;
+  }
 
   const before = {
     unitPricePaise: quotation.financialSnapshot.unitPricePaise,
     totalAmountPaise: quotation.financialSnapshot.totalAmountPaise,
   };
 
-  quotation.financialSnapshot = financialSnapshot;
+  quotation.financialSnapshot = topFinancialSnapshot;
   quotation.quantity = body.quantity ?? quotation.quantity;
   quotation.termsAndConditions = body.termsAndConditions?.toString().slice(0, 10000) ?? quotation.termsAndConditions;
   if (body.adminNotes !== undefined || body.notes !== undefined || body.message !== undefined || body.technicianNotes !== undefined) {
@@ -324,29 +444,92 @@ export const reviseQuotation = async ({ adminId, quotationId, body = {} }) => {
     throw err;
   }
 
+  const existingFs = existing.financialSnapshot || {};
+  const topUnitPaise = resolveUnitPaise(body, existingFs.unitPricePaise || 0);
+  const topQuantity = body.quantity || existing.quantity || 1;
+  const topInstPaise = resolveInstallationPaise(body, existingFs.installationAmountPaise || 0);
+  const topAddPaise = resolveAdditionalPaise(body, existingFs.additionalChargesPaise || 0);
+  const topDiscPaise = resolveDiscountPaise(body, existingFs.discountPaise || 0);
+  const topGst = resolveGstPercent(body, existingFs.gstPercent || 0);
+
   const { financialSnapshot, totalAmountPaise } = calculateQuotationTotals({
-    unitPricePaise: body.unitPricePaise ?? existing.financialSnapshot.unitPricePaise,
-    quantity: body.quantity || existing.quantity,
-    installationAmountPaise: body.installationAmountPaise ?? existing.financialSnapshot.installationAmountPaise,
-    additionalChargesPaise: body.additionalChargesPaise ?? existing.financialSnapshot.additionalChargesPaise,
-    discountPaise: body.discountPaise ?? existing.financialSnapshot.discountPaise,
-    gstPercent: body.gstPercent ?? existing.financialSnapshot.gstPercent,
+    unitPricePaise: topUnitPaise,
+    quantity: topQuantity,
+    installationAmountPaise: topInstPaise,
+    additionalChargesPaise: topAddPaise,
+    discountPaise: topDiscPaise,
+    gstPercent: topGst,
   });
   validateQuotationTotals(financialSnapshot);
+
+  let quotationItems = undefined;
+  let topFinancialSnapshot = financialSnapshot;
+  const itemsSource = Array.isArray(body.items) && body.items.length > 0 ? body.items : existing.items;
+  if (Array.isArray(itemsSource) && itemsSource.length > 0) {
+    quotationItems = [];
+    let aggBase = 0, aggGst = 0, aggTotal = 0, aggInst = 0, aggAdd = 0, aggDisc = 0;
+    for (const it of itemsSource) {
+      const itUnit = resolveUnitPaise(it, topUnitPaise);
+      const itQty = it.quantity || 1;
+      const itInst = resolveInstallationPaise(it, 0);
+      const itAdd = resolveAdditionalPaise(it, 0);
+      const itDisc = resolveDiscountPaise(it, 0);
+      const itGst = resolveGstPercent(it, topGst);
+
+      const itemTotals = calculateQuotationTotals({
+        unitPricePaise: itUnit,
+        quantity: itQty,
+        installationAmountPaise: itInst,
+        additionalChargesPaise: itAdd,
+        discountPaise: itDisc,
+        gstPercent: itGst,
+      });
+      validateQuotationTotals(itemTotals.financialSnapshot);
+      const snap = await snapshotProduct(it.productId);
+      quotationItems.push({
+        productId: it.productId,
+        productSnapshot: snap,
+        quantity: itQty,
+        financialSnapshot: itemTotals.financialSnapshot,
+        status: "pending",
+      });
+      aggBase += itemTotals.financialSnapshot.baseAmountPaise || 0;
+      aggInst += itemTotals.financialSnapshot.installationAmountPaise || 0;
+      aggAdd += itemTotals.financialSnapshot.additionalChargesPaise || 0;
+      aggDisc += itemTotals.financialSnapshot.discountPaise || 0;
+      aggGst += itemTotals.financialSnapshot.gstAmountPaise || 0;
+      aggTotal += itemTotals.financialSnapshot.totalAmountPaise || 0;
+    }
+    topFinancialSnapshot = {
+      currency: "INR",
+      unitPricePaise: quotationItems.length === 1 ? quotationItems[0].financialSnapshot.unitPricePaise : topUnitPaise,
+      baseAmountPaise: aggBase,
+      installationAmountPaise: aggInst,
+      additionalChargesPaise: aggAdd,
+      discountPaise: aggDisc,
+      taxableAmountPaise: aggBase + aggInst + aggAdd - aggDisc,
+      gstPercent: topGst,
+      gstAmountPaise: aggGst,
+      totalAmountPaise: aggTotal,
+      calculationVersion: financialSnapshot.calculationVersion,
+    };
+    validateQuotationTotals(topFinancialSnapshot);
+  }
 
   const revision = existing.revision + 1;
   const quotation = await Quotation.create({
     quotationNumber: generateQuotationNumber(),
     quoteRequestId: existing.quoteRequestId,
     customerId: existing.customerId,
-    productId: existing.productId,
+    productId: quotationItems?.[0]?.productId || existing.productId,
+    items: quotationItems,
     revision,
     supersedesQuotationId: existing._id,
     previousQuotationId: existing._id,
     customerSnapshot: existing.customerSnapshot,
     productSnapshot: existing.productSnapshot,
     quantity: body.quantity || existing.quantity,
-    financialSnapshot,
+    financialSnapshot: topFinancialSnapshot,
     termsAndConditions: body.termsAndConditions ?? existing.termsAndConditions,
     validFrom: body.validFrom ? new Date(body.validFrom) : existing.validFrom,
     validUntil: body.validUntil ? new Date(body.validUntil) : existing.validUntil,

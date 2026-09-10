@@ -72,6 +72,23 @@ export const hasActivePayoutBlock = async (technicianId, { session = null } = {}
 export const releaseOnResolution = async ({ bookingId, reportId, session = null }) => {
   const opts = session ? { session } : {};
   if (bookingId) {
+    // 🔒 Multi-Complaint Financial Guard: Check if ANY OTHER active complaint exists for this booking
+    const Report = (await import("../Schemas/Report.js")).default;
+    const otherActive = await Report.findOne(
+      {
+        bookingId,
+        _id: { $ne: reportId },
+        status: { $in: ["open", "under_review"] },
+      },
+      { _id: 1 },
+      opts
+    ).lean();
+
+    if (otherActive) {
+      console.log(`[COMPLAINT_FREEZE] Other active complaint (${otherActive._id}) exists for booking ${bookingId} — keeping payout hold & reserve frozen.`);
+      return { released: false, reason: "OTHER_ACTIVE_COMPLAINT_EXISTS" };
+    }
+
     await BookingPayoutBlock.updateOne(
       { bookingId },
       { $set: { releasedAt: new Date() } },
@@ -83,6 +100,7 @@ export const releaseOnResolution = async ({ bookingId, reportId, session = null 
     { $set: { status: "held", releaseAt: new Date(), frozenReason: null } },
     opts
   );
+  return { released: true };
 };
 
 export const releaseExpiredHolds = async (maxHours) => {

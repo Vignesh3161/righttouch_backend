@@ -60,7 +60,7 @@ export const createComplaintInternal = async ({
     throw err;
   }
 
-  const bookingOwnerId = bookingType === "product" ? booking.userId : booking.customerId;
+  const bookingOwnerId = bookingType === "product" ? (booking.customerId || booking.userId) : (booking.customerId || booking.userId);
   if (String(bookingOwnerId) !== String(customerId)) {
     const err = new Error("This booking does not belong to you");
     err.statusCode = 403;
@@ -465,6 +465,178 @@ export const adminRejectComplaintInternal = async ({ reportId, reason, adminUser
   } catch (e) {
     console.error("Reject complaint notify/audit error:", e.message);
   }
+
+  return report;
+};
+
+/**
+ * Customer withdraws an active complaint (open/under_review).
+ * Terminal complaints (resolved/withdrawn/expired) CANNOT be withdrawn.
+ */
+export const customerWithdrawComplaintInternal = async ({ customerId, reportId, reason }) => {
+  const report = await Report.findById(reportId);
+  if (!report) {
+    const err = new Error("Complaint not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (String(report.customerId) !== String(customerId)) {
+    const err = new Error("This complaint does not belong to you");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (TERMINAL_STATUSES.includes(report.status)) {
+    const err = new Error(`Cannot withdraw complaint in terminal state (${report.status})`);
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const prevStatus = report.status;
+  report.status = "withdrawn";
+  report.withdrawnAt = new Date();
+  report.withdrawalReason = reason || "Customer withdrew complaint";
+  await report.save();
+
+  // 🔒 Multi-complaint guarded release of financial hold
+  try {
+    await releaseOnResolution({ bookingId: report.bookingId, reportId: report._id });
+  } catch (relErr) {
+    console.error("Release reserve error on withdrawal:", relErr.message);
+  }
+
+  try {
+    if (report.technicianId) {
+      await notify({
+        eventType: "COMPLAINT_WITHDRAWN",
+        recipientId: report.technicianId,
+        recipientType: "technician",
+        data: { reportId: String(report._id), bookingId: String(report.bookingId) },
+        source: { type: "report", id: String(report._id) },
+        correlationId: String(report._id),
+        idempotencyKey: `complaint:${report._id}:withdrawn:technician:${report.technicianId}`,
+      });
+    }
+
+    await writeAuditLog({
+      action: "COMPLAINT_WITHDRAWN",
+      targetType: "Report",
+      targetId: report._id,
+      actor: customerId,
+      actorRole: "Customer",
+      before: { status: prevStatus },
+      after: { status: "withdrawn", withdrawalReason: report.withdrawalReason },
+    });
+  } catch (e) {
+    console.error("Withdrawal notify/audit error:", e.message);
+  }
+
+  broadcastAdminUnreadCounts(getIo());
+
+  return report;
+};
+
+/**
+ * Technician lists complaints filed against them.
+ */
+export const technicianListMyComplaintsInternal = async (technicianProfileId) => {
+  if (!technicianProfileId) return [];
+  return Report.find({ technicianId: technicianProfileId })
+    .populate("serviceId", "serviceName")
+    .populate("productId", "productName")
+    .populate("customerId", "fname lname mobileNumber")
+    .sort({ createdAt: -1 })
+    .lean();
+};
+
+/**
+ * Technician gets detailed complaint dossier filed against them.
+ */
+export const technicianGetComplaintDetailInternal = async ({ technicianProfileId, reportId }) => {
+  const report = await Report.findById(reportId)
+    .populate("serviceId", "serviceName")
+    .populate("productId", "productName")
+    .populate("customerId", "fname lname mobileNumber")
+    .lean();
+
+  if (!report) {
+    const err = new Error("Complaint not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (String(report.technicianId) !== String(technicianProfileId)) {
+    const err = new Error("Access denied — this complaint is not associated with your profile");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const BookingModel = report.bookingType === "product" ? ProductBooking : ServiceBooking;
+  const booking = await BookingModel.findById(report.bookingId).lean();
+  return { report, booking };
+};
+
+/**
+ * Technician submits response/explanation & evidence images for a complaint.
+ */
+export const technicianRespondToComplaintInternal = async ({ technicianProfileId, reportId, response, images = [] }) => {
+  if (!response || !response.trim()) {
+    const err = new Error("A written explanation is required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const report = await Report.findById(reportId);
+  if (!report) {
+    const err = new Error("Complaint not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (String(report.technicianId) !== String(technicianProfileId)) {
+    const err = new Error("Access denied — this complaint is not associated with your profile");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (TERMINAL_STATUSES.includes(report.status)) {
+    const err = new Error("Cannot submit response for a resolved or closed complaint");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  report.technicianResponse = response.trim();
+  if (Array.isArray(images) && images.length > 0) {
+    report.technicianImages = images;
+  }
+  report.technicianRespondedAt = new Date();
+  await report.save();
+
+  try {
+    await notify({
+      eventType: "TECHNICIAN_RESPONSE_RECEIVED",
+      recipientId: report.customerId,
+      recipientType: "customer",
+      data: { reportId: String(report._id), bookingId: String(report.bookingId) },
+      source: { type: "report", id: String(report._id) },
+      correlationId: String(report._id),
+      idempotencyKey: `complaint:${report._id}:tech_responded:customer:${report.customerId}`,
+    });
+
+    await writeAuditLog({
+      action: "COMPLAINT_TECHNICIAN_RESPONDED",
+      targetType: "Report",
+      targetId: report._id,
+      actor: technicianProfileId,
+      actorRole: "Technician",
+      after: { technicianResponse: report.technicianResponse, imageCount: report.technicianImages?.length || 0 },
+    });
+  } catch (e) {
+    console.error("Technician response notify/audit error:", e.message);
+  }
+
+  broadcastAdminUnreadCounts(getIo());
 
   return report;
 };

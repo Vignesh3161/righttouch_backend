@@ -37,6 +37,7 @@ import {
 import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob } from "../Controllers/serviceBookController.js";
 import { createWalletTransaction, getWalletTransactions, requestWithdrawal, getMyWithdrawalRequests, cancelMyWithdrawal } from "../Controllers/technicianWalletController.js";
 import { getMyZone, getServicesInMyZone } from "../Controllers/zoneAvailabilityController.js";
+import { technicianListMyComplaints, technicianGetComplaintDetail, technicianRespondToComplaint } from "../Controllers/complaintController.js";
 
 
 
@@ -229,5 +230,17 @@ router.put("/wallet/withdrawal/:id/cancel", Auth, isTechnician, cancelMyWithdraw
 
 router.get("/zone/me", Auth, isTechnician, getMyZone);
 router.get("/zone/services", Auth, isTechnician, getServicesInMyZone);
+
+/* ================= TECHNICIAN COMPLAINTS & DISPUTES ================= */
+
+router.get("/complaints", Auth, isTechnician, technicianListMyComplaints);
+router.get("/complaints/:id", Auth, isTechnician, technicianGetComplaintDetail);
+router.post(
+  "/complaints/:id/respond",
+  Auth,
+  isTechnician,
+  upload.array("images", 5),
+  technicianRespondToComplaint
+);
 
 export default router;
