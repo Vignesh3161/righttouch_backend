@@ -29,6 +29,14 @@ const zoneServiceMappingSchema = new mongoose.Schema(
       default: true,
     },
 
+    // Zone-specific pricing multiplier (e.g. 1.0 = normal, 1.2 = 20% surge/premium)
+    pricingMultiplier: {
+      type: Number,
+      default: 1.0,
+      min: 0.1,
+      max: 10.0,
+    },
+
     // Admin-controlled approval metadata
     approvedBy: {
       type: mongoose.Schema.Types.ObjectId,

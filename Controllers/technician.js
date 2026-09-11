@@ -12,6 +12,9 @@ import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
+import OperationalCity from "../Schemas/OperationalCity.js";
+import TechnicianDistrictPermission from "../Schemas/TechnicianDistrictPermission.js";
+
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
   try {
@@ -515,11 +518,11 @@ export const createTechnician = async (req, res) => {
 /* ================= GET ALL TECHNICIANS ================= */
 export const getAllTechnicians = async (req, res) => {
   try {
-    const { workStatus, search } = req.query;
-    const profileQuery = {};
-    // Always exclude deleted technicians
-    const query = { workStatus: { $ne: "deleted" } };
+    const { workStatus, search, districtId, district, cityId, city, zoneId, cityZoneId } = req.query;
 
+    const conditions = [];
+
+    // 1. WorkStatus filter (default: exclude deleted)
     if (workStatus) {
       if (!TECHNICIAN_STATUSES.includes(workStatus)) {
         return res.status(400).json({
@@ -528,15 +531,73 @@ export const getAllTechnicians = async (req, res) => {
           result: {},
         });
       }
-      profileQuery.workStatus = workStatus;
-      query.workStatus = workStatus;  // Overrides the $ne clause
+      conditions.push({ workStatus });
+    } else {
+      conditions.push({ workStatus: { $ne: "deleted" } });
     }
 
-    // 🔍 Two-step search: mobile/name lives on User, not TechnicianProfile
+    // 2. District / Operational City filter
+    const targetDistrictId = districtId || cityId;
+    const targetDistrictName = district || city;
+
+    if (targetDistrictId && mongoose.Types.ObjectId.isValid(targetDistrictId)) {
+      const targetObjId = new mongoose.Types.ObjectId(targetDistrictId);
+
+      const distPerms = await TechnicianDistrictPermission.find({
+        districtId: targetObjId,
+        isEnabled: true,
+      }).select("technicianId").lean();
+
+      const permTechIds = distPerms.map((p) => p.technicianId);
+
+      conditions.push({
+        $or: [
+          { primaryDistrictId: targetObjId },
+          { primaryCityId: targetObjId },
+          { enabledDistrictIds: targetObjId },
+          { allowedCityIds: targetObjId },
+          { _id: { $in: permTechIds } },
+        ],
+      });
+    } else if (targetDistrictName && targetDistrictName.trim().length >= 2) {
+      const districtRegex = new RegExp(targetDistrictName.trim(), "i");
+
+      const matchedCities = await OperationalCity.find({
+        $or: [{ name: districtRegex }, { city: districtRegex }],
+      }).select("_id").lean();
+
+      const cityIds = matchedCities.map((c) => c._id);
+
+      const distPerms = await TechnicianDistrictPermission.find({
+        districtId: { $in: cityIds },
+        isEnabled: true,
+      }).select("technicianId").lean();
+
+      const permTechIds = distPerms.map((p) => p.technicianId);
+
+      conditions.push({
+        $or: [
+          { primaryDistrictId: { $in: cityIds } },
+          { primaryCityId: { $in: cityIds } },
+          { enabledDistrictIds: { $in: cityIds } },
+          { allowedCityIds: { $in: cityIds } },
+          { city: districtRegex },
+          { locality: districtRegex },
+          { _id: { $in: permTechIds } },
+        ],
+      });
+    }
+
+    // 3. City Zone filter
+    const targetZoneId = zoneId || cityZoneId;
+    if (targetZoneId && mongoose.Types.ObjectId.isValid(targetZoneId)) {
+      conditions.push({ enabledCityZoneIds: new mongoose.Types.ObjectId(targetZoneId) });
+    }
+
+    // 4. Two-step search query (mobile/name lives on User, not TechnicianProfile)
     if (search && search.trim().length >= 2) {
       const searchRegex = { $regex: search.trim(), $options: "i" };
 
-      // Step 1: Find matching User IDs (name OR mobile number)
       const matchingUsers = await mongoose.model("User").find({
         $or: [
           { fname: searchRegex },
@@ -548,13 +609,16 @@ export const getAllTechnicians = async (req, res) => {
 
       const matchingUserIds = matchingUsers.map((u) => u._id);
 
-      // Step 2: Also search profile-level fields (locality, specialization)
-      profileQuery.$or = [
-        { userId: { $in: matchingUserIds } },
-        { locality: searchRegex },
-        { specialization: searchRegex },
-      ];
+      conditions.push({
+        $or: [
+          { userId: { $in: matchingUserIds } },
+          { locality: searchRegex },
+          { specialization: searchRegex },
+        ],
+      });
     }
+
+    const profileQuery = conditions.length > 1 ? { $and: conditions } : conditions[0] || {};
 
     const technicians = await TechnicianProfile.find(profileQuery)
       .populate("skills.serviceId", "serviceName")
@@ -562,6 +626,11 @@ export const getAllTechnicians = async (req, res) => {
         path: "userId",
         select: "fname lname gender mobileNumber email lastLoginAt",
       })
+      .populate("primaryDistrictId", "name code city state")
+      .populate("primaryCityId", "name code city state")
+      .populate("enabledDistrictIds", "name code city state")
+      .populate("allowedCityIds", "name code city state")
+      .populate("enabledCityZoneIds", "name zoneCode operationalCityId")
       .select("-password")
       .sort({ createdAt: -1 });
 

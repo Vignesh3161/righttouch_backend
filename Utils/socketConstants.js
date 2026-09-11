@@ -2,7 +2,6 @@
  * 🛰 SOCKET EVENT CONSTANTS
  * Centralized registry of all socket events to ensure consistency between
  * server-side logic and client-side implementation.
- * NOTE: Only events that have real server-side handlers/emitters live here.
  */
 
 export const SOCKET_EVENTS = {
@@ -13,20 +12,22 @@ export const SOCKET_EVENTS = {
 
     // 👤 User/Customer Events
     JOB_ACCEPTED_NOTIFY: "job_accepted", // Notifies customer
+    TECHNICIAN_STARTED_TRAVEL: "technician_started_travel",
+    TECHNICIAN_ARRIVED: "technician_arrived",
+    BOOKING_COMPLETED: "booking_completed",
+    BOOKING_CANCELLED: "booking_cancelled",
 
     // 👨‍🔧 Technician Events
     TECH_LOCATION_UPDATE: "technician:location_update",
     TECH_GET_JOBS: "technician:get_jobs",
     TECH_JOBS_LIST: "technician:jobs_list",
-    // 🛰 Push notification that the technician's job feed changed — the client
-    // should refetch jobs ONCE instead of polling continuously.
     TECH_JOBS_CHANGED: "technician:jobs_changed",
+    JOB_CANCELLED_BY_CUSTOMER: "job_cancelled_by_customer",
 
     // 📋 Job/Booking Events
     JOB_NEW: "job:new",
+    JOB_BROADCAST: "job:broadcast",
     JOB_TAKEN: "job_taken",
-    // 🛰 Offer expired (cron expiry / OTW timeout / travel no-show) — client
-    // drops the card instantly instead of waiting for a refetch.
     JOB_EXPIRED: "job:expired",
 
     // 📍 Location Events
@@ -36,23 +37,30 @@ export const SOCKET_EVENTS = {
     TRAVEL_REMINDER: "booking:travel_reminder",
     BOOKING_REMINDER: "booking:reminder",
     BOOKING_REBROADCAST: "booking:rebroadcast",
-    BOOKING_CANCELLED: "booking_cancelled",
+    BOOKING_AT_RISK: "booking_at_risk",
 
     // 💸 Payments / Payouts
-    // 🔔 System-initiated auto-payout sent to the technician's bank/UPI
+    PAYMENT_SUCCESS: "payment_success",
+    PAYMENT_RECEIVED: "payment_received",
     AUTO_PAYOUT_PAID: "auto_payout_paid",
-    // 🔔 Customer-facing payment status push (observed from persisted transitions)
+    WITHDRAWAL_FAILED: "withdrawal_failed",
     PAYMENT_STATUS: "payment:status",
 
-    // 🔐 Session Control
-    SESSION_REVOKED: "session:revoked",   // forced logout (status change)
-    SESSION_REPLACED: "session:replaced", // another device took over
+    // 👑 Admin Events
+    NEW_BOOKING: "new_booking",
+    ADMIN_UNREAD_COUNTS_UPDATED: "admin:unread_counts_updated",
 
-    // 🧾 Refunds / Complaints (observed from persisted transitions)
+    // 🔐 Session Control & Permissions
+    SESSION_REVOKED: "session:revoked",
+    SESSION_REPLACED: "session:replaced",
+    PERMISSION_STATUS_CHANGED: "permission_status_changed",
+
+    // 🧾 Refunds / Complaints
     COMPLAINT_RECEIVED: "complaint:received",
     COMPLAINT_UNDER_REVIEW: "complaint:under_review",
     COMPLAINT_REJECTED: "complaint:rejected",
     COMPLAINT_FILED_AGAINST_YOU: "complaint:filed_against_you",
+    COMPLAINT_SLA_BREACH: "complaint:sla_breach",
     REFUND_INITIATED: "refund:initiated",
     REFUND_PROCESSED: "refund:processed",
     REFUND_FAILED: "refund:failed",
@@ -72,4 +80,6 @@ export const SOCKET_ROOMS = {
     TECHNICIAN: (id) => `technician_${id}`,
     CUSTOMER: (id) => `customer_${id}`,
     ADMIN_DASHBOARD: "admin_dashboard",
+    ADMIN_ROOM: "admin_room",
+    ADMIN: "admin",
 };

@@ -1,3 +1,6 @@
+import { SOCKET_ROOMS, SOCKET_EVENTS } from "../Utils/socketConstants.js";
+import { sendPushNotification } from "../Utils/sendNotification.js";
+import Notification from "../Schemas/Notification.js";
 import mongoose from "mongoose";
 import OperationalCity from "../Schemas/OperationalCity.js";
 import CityZone from "../Schemas/CityZone.js";
@@ -8,7 +11,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import User from "../Schemas/User.js";
 import DistrictPermissionHistory from "../Schemas/DistrictPermissionHistory.js";
 import PolygonVersion from "../Schemas/PolygonVersion.js";
-import { validateAndSanitizePolygon, isPointInPolygonRing } from "../Utils/geoValidation.js";
+import { validateAndSanitizePolygon, isPointInPolygonRing, validateZoneInsideDistrict, checkZoneOverlap } from "../Utils/geoValidation.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
@@ -180,6 +183,30 @@ export const createCityZone = async (req, res) => {
     const validation = validateAndSanitizePolygon(polygon);
     if (!validation.valid) {
       return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors });
+    }
+
+    // Validate Parent-Child Containment (Zone must be inside Parent Operational District)
+    if (parentDistrict.polygon) {
+      const containment = validateZoneInsideDistrict(validation.sanitizedPolygon, parentDistrict.polygon);
+      if (!containment.valid) {
+        return res.status(400).json({
+          success: false,
+          code: "ZONE_OUTSIDE_PARENT_DISTRICT",
+          message: containment.reason,
+        });
+      }
+    }
+
+    // Overlap Detection: Verify zone polygon does not overlap existing active zones in district
+    const existingZones = await CityZone.find({ operationalCityId, active: true }).lean();
+    for (const ez of existingZones) {
+      if (ez.polygon && checkZoneOverlap(validation.sanitizedPolygon, ez.polygon)) {
+        return res.status(409).json({
+          success: false,
+          code: "ZONE_OVERLAP_DETECTED",
+          message: `Zone polygon overlaps geographically with existing active zone "${ez.name || ez.zoneName || "Zone"}" in the same district.`,
+        });
+      }
     }
 
     const zone = await CityZone.create({
@@ -864,6 +891,44 @@ export const updateTechnicianVerification = async (req, res) => {
     else return res.status(400).json({ success: false, message: "Invalid action. Allowed: APPROVE, REJECT, SUSPEND, REACTIVATE" });
 
     await tech.save();
+
+    try {
+      const io = req.app?.get("io") || req.io;
+      if (io) {
+        io.to(SOCKET_ROOMS.TECHNICIAN(id)).emit(SOCKET_EVENTS.PERMISSION_STATUS_CHANGED, {
+          permissionType: "Geofence / Location Validation",
+          status: tech.workStatus,
+          action,
+          reason,
+          timestamp: new Date(),
+        });
+      }
+      await sendPushNotification(
+        id,
+        {
+          title: "Geofence Verification Status Updated",
+          body: `Your GPS location verification status is now ${tech.workStatus.toUpperCase()}.`,
+          data: {
+            type: "permission_status_changed",
+            permissionType: "Geofence",
+            status: tech.workStatus,
+            action,
+          },
+        },
+        { recipientType: "technician" }
+      );
+      await Notification.create({
+        recipientId: id,
+        recipientType: "technician",
+        eventType: "PERMISSION_STATUS_CHANGED",
+        title: "Geofence Verification Status Updated",
+        body: `Your GPS location verification status is now ${tech.workStatus.toUpperCase()}.`,
+        data: { permissionType: "Geofence", status: tech.workStatus, action, reason },
+        category: "system",
+      }).catch(() => {});
+    } catch (notifErr) {
+      console.warn("Geofence verification notification error:", notifErr.message);
+    }
 
     return res.status(200).json({
       success: true,

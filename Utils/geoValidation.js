@@ -149,3 +149,56 @@ export function isPointInPolygonRing(point, ring) {
   }
   return inside;
 }
+
+/**
+ * Verifies that a sub-zone polygon is geographically contained inside its parent district polygon.
+ */
+export function validateZoneInsideDistrict(zonePolygon, districtPolygon) {
+  if (!zonePolygon || !districtPolygon) return { valid: false, reason: "Missing polygon geometry" };
+  
+  const zoneRings = zonePolygon.coordinates ? (zonePolygon.type === "Polygon" ? [zonePolygon.coordinates[0]] : zonePolygon.coordinates.map(p => p[0])) : [];
+  const districtRings = districtPolygon.coordinates ? (districtPolygon.type === "Polygon" ? [districtPolygon.coordinates[0]] : districtPolygon.coordinates.map(p => p[0])) : [];
+
+  if (!zoneRings.length || !districtRings.length) return { valid: false, reason: "Empty polygon coordinate rings" };
+
+  const districtOuterRing = districtRings[0];
+  const zoneOuterRing = zoneRings[0];
+
+  let insideCount = 0;
+  for (const pt of zoneOuterRing) {
+    if (isPointInPolygonRing(pt, districtOuterRing)) {
+      insideCount++;
+    }
+  }
+
+  const ratio = insideCount / zoneOuterRing.length;
+  if (ratio < 0.5) {
+    return {
+      valid: false,
+      reason: `Sub-zone polygon is geographically outside the parent Operational District boundary (only ${Math.round(ratio * 100)}% of vertices fall inside district polygon).`
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Checks whether two zone outer rings overlap geographically.
+ */
+export function checkZoneOverlap(zonePolygon1, zonePolygon2) {
+  if (!zonePolygon1 || !zonePolygon2) return false;
+  const getRing = (p) => p.coordinates ? (p.type === "Polygon" ? p.coordinates[0] : p.coordinates[0][0]) : p;
+  const ring1 = getRing(zonePolygon1);
+  const ring2 = getRing(zonePolygon2);
+
+  if (!Array.isArray(ring1) || !Array.isArray(ring2)) return false;
+
+  for (const pt of ring1) {
+    if (isPointInPolygonRing(pt, ring2)) return true;
+  }
+  for (const pt of ring2) {
+    if (isPointInPolygonRing(pt, ring1)) return true;
+  }
+  return false;
+}
+

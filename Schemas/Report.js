@@ -86,6 +86,15 @@ const reportSchema = new mongoose.Schema(
 
     resolutionNote: { type: String, default: null },
 
+    // Financial resolution adjustments (Refund / Penalty amounts in INR & Fault allocation)
+    refundAmount: { type: Number, default: 0 },
+    penaltyAmount: { type: Number, default: 0 },
+    faultParty: {
+      type: String,
+      enum: ["technician", "customer", "company", null],
+      default: null,
+    },
+
     // Technician Response & Evidence
     technicianResponse: { type: String, default: null },
     technicianImages: { type: [String], default: [] },

@@ -5,6 +5,8 @@ import { recordAck } from "./socketMetrics.js";
 import { sendFcmMulticast } from "./firebase.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import User from "../Schemas/User.js";
+import DeviceToken from "../Schemas/DeviceToken.js";
+import Notification from "../Schemas/Notification.js";
 import { deactivateTokenByValue } from "./permissionService.js";
 
 /**
@@ -14,16 +16,6 @@ import { deactivateTokenByValue } from "./permissionService.js";
 
 /**
  * 🔌 LIVE SOCKET PRESENCE (O(1), synchronous)
- * Returns true if the technician currently has at least one connected socket
- * in their private room. Uses the adapter's local room registry so it works
- * with both the in-memory adapter and the Redis ClusterAdapter (which also
- * tracks local rooms).
- *
- * This is the production-grade gate for ACK-waiting emits: we must NEVER run
- * the `.timeout()` ack machinery for an offline technician — that is what
- * produced the misleading "Job alert ... timed out (No ACK)" warnings and,
- * under concurrent broadcasts, wasted ack timers. Offline delivery is the
- * push channel's job (durable fallback), not a socket timeout.
  */
 export const hasLiveSocket = (io, technicianId) => {
   try {
@@ -33,19 +25,12 @@ export const hasLiveSocket = (io, technicianId) => {
     const roomSockets = nsp?.adapter?.rooms?.get(room);
     return Boolean(roomSockets && roomSockets.size > 0);
   } catch {
-    // Unknown adapter state — be conservative and treat as offline. The push
-    // channel remains the durable delivery path, so nothing is lost.
     return false;
   }
 };
 
 /**
  * 🛰 JOBS-CHANGED PUSH (Socket Analysis — anti-polling fix)
- * Emits `technician:jobs_changed` to a technician's room whenever their job
- * feed changes (broadcast created/revived, job taken, expired, cancelled,
- * completed). The client should treat this as "refetch your jobs once" —
- * which eliminates the continuous get_jobs polling loop entirely.
- * Fire-and-forget: never throws.
  */
 export const emitJobsChanged = (io, technicianProfileId) => {
   try {
@@ -60,10 +45,7 @@ export const emitJobsChanged = (io, technicianProfileId) => {
 };
 
 /**
- * 🛰 JOB-EXPIRED PUSH — tells a technician their offer on a booking just died
- * (broadcast expired: no_technician_accept, OTW timeout, travel no-show) so
- * the client drops the card instantly instead of waiting for a refetch.
- * Fire-and-forget: never throws.
+ * 🛰 JOB-EXPIRED PUSH
  */
 export const emitJobExpired = (io, technicianProfileId, { bookingId, expiresAt, reason } = {}) => {
   try {
@@ -82,53 +64,95 @@ export const emitJobExpired = (io, technicianProfileId, { bookingId, expiresAt, 
 };
 
 /**
- * Send push notification via FCM (real delivery — was a log-only stub).
- * @param {String} recipientId - TechnicianProfile _id (default) or User _id
- * @param {Object} payload - { title, body, data }
- * @param {Object} [options] - { recipientType: "technician" | "customer" }
+ * Send push notification via FCM to Customer, Technician, or Admin.
+ * @param {String} recipientId - User _id or TechnicianProfile _id
+ * @param {Object} payload - { title, body, data, badge }
+ * @param {Object} [options] - { recipientType: "customer" | "technician" | "admin" }
  * @returns {Object} result
  */
 const INVALID_TOKEN_RE = /not-registered|invalid-argument|unregistered/i;
 
 const pruneInvalidTokens = async (recipientId, recipientType, tokens) => {
-  if (!tokens.length) return;
+  if (!tokens || !tokens.length) return;
   const $pull = { fcmTokens: { $in: tokens } };
-  if (recipientType === "customer") {
-    await User.updateOne({ _id: recipientId }, { $pull });
-  } else {
-    await TechnicianProfile.updateOne({ _id: recipientId }, { $pull });
+  try {
+    if (recipientType === "technician") {
+      await TechnicianProfile.updateOne({ _id: recipientId }, { $pull });
+      const tech = await TechnicianProfile.findById(recipientId).select("userId").lean();
+      if (tech?.userId) {
+        await User.updateOne({ _id: tech.userId }, { $pull });
+      }
+    } else {
+      await User.updateOne({ _id: recipientId }, { $pull });
+    }
+    // Also mark dead in DeviceToken collection
+    await DeviceToken.updateMany({ fcmToken: { $in: tokens } }, { $set: { isActive: false } });
+  } catch (err) {
+    console.warn(`⚠️ Token prune warning for ${recipientId}:`, err.message);
   }
 };
 
 export const sendPushNotification = async (recipientId, payload, options = {}) => {
-  const recipientType = options.recipientType === "customer" ? "customer" : "technician";
+  const recipientType = options.recipientType === "admin"
+    ? "admin"
+    : options.recipientType === "customer"
+    ? "customer"
+    : "technician";
+
   try {
-    // Pick up the recipient's registered FCM tokens (multi-device array).
-    let tokens = [];
-    if (recipientType === "customer") {
-      const user = await User.findById(recipientId).select("fcmTokens").lean();
-      tokens = user?.fcmTokens || [];
+    let rawTokens = [];
+
+    // 1. Gather tokens from DeviceToken collection (active tokens)
+    const deviceDocs = await DeviceToken.find({
+      userId: recipientId,
+      isActive: true,
+    }).select("fcmToken").lean().catch(() => []);
+
+    deviceDocs.forEach((d) => {
+      if (d.fcmToken) rawTokens.push(d.fcmToken);
+    });
+
+    // 2. Gather tokens from legacy User / TechnicianProfile arrays
+    if (recipientType === "customer" || recipientType === "admin") {
+      const user = await User.findById(recipientId).select("fcmTokens").lean().catch(() => null);
+      if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
     } else {
-      const tech = await TechnicianProfile.findById(recipientId).select("fcmTokens").lean();
-      tokens = tech?.fcmTokens || [];
+      const tech = await TechnicianProfile.findById(recipientId).select("fcmTokens userId").lean().catch(() => null);
+      if (tech?.fcmTokens) rawTokens.push(...tech.fcmTokens);
+      if (tech?.userId) {
+        const user = await User.findById(tech.userId).select("fcmTokens").lean().catch(() => null);
+        if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
+        const userDeviceDocs = await DeviceToken.find({
+          userId: tech.userId,
+          isActive: true,
+        }).select("fcmToken").lean().catch(() => []);
+        userDeviceDocs.forEach((d) => {
+          if (d.fcmToken) rawTokens.push(d.fcmToken);
+        });
+      }
     }
-    tokens = (tokens || []).filter((t) => typeof t === "string" && t.length > 10);
+
+    // 3. De-duplicate and validate
+    const tokens = [...new Set(rawTokens)].filter(
+      (t) => typeof t === "string" && t.trim().length > 10
+    );
+
     if (!tokens.length) {
       return { success: true, skipped: true, reason: "no_fcm_token" };
     }
 
     const result = await sendFcmMulticast(tokens, payload);
 
-    // 🧹 Prune tokens FCM rejected as dead (device-not-registered / malformed).
+    // 🧹 Prune tokens FCM rejected as dead
     const invalid = (result.failedTokens || [])
       .filter((f) => INVALID_TOKEN_RE.test(String(f.error)))
       .map((f) => f.token)
       .filter(Boolean);
+
     if (invalid.length) {
       await pruneInvalidTokens(recipientId, recipientType, invalid).catch((e) =>
         console.warn(`⚠️ FCM token prune failed for ${recipientId}:`, e.message)
       );
-      // Keep the DeviceToken store consistent (section 14): mark dead tokens inactive.
       await Promise.all(invalid.map((t) => deactivateTokenByValue(t))).catch(() => {});
       console.log(`🧹 Pruned ${invalid.length} invalid FCM token(s) for ${recipientType} ${recipientId}`);
     }
@@ -142,10 +166,6 @@ export const sendPushNotification = async (recipientId, payload, options = {}) =
 
 /**
  * Send socket notification (real-time)
- * @param {Object} io - Socket.io instance
- * @param {String} technicianId - Technician profile ID
- * @param {String} event - Socket event name
- * @param {Object} data - Event data
  */
 export const sendSocketNotification = (io, technicianId, event, data) => {
   try {
@@ -154,9 +174,7 @@ export const sendSocketNotification = (io, technicianId, event, data) => {
       return { success: false, message: "Socket.io not available" };
     }
 
-    // Emit to specific technician room
     io.to(SOCKET_ROOMS.TECHNICIAN(technicianId)).emit(event, data);
-
     console.log(`🔌 Socket notification sent to Technician ${technicianId}:`, event);
     return { success: true, message: "Socket notification sent" };
   } catch (error) {
@@ -167,13 +185,8 @@ export const sendSocketNotification = (io, technicianId, event, data) => {
 
 /* ============================================================
    🛡 DEDUPE CACHE — closes the "double-fire" match race
-   (Concurrent-Risks §3.3): two concurrent path triggers for the
-   same broadcast must produce exactly ONE job:new per technician.
-   In-memory Map is correct for the single-instance deployment.
-   When the Redis adapter is enabled, switch to SETNX for
-   multi-instance safety.
    ============================================================ */
-const recentBroadcastCache = new Map(); // `${broadcastId}:${technicianId}` -> timestamp
+const recentBroadcastCache = new Map();
 const DEDUPE_WINDOW_MS = 5 * 60 * 1000;
 
 const alreadySent = (broadcastId, technicianId) => {
@@ -193,16 +206,9 @@ setInterval(() => {
 
 /**
  * Notify a single technician about a new job
- * @param {Object} io - Socket.io instance
- * @param {String} technicianId - Technician profile ID
- * @param {Object} jobData - Job data (see Utils/socketDTO.js toJobNewDTO)
- * @param {Object} [broadcast] - JobBroadcast doc (for broadcastId + version)
  */
 export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadcast) => {
   try {
-    // 🔒 Eligibility re-check IMMEDIATELY before emit (Socket Analysis B1.5):
-    // a technician suspended/revoked mid-session must not receive job alerts,
-    // even though their socket is still connected with frozen JWT claims.
     const activation = await checkTechnicianActivation(technicianId);
     if (!activation.isActive) {
       console.log(`⚠️ Skipped job:new for ineligible technician ${technicianId} (${activation.message})`);
@@ -217,7 +223,6 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 
     const jobDTO = toJobNewDTO(jobData, broadcast);
 
-    // 🛡 Server-side dedupe (Concurrent-Risks §3.3)
     if (alreadySent(jobDTO.broadcastId, technicianId)) {
       console.log(`⚠️ Skipped duplicate job:new ${jobDTO.broadcastId} → tech ${technicianId}`);
       return { success: false, skipped: true, reason: "duplicate" };
@@ -229,17 +234,13 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       body: `New ${jobDTO.serviceName || "service"} job in your area`,
       data: {
         type: "new_job",
-        bookingId: jobDTO.bookingId,
-        serviceId: jobDTO.serviceId,
-        scheduledAt: jobDTO.scheduledAt,
+        bookingId: String(jobDTO.bookingId || ""),
+        serviceId: String(jobDTO.serviceId || ""),
+        scheduledAt: String(jobDTO.scheduledAt || ""),
       },
-    });
+    }, { recipientType: "technician" });
 
-    // 2️⃣ Send socket notification — ONLY when the technician is actually
-    //    connected. Offline techs skip the ack machinery entirely (no held
-    //    10s timers, no misleading "No ACK" warning); their durable channel
-    //    is the push notification already sent above, and they catch up via
-    //    broadcastPendingJobsToTechnician when they come back online.
+    // 2️⃣ Send socket notification
     let socketResult = { success: false, offline: true, message: "Technician offline — push only" };
     if (io && hasLiveSocket(io, technicianId)) {
       const ACK_TIMEOUT_MS = 10000;
@@ -248,10 +249,6 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
         .emit(SOCKET_EVENTS.JOB_NEW, jobDTO, (err) => {
           recordAck(Boolean(err));
           if (err) {
-            // Delivery telemetry only — NOT an error. The push notification
-            // is already in flight (durable channel) and the client can also
-            // refetch via technician:jobs_changed / get_jobs, so an
-            // unacknowledged alert is never a lost job.
             console.info(
               `ℹ️ Job alert to Tech ${technicianId} unacknowledged within ${ACK_TIMEOUT_MS}ms (live socket, push already sent)`
             );
@@ -274,10 +271,6 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 
 /**
  * Broadcast new job to technicians
- * @param {Object} io - Socket.io instance (optional)
- * @param {Array} technicianIds - Array of technician profile IDs
- * @param {Object} jobData - Job broadcast data
- * @param {Object} [broadcastMap] - Optional Map(technicianId -> broadcast doc)
  */
 export const broadcastJobToTechnicians = async (io, technicianIds, jobData, broadcastMap) => {
   try {
@@ -286,7 +279,6 @@ export const broadcastJobToTechnicians = async (io, technicianIds, jobData, broa
       socket: [],
     };
 
-    // Parallel broadcast — never block the other 80 on the 20 slow/dead sockets
     await Promise.allSettled(
       technicianIds.map(async (technicianId) => {
         const broadcast = broadcastMap?.get(technicianId?.toString?.() || technicianId);
@@ -306,28 +298,56 @@ export const broadcastJobToTechnicians = async (io, technicianIds, jobData, broa
 };
 
 /**
- * Notify customer about job acceptance
- * @param {String} customerProfileId - Customer profile ID
- * @param {Object} jobData - Job acceptance data
+ * Notify customer about job acceptance (Socket + FCM Push + In-App DB)
  */
 export const notifyCustomerJobAccepted = async (io, customerProfileId, jobData) => {
   try {
     console.log(`📱 Notifying Customer ${customerProfileId} - Job Accepted`);
+    const bookingIdStr = String(jobData.bookingId?._id || jobData.bookingId || "");
+    const techName = jobData.technicianName || "A technician";
 
-    // Socket notification (real-time)
+    // 1️⃣ Socket notification (real-time)
     if (io) {
       io.to(SOCKET_ROOMS.CUSTOMER(customerProfileId)).emit(SOCKET_EVENTS.JOB_ACCEPTED_NOTIFY, {
-        bookingId: jobData.bookingId?.toString?.() || jobData.bookingId,
+        bookingId: bookingIdStr,
         technicianId: jobData.technicianId?.toString?.() || jobData.technicianId,
         status: jobData.status || "accepted",
+        technicianName: techName,
         timestamp: new Date(),
       });
     }
 
-    // TODO: Push notification to customer (FCM)
-    // TODO: SMS/WhatsApp notification if needed
+    // 2️⃣ FCM Push notification to customer
+    await sendPushNotification(
+      customerProfileId,
+      {
+        title: "Technician Assigned!",
+        body: `${techName} has accepted your booking.`,
+        data: {
+          type: "job_accepted",
+          bookingId: bookingIdStr,
+        },
+      },
+      { recipientType: "customer" }
+    );
 
-    return { success: true, message: "Customer notified" };
+    // 3️⃣ In-App Notification Store
+    await Notification.create({
+      recipientId: customerProfileId,
+      recipientType: "customer",
+      eventType: "BOOKING_ACCEPTED",
+      title: "Technician Assigned!",
+      body: `${techName} has accepted your booking.`,
+      data: {
+        bookingId: bookingIdStr,
+        technicianId: String(jobData.technicianId || ""),
+      },
+      category: "booking",
+      sourceType: "Booking",
+      sourceId: bookingIdStr,
+    }).catch((e) => console.warn("Failed to create in-app notification for booking acceptance:", e.message));
+
+    return { success: true, message: "Customer notified via Socket, Push & In-App" };
   } catch (error) {
     console.error("❌ Customer notification error:", error.message);
     return { success: false, error: error.message };
@@ -336,8 +356,6 @@ export const notifyCustomerJobAccepted = async (io, customerProfileId, jobData) 
 
 /**
  * Notify other technicians that job was taken
- * @param {Array} technicianIds - Array of technician IDs to notify
- * @param {String} bookingId - Booking ID that was accepted
  */
 export const notifyJobTaken = (io, technicianIds, bookingId) => {
   try {
@@ -345,7 +363,7 @@ export const notifyJobTaken = (io, technicianIds, bookingId) => {
 
     technicianIds.forEach((technicianId) => {
       io.to(SOCKET_ROOMS.TECHNICIAN(technicianId)).emit(SOCKET_EVENTS.JOB_TAKEN, {
-        bookingId,
+        bookingId: String(bookingId),
         message: "This job has been accepted by another technician",
         timestamp: new Date(),
       });
@@ -361,25 +379,20 @@ export const notifyJobTaken = (io, technicianIds, bookingId) => {
 
 /**
  * Notify a technician with reliable fallback (Socket -> Push -> SMS).
- * USED FOR BEST-EFFORT events (travel reminders, alerts): the 10s ACK
- * timer is intentionally DROPPED here so slow/offline clients don't pile
- * up held timers (Socket Analysis B2.3).
  */
 export const notifyTechnicianWithFallback = async (io, technicianId, payload, critical = false) => {
   try {
     const { event, data, pushTitle, pushBody, smsMessage } = payload;
     let delivered = false;
 
-    // 1️⃣ Try Socket Notification (no ACK timeout held — best effort)
+    // 1️⃣ Try Socket Notification
     if (io) {
       try {
-        await new Promise((resolve, reject) => {
+        await new Promise((resolve) => {
           io.to(SOCKET_ROOMS.TECHNICIAN(technicianId)).emit(event, data, () => {
             delivered = true;
             resolve();
           });
-          // Best-effort: if the room has no connected socket for this tech,
-          // resolve immediately so we fall through to push.
           setTimeout(() => {
             if (!delivered) resolve();
           }, 500).unref?.();
@@ -392,12 +405,16 @@ export const notifyTechnicianWithFallback = async (io, technicianId, payload, cr
 
     if (delivered) return { success: true, via: "socket" };
 
-    // 2️⃣ Fallback to Firebase Push (Free & Supports Custom Text)
-    await sendPushNotification(technicianId, {
-      title: pushTitle || "RightTouch Update",
-      body: pushBody || "You have a new update",
-      data: { ...data, type: event }
-    });
+    // 2️⃣ Fallback to Firebase Push
+    await sendPushNotification(
+      technicianId,
+      {
+        title: pushTitle || "RightTouch Update",
+        body: pushBody || "You have a new update",
+        data: { ...data, type: event },
+      },
+      { recipientType: "technician" }
+    );
 
     return { success: true, via: "push" };
   } catch (error) {

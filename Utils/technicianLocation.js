@@ -1,4 +1,5 @@
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import TechnicianLocationHistory from "../Schemas/TechnicianLocationHistory.js";
 import { broadcastPendingJobsToTechnician } from "./technicianMatching.js";
 import { geoAdd } from "./technicianGeo.js";
 import { resolveZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
@@ -96,6 +97,19 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
                 },
             }
         );
+
+        // Asynchronously record location history ping (best-effort, 30-day TTL)
+        TechnicianLocationHistory.create({
+            technicianId: technicianProfileId,
+            location: {
+                type: "Point",
+                coordinates: [longitude, latitude],
+            },
+            timestamp: new Date(),
+            districtId: resolvedDistrictId || null,
+            cityZoneId: resolvedZoneId || null,
+            source: via,
+        }).catch((histErr) => console.error("Location history record error:", histErr.message));
 
         const profileWithZone = await TechnicianProfile.findById(technicianProfileId)
             .select("cityZoneId zoneMismatch")

@@ -86,6 +86,14 @@ const technicianProfileSchema = new mongoose.Schema(
       min: 0,
     },
 
+    // Dynamic technician service radius in kilometers (Admin configurable, default 10 KM)
+    serviceRadiusKm: {
+      type: Number,
+      default: 10,
+      min: 1,
+      max: 100,
+    },
+
     specialization: {
       type: String,
       trim: true,

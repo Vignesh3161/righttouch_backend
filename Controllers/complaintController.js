@@ -93,12 +93,15 @@ export const adminGetComplaint = async (req, res) => {
 
 export const adminUpdateComplaintStatus = async (req, res) => {
   try {
-    const { status, resolutionNote, refundId } = req.body;
+    const { status, resolutionNote, refundId, refundAmount, penaltyAmount, faultParty } = req.body;
     const { report, noChange } = await adminUpdateComplaintStatusInternal({
       reportId: req.params.id,
       status,
       resolutionNote,
       refundId,
+      refundAmount,
+      penaltyAmount,
+      faultParty,
       adminUser: req.user,
     });
 

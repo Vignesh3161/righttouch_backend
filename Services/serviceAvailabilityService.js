@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import ServiceAvailability from "../Schemas/ServiceAvailability.js";
 import Service from "../Schemas/Service.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
+import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 
 /**
  * 🗺 RESOLVE SERVICE AVAILABILITY FOR CUSTOMER LOCATION
@@ -70,6 +71,19 @@ export const resolveServiceAvailability = async ({
   const zoneObjId = targetZoneId ? new mongoose.Types.ObjectId(targetZoneId) : null;
   const cityObjId = zoneObjId;
 
+  // Look up pricing multiplier from ZoneServiceMapping if zone is specified
+  let pricingMultiplier = 1.0;
+  if (zoneObjId) {
+    const mapping = await ZoneServiceMapping.findOne({
+      zoneId: zoneObjId,
+      serviceId,
+      active: true,
+    }).lean();
+    if (mapping && mapping.pricingMultiplier) {
+      pricingMultiplier = Number(mapping.pricingMultiplier) || 1.0;
+    }
+  }
+
   // 1. ZONE / SUB-ZONE LEVEL OVERRIDE CHECK (Priority 1: ZONE > DISTRICT)
   if (zoneObjId) {
     const zoneOverride = await ServiceAvailability.findOne({
@@ -88,6 +102,7 @@ export const resolveServiceAvailability = async ({
           districtId: String(districtObjId),
           cityZoneId: String(zoneObjId),
           cityId: String(zoneObjId),
+          pricingMultiplier,
           status: "ENABLED",
           reason: isCityScope ? "CITY_ENABLED" : "ZONE_ENABLED",
         };
@@ -98,6 +113,7 @@ export const resolveServiceAvailability = async ({
           districtId: String(districtObjId),
           cityZoneId: String(zoneObjId),
           cityId: String(zoneObjId),
+          pricingMultiplier,
           status: "DISABLED",
           reason: isCityScope ? "CITY_RESTRICTION" : "ZONE_RESTRICTION",
         };
@@ -121,6 +137,7 @@ export const resolveServiceAvailability = async ({
         scope: "DISTRICT",
         districtId: String(districtObjId),
         cityId: cityObjId ? String(cityObjId) : null,
+        pricingMultiplier,
         status: "ENABLED",
         reason: "DISTRICT_ENABLED",
       };
@@ -130,6 +147,7 @@ export const resolveServiceAvailability = async ({
         scope: "DISTRICT",
         districtId: String(districtObjId),
         cityId: cityObjId ? String(cityObjId) : null,
+        pricingMultiplier,
         status: "DISABLED",
         reason: "SERVICE_DISABLED",
       };
@@ -148,6 +166,7 @@ export const resolveServiceAvailability = async ({
       scope: "DISTRICT",
       districtId: String(districtObjId),
       cityId: cityObjId ? String(cityObjId) : null,
+      pricingMultiplier,
       status: "DISABLED",
       reason: "SERVICE_NOT_AVAILABLE",
     };
@@ -159,6 +178,7 @@ export const resolveServiceAvailability = async ({
     scope: "DISTRICT",
     districtId: String(districtObjId),
     cityId: cityObjId ? String(cityObjId) : null,
+    pricingMultiplier,
     status: "ENABLED",
     reason: "DEFAULT_ENABLED",
   };

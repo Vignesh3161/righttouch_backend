@@ -204,7 +204,7 @@ export const adminListComplaintsInternal = async ({ status = "open", search }) =
 };
 
 /**
- * Admin get complaint detail by ID.
+ * Admin get complaint detail by ID with financial defaults & payment context.
  */
 export const adminGetComplaintInternal = async (reportId) => {
   const report = await Report.findById(reportId)
@@ -227,13 +227,54 @@ export const adminGetComplaintInternal = async (reportId) => {
   const BookingModel = report.bookingType === "product" ? ProductBooking : ServiceBooking;
   const booking = await BookingModel.findById(report.bookingId).lean();
   const holds = await ReserveHold.find({ bookingId: report.bookingId }).lean();
-  return { report, booking, reserveHolds: holds };
+  const payment = await Payment.findOne({
+    $or: [{ bookingId: report.bookingId }, { providerOrderId: booking?.providerOrderId || "" }]
+  }).lean();
+
+  // Compute recommended default refund and penalty amounts (in INR)
+  let defaultRefundAmount = 0;
+  if (payment) {
+    const capturedPaise = payment.capturedAmountPaise ?? payment.totalAmountPaise ?? 0;
+    const refundedPaise = payment.amountRefundedPaise ?? 0;
+    defaultRefundAmount = Math.max(0, (capturedPaise - refundedPaise) / 100);
+  } else if (booking) {
+    defaultRefundAmount = booking.totalAmount || booking.totalPrice || booking.amount || booking.price || 0;
+  }
+
+  let defaultPenaltyAmount = 0;
+  if (holds && holds.length > 0) {
+    const totalHoldPaise = holds.reduce((acc, h) => acc + (h.amountPaise || 0), 0);
+    defaultPenaltyAmount = totalHoldPaise / 100;
+  } else {
+    defaultPenaltyAmount = defaultRefundAmount;
+  }
+
+  return {
+    report,
+    booking,
+    payment,
+    reserveHolds: holds,
+    defaults: {
+      refundAmount: report.refundAmount > 0 ? report.refundAmount : defaultRefundAmount,
+      penaltyAmount: report.penaltyAmount > 0 ? report.penaltyAmount : defaultPenaltyAmount,
+      faultParty: report.faultParty || "technician",
+    },
+  };
 };
 
 /**
- * Admin updates complaint status with terminal transition release, notifications, and audit log.
+ * Admin updates complaint status with terminal transition release, custom refund/penalty amounts, notifications, and audit log.
  */
-export const adminUpdateComplaintStatusInternal = async ({ reportId, status, resolutionNote, refundId, adminUser }) => {
+export const adminUpdateComplaintStatusInternal = async ({
+  reportId,
+  status,
+  resolutionNote,
+  refundId,
+  refundAmount,
+  penaltyAmount,
+  faultParty,
+  adminUser,
+}) => {
   const ALLOWED = ["open", "under_review", "resolved_refunded", "resolved_no_refund", "withdrawn", "expired"];
   if (!ALLOWED.includes(status)) {
     const err = new Error("Invalid status");
@@ -262,6 +303,16 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
   report.status = status;
   if (resolutionNote) report.resolutionNote = resolutionNote;
   if (refundId && mongoose.Types.ObjectId.isValid(refundId)) report.refundId = refundId;
+  
+  if (refundAmount !== undefined && refundAmount !== null) {
+    report.refundAmount = Number(refundAmount) || 0;
+  }
+  if (penaltyAmount !== undefined && penaltyAmount !== null) {
+    report.penaltyAmount = Number(penaltyAmount) || 0;
+  }
+  if (faultParty) {
+    report.faultParty = faultParty;
+  }
 
   if (status === "under_review") {
     await report.save();
@@ -279,8 +330,8 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
         action: "COMPLAINT_UNDER_REVIEW",
         targetType: "Report",
         targetId: report._id,
-        actor: adminUser.userId,
-        actorRole: adminUser.role,
+        actor: adminUser?.userId || null,
+        actorRole: adminUser?.role || "Admin",
         before: { status: prev },
         after: { status },
       });
@@ -290,8 +341,31 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
     return { report, noChange: false };
   }
 
+  // If status is resolved_refunded and no refundId was provided, auto-trigger refund if payment exists
+  if (status === "resolved_refunded" && !report.refundId) {
+    try {
+      const payment = await Payment.findOne({ bookingId: report.bookingId }).lean();
+      if (payment) {
+        const requestedPaise = (report.refundAmount > 0 ? report.refundAmount : ((payment.capturedAmountPaise ?? payment.totalAmountPaise) / 100)) * 100;
+        const refundObj = await createRefund({
+          paymentId: payment._id,
+          requestedPaise,
+          reason: resolutionNote || "Complaint resolved in customer favor",
+          faultParty: faultParty || "technician",
+          reportId: report._id,
+          initiatedBy: adminUser?.userId,
+        });
+        if (refundObj && refundObj._id) {
+          report.refundId = refundObj._id;
+        }
+      }
+    } catch (autoRefundErr) {
+      console.error("Auto refund creation error during complaint resolution:", autoRefundErr.message);
+    }
+  }
+
   // Terminal transition: release reserve hold & payout block
-  report.reviewedBy = adminUser.userId;
+  report.reviewedBy = adminUser?.userId || null;
   report.reviewedAt = new Date();
   await report.save();
 
@@ -309,7 +383,7 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
       eventType: resolvedEvent,
       recipientId: report.customerId,
       recipientType: "customer",
-      data: { reportId: String(report._id), status, resolutionNote: report.resolutionNote },
+      data: { reportId: String(report._id), status, resolutionNote: report.resolutionNote, refundAmount: report.refundAmount },
       source: { type: "report", id: String(report._id) },
       correlationId: String(report._id),
       idempotencyKey: `complaint:${report._id}:resolved:customer:${report.customerId}`,
@@ -320,7 +394,7 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
         eventType: resolvedEvent,
         recipientId: report.technicianId,
         recipientType: "technician",
-        data: { reportId: String(report._id), status },
+        data: { reportId: String(report._id), status, penaltyAmount: report.penaltyAmount },
         source: { type: "report", id: String(report._id) },
         correlationId: String(report._id),
         idempotencyKey: `complaint:${report._id}:resolved:technician:${report.technicianId}`,
@@ -331,10 +405,17 @@ export const adminUpdateComplaintStatusInternal = async ({ reportId, status, res
       action: "COMPLAINT_STATUS_UPDATED",
       targetType: "Report",
       targetId: report._id,
-      actor: adminUser.userId,
-      actorRole: adminUser.role,
+      actor: adminUser?.userId || null,
+      actorRole: adminUser?.role || "Admin",
       before: { status: prev },
-      after: { status, resolutionNote: report.resolutionNote, refundId: report.refundId },
+      after: {
+        status,
+        resolutionNote: report.resolutionNote,
+        refundId: report.refundId,
+        refundAmount: report.refundAmount,
+        penaltyAmount: report.penaltyAmount,
+        faultParty: report.faultParty,
+      },
     });
   } catch (e) {
     console.error("Terminal resolution notify/audit error:", e.message);

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1004708226378",
+    "project_id": "righttouchmessaging-401e9",
+    "storage_bucket": "righttouchmessaging-401e9.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1004708226378:android:39dfae6aa9bb4b1648cdb3",
+        "android_client_info": {
+          "package_name": "com.righttouch.customer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCroqPzTBPfDHoMyUDw3DNUkR_BvVIvK98"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

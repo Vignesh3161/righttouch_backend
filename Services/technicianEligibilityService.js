@@ -183,7 +183,7 @@ export const checkTechnicianEligibility = async ({
     details.gpsFresh = true;
   }
 
-  // 8. DISTRICT PERMISSION CHECK (DISTRICT ONLY — NO TECHNICIAN CITY ASSIGNMENT)
+  // 8. DISTRICT & ZONE PERMISSION CHECK
   const primaryId = tech.primaryDistrictId || tech.primaryCityId;
   const enabledDistricts = [
     ...(tech.enabledDistrictIds || []),
@@ -199,10 +199,20 @@ export const checkTechnicianEligibility = async ({
     const hasDistAccess = allowedDistrictIds.includes(targetDistrictId);
     details.districtPermission = hasDistAccess;
     if (!hasDistAccess) {
-      reasons.push("DISTRICT_NOT_ALLOWED");
+      reasons.push("DISTRICT_PERMISSION_DENIED");
     }
   } else {
     details.districtPermission = allowedDistrictIds.length > 0;
+  }
+
+  // Check Zone Permission if job specifies a CityZone
+  if (jobCityId && Array.isArray(tech.enabledCityZoneIds)) {
+    const targetZoneIdStr = String(jobCityId._id || jobCityId);
+    const hasZoneAccess = tech.enabledCityZoneIds.some((z) => String(z._id || z) === targetZoneIdStr);
+    details.zonePermission = hasZoneAccess;
+    if (!hasZoneAccess) {
+      reasons.push("ZONE_PERMISSION_DENIED");
+    }
   }
 
   // 9. CURRENT PHYSICAL GPS DISTRICT CHECK
@@ -223,7 +233,7 @@ export const checkTechnicianEligibility = async ({
     }
   }
 
-  // 10. 10 KM RADIUS GATE (CURRENT GPS TO CUSTOMER JOB GPS)
+  // 10. DYNAMIC TECHNICIAN RADIUS GATE (CURRENT GPS TO CUSTOMER JOB GPS)
   if (hasTechCoords && Number.isFinite(jobLat) && Number.isFinite(jobLng)) {
     const distMeters = haversineMeters(
       { latitude: techCoords[1], longitude: techCoords[0] },
@@ -232,11 +242,16 @@ export const checkTechnicianEligibility = async ({
     const distKm = Number((distMeters / 1000).toFixed(2));
     details.distanceKm = distKm;
 
-    const withinRadius = distMeters <= MAX_JOB_DISTANCE_METERS;
+    // Use per-technician configured radius or fallback to 10 KM default
+    const maxRadiusKm = Number(tech.serviceRadiusKm) > 0 ? Number(tech.serviceRadiusKm) : MAX_JOB_DISTANCE_KM;
+    const maxRadiusMeters = maxRadiusKm * 1000;
+    details.configuredRadiusKm = maxRadiusKm;
+
+    const withinRadius = distMeters <= maxRadiusMeters;
     details.radiusPassed = withinRadius;
 
     if (!withinRadius) {
-      reasons.push("OUTSIDE_RADIUS");
+      reasons.push("TECHNICIAN_OUTSIDE_RADIUS");
     }
   }
 
