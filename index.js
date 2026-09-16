@@ -653,8 +653,11 @@ App.use((err, req, res, next) => {
 const startServer = async () => {
   validateSecrets();
   try {
-    // 1. Connect MongoDB Atlas
+    // 1. Connect MongoDB Atlas with optimized connection pooling
     await mongoose.connect(process.env.MONGO_URI, {
+      maxPoolSize: 50,
+      minPoolSize: 5,
+      maxIdleTimeMS: 30000,
       serverSelectionTimeoutMS: 10000,
       socketTimeoutMS: 45000,
     });

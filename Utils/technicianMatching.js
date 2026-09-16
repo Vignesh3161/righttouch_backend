@@ -634,22 +634,9 @@ export const findEligibleTechniciansForService = async ({
   const serviceObjectId = new mongoose.Types.ObjectId(serviceId);
   const serviceIdString = String(serviceId);
 
-  let approvedKycQuery = TechnicianKyc.find({
-    verificationStatus: "approved",
-  }).select("technicianId");
-  if (session) approvedKycQuery = approvedKycQuery.session(session);
-  const approvedKyc = await approvedKycQuery;
-
-  const approvedTechnicianIds = approvedKyc
-    .map((d) => d.technicianId)
-    .filter(Boolean);
-
-  if (approvedTechnicianIds.length === 0) {
-    return [];
-  }
-
-  const activeTechIdsQuery = ServiceBooking.find({
-    technicianId: { $in: approvedTechnicianIds },
+  // ⚡ 1. Efficiently query busy technicians (indexed distinct query on active bookings)
+  let activeTechIdsQuery = ServiceBooking.find({
+    technicianId: { $ne: null },
     status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
   }).distinct("technicianId");
 
@@ -657,8 +644,8 @@ export const findEligibleTechniciansForService = async ({
     ? await activeTechIdsQuery.session(session)
     : await activeTechIdsQuery;
 
+  // ⚡ 2. Build targeted candidate query using compound indexes on TechnicianProfile
   const baseQuery = {
-    _id: { $in: approvedTechnicianIds, $nin: activeTechIds },
     workStatus: "approved",
     profileComplete: true,
     trainingCompleted: true,
@@ -669,9 +656,26 @@ export const findEligibleTechniciansForService = async ({
     ],
   };
 
+  if (activeTechIds && activeTechIds.length > 0) {
+    baseQuery._id = { $nin: activeTechIds };
+  }
+
   if (STALENESS_SECONDS > 0) {
     baseQuery.locationUpdatedAt = { $gte: stalenessCutoff() };
   }
+
+  // Helper to verify KYC only for the shortlisted candidates (O(candidates), not O(all technicians in DB))
+  const filterByApprovedKyc = async (techIds) => {
+    if (!techIds?.length) return [];
+    let kycQuery = TechnicianKyc.find({
+      technicianId: { $in: techIds },
+      verificationStatus: "approved",
+    }).distinct("technicianId");
+    if (session) kycQuery = kycQuery.session(session);
+    const approved = await kycQuery;
+    const approvedSet = new Set(approved.map(String));
+    return techIds.filter((id) => approvedSet.has(String(id)));
+  };
 
   const lat = Number(address?.latitude);
   const lng = Number(address?.longitude);
@@ -719,7 +723,8 @@ export const findEligibleTechniciansForService = async ({
       if (session) redisQuery = redisQuery.session(session);
       const redisMatches = await redisQuery;
       if (redisMatches.length > 0) {
-        return filterByOperationalPolygon(redisMatches.map((t) => t._id));
+        const verifiedIds = await filterByApprovedKyc(redisMatches.map((t) => t._id));
+        return filterByOperationalPolygon(verifiedIds);
       }
     }
 
@@ -748,7 +753,8 @@ export const findEligibleTechniciansForService = async ({
     const nearby = await nearbyQuery;
 
     if (nearby.length > 0) {
-      return filterByOperationalPolygon(nearby.map((t) => t._id));
+      const verifiedIds = await filterByApprovedKyc(nearby.map((t) => t._id));
+      return filterByOperationalPolygon(verifiedIds);
     }
   }
 
@@ -767,7 +773,8 @@ export const findEligibleTechniciansForService = async ({
     .limit(limit);
   if (session) fallbackFindQuery = fallbackFindQuery.session(session);
   const fallbackTechs = await fallbackFindQuery;
-  return filterByOperationalPolygon(fallbackTechs.map((t) => t._id));
+  const verifiedFallbackIds = await filterByApprovedKyc(fallbackTechs.map((t) => t._id));
+  return filterByOperationalPolygon(verifiedFallbackIds);
 };
 
 /**

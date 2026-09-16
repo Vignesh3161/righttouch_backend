@@ -88,6 +88,7 @@ const bookingOutboxSchema = new mongoose.Schema(
 );
 
 bookingOutboxSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+bookingOutboxSchema.index({ status: 1, claimedAt: 1 });
 
 export default mongoose.models.BookingOutbox ||
   mongoose.model("BookingOutbox", bookingOutboxSchema);

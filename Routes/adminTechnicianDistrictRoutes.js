@@ -38,8 +38,10 @@ router.get("/technicians/:technicianId/zones", Auth, getTechnicianZonePermission
 router.post("/technicians/:technicianId/city-zones", Auth, enableTechnicianZonePermission);
 router.post("/technicians/:technicianId/zones/:zoneId/enable", Auth, enableTechnicianZonePermission);
 
-// Revoke a city zone permission for technician
+// Revoke city zone permission(s) for technician (single zone in URL or multiple in body)
 router.delete("/technicians/:technicianId/city-zones/:zoneId", Auth, disableTechnicianZonePermission);
+router.delete("/technicians/:technicianId/city-zones", Auth, disableTechnicianZonePermission);
+router.post("/technicians/:technicianId/city-zones/remove", Auth, disableTechnicianZonePermission);
 router.post("/technicians/:technicianId/zones/:zoneId/disable", Auth, disableTechnicianZonePermission);
 
 export default router;

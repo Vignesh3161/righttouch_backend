@@ -677,8 +677,46 @@ export const listAdminTechnicians = async (req, res) => {
 
     const techQuery = {};
 
-    if (districtId) {
-      techQuery.$or = [{ primaryDistrictId: districtId }, { enabledDistrictIds: districtId }];
+    if (districtId && districtId !== "all" && districtId !== "All" && districtId !== "undefined" && districtId !== "null" && String(districtId).trim() !== "") {
+      const dStr = String(districtId).trim();
+      const districtConditions = [];
+
+      if (mongoose.Types.ObjectId.isValid(dStr)) {
+        const dObjId = new mongoose.Types.ObjectId(dStr);
+        districtConditions.push(
+          { primaryDistrictId: dObjId },
+          { primaryCityId: dObjId },
+          { enabledDistrictIds: dObjId },
+          { allowedCityIds: dObjId }
+        );
+      }
+
+      // Also match by district name if passed as text or code
+      const matchingDistricts = await OperationalCity.find({
+        $or: [
+          { name: new RegExp(`^${dStr}$`, "i") },
+          { city: new RegExp(`^${dStr}$`, "i") },
+          { code: new RegExp(`^${dStr}$`, "i") },
+          { name: { $regex: dStr, $options: "i" } }
+        ]
+      }).select("_id").lean().catch(() => []);
+
+      if (matchingDistricts.length > 0) {
+        const matchingIds = matchingDistricts.map(d => d._id);
+        districtConditions.push(
+          { primaryDistrictId: { $in: matchingIds } },
+          { primaryCityId: { $in: matchingIds } },
+          { enabledDistrictIds: { $in: matchingIds } },
+          { allowedCityIds: { $in: matchingIds } }
+        );
+      }
+
+      // Match legacy text string in city
+      districtConditions.push({ city: new RegExp(`^${dStr}$`, "i") });
+
+      if (districtConditions.length > 0) {
+        techQuery.$or = districtConditions;
+      }
     }
 
     if (accountStatus && accountStatus !== "All") {
@@ -701,8 +739,10 @@ export const listAdminTechnicians = async (req, res) => {
 
     const technicians = await TechnicianProfile.find(techQuery)
       .populate("userId", "fname lname email mobileNumber status")
-      .populate("primaryDistrictId", "name code")
-      .populate("enabledDistrictIds", "name code")
+      .populate("primaryDistrictId", "name code city")
+      .populate("primaryCityId", "name code city")
+      .populate("enabledDistrictIds", "name code city")
+      .populate("allowedCityIds", "name code city")
       .lean();
 
     const now = Date.now();
@@ -777,15 +817,33 @@ export const listAdminTechnicians = async (req, res) => {
         failureReason = eligibility.reasons[0] || "INELIGIBLE";
       }
 
+      const primaryDistrictDoc = tech.primaryDistrictId || tech.primaryCityId;
+      const primaryDistrictName = primaryDistrictDoc?.name || primaryDistrictDoc?.city || tech.city || "Unassigned";
+      const radiusVal = tech.coverageRadiusKm || tech.serviceRadius || tech.radius || 10;
+
       formattedList.push({
         _id: tech._id,
+        id: tech._id,
         technicianId: techIdStr,
         name,
+        technician: name,
+        technicianName: name,
         mobile,
+        phone: mobile,
+        mobileNumber: mobile,
         email,
-        district: tech.primaryDistrictId?.name || "Unassigned",
-        primaryDistrictId: tech.primaryDistrictId,
-        enabledDistricts: (tech.enabledDistrictIds || []).map((d) => d.name),
+        primaryDistrict: primaryDistrictName,
+        district: primaryDistrictName,
+        primaryDistrictId: primaryDistrictDoc?._id || null,
+        enabledDistricts: [
+          ...(tech.enabledDistrictIds || []),
+          ...(tech.allowedCityIds || [])
+        ].map((d) => d?.name || d?.city || String(d)).filter(Boolean),
+        serviceRadius: `${radiusVal} KM`,
+        coverageRadiusKm: radiusVal,
+        radius: radiusVal,
+        geofenceStatus: tech.zoneMismatch ? "Outside Zone" : (tech.location?.coordinates ? "GPS Defined" : "No GPS"),
+        status: tech.workStatus || "Active",
         online: tech.availability?.isOnline ? "🟢 Online" : "🔴 Offline",
         isOnline: tech.availability?.isOnline || false,
         gpsFreshness: freshnessBadge,
@@ -824,12 +882,14 @@ export const getAdminTechnicianDetails = async (req, res) => {
     const [tech, permHistory] = await Promise.all([
       TechnicianProfile.findById(id)
         .populate("userId", "fname lname email mobileNumber status createdAt")
-        .populate("primaryDistrictId", "name code state")
-        .populate("enabledDistrictIds", "name code state")
+        .populate("primaryDistrictId", "name code state city")
+        .populate("primaryCityId", "name code state city")
+        .populate("enabledDistrictIds", "name code state city")
+        .populate("allowedCityIds", "name code state city")
         .populate("skills.serviceId", "serviceName serviceType")
         .lean(),
       DistrictPermissionHistory.find({ technicianId: id })
-        .populate("districtId", "name code")
+        .populate("districtId", "name code city")
         .populate("adminId", "fname lname email")
         .sort({ createdAt: -1 })
         .lean(),
@@ -839,13 +899,15 @@ export const getAdminTechnicianDetails = async (req, res) => {
 
     const lastUpdate = tech.locationUpdatedAt ? new Date(tech.locationUpdatedAt).getTime() : 0;
     const ageSeconds = lastUpdate > 0 ? Math.floor((Date.now() - lastUpdate) / 1000) : 9999;
+    const primaryDistrictDoc = tech.primaryDistrictId || tech.primaryCityId;
+    const radiusVal = tech.coverageRadiusKm || tech.serviceRadius || tech.radius || 10;
 
     return res.status(200).json({
       success: true,
       result: {
         profile: {
           technicianId: tech._id,
-          name: `${tech.userId?.fname || ""} ${tech.userId?.lname || ""}`.trim(),
+          name: `${tech.userId?.fname || ""} ${tech.userId?.lname || ""}`.trim() || "Technician",
           email: tech.userId?.email,
           mobile: tech.userId?.mobileNumber,
           accountStatus: tech.userId?.status || "Active",
@@ -864,10 +926,16 @@ export const getAdminTechnicianDetails = async (req, res) => {
           freshnessBadge: ageSeconds <= 90 ? "Fresh (<=90s)" : "Stale (>90s)",
         },
         permissions: {
-          primaryDistrict: tech.primaryDistrictId,
-          enabledDistricts: tech.enabledDistrictIds,
+          primaryDistrict: primaryDistrictDoc || { name: tech.city || "Unassigned" },
+          enabledDistricts: [
+            ...(tech.enabledDistrictIds || []),
+            ...(tech.allowedCityIds || [])
+          ],
           permissionHistory: permHistory,
         },
+        coverageRadiusKm: radiusVal,
+        serviceRadius: radiusVal,
+        radius: radiusVal,
         skills: tech.skills || [],
       },
     });

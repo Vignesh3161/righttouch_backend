@@ -111,13 +111,19 @@ export const getTechnicianZonePermissions = async (req, res) => {
       };
     }
 
+    const radiusVal = tech.coverageRadiusKm || tech.serviceRadius || tech.radius || 10;
+
     return res.status(200).json({
       success: true,
       technicianId: String(tech._id),
       primaryDistrict,
       enabledDistricts,
+      allowedDistricts: enabledDistricts,
       enabledCityZones,
       groupedZonesByDistrict,
+      coverageRadiusKm: radiusVal,
+      serviceRadius: radiusVal,
+      radius: radiusVal,
     });
   } catch (error) {
     console.error("❌ getTechnicianZonePermissions error:", error);
@@ -127,33 +133,23 @@ export const getTechnicianZonePermissions = async (req, res) => {
 
 /**
  * 2. POST /api/admin/technicians/:technicianId/city-zones
- * Enables a specific city zone for a technician. Validates that the zone's parent
- * district is enabled for the technician first.
+ * Enables one or multiple city zones for a technician. Validates that all zones'
+ * parent districts are authorized for the technician first.
+ * Supports: { cityZoneId } OR { cityZoneIds: [...] } / { zoneIds: [...] }
  */
 export const enableTechnicianZonePermission = async (req, res) => {
   try {
     const { technicianId } = req.params;
-    const { cityZoneId, reason } = req.body;
+    const { cityZoneId, zoneId, cityZoneIds, zoneIds, reason } = req.body || {};
 
-    if (!technicianId || !cityZoneId) {
-      return res.status(400).json({ success: false, message: "technicianId and cityZoneId are required" });
+    const rawIds = cityZoneIds || zoneIds || (cityZoneId ? [cityZoneId] : zoneId ? [zoneId] : []);
+    const targetZoneIds = [...new Set(rawIds.map((id) => String(id?._id || id)))].filter(Boolean);
+
+    if (!technicianId || targetZoneIds.length === 0) {
+      return res.status(400).json({ success: false, message: "technicianId and cityZoneId(s) are required" });
     }
 
-    // 1. Find CityZone and its operational district
-    const zone = await CityZone.findById(cityZoneId).lean();
-    if (!zone) {
-      return res.status(404).json({ success: false, message: "City zone not found" });
-    }
-
-    const districtId = zone.operationalCityId;
-    if (!districtId) {
-      return res.status(400).json({ success: false, message: "City zone does not belong to an operational district" });
-    }
-
-    const district = await OperationalCity.findById(districtId).select("name city").lean();
-    const districtName = district?.name || district?.city || "Unknown District";
-
-    // 2. Validate Technician District Permission
+    // 1. Fetch Technician to check authorized parent districts
     const tech = await TechnicianProfile.findById(technicianId).lean();
     if (!tech) {
       return res.status(404).json({ success: false, message: "Technician profile not found" });
@@ -166,42 +162,61 @@ export const enableTechnicianZonePermission = async (req, res) => {
       ...(tech.allowedCityIds || []).map((id) => String(id._id || id)),
     ].filter(Boolean);
 
-    // Also check TechnicianDistrictPermission collection
-    const activeDistPerm = await TechnicianDistrictPermission.findOne({
+    const activeDistPerms = await TechnicianDistrictPermission.find({
       technicianId,
-      districtId,
       isEnabled: true,
-    }).lean();
+    }).select("districtId").lean();
 
-    const hasDistrictAccess = allowedDistrictIds.includes(String(districtId)) || Boolean(activeDistPerm);
+    activeDistPerms.forEach((p) => {
+      if (p.districtId) allowedDistrictIds.push(String(p.districtId));
+    });
 
-    if (!hasDistrictAccess) {
+    // 2. Fetch requested zones
+    const zones = await CityZone.find({ _id: { $in: targetZoneIds } }).lean();
+    if (!zones.length) {
+      return res.status(404).json({ success: false, message: "No valid city zones found" });
+    }
+
+    const unauthorized = [];
+    const validZoneIds = [];
+
+    for (const z of zones) {
+      const dId = String(z.operationalCityId || "");
+      if (!allowedDistrictIds.includes(dId)) {
+        unauthorized.push(z.name);
+      } else {
+        validZoneIds.push(z._id);
+      }
+    }
+
+    if (unauthorized.length > 0) {
       return res.status(400).json({
         success: false,
-        message: `Cannot enable zone "${zone.name}". Technician does not have permission for the parent district "${districtName}".`,
+        message: `Cannot enable zone(s) [${unauthorized.join(", ")}]: technician does not have permission for the parent district.`,
       });
     }
 
-    // 3. Enable Zone Permission (addToSet)
+    // 3. Enable Zone Permissions via $addToSet
     await TechnicianProfile.updateOne(
       { _id: technicianId },
       {
         $addToSet: {
-          enabledCityZoneIds: cityZoneId,
+          enabledCityZoneIds: { $each: validZoneIds },
         },
       }
     );
 
     // 4. Record Audit Log
-    await TechnicianZonePermissionAudit.create({
+    const auditDocs = validZoneIds.map((zid) => ({
       technicianId,
-      cityZoneId,
+      cityZoneId: zid,
       action: "enabled",
-      changedBy: req.user._id,
+      changedBy: req.user?._id || req.user?.userId,
       reason: reason || "Admin granted zone work permission",
-    });
+    }));
+    await TechnicianZonePermissionAudit.insertMany(auditDocs).catch(() => {});
 
-    console.log(`✅ Granted zone ${zone.name} (${cityZoneId}) permission for tech ${technicianId}`);
+    console.log(`✅ Granted ${validZoneIds.length} zone(s) permission for tech ${technicianId}`);
     return getTechnicianZonePermissions(req, res);
   } catch (error) {
     console.error("❌ enableTechnicianZonePermission error:", error);
@@ -210,38 +225,43 @@ export const enableTechnicianZonePermission = async (req, res) => {
 };
 
 /**
- * 3. DELETE /api/admin/technicians/:technicianId/city-zones/:zoneId
- * Revokes a city zone permission for a technician.
+ * 3. DELETE /api/admin/technicians/:technicianId/city-zones/:zoneId (single)
+ *    DELETE /api/admin/technicians/:technicianId/city-zones (bulk in body)
+ * Revokes one or multiple city zone permissions for a technician.
  */
 export const disableTechnicianZonePermission = async (req, res) => {
   try {
     const { technicianId, zoneId } = req.params;
-    const { reason } = req.body || {};
+    const { cityZoneId, cityZoneIds, zoneIds, reason } = req.body || {};
 
-    if (!technicianId || !zoneId) {
-      return res.status(400).json({ success: false, message: "technicianId and zoneId are required" });
+    const rawIds = cityZoneIds || zoneIds || (zoneId ? [zoneId] : cityZoneId ? [cityZoneId] : []);
+    const targetZoneIds = [...new Set(rawIds.map((id) => String(id?._id || id)))].filter(Boolean);
+
+    if (!technicianId || targetZoneIds.length === 0) {
+      return res.status(400).json({ success: false, message: "technicianId and zoneId(s) are required" });
     }
 
-    // 1. Pull zone from enabledCityZoneIds
+    // 1. Pull zones from enabledCityZoneIds
     await TechnicianProfile.updateOne(
       { _id: technicianId },
       {
         $pull: {
-          enabledCityZoneIds: zoneId,
+          enabledCityZoneIds: { $in: targetZoneIds },
         },
       }
     );
 
     // 2. Record Audit Log
-    await TechnicianZonePermissionAudit.create({
+    const auditDocs = targetZoneIds.map((zid) => ({
       technicianId,
-      cityZoneId: zoneId,
+      cityZoneId: zid,
       action: "disabled",
-      changedBy: req.user._id,
+      changedBy: req.user?._id || req.user?.userId,
       reason: reason || "Admin revoked zone work permission",
-    });
+    }));
+    await TechnicianZonePermissionAudit.insertMany(auditDocs).catch(() => {});
 
-    console.log(`🚫 Revoked zone ${zoneId} permission for tech ${technicianId}`);
+    console.log(`🚫 Revoked ${targetZoneIds.length} zone(s) permission for tech ${technicianId}`);
     return getTechnicianZonePermissions(req, res);
   } catch (error) {
     console.error("❌ disableTechnicianZonePermission error:", error);

@@ -24,6 +24,7 @@ const NotificationOutboxSchema = new Schema(
 );
 
 NotificationOutboxSchema.index({ status: 1, nextAttemptAt: 1 });
+NotificationOutboxSchema.index({ status: 1, publishedAt: 1 });
 
 export default mongoose.models.NotificationOutbox ||
   mongoose.model("NotificationOutbox", NotificationOutboxSchema);

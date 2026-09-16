@@ -96,6 +96,7 @@ const dispatchOutboxSchema = new mongoose.Schema(
 
 // Poller query: due pending jobs, oldest first
 dispatchOutboxSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+dispatchOutboxSchema.index({ status: 1, claimedAt: 1 });
 
 // Prevent duplicate outbox rows for the same broadcast (re-broadcast cycles).
 // This single (unique, partial) index on { bookingId, technicianId, kind }

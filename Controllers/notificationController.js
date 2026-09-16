@@ -4,11 +4,11 @@ const ok = (res, status, message, result = {}) => res.status(status).json({ succ
 const fail = (res, status, message, result = {}) => res.status(status).json({ success: false, message, result });
 
 const getRecipient = (req) => {
-  const role = req.user?.role;
+  const role = (req.user?.role || "").toLowerCase();
   if (role === "technician") {
-    return { recipientId: req.user.technicianProfileId, recipientType: "technician" };
+    return { recipientId: req.user.technicianProfileId || req.user.userId, recipientType: "technician" };
   }
-  if (role === "admin" || role === "Owner") {
+  if (role === "admin" || role === "owner") {
     return { recipientId: req.user.userId, recipientType: "admin" };
   }
   return { recipientId: req.user.userId, recipientType: "customer" };
