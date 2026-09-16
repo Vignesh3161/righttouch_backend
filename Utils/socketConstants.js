@@ -10,12 +10,18 @@ export const SOCKET_EVENTS = {
     DISCONNECT: "disconnect",
     ERROR: "error",
 
+    // 🔔 Unified Notification Events
+    NOTIFICATION_NEW: "notification:new",
+
     // 👤 User/Customer Events
-    JOB_ACCEPTED_NOTIFY: "job_accepted", // Notifies customer
+    JOB_ACCEPTED_NOTIFY: "job_accepted", // Legacy event
+    BOOKING_ACCEPTED: "booking:accepted", // Standardized event
+    BOOKING_STARTED: "booking:started",
+    BOOKING_ARRIVED: "booking:arrived",
+    BOOKING_COMPLETED: "booking:completed",
+    BOOKING_CANCELLED: "booking:cancelled",
     TECHNICIAN_STARTED_TRAVEL: "technician_started_travel",
     TECHNICIAN_ARRIVED: "technician_arrived",
-    BOOKING_COMPLETED: "booking_completed",
-    BOOKING_CANCELLED: "booking_cancelled",
 
     // 👨‍🔧 Technician Events
     TECH_LOCATION_UPDATE: "technician:location_update",
@@ -74,9 +80,14 @@ export const SOCKET_EVENTS = {
 };
 
 /**
- * 🔒 SOCKET ROOM PREFIXES
+ * 🔒 SOCKET ROOM PREFIXES & HELPERS
  */
 export const SOCKET_ROOMS = {
+    // Standardized user/role rooms
+    USER: (userId) => `user:${userId}`,
+    ROLE: (role) => `role:${String(role).toLowerCase()}`,
+
+    // Backward-compatible legacy rooms
     TECHNICIAN: (id) => `technician_${id}`,
     CUSTOMER: (id) => `customer_${id}`,
     ADMIN_DASHBOARD: "admin_dashboard",

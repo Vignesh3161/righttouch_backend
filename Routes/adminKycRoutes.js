@@ -1,4 +1,5 @@
 import express from "express";
+import { Auth, authorizeRoles } from "../Middleware/Auth.js";
 import {
   getAllTechnicianKyc,
   getTechnicianKyc,
@@ -14,6 +15,9 @@ import {
 } from "../Controllers/technicianKycController.js";
 
 const router = express.Router();
+
+// Enforce authentication & Admin/Owner role across all admin KYC routes
+router.use(Auth, authorizeRoles("Admin", "Owner"));
 
 /* ================= ADMIN KYC / BANK MANAGEMENT ================= */
 // These are admin/owner-only operations, mounted under /api/admin so they

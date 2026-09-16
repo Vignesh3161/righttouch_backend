@@ -8,8 +8,13 @@ import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
 import { handleLocationUpdate } from "../Utils/technicianLocation.js";
 import { revokeSocketSession } from "../Utils/socketSessionControl.js";
-import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import {
+  resolveZoneFromCoordinates,
+  resolveDistrictAndZoneFromCoordinates,
+} from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
+import CityZone from "../Schemas/CityZone.js";
+import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
 import OperationalCity from "../Schemas/OperationalCity.js";
@@ -383,7 +388,529 @@ export const removeTechnicianSkills = async (req, res) => {
   }
 };
 
-/* ================= UPDATE TECHNICIAN SKILLS ================= */
+/* ==========================================================================
+   🏙 STEP 1: GET DISTRICTS FOR TECHNICIAN REGISTRATION
+   Returns ONLY active districts where technician registration is enabled.
+   ========================================================================== */
+export const getRegistrationDistricts = async (req, res) => {
+  try {
+    const districts = await OperationalCity.find({
+      active: true,
+      isRegistrationEnabled: true,
+    })
+      .select("_id name city state code polygon active isRegistrationEnabled isJobEnabled")
+      .sort({ name: 1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      message: "Registration-enabled districts fetched successfully",
+      result: districts,
+    });
+  } catch (error) {
+    console.error("getRegistrationDistricts Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error fetching registration districts",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   🏘 STEP 2: GET CITY / ZONES FOR SELECTED DISTRICT
+   Returns active micro-zones belonging to the selected active district.
+   ========================================================================== */
+export const getRegistrationZones = async (req, res) => {
+  try {
+    const districtId = req.query.districtId || req.query.operationalCityId || req.query.cityId;
+
+    if (!districtId || !isValidObjectId(districtId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid districtId is required",
+        result: {},
+      });
+    }
+
+    // Verify district exists and is open for registration
+    const district = await OperationalCity.findOne({
+      _id: districtId,
+      active: true,
+      isRegistrationEnabled: true,
+    }).lean();
+
+    if (!district) {
+      return res.status(404).json({
+        success: false,
+        message: "District not found or technician registration is disabled for this district",
+        result: {},
+      });
+    }
+
+    const zones = await CityZone.find({
+      operationalCityId: districtId,
+      active: true,
+    })
+      .select("_id name zoneCode description polygon active operationalCityId")
+      .sort({ name: 1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      message: "Active zones fetched successfully",
+      result: {
+        district: {
+          _id: district._id,
+          name: district.name,
+          code: district.code,
+        },
+        zones,
+      },
+    });
+  } catch (error) {
+    console.error("getRegistrationZones Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error fetching registration zones",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   📍 STEP 3 & 4: AUTHORITATIVE GPS & ZONE MISMATCH VALIDATION
+   Authoritative check: validates GPS coordinates against selected District & Zone.
+   Prevents registering in incorrect zone.
+   ========================================================================== */
+export const validateRegistrationLocation = async (req, res) => {
+  try {
+    const { latitude, longitude, selectedDistrictId, selectedZoneId } = req.body;
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_COORDINATES",
+        message: "Valid latitude and longitude are required",
+        result: {},
+      });
+    }
+
+    const { district: resolvedDistrict, zone: resolvedZone } =
+      await resolveDistrictAndZoneFromCoordinates(lat, lng);
+
+    if (!resolvedDistrict) {
+      return res.status(400).json({
+        success: false,
+        code: "LOCATION_OUTSIDE_SERVICE_AREA",
+        message: "Your current GPS location is outside our operational service areas.",
+        result: {
+          providedCoordinates: { latitude: lat, longitude: lng },
+        },
+      });
+    }
+
+    if (!resolvedDistrict.isRegistrationEnabled) {
+      return res.status(400).json({
+        success: false,
+        code: "REGISTRATION_DISABLED_IN_DISTRICT",
+        message: `Technician registration is currently disabled in ${resolvedDistrict.name}.`,
+        result: {
+          resolvedDistrict: {
+            id: resolvedDistrict._id,
+            name: resolvedDistrict.name,
+          },
+        },
+      });
+    }
+
+    // Check District Match if selectedDistrictId provided
+    if (selectedDistrictId && isValidObjectId(selectedDistrictId)) {
+      if (resolvedDistrict._id.toString() !== selectedDistrictId.toString()) {
+        const selectedDistDoc = await OperationalCity.findById(selectedDistrictId).select("name").lean();
+        const selectedName = selectedDistDoc?.name || "the selected district";
+        return res.status(400).json({
+          success: false,
+          code: "LOCATION_DISTRICT_MISMATCH",
+          message: `Your GPS location is in ${resolvedDistrict.name}, but you selected ${selectedName}. Please select the correct district.`,
+          result: {
+            resolvedDistrict: {
+              id: resolvedDistrict._id,
+              name: resolvedDistrict.name,
+              code: resolvedDistrict.code,
+            },
+            selectedDistrictId,
+          },
+        });
+      }
+    }
+
+    // Check Zone Match if selectedZoneId provided
+    if (selectedZoneId && isValidObjectId(selectedZoneId)) {
+      if (!resolvedZone) {
+        return res.status(400).json({
+          success: false,
+          code: "LOCATION_ZONE_MISMATCH",
+          message: "Your GPS location does not fall into any active micro-zone within this district. Please check your address.",
+          result: {
+            resolvedDistrict: {
+              id: resolvedDistrict._id,
+              name: resolvedDistrict.name,
+            },
+          },
+        });
+      }
+
+      if (resolvedZone._id.toString() !== selectedZoneId.toString()) {
+        const selectedZoneDoc = await CityZone.findById(selectedZoneId).select("name").lean();
+        const selectedZoneName = selectedZoneDoc?.name || "the selected area";
+        return res.status(400).json({
+          success: false,
+          code: "LOCATION_ZONE_MISMATCH",
+          message: `Your address is located in ${resolvedZone.name}, but you selected ${selectedZoneName}. Please select the correct service area.`,
+          result: {
+            resolvedZone: {
+              id: resolvedZone._id,
+              name: resolvedZone.name,
+              zoneCode: resolvedZone.zoneCode,
+            },
+            resolvedDistrict: {
+              id: resolvedDistrict._id,
+              name: resolvedDistrict.name,
+            },
+            selectedZoneId,
+          },
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Location validation successful",
+      result: {
+        valid: true,
+        resolvedDistrict: {
+          _id: resolvedDistrict._id,
+          name: resolvedDistrict.name,
+          code: resolvedDistrict.code,
+        },
+        resolvedZone: resolvedZone ? {
+          _id: resolvedZone._id,
+          name: resolvedZone.name,
+          zoneCode: resolvedZone.zoneCode,
+        } : null,
+      },
+    });
+  } catch (error) {
+    console.error("validateRegistrationLocation Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error validating registration location",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   🛠 STEP 5: GET SERVICES AVAILABLE IN ZONE (FROM ZoneServiceMapping)
+   Returns active services configured for the zone, annotated with availability
+   and technician's skill approval statuses.
+   ========================================================================== */
+export const getZoneServicesForTechnician = async (req, res) => {
+  try {
+    let zoneId = req.query.zoneId || req.query.cityZoneId;
+
+    // If authenticated technician and zoneId not passed in query, use registered zone
+    if (!zoneId && req.user?.technicianProfileId) {
+      const tech = await TechnicianProfile.findById(req.user.technicianProfileId).select("cityZoneId").lean();
+      zoneId = tech?.cityZoneId;
+    }
+
+    if (!zoneId || !isValidObjectId(zoneId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid zoneId is required",
+        result: {},
+      });
+    }
+
+    const zone = await CityZone.findById(zoneId)
+      .populate("operationalCityId", "name code")
+      .lean();
+
+    if (!zone) {
+      return res.status(404).json({
+        success: false,
+        message: "Zone not found",
+        result: {},
+      });
+    }
+
+    // Fetch active ZoneServiceMapping for this zone
+    const mappings = await ZoneServiceMapping.find({
+      zoneId,
+      active: true,
+    })
+      .populate("serviceId", "serviceName image description category price isActive")
+      .lean();
+
+    const activeMappedServiceMap = new Map();
+    for (const m of mappings) {
+      if (m.serviceId && m.serviceId.isActive) {
+        activeMappedServiceMap.set(String(m.serviceId._id), m);
+      }
+    }
+
+    // Fetch all active services in system catalog to show unavailable/requestable services
+    const allServices = await Service.find({ isActive: true })
+      .select("serviceName image description category price")
+      .sort({ serviceName: 1 })
+      .lean();
+
+    // If technician is authenticated, fetch their current skills and pending skill requests
+    let techSkillSet = new Set();
+    let pendingRequestMap = new Map();
+
+    if (req.user?.technicianProfileId) {
+      const techProfile = await TechnicianProfile.findById(req.user.technicianProfileId)
+        .select("skills")
+        .lean();
+      if (techProfile?.skills) {
+        techSkillSet = new Set(techProfile.skills.map((s) => String(s.serviceId)));
+      }
+
+      const pendingRequests = await TechnicianSkillRequest.find({
+        technicianId: req.user.technicianProfileId,
+        status: { $in: ["pending", "rejected"] },
+      }).lean();
+
+      for (const pr of pendingRequests) {
+        pendingRequestMap.set(String(pr.serviceId), pr);
+      }
+    }
+
+    const formattedServices = allServices.map((srv) => {
+      const srvId = String(srv._id);
+      const isMapped = activeMappedServiceMap.has(srvId);
+      const mappingData = isMapped ? activeMappedServiceMap.get(srvId) : null;
+
+      let skillStatus = "not_added";
+      if (techSkillSet.has(srvId)) {
+        skillStatus = "approved";
+      } else if (pendingRequestMap.has(srvId)) {
+        const pr = pendingRequestMap.get(srvId);
+        skillStatus = pr.status === "pending" ? "pending_approval" : "rejected";
+      }
+
+      return {
+        _id: srv._id,
+        serviceName: srv.serviceName,
+        image: srv.image,
+        description: srv.description,
+        category: srv.category,
+        price: srv.price,
+        isAvailableInZone: isMapped,
+        pricingMultiplier: mappingData?.pricingMultiplier || 1.0,
+        skillStatus,
+        hasSkill: techSkillSet.has(srvId),
+        canRequestSkill: !techSkillSet.has(srvId) && skillStatus !== "pending_approval",
+      };
+    });
+
+    const availableServices = formattedServices.filter((s) => s.isAvailableInZone);
+    const unavailableServices = formattedServices.filter((s) => !s.isAvailableInZone);
+
+    return res.status(200).json({
+      success: true,
+      message: "Zone services retrieved successfully",
+      result: {
+        zone: {
+          _id: zone._id,
+          name: zone.name,
+          zoneCode: zone.zoneCode,
+          district: zone.operationalCityId,
+        },
+        services: formattedServices,
+        availableServices,
+        unavailableServices,
+      },
+    });
+  } catch (error) {
+    console.error("getZoneServicesForTechnician Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error fetching zone services",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   📝 STEP 6: SUBMIT TECHNICIAN SKILL / NEW SERVICE REQUEST
+   Allows technician to request approval for a new skill/service.
+   ========================================================================== */
+export const submitTechnicianSkillRequest = async (req, res) => {
+  try {
+    const technicianProfileId = req.user?.technicianProfileId;
+    const authUserId = req.user?.userId;
+
+    if (!technicianProfileId || !isValidObjectId(technicianProfileId)) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+        result: {},
+      });
+    }
+
+    const { serviceId, experienceYears = 0, reason, documentUrls = [], zoneId } = req.body;
+
+    if (!serviceId || !isValidObjectId(serviceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid serviceId is required",
+        result: {},
+      });
+    }
+
+    if (!reason || typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Reason for requesting the service is required",
+        result: {},
+      });
+    }
+
+    const exp = Number(experienceYears);
+    if (!Number.isFinite(exp) || exp < 0 || exp > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Experience years must be between 0 and 15",
+        result: {},
+      });
+    }
+
+    const serviceDoc = await Service.findById(serviceId).lean();
+    if (!serviceDoc || !serviceDoc.isActive) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or inactive",
+        result: {},
+      });
+    }
+
+    const techProfile = await TechnicianProfile.findById(technicianProfileId);
+    if (!techProfile) {
+      return res.status(404).json({
+        success: false,
+        message: "Technician profile not found",
+        result: {},
+      });
+    }
+
+    // Check if skill is already approved
+    const alreadyHasSkill = (techProfile.skills || []).some(
+      (s) => String(s.serviceId) === String(serviceId)
+    );
+    if (alreadyHasSkill) {
+      return res.status(400).json({
+        success: false,
+        message: "You already have this skill approved on your profile",
+        result: {},
+      });
+    }
+
+    // Check if there is an existing pending request
+    const existingPending = await TechnicianSkillRequest.findOne({
+      technicianId: technicianProfileId,
+      serviceId,
+      status: "pending",
+    });
+    if (existingPending) {
+      return res.status(400).json({
+        success: false,
+        message: "A request for this service is already pending admin review",
+        result: { requestId: existingPending._id },
+      });
+    }
+
+    const effectiveZoneId = zoneId && isValidObjectId(zoneId) ? zoneId : techProfile.cityZoneId;
+    const effectiveDistrictId = techProfile.primaryDistrictId || techProfile.primaryCityId;
+
+    const skillRequest = await TechnicianSkillRequest.create({
+      technicianId: technicianProfileId,
+      userId: authUserId,
+      districtId: effectiveDistrictId,
+      zoneId: effectiveZoneId,
+      serviceId,
+      serviceName: serviceDoc.serviceName,
+      experienceYears: exp,
+      reason: reason.trim(),
+      documentUrls: Array.isArray(documentUrls) ? documentUrls : [],
+      status: "pending",
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Skill request submitted successfully. It will be reviewed by Admin.",
+      result: skillRequest,
+    });
+  } catch (error) {
+    console.error("submitTechnicianSkillRequest Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error submitting skill request",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   📜 GET MY TECHNICIAN SKILL REQUESTS
+   ========================================================================== */
+export const getMyTechnicianSkillRequests = async (req, res) => {
+  try {
+    const technicianProfileId = req.user?.technicianProfileId;
+
+    if (!technicianProfileId || !isValidObjectId(technicianProfileId)) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+        result: {},
+      });
+    }
+
+    const requests = await TechnicianSkillRequest.find({
+      technicianId: technicianProfileId,
+    })
+      .sort({ createdAt: -1 })
+      .populate("serviceId", "serviceName image category price")
+      .populate("districtId", "name code")
+      .populate("zoneId", "name zoneCode")
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      message: "Skill requests fetched successfully",
+      result: requests,
+    });
+  } catch (error) {
+    console.error("getMyTechnicianSkillRequests Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error fetching skill requests",
+      result: { error: error.message },
+    });
+  }
+};
+
+/* ==========================================================================
+   👤 CREATE / UPDATE TECHNICIAN PROFILE (ONBOARDING)
+   Authoritative GPS & Zone validation, District auto-permissioning, and
+   ZoneServiceMapping skill verification.
+   ========================================================================== */
 export const createTechnician = async (req, res) => {
   try {
     const technicianProfileId = req.user?.technicianProfileId;
@@ -401,6 +928,13 @@ export const createTechnician = async (req, res) => {
       experienceYears,
       specialization,
       profileComplete,
+      districtId,
+      primaryDistrictId,
+      cityZoneId,
+      zoneId,
+      latitude,
+      longitude,
+      location,
     } = req.body;
 
     if (!technicianProfileId || !isValidObjectId(technicianProfileId)) {
@@ -419,17 +953,146 @@ export const createTechnician = async (req, res) => {
       });
     }
 
-    // Ensure only users with Technician role can update skills
+    // Ensure only users with Technician role can update profile
     if (req.user?.role !== "Technician") {
       return res.status(403).json({
         success: false,
-        message: "Only users with Technician role can update skills",
+        message: "Only users with Technician role can update profile",
         result: {},
       });
     }
 
+    const targetDistrictId = primaryDistrictId || districtId;
+    const targetZoneId = cityZoneId || zoneId;
+
+    let effectiveLat = latitude;
+    let effectiveLng = longitude;
+    if ((effectiveLat === undefined || effectiveLng === undefined) && location?.coordinates?.length === 2) {
+      effectiveLng = location.coordinates[0];
+      effectiveLat = location.coordinates[1];
+    }
+
     const profileUpdate = {};
-    if (skills !== undefined) profileUpdate.skills = skills;
+
+    // 📍 Authoritative GPS & Zone Validation if coordinates are provided
+    if (effectiveLat !== undefined && effectiveLng !== undefined) {
+      const lat = Number(effectiveLat);
+      const lng = Number(effectiveLng);
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_COORDINATES",
+          message: "Invalid GPS coordinates provided",
+          result: {},
+        });
+      }
+
+      const { district: resolvedDistrict, zone: resolvedZone } =
+        await resolveDistrictAndZoneFromCoordinates(lat, lng);
+
+      if (!resolvedDistrict) {
+        return res.status(400).json({
+          success: false,
+          code: "LOCATION_OUTSIDE_SERVICE_AREA",
+          message: "Your address GPS coordinates fall outside our operational service areas.",
+          result: { latitude: lat, longitude: lng },
+        });
+      }
+
+      if (targetDistrictId && isValidObjectId(targetDistrictId)) {
+        if (resolvedDistrict._id.toString() !== targetDistrictId.toString()) {
+          const selectedDist = await OperationalCity.findById(targetDistrictId).select("name").lean();
+          return res.status(400).json({
+            success: false,
+            code: "LOCATION_DISTRICT_MISMATCH",
+            message: `Your address GPS is in ${resolvedDistrict.name}, but you selected ${selectedDist?.name || "another district"}. Please select the correct district.`,
+            result: {
+              resolvedDistrict: { id: resolvedDistrict._id, name: resolvedDistrict.name },
+            },
+          });
+        }
+      }
+
+      if (targetZoneId && isValidObjectId(targetZoneId)) {
+        if (!resolvedZone || resolvedZone._id.toString() !== targetZoneId.toString()) {
+          const selectedZone = await CityZone.findById(targetZoneId).select("name").lean();
+          return res.status(400).json({
+            success: false,
+            code: "LOCATION_ZONE_MISMATCH",
+            message: `Your address is located in ${resolvedZone?.name || "an unmapped zone"}, but you selected ${selectedZone?.name || "a different zone"}. Please select the correct service area.`,
+            result: {
+              resolvedZone: resolvedZone ? { id: resolvedZone._id, name: resolvedZone.name } : null,
+              resolvedDistrict: { id: resolvedDistrict._id, name: resolvedDistrict.name },
+            },
+          });
+        }
+      }
+
+      // Assign verified geo location & districts
+      profileUpdate.location = {
+        type: "Point",
+        coordinates: [lng, lat],
+      };
+      profileUpdate.primaryDistrictId = resolvedDistrict._id;
+      profileUpdate.primaryCityId = resolvedDistrict._id;
+      profileUpdate.cityZoneId = resolvedZone ? resolvedZone._id : (targetZoneId || null);
+
+      // Auto-grant TechnicianDistrictPermission for primary district
+      try {
+        await TechnicianDistrictPermission.findOneAndUpdate(
+          { technicianId: technicianProfileId, districtId: resolvedDistrict._id },
+          { $set: { isEnabled: true } },
+          { upsert: true, new: true }
+        );
+      } catch (permErr) {
+        console.warn("Auto-grant district permission failed:", permErr.message);
+      }
+    } else {
+      if (targetDistrictId && isValidObjectId(targetDistrictId)) {
+        profileUpdate.primaryDistrictId = targetDistrictId;
+        profileUpdate.primaryCityId = targetDistrictId;
+      }
+      if (targetZoneId && isValidObjectId(targetZoneId)) {
+        profileUpdate.cityZoneId = targetZoneId;
+      }
+    }
+
+    // 🏘 Check skills against ZoneServiceMapping if skills are being updated
+    if (skills !== undefined && Array.isArray(skills) && skills.length > 0) {
+      const activeZoneId = profileUpdate.cityZoneId || (await TechnicianProfile.findById(technicianProfileId).select("cityZoneId").lean())?.cityZoneId;
+
+      if (activeZoneId) {
+        const skillServiceIds = skills.map((s) => new mongoose.Types.ObjectId(s.serviceId));
+        const approvedMappings = await ZoneServiceMapping.find({
+          zoneId: activeZoneId,
+          serviceId: { $in: skillServiceIds },
+          active: true,
+        }).select("serviceId").lean();
+
+        const approvedSet = new Set(approvedMappings.map((m) => String(m.serviceId)));
+        const unapprovedIds = skillServiceIds.filter((sid) => !approvedSet.has(String(sid)));
+
+        if (unapprovedIds.length > 0) {
+          const unapprovedDocs = await Service.find({ _id: { $in: unapprovedIds } }).select("serviceName").lean();
+          const unapprovedNames = unapprovedDocs.map((d) => d.serviceName).join(", ");
+          return res.status(400).json({
+            success: false,
+            code: "SERVICE_NOT_AVAILABLE_IN_ZONE",
+            message: `The following services are not available in your service area: ${unapprovedNames}. Please submit a skill request for approval.`,
+            result: {
+              blockedServiceIds: unapprovedIds.map(String),
+              unapprovedNames,
+            },
+          });
+        }
+      }
+
+      profileUpdate.skills = skills;
+    } else if (skills !== undefined) {
+      profileUpdate.skills = skills;
+    }
+
     if (address !== undefined) profileUpdate.address = address;
     if (city !== undefined) profileUpdate.city = city;
     if (state !== undefined) profileUpdate.state = state;
@@ -462,17 +1125,22 @@ export const createTechnician = async (req, res) => {
       typeof effectiveLname === "string" &&
       effectiveLname.trim().length > 0;
 
-    // 🔒 profileComplete is ALWAYS computed server-side — never accepted
-    // from the client. A forged `profileComplete: true` previously bypassed
-    // the activation gate.
+    // 🔒 profileComplete is ALWAYS computed server-side
+    const currentTech = await TechnicianProfile.findById(technicianProfileId).lean();
+    const effectiveAddress = address !== undefined ? address : currentTech?.address;
+    const effectiveCity = city !== undefined ? city : currentTech?.city;
+    const effectiveSpecialization = specialization !== undefined ? specialization : currentTech?.specialization;
+    const effectiveLocality = locality !== undefined ? locality : currentTech?.locality;
+    const effectiveSkills = skills !== undefined ? skills : currentTech?.skills;
+
     const isComplete = Boolean(
       hasCompleteName &&
-      (address || "").trim() &&
-      (city || "").trim() &&
-      (specialization || "").trim() &&
-      (locality || "").trim() &&
-      Array.isArray(skills) &&
-      skills.length > 0
+      (effectiveAddress || "").trim() &&
+      (effectiveCity || "").trim() &&
+      (effectiveSpecialization || "").trim() &&
+      (effectiveLocality || "").trim() &&
+      Array.isArray(effectiveSkills) &&
+      effectiveSkills.length > 0
     );
     profileUpdate.profileComplete = isComplete;
 
@@ -491,7 +1159,11 @@ export const createTechnician = async (req, res) => {
       technicianProfileId,
       profileUpdate,
       { new: true, runValidators: true }
-    ).select("-password");
+    )
+      .populate("skills.serviceId", "serviceName")
+      .populate("primaryDistrictId", "name code")
+      .populate("cityZoneId", "name zoneCode")
+      .select("-password");
 
     if (!technician) {
       return res.status(404).json({
@@ -503,10 +1175,11 @@ export const createTechnician = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Skills updated successfully",
+      message: "Technician profile updated successfully",
       result: technician,
     });
   } catch (error) {
+    console.error("createTechnician Error:", error);
     return res.status(500).json({
       success: false,
       message: "Server error",

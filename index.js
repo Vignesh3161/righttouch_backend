@@ -33,6 +33,7 @@ import adminZoneRoutes from "./Routes/adminZones.js";
 import adminPermissionRoutes from "./Routes/adminPermissionRoutes.js";
 import adminProductDashboardRoutes from "./Routes/adminProductDashboardRoutes.js";
 import adminServiceAvailabilityRoutes from "./Routes/adminServiceAvailabilityRoutes.js";
+import adminSkillRequestRoutes from "./Routes/adminSkillRequestRoutes.js";
 import adminZoneGeofenceRoutes from "./Routes/adminZoneGeofenceRoutes.js";
 import adminRefundsRoutes from "./Routes/adminRefunds.js";
 import adminQuotationRoutes from "./Routes/adminQuotationRoutes.js";
@@ -157,21 +158,52 @@ const io = new Server(httpServer, {
 // consumed lazily via getIo() to avoid circular imports.
 setIo(io);
 
-// 🔌 Redis Adapter Setup for Scaling (Required for multi-instance production)
-// const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-// const pubClient = createClient({ url: redisUrl });
-// const subClient = pubClient.duplicate();
+// 🔌 Redis Adapter Setup for Scaling
+let redisPubClient = null;
+let redisSubClient = null;
 
-// pubClient.on("error", (err) => console.error("❌ Redis Pub Client Error:", err.message));
-// subClient.on("error", (err) => console.error("❌ Redis Sub Client Error:", err.message));
+const initRedisAdapter = async (ioServer) => {
+  const redisUrl = process.env.REDIS_URL || "";
+  const redisEnabled = String(process.env.REDIS_ENABLED).toLowerCase() !== "false";
 
-// Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
-//   io.adapter(createAdapter(pubClient, subClient));
-//   console.log(`✅ Socket.IO Redis Adapter connected scaling active via ${redisUrl}`);
-// }).catch(err => {
-//   console.error("❌ Redis Adapter Connection Failed:", err.message);
-//   console.warn("⚠️ Continuing in single-instance mode...");
-// });
+  if (!redisEnabled || !redisUrl) {
+    console.log("ℹ️ [REDIS] Redis adapter is disabled or REDIS_URL not configured. Running in single-instance mode.");
+    return false;
+  }
+
+  try {
+    const socketOptions = {
+      connectTimeout: 3000,
+      reconnectStrategy: false, // Don't infinite loop if local Redis isn't running
+    };
+
+    redisPubClient = createClient({ url: redisUrl, socket: socketOptions });
+    redisSubClient = redisPubClient.duplicate();
+
+    redisPubClient.on("error", (err) => {
+      if (redisPubClient?.isReady) {
+        console.error("❌ [REDIS PUB ERROR]:", err.message);
+      }
+    });
+    redisSubClient.on("error", (err) => {
+      if (redisSubClient?.isReady) {
+        console.error("❌ [REDIS SUB ERROR]:", err.message);
+      }
+    });
+
+    await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
+    ioServer.adapter(createAdapter(redisPubClient, redisSubClient));
+    console.log(`✅ [REDIS ADAPTER] Socket.IO Redis Adapter connected & scaling active via ${redisUrl}`);
+    return true;
+  } catch (err) {
+    console.warn(`⚠️ [REDIS ADAPTER] Could not connect to Redis (${err.message}) — running in single-instance mode.`);
+    try { await redisPubClient?.disconnect(); } catch { /* noop */ }
+    try { await redisSubClient?.disconnect(); } catch { /* noop */ }
+    redisPubClient = null;
+    redisSubClient = null;
+    return false;
+  }
+};
 
 // 🛡 Handshake rate limiter MUST run before auth: a flood of junk tokens
 // never reaches jwt.verify (Socket Analysis B1.3).
@@ -185,23 +217,30 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   const role = socket.user?.role;
   const techProfileId = socket.user?.technicianProfileId;
 
-  console.log(`🔌 New connection: ${socket.id} (User: ${userId}, Role: ${role})`);
+  console.log(`🔌 [SOCKET CONNECTED] SocketID: ${socket.id} (User: ${userId}, Role: ${role})`);
 
-  // 🏠 Room Management - Auto-join based on identity
+  // 🏠 Standardized User & Role Rooms (User ID and Role)
   if (userId) {
-    // Both Customers and Technicians join their private customer room (by userId)
+    socket.join(SOCKET_ROOMS.USER(userId));
+    if (role) {
+      socket.join(SOCKET_ROOMS.ROLE(role));
+    }
+    // Backward compatibility: customer_{userId}
     socket.join(SOCKET_ROOMS.CUSTOMER(userId));
+    console.log(`🏠 [USER ROOMS] Joined: user:${userId}, role:${role?.toLowerCase()}`);
   }
 
   if (role === "Technician" && techProfileId) {
     socket.join(SOCKET_ROOMS.TECHNICIAN(techProfileId));
-    console.log(`🏠 Technician joined room: technician_${techProfileId}`);
+    console.log(`🏠 [TECH ROOM] Joined legacy: technician_${techProfileId}`);
   }
 
   // Admin/Owner dashboard feed (replaces the old global new_booking io.emit —
   // Socket Analysis Fix #1). Only Admin/Owner roles ever see it.
   if (role === "Admin" || role === "Owner") {
     socket.join(SOCKET_ROOMS.ADMIN_DASHBOARD);
+    socket.join(SOCKET_ROOMS.ADMIN_ROOM);
+    socket.join(SOCKET_ROOMS.ADMIN);
   }
 
   // 🛡 SINGLE ACTIVE SESSION (Socket Analysis Fix #9 / B3.4):
@@ -505,43 +544,6 @@ const startBackgroundWorkers = async () => {
   console.log("✅ Background workers & crons started after Mongo connection.");
 };
 
-const connectToMongo = async () => {
-  try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 10000, // 10 seconds
-      socketTimeoutMS: 45000, // 45 seconds
-    });
-    console.log("Connected to MongoDB Atlas...");
-    startBackgroundWorkers();
-  } catch (err) {
-    console.error("Could not connect to MongoDB...", err.message);
-    // Retry so a transient outage doesn't leave the process half-alive.
-    setTimeout(connectToMongo, 5000).unref?.();
-  }
-};
-
-// Mongo connection lifecycle — workers/crons self-guard via readyState, so a
-// runtime disconnect just makes them no-op until Mongo reconnects (no restart
-// needed, which also avoids double-registering cron schedules).
-mongoose.connection.on("disconnected", () => {
-  console.warn("⚠️ MongoDB disconnected — workers will pause until reconnect.");
-});
-mongoose.connection.on("reconnected", () => {
-  console.log("✅ MongoDB reconnected — workers resumed.");
-});
-mongoose.connection.on("error", (err) => {
-  console.error("MongoDB connection error:", err.message);
-});
-
-// 🔒 Fail fast on weak/placeholder secrets before accepting traffic.
-validateSecrets();
-
-connectToMongo();
-
-App.get("/", (req, res) => {
-  res.send("welcome");
-});
-
 // 🩺 Health endpoints — wire into the process supervisor / LB health checks
 App.get("/health/live", (req, res) => {
   res.status(200).json({ status: "ok", uptime: process.uptime() });
@@ -549,8 +551,9 @@ App.get("/health/live", (req, res) => {
 
 App.get("/health/ready", async (req, res) => {
   const mongoOk = mongoose.connection.readyState === 1;
-  if (mongoOk) return res.status(200).json({ status: "ready" });
-  return res.status(503).json({ status: "not_ready", mongoOk });
+  const redisOk = redisPubClient?.isReady || false;
+  if (mongoOk) return res.status(200).json({ status: "ready", mongo: true, redis: redisOk });
+  return res.status(503).json({ status: "not_ready", mongo: mongoOk, redis: redisOk });
 });
 
 /* ==========================================================================
@@ -571,6 +574,7 @@ App.use("/api/admin", adminProductDashboardRoutes);
 App.use("/api/admin", adminServiceAvailabilityRoutes);
 App.use("/api/admin/zone-geofence", adminZoneGeofenceRoutes);
 App.use("/api/admin", adminKycRoutes);
+App.use("/api/admin", adminSkillRequestRoutes);
 App.use("/api/admin/payments", adminPaymentRoutes);
 App.use("/api/admin/notifications", Auth, authorizeRoles("Admin", "Owner"), notificationRoutes);
 App.use("/api/admin/permissions", adminPermissionRoutes);
@@ -645,18 +649,52 @@ App.use((err, req, res, next) => {
   });
 });
 
-const port = parseInt(process.env.PORT, 10) || 7372;
-httpServer.listen(port, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${port} (0.0.0.0)`);
-  console.log(`🔌 Socket.IO ready for real-time notifications`);
+// 🚀 UNIFIED SERVER STARTUP SEQUENCE
+const startServer = async () => {
+  validateSecrets();
+  try {
+    // 1. Connect MongoDB Atlas
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+    console.log("✅ Connected to MongoDB Atlas...");
+
+    // 2. Initialize Redis Adapter BEFORE accepting traffic
+    await initRedisAdapter(io);
+
+    // 3. Start Background Workers & Crons
+    await startBackgroundWorkers();
+
+    // 4. Start HTTP & WebSocket Server
+    const port = parseInt(process.env.PORT, 10) || 7372;
+    httpServer.listen(port, "0.0.0.0", () => {
+      console.log(`🚀 Server running on port ${port} (0.0.0.0)`);
+      console.log(`🔌 Socket.IO ready for real-time notifications`);
+    });
+
+    // 5. Start Socket metrics logger
+    startSocketMetricsLogger(io, 60000);
+  } catch (err) {
+    console.error("❌ Server startup failed:", err);
+    process.exit(1);
+  }
+};
+
+// Mongo connection lifecycle listeners
+mongoose.connection.on("disconnected", () => {
+  console.warn("⚠️ MongoDB disconnected — workers will pause until reconnect.");
+});
+mongoose.connection.on("reconnected", () => {
+  console.log("✅ MongoDB reconnected — workers resumed.");
+});
+mongoose.connection.on("error", (err) => {
+  console.error("MongoDB connection error:", err.message);
 });
 
-// 📊 Socket metrics logger (Socket Analysis Fix #8 / B2.4)
-startSocketMetricsLogger(io, 60000);
+startServer();
 
 // 🛑 GRACEFUL SHUTDOWN (Crash & Recovery hardening)
-// Closes the socket layer, stops accepting HTTP, then closes Mongo — so
-// in-flight broadcasts/acks aren't cut off mid-delivery on deploys/restarts.
 const shutdown = async (signal) => {
   console.log(`🛑 ${signal} received — shutting down gracefully...`);
   try {
@@ -665,6 +703,8 @@ const shutdown = async (signal) => {
     stopPaymentNotificationWorker();
     io.close();
     await new Promise((resolve) => httpServer.close(resolve));
+    if (redisPubClient) await redisPubClient.disconnect().catch(() => {});
+    if (redisSubClient) await redisSubClient.disconnect().catch(() => {});
     await mongoose.connection.close();
   } catch (err) {
     console.error("Shutdown error:", err.message);

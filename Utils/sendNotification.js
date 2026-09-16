@@ -228,8 +228,30 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       return { success: false, skipped: true, reason: "duplicate" };
     }
 
-    // 1️⃣ Send push notification
-    const pushResult = await sendPushNotification(technicianId, {
+    // 1️⃣ Send socket notification FIRST (< 5ms hot path)
+    let socketResult = { success: false, offline: true, message: "Technician offline — push queued" };
+    if (io) {
+      const userRoom = SOCKET_ROOMS.USER(technicianId);
+      const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianId);
+
+      // Emit to standardized room and legacy room
+      io.to(userRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+      io.to(techRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+      io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
+        id: `job-${jobDTO.bookingId}`,
+        type: "JOB_NEW",
+        title: "🆕 New Job Available",
+        message: `New ${jobDTO.serviceName || "service"} job in your area`,
+        bookingId: String(jobDTO.bookingId || ""),
+        createdAt: new Date().toISOString(),
+      });
+
+      console.log(`⚡ [JOB_NEW EMIT] Dispatched to Tech ${technicianId} (rooms: ${userRoom}, ${techRoom})`);
+      socketResult = { success: true, message: "Job alert emitted to live socket" };
+    }
+
+    // 2️⃣ Send push notification in background (non-blocking)
+    sendPushNotification(technicianId, {
       title: "🆕 New Job Available",
       body: `New ${jobDTO.serviceName || "service"} job in your area`,
       data: {
@@ -238,31 +260,11 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
         serviceId: String(jobDTO.serviceId || ""),
         scheduledAt: String(jobDTO.scheduledAt || ""),
       },
-    }, { recipientType: "technician" });
+    }, { recipientType: "technician" }).catch((err) => {
+      console.warn(`⚠️ Background push notification error for tech ${technicianId}:`, err.message);
+    });
 
-    // 2️⃣ Send socket notification
-    let socketResult = { success: false, offline: true, message: "Technician offline — push only" };
-    if (io && hasLiveSocket(io, technicianId)) {
-      const ACK_TIMEOUT_MS = 10000;
-      io.to(SOCKET_ROOMS.TECHNICIAN(technicianId))
-        .timeout(ACK_TIMEOUT_MS)
-        .emit(SOCKET_EVENTS.JOB_NEW, jobDTO, (err) => {
-          recordAck(Boolean(err));
-          if (err) {
-            console.info(
-              `ℹ️ Job alert to Tech ${technicianId} unacknowledged within ${ACK_TIMEOUT_MS}ms (live socket, push already sent)`
-            );
-          } else {
-            console.log(`✅ Job alert acknowledged by Tech ${technicianId}`);
-          }
-        });
-
-      socketResult = { success: true, message: "Job alert emitted to live socket" };
-    } else if (io) {
-      console.log(`ℹ️ Job alert to Tech ${technicianId}: no live socket — push-only delivery`);
-    }
-
-    return { success: true, push: pushResult, socket: socketResult };
+    return { success: true, socket: socketResult };
   } catch (error) {
     console.error(`❌ Error notifying technician ${technicianId}:`, error.message);
     return { success: false, error: error.message };
@@ -270,26 +272,71 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 };
 
 /**
- * Broadcast new job to technicians
+ * Batch-send push notifications across multiple recipients with a SINGLE DB query.
+ */
+export const sendPushNotificationBatch = async (recipientIds, payload, options = {}) => {
+  if (!recipientIds?.length) return { success: true, count: 0 };
+  const recipientType = options.recipientType || "technician";
+
+  try {
+    const stringIds = recipientIds.map(String);
+
+    // ⚡ 1 SINGLE BATCH QUERY for all active tokens
+    const deviceDocs = await DeviceToken.find({
+      userId: { $in: stringIds },
+      isActive: true,
+    }).select("userId fcmToken").lean().catch(() => []);
+
+    const tokens = [...new Set(deviceDocs.map(d => d.fcmToken).filter(t => typeof t === "string" && t.trim().length > 10))];
+
+    if (!tokens.length) {
+      return { success: true, skipped: true, reason: "no_fcm_tokens" };
+    }
+
+    const result = await sendFcmMulticast(tokens, payload);
+    return { success: true, count: tokens.length, ...result };
+  } catch (err) {
+    console.warn(`[sendPushNotificationBatch] Error for ${recipientType}s:`, err.message);
+    return { success: false, error: err.message };
+  }
+};
+
+/**
+ * Broadcast new job to technicians — Socket FIRST, batch FCM in background
  */
 export const broadcastJobToTechnicians = async (io, technicianIds, jobData, broadcastMap) => {
   try {
     const results = {
-      push: [],
       socket: [],
     };
 
+    // ⚡ 1. EMIT WEBSOCKETS IMMEDIATELY (Hot path < 10ms)
     await Promise.allSettled(
       technicianIds.map(async (technicianId) => {
         const broadcast = broadcastMap?.get(technicianId?.toString?.() || technicianId);
         const notifyResult = await notifyTechnicianOfNewJob(io, technicianId, jobData, broadcast);
-        results.push.push({ technicianId, ...notifyResult });
         results.socket.push({ technicianId, ...notifyResult });
       })
     );
 
+    // ⚡ 2. BATCH FCM PUSH IN BACKGROUND (1 Query, Non-blocking)
+    const pushPayload = {
+      title: "🆕 New Job Available",
+      body: `New ${jobData.serviceName || "service"} job in your area`,
+      data: {
+        type: "new_job",
+        bookingId: String(jobData.bookingId || ""),
+        serviceId: String(jobData.serviceId || ""),
+        scheduledAt: String(jobData.scheduledAt || ""),
+      },
+    };
+
+    sendPushNotificationBatch(technicianIds, pushPayload, { recipientType: "technician" }).catch((e) =>
+      console.warn("[broadcastJobToTechnicians] Background batch push error:", e.message)
+    );
+
     const delivered = technicianIds.length;
-    console.log(`✅ Broadcast completed: ${delivered} technicians notified`);
+    console.log(`✅ [BROADCAST COMPLETED] ${delivered} technicians notified via live Socket + background FCM`);
     return { success: true, results };
   } catch (error) {
     console.error("❌ Broadcast error:", error.message);
@@ -305,34 +352,39 @@ export const notifyCustomerJobAccepted = async (io, customerProfileId, jobData) 
     console.log(`📱 Notifying Customer ${customerProfileId} - Job Accepted`);
     const bookingIdStr = String(jobData.bookingId?._id || jobData.bookingId || "");
     const techName = jobData.technicianName || "A technician";
+    const userRoom = SOCKET_ROOMS.USER(customerProfileId);
+    const custRoom = SOCKET_ROOMS.CUSTOMER(customerProfileId);
 
-    // 1️⃣ Socket notification (real-time)
+    const notificationPayload = {
+      bookingId: bookingIdStr,
+      technicianId: jobData.technicianId?.toString?.() || jobData.technicianId,
+      status: jobData.status || "accepted",
+      technicianName: techName,
+      title: "Technician Assigned!",
+      message: `${techName} has accepted your booking.`,
+      timestamp: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    };
+
+    // 1️⃣ Socket notification FIRST (real-time hot path)
     if (io) {
-      io.to(SOCKET_ROOMS.CUSTOMER(customerProfileId)).emit(SOCKET_EVENTS.JOB_ACCEPTED_NOTIFY, {
+      io.to(userRoom).emit(SOCKET_EVENTS.BOOKING_ACCEPTED, notificationPayload);
+      io.to(userRoom).emit(SOCKET_EVENTS.JOB_ACCEPTED_NOTIFY, notificationPayload);
+      io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
+        type: "BOOKING_ACCEPTED",
+        title: "Technician Assigned!",
+        message: `${techName} has accepted your booking.`,
         bookingId: bookingIdStr,
-        technicianId: jobData.technicianId?.toString?.() || jobData.technicianId,
-        status: jobData.status || "accepted",
-        technicianName: techName,
-        timestamp: new Date(),
+        createdAt: new Date().toISOString(),
       });
+
+      // Legacy room support
+      io.to(custRoom).emit(SOCKET_EVENTS.JOB_ACCEPTED_NOTIFY, notificationPayload);
+      console.log(`⚡ [BOOKING_ACCEPTED EMIT] Emitted to Customer ${customerProfileId} (rooms: ${userRoom}, ${custRoom})`);
     }
 
-    // 2️⃣ FCM Push notification to customer
-    await sendPushNotification(
-      customerProfileId,
-      {
-        title: "Technician Assigned!",
-        body: `${techName} has accepted your booking.`,
-        data: {
-          type: "job_accepted",
-          bookingId: bookingIdStr,
-        },
-      },
-      { recipientType: "customer" }
-    );
-
-    // 3️⃣ In-App Notification Store
-    await Notification.create({
+    // 2️⃣ Persistent Notification in MongoDB (Layer A)
+    Notification.create({
       recipientId: customerProfileId,
       recipientType: "customer",
       eventType: "BOOKING_ACCEPTED",
@@ -346,6 +398,20 @@ export const notifyCustomerJobAccepted = async (io, customerProfileId, jobData) 
       sourceType: "Booking",
       sourceId: bookingIdStr,
     }).catch((e) => console.warn("Failed to create in-app notification for booking acceptance:", e.message));
+
+    // 3️⃣ FCM Push notification in background
+    sendPushNotification(
+      customerProfileId,
+      {
+        title: "Technician Assigned!",
+        body: `${techName} has accepted your booking.`,
+        data: {
+          type: "job_accepted",
+          bookingId: bookingIdStr,
+        },
+      },
+      { recipientType: "customer" }
+    ).catch((e) => console.warn("Failed to dispatch customer FCM push:", e.message));
 
     return { success: true, message: "Customer notified via Socket, Push & In-App" };
   } catch (error) {

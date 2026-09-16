@@ -67,6 +67,7 @@ const deviceTokenSchema = new mongoose.Schema(
 // One active registration per device; re-registration replaces the token.
 deviceTokenSchema.index({ userId: 1, deviceId: 1 }, { unique: true });
 deviceTokenSchema.index({ fcmToken: 1, isActive: 1 });
+deviceTokenSchema.index({ userId: 1, isActive: 1 });
 
 export default mongoose.models.DeviceToken ||
   mongoose.model("DeviceToken", deviceTokenSchema);

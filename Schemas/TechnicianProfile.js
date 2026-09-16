@@ -363,6 +363,7 @@ technicianProfileSchema.index({ locationUpdatedAt: -1 });
 technicianProfileSchema.index({ availableBalancePaise: 1 });
 technicianProfileSchema.index({ isRead: 1, workStatus: 1 });
 technicianProfileSchema.index({ allowedCityIds: 1 });
+technicianProfileSchema.index({ "availability.isOnline": 1, workStatus: 1, primaryDistrictId: 1 });
 
 export default mongoose.models.TechnicianProfile ||
   mongoose.model("TechnicianProfile", technicianProfileSchema);

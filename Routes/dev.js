@@ -13,6 +13,52 @@ const devSocketRoutesEnabled = process.env.ENABLE_DEV_SOCKET_ROUTES === "true";
 
 if (devSocketRoutesEnabled) {
 
+  // @route   POST /api/dev/test-notification
+  // @desc    Test 2-Layer Notification (Persistent Mongo + Socket.IO / Redis Adapter)
+  // @access  Private (Auth required)
+  router.post("/test-notification", Auth, async (req, res) => {
+    try {
+      const { userId, recipientType, event, title, message, bookingId, metadata } = req.body;
+      const targetUserId = userId || req.user?.userId;
+
+      if (!targetUserId) {
+        return res.status(400).json({ success: false, message: "userId is required" });
+      }
+
+      const { sendAppNotification } = await import("../Services/unifiedNotificationService.js");
+
+      const result = await sendAppNotification({
+        userId: targetUserId,
+        recipientType: recipientType || (req.user?.role?.toLowerCase() || "customer"),
+        technicianProfileId: req.user?.technicianProfileId || null,
+        type: event || "TEST_NOTIFICATION",
+        title: title || "Test Notification",
+        message: message || "Hello from RightTouch 2-Layer Notification System!",
+        bookingId: bookingId || `dev-booking-${Date.now()}`,
+        metadata: {
+          socketEvent: event || "notification:new",
+          ...(typeof metadata === "object" ? metadata : {}),
+        },
+        sendPush: false, // Dev test focuses on Socket + Mongo
+        io: req.io,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "2-Layer Notification dispatched successfully",
+        diagnostic: {
+          targetUserId,
+          room: `user:${targetUserId}`,
+          event: event || "notification:new",
+          socketEmitted: result.socketEmitted,
+          notification: result.notification,
+        },
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // @route   POST /api/dev/test-redis
   // @desc    Test Socket Broadcast (Targets YOU based on your token)
   // @access  Private (Auth required)
@@ -49,11 +95,12 @@ if (devSocketRoutesEnabled) {
 
         // Emit via Socket.io
         req.io.to(targetRoom).emit(targetEvent, payload);
+        req.io.to(`user:${req.user.userId}`).emit(targetEvent, payload);
 
         return res.status(200).json({
             success: true,
             message: "Socket test event emitted",
-            details: { room: targetRoom, event: targetEvent, payload }
+            details: { room: targetRoom, userRoom: `user:${req.user.userId}`, event: targetEvent, payload }
         });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });

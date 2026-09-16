@@ -114,7 +114,8 @@ export const getSignedKycUrl = (publicIdOrUrl, ttlSeconds = 300) => {
   if (/^https?:\/\//.test(publicIdOrUrl)) return publicIdOrUrl; // legacy public URL
   return cloudinary.url(publicIdOrUrl, {
     sign_url: true,
-    type: "authenticated",
+    type: "upload",
+    secure: true,
     expires_at: Math.floor(Date.now() / 1000) + ttlSeconds,
     fetch_format: "auto",
   });

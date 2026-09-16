@@ -14,22 +14,29 @@ const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
 ===================================================== */
 export const listOperationalCities = async (req, res) => {
   try {
-    if (!isOwnerOrAdmin(req)) {
-      return res.status(403).json({ success: false, message: "Owner/Admin access only" });
-    }
+    const isAdmin = isOwnerOrAdmin(req);
     const { active, isRegistrationEnabled, isJobEnabled } = req.query;
     const filter = {};
-    if (active !== undefined && active !== "") {
-      filter.active = active === "true";
-    }
-    if (isRegistrationEnabled !== undefined && isRegistrationEnabled !== "") {
-      filter.isRegistrationEnabled = isRegistrationEnabled === "true";
-    }
-    if (isJobEnabled !== undefined && isJobEnabled !== "") {
-      filter.isJobEnabled = isJobEnabled === "true";
+
+    if (isAdmin) {
+      if (active !== undefined && active !== "") {
+        filter.active = active === "true";
+      }
+      if (isRegistrationEnabled !== undefined && isRegistrationEnabled !== "") {
+        filter.isRegistrationEnabled = isRegistrationEnabled === "true";
+      }
+      if (isJobEnabled !== undefined && isJobEnabled !== "") {
+        filter.isJobEnabled = isJobEnabled === "true";
+      }
+    } else {
+      // Non-admin (Technicians, Public, Customers) only see active operational districts
+      filter.active = true;
+      if (isRegistrationEnabled !== undefined && isRegistrationEnabled !== "") {
+        filter.isRegistrationEnabled = isRegistrationEnabled === "true";
+      }
     }
 
-    const cities = await OperationalCity.find(filter).sort({ updatedAt: -1 }).lean();
+    const cities = await OperationalCity.find(filter).sort({ name: 1, updatedAt: -1 }).lean();
     return res.status(200).json({
       success: true,
       message: "Operational cities/districts fetched",
@@ -46,9 +53,6 @@ export const listOperationalCities = async (req, res) => {
 ===================================================== */
 export const getOperationalCityById = async (req, res) => {
   try {
-    if (!isOwnerOrAdmin(req)) {
-      return res.status(403).json({ success: false, message: "Owner/Admin access only" });
-    }
     const { id } = req.params;
     if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid district ID", result: {} });
@@ -57,6 +61,10 @@ export const getOperationalCityById = async (req, res) => {
     const city = await OperationalCity.findById(id).lean();
     if (!city) {
       return res.status(404).json({ success: false, message: "District not found", result: {} });
+    }
+
+    if (!isOwnerOrAdmin(req) && !city.active) {
+      return res.status(404).json({ success: false, message: "District not active", result: {} });
     }
 
     return res.status(200).json({ success: true, result: city });
@@ -70,9 +78,6 @@ export const getOperationalCityById = async (req, res) => {
 ===================================================== */
 export const getActiveOperationalCity = async (req, res) => {
   try {
-    if (!isOwnerOrAdmin(req)) {
-      return res.status(403).json({ success: false, message: "Owner/Admin access only" });
-    }
     const city = await OperationalCity.findOne({ active: true })
       .sort({ updatedAt: -1 })
       .lean();

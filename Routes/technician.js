@@ -16,6 +16,12 @@ import {
   updateTechnicianTraining,
   uploadProfileImage,
   registerTechnicianFcmToken,
+  getRegistrationDistricts,
+  getRegistrationZones,
+  validateRegistrationLocation,
+  getZoneServicesForTechnician,
+  submitTechnicianSkillRequest,
+  getMyTechnicianSkillRequests,
 } from "../Controllers/technician.js";
 import { technicianLogin, verifyTechnicianOtp } from "../Controllers/User.js";
 import { respondToJob, getMyJobs } from "../Controllers/technicianBroadcastController.js";
@@ -87,6 +93,26 @@ router.post("/signup/technician", authLimiter, async (req, res, next) => {
 
 // Technician: verify OTP after signup
 router.post("/signup/technician/verify-otp", authLimiter, verifyOtp);
+
+/* ================= TECHNICIAN REGISTRATION FLOW & ZONE-SERVICE ================= */
+// Step 1: Get active districts where registration is enabled
+router.get("/registration/districts", getRegistrationDistricts);
+router.get("/districts", getRegistrationDistricts);
+
+// Step 2: Get active zones for selected district
+router.get("/registration/zones", getRegistrationZones);
+router.get("/zones", getRegistrationZones);
+
+// Step 3 & 4: Authoritative GPS location & Zone mismatch validation
+router.post("/registration/validate-location", validateRegistrationLocation);
+
+// Step 5: Get services available in zone (from ZoneServiceMapping)
+router.get("/registration/zone-services", getZoneServicesForTechnician);
+router.get("/zone-services", Auth, isTechnician, getZoneServicesForTechnician);
+
+// Step 6: Technician Skill Requests (Requesting unapproved/new skills)
+router.post("/skill-requests", Auth, isTechnician, submitTechnicianSkillRequest);
+router.get("/skill-requests", Auth, isTechnician, getMyTechnicianSkillRequests);
 
 /* ================= TECHNICIAN AUTH ================= */
 router.post("/login/technician", technicianLogin);
