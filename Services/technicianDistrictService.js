@@ -56,8 +56,13 @@ export const getAllowedDistrictsForTechnician = async (techProfile) => {
   // Auto-heal legacy profile if primaryCityId is null
   if (!primaryId) {
     if (profileDoc.city) {
+      const cityRegex = new RegExp(`^${escapeRegExp(String(profileDoc.city).trim())}$`, "i");
       const matchedCity = await OperationalCity.findOne({
-        name: new RegExp(`^${escapeRegExp(String(profileDoc.city).trim())}$`, "i"),
+        $or: [
+          { city: cityRegex },
+          { name: cityRegex },
+          { name: new RegExp(escapeRegExp(String(profileDoc.city).trim()), "i") },
+        ],
         active: true,
       })
         .select("_id")
@@ -65,7 +70,13 @@ export const getAllowedDistrictsForTechnician = async (techProfile) => {
 
       if (matchedCity?._id) {
         primaryId = matchedCity._id;
-        await TechnicianProfile.updateOne({ _id: profileDoc._id }, { $set: { primaryCityId: primaryId } }).catch(() => {});
+        await TechnicianProfile.updateOne(
+          { _id: profileDoc._id },
+          {
+            $set: { primaryCityId: primaryId, primaryDistrictId: primaryId },
+            $addToSet: { enabledDistrictIds: primaryId, allowedCityIds: primaryId },
+          }
+        ).catch(() => {});
         // Also seed primary permission row if missing
         await TechnicianDistrictPermission.updateOne(
           { technicianId: profileDoc._id, districtId: primaryId },

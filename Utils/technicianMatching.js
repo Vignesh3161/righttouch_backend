@@ -16,6 +16,8 @@ import { geoSearch } from "./technicianGeo.js";
 import { enqueueJobNewNotifications } from "./dispatchQueue.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { toJobNewDTO } from "./socketDTO.js";
+import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -103,15 +105,26 @@ export const getAllowedDistrictIdsForTechnician = async (techProfile) => {
         await TechnicianProfile.updateOne({ _id: techProfile._id }, { $set: { primaryDistrictId: primaryId, primaryCityId: primaryId } }).catch(() => {});
       }
     } else if (techProfile.city) {
+      const cityRegex = new RegExp(`^${escapeRegExp(String(techProfile.city).trim())}$`, "i");
       const matchedCity = await OperationalCity.findOne({
-        name: new RegExp(`^${escapeRegExp(String(techProfile.city).trim())}$`, "i"),
+        $or: [
+          { city: cityRegex },
+          { name: cityRegex },
+          { name: new RegExp(escapeRegExp(String(techProfile.city).trim()), "i") },
+        ],
         active: true,
       })
         .select("_id")
         .lean();
       if (matchedCity?._id) {
         primaryId = matchedCity._id;
-        await TechnicianProfile.updateOne({ _id: techProfile._id }, { $set: { primaryDistrictId: primaryId, primaryCityId: primaryId } }).catch(() => {});
+        await TechnicianProfile.updateOne(
+          { _id: techProfile._id },
+          {
+            $set: { primaryDistrictId: primaryId, primaryCityId: primaryId },
+            $addToSet: { enabledDistrictIds: primaryId, allowedCityIds: primaryId },
+          }
+        ).catch(() => {});
       }
     }
   }
@@ -482,6 +495,23 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
     let eligibleBookings = await ServiceBooking.find(bookingQuery);
 
     if (eligibleBookings.length === 0) {
+      console.log(`🔍 [TECH LOCATION SCAN] Tech ${technicianProfileId} at [${lng}, ${lat}] scanned jobs within 10 km radius: 0 matching jobs found.`);
+      try {
+        const unassignedSample = await ServiceBooking.find({
+          technicianId: null,
+          status: { $in: ["pending", "broadcasted"] },
+          "location.coordinates.0": { $type: "number" }
+        }).select("_id location serviceId districtId cityZoneId").limit(3).lean();
+
+        if (unassignedSample.length > 0) {
+          console.log(`   ℹ️ Active unassigned jobs in system & distance to Tech GPS [${lng}, ${lat}]:`);
+          for (const ub of unassignedSample) {
+            const uCoords = ub.location.coordinates;
+            const d = haversineMeters({ latitude: lat, longitude: lng }, { latitude: uCoords[1], longitude: uCoords[0] });
+            console.log(`      • Booking ${ub._id}: Customer GPS [${uCoords[0]}, ${uCoords[1]}] | Distance: ${(d / 1000).toFixed(2)} km (${Math.round(d)}m) -> ❌ EXCEEDS 10 km radius limit`);
+          }
+        }
+      } catch (e) {}
       return { success: true, count: 0, message: "No matching jobs nearby" };
     }
 
@@ -505,6 +535,30 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
     for (const booking of eligibleBookings) {
       try {
         if (booking.technicianId) {
+          continue;
+        }
+
+        const distanceMeters = haversineMeters(
+          { latitude: lat, longitude: lng },
+          {
+            latitude: booking.location?.coordinates?.[1],
+            longitude: booking.location?.coordinates?.[0],
+          }
+        );
+
+        if (distanceMeters == null || distanceMeters > 10000) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — distance > 10km (${Math.round(distanceMeters || 0)}m)`);
+          continue;
+        }
+
+        const avail = await resolveServiceAvailability({
+          serviceId: booking.serviceId,
+          districtId: booking.districtId,
+          cityId: booking.cityZoneId,
+        });
+
+        if (!avail.available) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — service not available in zone (${avail.reason})`);
           continue;
         }
 
@@ -707,55 +761,53 @@ export const findEligibleTechniciansForService = async ({
     baseQuery.$and = baseQuery.$and || [];
     baseQuery.$and.push({
       $or: [
+        { primaryDistrictId: jobDistrictObjId },
         { primaryCityId: jobDistrictObjId },
+        { enabledDistrictIds: jobDistrictObjId },
         { allowedCityIds: jobDistrictObjId },
       ],
     });
   }
 
   if (enableGeo && hasCoords) {
-    const redisNearby = await geoSearch(lng, lat, radiusMeters, limit);
-    if (redisNearby?.length) {
-      const candidateIds = redisNearby.map((r) => r.technicianId);
-      let redisQuery = TechnicianProfile.find({ ...baseQuery, _id: { $in: candidateIds } })
-        .select("_id")
-        .limit(limit);
-      if (session) redisQuery = redisQuery.session(session);
-      const redisMatches = await redisQuery;
-      if (redisMatches.length > 0) {
-        const verifiedIds = await filterByApprovedKyc(redisMatches.map((t) => t._id));
-        return filterByOperationalPolygon(verifiedIds);
-      }
-    }
-
     const geoQuery = {
       ...baseQuery,
-      $and: [
-        { "location.type": "Point" },
-        { "location.coordinates.0": { $type: "number" } },
-        { "location.coordinates.1": { $type: "number" } },
-        {
-          location: {
-            $nearSphere: {
-              $geometry: {
-                type: "Point",
-                coordinates: [lng, lat],
-              },
-              $maxDistance: radiusMeters,
-            },
+      "location.type": "Point",
+      "location.coordinates.0": { $type: "number" },
+      "location.coordinates.1": { $type: "number" },
+      location: {
+        $nearSphere: {
+          $geometry: {
+            type: "Point",
+            coordinates: [lng, lat],
           },
+          $maxDistance: radiusMeters,
         },
-      ],
+      },
     };
 
-    let nearbyQuery = TechnicianProfile.find(geoQuery).select("_id").limit(limit);
+    let nearbyQuery = TechnicianProfile.find(geoQuery).select("_id location").limit(limit);
     if (session) nearbyQuery = nearbyQuery.session(session);
     const nearby = await nearbyQuery;
 
     if (nearby.length > 0) {
-      const verifiedIds = await filterByApprovedKyc(nearby.map((t) => t._id));
+      // Double check Haversine distance <= radiusMeters (10,000m)
+      const withinRadiusTechs = nearby.filter((tech) => {
+        const tCoords = tech.location?.coordinates;
+        if (!Array.isArray(tCoords) || tCoords.length !== 2) return false;
+        const d = haversineMeters(
+          { latitude: tCoords[1], longitude: tCoords[0] },
+          { latitude: lat, longitude: lng }
+        );
+        return d != null && d <= radiusMeters;
+      });
+
+      const verifiedIds = await filterByApprovedKyc(withinRadiusTechs.map((t) => t._id));
       return filterByOperationalPolygon(verifiedIds);
     }
+
+    // STRICT: When coordinates are present and enableGeo is true, never fall back to state/city wide search!
+    return [];
   }
 
   const fallbackQuery = { ...baseQuery };
@@ -824,22 +876,33 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
 
     // 0. Check Service Availability at Customer Location
     let targetDistrictId = booking.districtId;
+    if (!targetDistrictId && booking.cityZoneId) {
+      const zone = await CityZone.findById(booking.cityZoneId).select("operationalCityId").lean();
+      if (zone?.operationalCityId) targetDistrictId = zone.operationalCityId;
+    }
     if (!targetDistrictId && Number.isFinite(latitude) && Number.isFinite(longitude)) {
       const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
       if (city?._id) targetDistrictId = city._id;
     }
 
-    if (targetDistrictId) {
-      const avail = await resolveServiceAvailability({
-        serviceId: booking.serviceId,
-        districtId: targetDistrictId,
-        cityId: booking.cityZoneId,
-      });
+    console.log(`\n======================================================================`);
+    console.log(`🎯 [JOB MATCHING & BROADCAST PIPELINE]`);
+    console.log(`   🆔 Booking ID: ${bookingId}`);
+    console.log(`   🛠 Service: ${service.serviceName || booking.serviceId} (ID: ${booking.serviceId})`);
+    console.log(`   📍 Customer GPS: [${longitude}, ${latitude}]`);
+    console.log(`   🏢 District ID: ${targetDistrictId || "N/A"} | Zone ID: ${booking.cityZoneId || "N/A"}`);
+    console.log(`   📏 Max Search Radius: 10 KM (10,000 meters)`);
 
-      if (!avail.available) {
-        console.log(`⚠️ matchAndBroadcastBooking: Service ${booking.serviceId} unavailable at customer location (${avail.reason})`);
-        return { success: true, count: 0, message: `Service unavailable at customer location (${avail.reason})` };
-      }
+    const avail = await resolveServiceAvailability({
+      serviceId: booking.serviceId,
+      districtId: targetDistrictId,
+      cityId: booking.cityZoneId,
+    });
+
+    if (!avail.available) {
+      console.log(`⚠️ matchAndBroadcastBooking: Service ${booking.serviceId} unavailable at customer location (${avail.reason || avail.code})`);
+      console.log(`======================================================================\n`);
+      return { success: false, count: 0, message: `Service unavailable at customer location (${avail.reason || avail.code})` };
     }
 
     // 1. Find Technicians
@@ -849,13 +912,34 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
         latitude: booking.location?.coordinates[1],
         longitude: booking.location?.coordinates[0]
       },
+      radiusMeters: 10000,
+      enableGeo: true,
       limit: 100
     });
 
     let technicianIds = eligibleTechnicians.map(t => t._id.toString());
 
     if (technicianIds.length === 0) {
-      console.log(`⚠️ No technicians found for booking ${bookingId}`);
+      console.log(`   ⚠️ [RADIUS SCAN] 0 technicians found within 10 km of customer GPS [${longitude}, ${latitude}] for Booking ${bookingId}`);
+      try {
+        const sampleTechs = await TechnicianProfile.find({
+          workStatus: "approved",
+          "availability.isOnline": true,
+          "location.coordinates.0": { $type: "number" },
+        }).select("_id location skills primaryDistrictId cityZoneId").limit(5).lean();
+
+        if (sampleTechs.length > 0) {
+          console.log(`   📍 Distances of online technicians to Customer GPS [${longitude}, ${latitude}]:`);
+          for (const st of sampleTechs) {
+            const sCoords = st.location.coordinates;
+            const dist = haversineMeters({ latitude, longitude }, { latitude: sCoords[1], longitude: sCoords[0] });
+            console.log(`      • Tech ${st._id}: GPS [${sCoords[0]}, ${sCoords[1]}] | Distance: ${(dist / 1000).toFixed(2)} km (${Math.round(dist)}m) -> ❌ EXCEEDS 10 km radius limit`);
+          }
+        } else {
+          console.log(`   ℹ️ No online approved technicians found in the system.`);
+        }
+      } catch (e) {}
+      console.log(`======================================================================\n`);
       return { success: true, count: 0, message: "No technicians found" };
     }
 
@@ -868,46 +952,101 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       }
     }
 
-    // ⏱ Feasibility filter — TWO batched queries (locations + committed queues),
-    // then pure in-memory math. Techs who'd be late for their next scheduled
-    // appointment because of this job are excluded before anything is sent.
-    const [techLocations, queueMap] = await Promise.all([
+    // Load full profiles and queues for candidates
+    const [techProfiles, queueMap] = await Promise.all([
       TechnicianProfile.find({ _id: { $in: technicianIds } })
-        .select("_id location")
+        .select("_id location locationUpdatedAt workStatus availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
         .lean(),
       loadCommittedQueues(technicianIds),
     ]);
-    const locationById = new Map(
-      techLocations.map((t) => [String(t._id), t.location])
-    );
+    const profileById = new Map(techProfiles.map((t) => [String(t._id), t]));
 
     const offerRows = [];
-    const feasibleIds = technicianIds.filter((techId) => {
+    const validCandidateIds = [];
+
+    for (const techId of technicianIds) {
+      const techProfile = profileById.get(techId);
+      if (!techProfile || !techProfile.location?.coordinates) {
+        console.log(`REJECT TECHNICIAN`, JSON.stringify({
+          technicianId: techId,
+          bookingId: booking._id,
+          reasons: ["MISSING_LOCATION"]
+        }));
+        continue;
+      }
+
+      const [tLng, tLat] = techProfile.location.coordinates;
+      const techCoords = { latitude: tLat, longitude: tLng };
+      const customerCoords = { latitude, longitude };
+      const distMeters = haversineMeters(techCoords, customerCoords);
+
+      const hasDist = hasDistrictAccess(techProfile, targetDistrictId);
+      const hasZone = hasCityZoneAccess(techProfile, booking.cityZoneId);
+      const isFresh = techProfile.locationUpdatedAt && new Date(techProfile.locationUpdatedAt) >= stalenessCutoff();
+      const isOnline = techProfile.availability?.isOnline === true;
+      const distPassed = distMeters != null && distMeters <= 10000;
+
+      console.log(`TECHNICIAN MATCH DEBUG`, JSON.stringify({
+        technicianId: techId,
+        bookingId: booking._id,
+        serviceId: booking.serviceId,
+        districtId: targetDistrictId,
+        cityZoneId: booking.cityZoneId,
+        technicianCoordinates: [tLng, tLat],
+        customerCoordinates: [longitude, latitude],
+        distanceMeters: Math.round(distMeters || 0),
+        maxDistanceMeters: 10000,
+        serviceAvailable: avail.available,
+        zoneOverrideStatus: avail.status || null,
+        zoneServiceMappingActive: avail.scope !== "DEFAULT",
+        districtPermission: hasDist,
+        zonePermission: hasZone,
+        currentDistrictMatch: true,
+        gpsFresh: Boolean(isFresh),
+        online: isOnline,
+      }));
+
+      const rejectReasons = [];
+      if (!distPassed) rejectReasons.push("RADIUS_EXCEEDED");
+      if (!hasDist) rejectReasons.push("DISTRICT_PERMISSION_DENIED");
+      if (!hasZone) rejectReasons.push("ZONE_PERMISSION_DENIED");
+      if (!isFresh) rejectReasons.push("GPS_STALE");
+      if (!isOnline) rejectReasons.push("TECHNICIAN_OFFLINE");
+
+      if (rejectReasons.length > 0) {
+        console.log(`REJECT TECHNICIAN`, JSON.stringify({
+          technicianId: techId,
+          bookingId: booking._id,
+          reasons: rejectReasons
+        }));
+        continue;
+      }
+
       const feasibility = evaluateJobFeasibility({
-        techLocation: locationById.get(techId),
+        techLocation: techProfile.location,
         candidateJob: booking,
         queue: queueMap.get(techId),
       });
+
       if (!feasibility.feasible) {
-        console.log(`⏱ Excluded tech ${techId} from job ${bookingId} — ${feasibility.reason}`);
-        return false;
+        console.log(`REJECT TECHNICIAN`, JSON.stringify({
+          technicianId: techId,
+          bookingId: booking._id,
+          reasons: [feasibility.reason || "FEASIBILITY_FAILED"]
+        }));
+        continue;
       }
+
       offerRows.push({
         bookingId: booking._id,
         technicianId: techId,
-        distanceAtOffer: haversineMeters(
-          locationById.get(techId),
-          {
-            latitude: booking.location?.coordinates?.[1],
-            longitude: booking.location?.coordinates?.[0],
-          }
-        ),
+        distanceAtOffer: distMeters,
         feasibilitySnapshot: feasibility,
       });
-      return true;
-    });
+      validCandidateIds.push(techId);
+    }
 
-    technicianIds = feasibleIds;
+    technicianIds = validCandidateIds;
 
     if (technicianIds.length === 0) {
       console.log(`⏱ No feasible technicians for booking ${bookingId}`);
@@ -953,9 +1092,9 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       const broadcastRows = await JobBroadcast.find({
         bookingId: booking._id,
         technicianId: { $in: technicianIds },
-      }).select("_id version");
+      }).select("_id version technicianId");
       broadcastMap = new Map(
-        broadcastRows.map(b => [b.technicianId.toString(), b])
+        broadcastRows.map(b => [b.technicianId ? b.technicianId.toString() : "", b])
       );
     } catch (e) {
       console.error("❌ matchAndBroadcastBooking: broadcast map query failed:", e.message);
@@ -971,25 +1110,55 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       }
     );
 
-    // 5. Send Notifications (Push + Socket) — via the dispatch outbox queue:
-    //    the request/cron thread must not block on N push+socket sends.
-    //    The worker delivers with bounded concurrency + backoff, calling the
-    //    same deduped notifyTechnicianOfNewJob (alreadySent 5-min window).
+    // 5. Send Notifications (Immediate Socket + Background Push)
+    const jobDataPayload = {
+      bookingId: booking._id,
+      serviceId: service._id,
+      serviceName: service.serviceName,
+      serviceType: service.serviceType,
+      description: service.description,
+      duration: service.duration,
+      customerName: booking.addressSnapshot?.name || "Customer",
+      baseAmount: booking.baseAmount,
+      address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
+      scheduledAt: booking.scheduledAt,
+    };
+
+    // ⚡ INSTANT DIRECT SOCKET DISPATCH (<1ms latency)
+    if (io) {
+      technicianIds.forEach((techId) => {
+        const b = broadcastMap.get(String(techId));
+        const techOffer = offerRows.find(o => String(o.technicianId) === String(techId));
+        const distM = techOffer?.distanceAtOffer != null ? Math.round(techOffer.distanceAtOffer) : null;
+        const jobDTO = toJobNewDTO({
+          ...jobDataPayload,
+          latitude,
+          longitude,
+          distanceMeters: distM,
+          distanceKm: distM != null ? Number((distM / 1000).toFixed(2)) : null,
+          distanceStr: distM != null ? `${(distM / 1000).toFixed(1)} km` : null,
+          jobRadiusKm: 10,
+          maxRadiusKm: 10,
+          maxAllowedMeters: 10000,
+        }, b);
+        io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        io.to(SOCKET_ROOMS.USER(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
+          id: `job-${jobDTO.bookingId}`,
+          type: "JOB_NEW",
+          title: "🆕 New Job Available",
+          message: `New ${jobDTO.serviceName || "service"} job in your area (${jobDTO.distanceStr || "nearby"})`,
+          bookingId: String(jobDTO.bookingId || ""),
+          createdAt: new Date().toISOString(),
+        });
+      });
+    }
+
+    // Persistent outbox for background push notifications (FCM) & retries
     await enqueueJobNewNotifications({
       bookingId: booking._id,
       technicianIds,
-      jobData: {
-        bookingId: booking._id,
-        serviceId: service._id,
-        serviceName: service.serviceName,
-        serviceType: service.serviceType,
-        description: service.description,
-        duration: service.duration,
-        customerName: booking.addressSnapshot?.name || "Customer",
-        baseAmount: booking.baseAmount,
-        address: booking.address, // legacy string or snapshot line
-        scheduledAt: booking.scheduledAt,
-      },
+      jobData: jobDataPayload,
       broadcastMap,
     });
 
@@ -1005,7 +1174,12 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       console.error("❌ matchAndBroadcastBooking: cursor bump failed:", e.message);
     }
 
-    console.log(`✅ matchAndBroadcastBooking: Broadcasted booking ${bookingId} to ${technicianIds.length} techs`);
+    console.log(`🚀 [MATCH SUCCESS] Broadcasted Booking ${bookingId} to ${technicianIds.length} technician(s) within 10 km radius:`);
+    technicianIds.forEach((tid, i) => {
+      const offer = offerRows.find(o => String(o.technicianId) === String(tid));
+      console.log(`   [${i + 1}] Tech ${tid} -> Distance: ${offer ? `${(offer.distanceAtOffer / 1000).toFixed(2)} km (${Math.round(offer.distanceAtOffer)}m)` : "within 10km"}`);
+    });
+    console.log(`======================================================================\n`);
     return { success: true, count: technicianIds.length };
 
   } catch (error) {

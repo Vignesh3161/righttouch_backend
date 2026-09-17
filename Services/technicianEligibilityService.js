@@ -114,7 +114,16 @@ export const checkTechnicianEligibility = async ({
     });
     details.serviceAvailable = avail.available;
     if (!avail.available) {
-      reasons.push(avail.reason || "SERVICE_NOT_AVAILABLE");
+      const primaryReason = avail.reason || "SERVICE_NOT_AVAILABLE";
+      if (!reasons.includes(primaryReason)) {
+        reasons.push(primaryReason);
+      }
+      if (
+        (avail.code === "SERVICE_DISABLED" || avail.code === "ZONE_RESTRICTION" || avail.status === "DISABLED") &&
+        !reasons.includes("SERVICE_DISABLED")
+      ) {
+        reasons.push("SERVICE_DISABLED");
+      }
     }
   } else {
     details.serviceAvailable = true; // Fallback if no service/district specified
@@ -251,6 +260,7 @@ export const checkTechnicianEligibility = async ({
     details.radiusPassed = withinRadius;
 
     if (!withinRadius) {
+      reasons.push("RADIUS_EXCEEDED");
       reasons.push("TECHNICIAN_OUTSIDE_RADIUS");
     }
   }
@@ -261,6 +271,21 @@ export const checkTechnicianEligibility = async ({
   }
 
   const eligible = reasons.length === 0;
+
+  console.log("ACCEPT ELIGIBILITY DEBUG", JSON.stringify({
+    technicianId: tech?._id,
+    bookingId: booking?._id,
+    eligible,
+    reasons,
+    distanceMeters: details.distanceKm != null ? Math.round(details.distanceKm * 1000) : null,
+    maxDistanceMeters: MAX_JOB_DISTANCE_METERS,
+    serviceAvailable: details.serviceAvailable,
+    districtPermission: details.districtPermission,
+    currentDistrictMatch: details.currentDistrictMatch,
+    gpsFresh: details.gpsFresh,
+    online: details.online,
+    verified: details.verified,
+  }));
 
   return {
     eligible,

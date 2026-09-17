@@ -43,7 +43,7 @@ export const resolveServiceAvailability = async ({
     };
   }
 
-  const service = await Service.findById(serviceId).select("isActive").lean();
+  const service = await Service.findById(serviceId).select("isActive serviceName").lean();
   if (!service || !service.isActive) {
     return {
       available: false,
@@ -51,62 +51,90 @@ export const resolveServiceAvailability = async ({
       districtId: districtId || null,
       cityZoneId: cityZoneId || cityId || null,
       status: "DISABLED",
-      reason: "SERVICE_DISABLED",
+      reason: "SERVICE_INACTIVE",
     };
   }
 
-  if (!districtId) {
+  let resolvedDistrictId = districtId;
+  const targetZoneId = cityZoneId || cityId;
+
+  if (!resolvedDistrictId && targetZoneId) {
+    const zDoc = await CityZone.findById(targetZoneId).select("operationalCityId").lean();
+    if (zDoc?.operationalCityId) {
+      resolvedDistrictId = zDoc.operationalCityId;
+    }
+  }
+
+  if (!resolvedDistrictId) {
     return {
       available: true,
       scope: "DEFAULT",
       districtId: null,
-      cityZoneId: null,
+      cityZoneId: targetZoneId ? String(targetZoneId) : null,
       status: "ENABLED",
       reason: "NO_DISTRICT_CONTEXT",
     };
   }
 
-  const districtObjId = new mongoose.Types.ObjectId(districtId);
-  const targetZoneId = cityZoneId || cityId;
+  const districtObjId = new mongoose.Types.ObjectId(resolvedDistrictId);
   const zoneObjId = targetZoneId ? new mongoose.Types.ObjectId(targetZoneId) : null;
   const cityObjId = zoneObjId;
 
-  // Look up pricing multiplier from ZoneServiceMapping if zone is specified
+  // 0. DISTRICT OPERATIONAL STATUS CHECK (District must be active and jobs enabled)
+  const districtDoc = await OperationalCity.findById(districtObjId)
+    .select("active isJobEnabled")
+    .lean();
+  if (districtDoc && (districtDoc.active === false || districtDoc.isJobEnabled === false)) {
+    return {
+      available: false,
+      scope: "DISTRICT",
+      districtId: String(districtObjId),
+      cityZoneId: zoneObjId ? String(zoneObjId) : null,
+      cityId: cityObjId ? String(cityObjId) : null,
+      status: "DISABLED",
+      reason: "DISTRICT_DISABLED",
+    };
+  }
+
+  // 1. ZONE-LEVEL VALIDATION & OVERRIDE CHECK (Priority 1: ZONE > DISTRICT)
   let pricingMultiplier = 1.0;
   if (zoneObjId) {
+    // 1A. Validate ZoneServiceMapping (Service must be mapped to this zone and active)
     const mapping = await ZoneServiceMapping.findOne({
       zoneId: zoneObjId,
       serviceId,
       active: true,
     }).lean();
-    if (mapping && mapping.pricingMultiplier) {
+
+    if (!mapping) {
+      return {
+        available: false,
+        scope: "ZONE",
+        districtId: String(districtObjId),
+        cityZoneId: String(zoneObjId),
+        cityId: String(zoneObjId),
+        pricingMultiplier: 1.0,
+        status: "DISABLED",
+        reason: "ZONE_SERVICE_NOT_MAPPED",
+      };
+    }
+
+    if (mapping.pricingMultiplier) {
       pricingMultiplier = Number(mapping.pricingMultiplier) || 1.0;
     }
-  }
 
-  // 1. ZONE / SUB-ZONE LEVEL OVERRIDE CHECK (Priority 1: ZONE > DISTRICT)
-  if (zoneObjId) {
+    // 1B. Zone-Level ServiceAvailability Override
     const zoneOverride = await ServiceAvailability.findOne({
       serviceId,
       districtId: districtObjId,
-      $or: [{ cityZoneId: zoneObjId }, { cityId: zoneObjId }],
+      cityZoneId: zoneObjId,
       scope: { $in: ["ZONE", "CITY"] },
     }).lean();
 
     if (zoneOverride) {
       const isCityScope = zoneOverride.scope === "CITY";
-      if (zoneOverride.status === "ENABLED") {
-        return {
-          available: true,
-          scope: zoneOverride.scope,
-          districtId: String(districtObjId),
-          cityZoneId: String(zoneObjId),
-          cityId: String(zoneObjId),
-          pricingMultiplier,
-          status: "ENABLED",
-          reason: isCityScope ? "CITY_ENABLED" : "ZONE_ENABLED",
-        };
-      } else {
+      if (zoneOverride.status === "DISABLED") {
+        // ZONE DISABLED strictly overrides District ENABLED!
         return {
           available: false,
           scope: zoneOverride.scope,
@@ -117,16 +145,26 @@ export const resolveServiceAvailability = async ({
           status: "DISABLED",
           reason: isCityScope ? "CITY_RESTRICTION" : "ZONE_RESTRICTION",
         };
+      } else if (zoneOverride.status === "ENABLED") {
+        return {
+          available: true,
+          scope: zoneOverride.scope,
+          districtId: String(districtObjId),
+          cityZoneId: String(zoneObjId),
+          cityId: String(zoneObjId),
+          pricingMultiplier,
+          status: "ENABLED",
+          reason: isCityScope ? "CITY_ENABLED" : "ZONE_ENABLED",
+        };
       }
     }
   }
 
-  // 2. DISTRICT LEVEL DEFAULT CHECK
+  // 2. DISTRICT LEVEL DEFAULT CHECK (Priority 2: Evaluated only when no zone override exists)
   const districtDefault = await ServiceAvailability.findOne({
     serviceId,
     districtId: districtObjId,
     cityZoneId: null,
-    cityId: null,
     scope: "DISTRICT",
   }).lean();
 

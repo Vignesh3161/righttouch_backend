@@ -8,12 +8,7 @@
     "test": "node --test \"test/*.test.js\"",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "generate-postman:admin": "node scripts/generateAdminPostman.cjs",
-    "generate-postman:admin-technician": "node scripts/generateAdminTechnicianManagementPostman.cjs",
-    "generate-postman:technician": "node scripts/generateTechnicianPostman.cjs",
-    "generate-postman:technician-wallet": "node scripts/generateTechnicianWalletPaymentsPostman.cjs",
-    "generate-postman:customer": "node scripts/generateCustomerPostman.cjs",
-    "generate-postman": "npm run generate-postman:admin && npm run generate-postman:admin-technician && npm run generate-postman:technician && npm run generate-postman:technician-wallet && npm run generate-postman:customer"
+    "generate-postman": "node scripts/generateAllPostman.js"
   },
   "repository": {
     "type": "git",

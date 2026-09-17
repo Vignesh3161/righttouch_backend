@@ -28,17 +28,31 @@ export const toBookingCancelledDTO = (booking, reason) => ({
  *   address, scheduledAt)
  * @param {Object} [broadcast] - JobBroadcast doc (broadcastId, version)
  */
-export const toJobNewDTO = (jobData, broadcast) => ({
-  bookingId: jobData?.bookingId ? jobData.bookingId.toString() : null,
-  broadcastId: broadcast?._id ? broadcast._id.toString() : null,
-  version: broadcast?.version || 1,
-  serviceId: jobData?.serviceId ? jobData.serviceId.toString() : null,
-  serviceName: jobData?.serviceName || "New Service",
-  serviceType: jobData?.serviceType,
-  description: jobData?.description,
-  duration: jobData?.duration,
-  customerName: jobData?.customerName || "Customer",
-  baseAmount: jobData?.baseAmount ?? null,
-  address: jobData?.address || "Location unavailable",
-  scheduledAt: jobData?.scheduledAt || null,
-});
+export const toJobNewDTO = (jobData, broadcast) => {
+  const distM = jobData?.distanceMeters ?? (jobData?.distanceAtOffer ? Math.round(jobData.distanceAtOffer) : null);
+  const distKm = distM != null ? Number((distM / 1000).toFixed(2)) : (jobData?.distanceKm != null ? Number(jobData.distanceKm) : null);
+  const distStr = jobData?.distanceStr || (distKm != null ? `${distKm} km` : null);
+
+  return {
+    bookingId: jobData?.bookingId ? jobData.bookingId.toString() : null,
+    broadcastId: broadcast?._id ? broadcast._id.toString() : null,
+    version: broadcast?.version || 1,
+    serviceId: jobData?.serviceId ? jobData.serviceId.toString() : null,
+    serviceName: jobData?.serviceName || "New Service",
+    serviceType: jobData?.serviceType,
+    description: jobData?.description,
+    duration: jobData?.duration,
+    customerName: jobData?.customerName || "Customer",
+    baseAmount: jobData?.baseAmount ?? null,
+    address: jobData?.address || "Location unavailable",
+    scheduledAt: jobData?.scheduledAt || null,
+    latitude: jobData?.latitude ?? null,
+    longitude: jobData?.longitude ?? null,
+    distanceMeters: distM,
+    distanceKm: distKm,
+    distanceStr: distStr,
+    jobRadiusKm: 10,
+    maxRadiusKm: 10,
+    maxAllowedMeters: 10000,
+  };
+};

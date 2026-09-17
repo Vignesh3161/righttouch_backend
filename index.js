@@ -1,4 +1,5 @@
 import express from "express";
+import path from "path";
 import bodyParser from "body-parser";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
@@ -8,8 +9,6 @@ import multer from "multer";
 import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { createAdapter } from "@socket.io/redis-adapter";
-import { createClient } from "redis";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
 
 // Load environment variables
@@ -158,53 +157,6 @@ const io = new Server(httpServer, {
 // consumed lazily via getIo() to avoid circular imports.
 setIo(io);
 
-// 🔌 Redis Adapter Setup for Scaling
-let redisPubClient = null;
-let redisSubClient = null;
-
-const initRedisAdapter = async (ioServer) => {
-  const redisUrl = process.env.REDIS_URL || "";
-  const redisEnabled = String(process.env.REDIS_ENABLED).toLowerCase() !== "false";
-
-  if (!redisEnabled || !redisUrl) {
-    console.log("ℹ️ [REDIS] Redis adapter is disabled or REDIS_URL not configured. Running in single-instance mode.");
-    return false;
-  }
-
-  try {
-    const socketOptions = {
-      connectTimeout: 3000,
-      reconnectStrategy: false, // Don't infinite loop if local Redis isn't running
-    };
-
-    redisPubClient = createClient({ url: redisUrl, socket: socketOptions });
-    redisSubClient = redisPubClient.duplicate();
-
-    redisPubClient.on("error", (err) => {
-      if (redisPubClient?.isReady) {
-        console.error("❌ [REDIS PUB ERROR]:", err.message);
-      }
-    });
-    redisSubClient.on("error", (err) => {
-      if (redisSubClient?.isReady) {
-        console.error("❌ [REDIS SUB ERROR]:", err.message);
-      }
-    });
-
-    await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
-    ioServer.adapter(createAdapter(redisPubClient, redisSubClient));
-    console.log(`✅ [REDIS ADAPTER] Socket.IO Redis Adapter connected & scaling active via ${redisUrl}`);
-    return true;
-  } catch (err) {
-    console.warn(`⚠️ [REDIS ADAPTER] Could not connect to Redis (${err.message}) — running in single-instance mode.`);
-    try { await redisPubClient?.disconnect(); } catch { /* noop */ }
-    try { await redisSubClient?.disconnect(); } catch { /* noop */ }
-    redisPubClient = null;
-    redisSubClient = null;
-    return false;
-  }
-};
-
 // 🛡 Handshake rate limiter MUST run before auth: a flood of junk tokens
 // never reaches jwt.verify (Socket Analysis B1.3).
 io.use(createHandshakeLimiter({ max: 20, windowMs: 60000 }));
@@ -232,7 +184,8 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
 
   if (role === "Technician" && techProfileId) {
     socket.join(SOCKET_ROOMS.TECHNICIAN(techProfileId));
-    console.log(`🏠 [TECH ROOM] Joined legacy: technician_${techProfileId}`);
+    socket.join(SOCKET_ROOMS.USER(techProfileId));
+    console.log(`🏠 [TECH ROOM] Joined: technician_${techProfileId}, user:${techProfileId}`);
   }
 
   // Admin/Owner dashboard feed (replaces the old global new_booking io.emit —
@@ -409,7 +362,6 @@ import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.j
 import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
 import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
 import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
-import { ensureConnected as ensureGeoConnected } from "./Utils/technicianGeo.js";
 import { processQuotationDeliveries } from "./Services/quotationDeliveryService.js";
 import { expireQuotations } from "./Services/quotationService.js";
 import { startNotificationWorker } from "./Utils/notificationWorker.js";
@@ -513,9 +465,6 @@ const startBackgroundWorkers = async () => {
   // 📤 Booking outbox worker — broadcast only AFTER booking transaction commit
   startBookingOutboxWorker(io);
 
-  // 🗺 Redis GEO layer (best-effort — matching falls back to Mongo if absent)
-  ensureGeoConnected().catch(() => { });
-
   // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
   initPaymentCrons();
 
@@ -551,9 +500,8 @@ App.get("/health/live", (req, res) => {
 
 App.get("/health/ready", async (req, res) => {
   const mongoOk = mongoose.connection.readyState === 1;
-  const redisOk = redisPubClient?.isReady || false;
-  if (mongoOk) return res.status(200).json({ status: "ready", mongo: true, redis: redisOk });
-  return res.status(503).json({ status: "not_ready", mongo: mongoOk, redis: redisOk });
+  if (mongoOk) return res.status(200).json({ status: "ready", mongo: true });
+  return res.status(503).json({ status: "not_ready", mongo: mongoOk });
 });
 
 /* ==========================================================================
@@ -608,6 +556,7 @@ App.use("/api", userZoneRoutes);
    -------------------------------------------------------------------------- */
 App.use("/api", razorpayXWebhookRoutes);
 App.use("/api/dev", DevRoutes);
+App.use("/dev-inspector", express.static(path.join(process.cwd(), "frontend")));
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
 App.use((err, req, res, next) => {
@@ -663,10 +612,7 @@ const startServer = async () => {
     });
     console.log("✅ Connected to MongoDB Atlas...");
 
-    // 2. Initialize Redis Adapter BEFORE accepting traffic
-    await initRedisAdapter(io);
-
-    // 3. Start Background Workers & Crons
+    // 2. Start Background Workers & Crons
     await startBackgroundWorkers();
 
     // 4. Start HTTP & WebSocket Server
@@ -706,8 +652,6 @@ const shutdown = async (signal) => {
     stopPaymentNotificationWorker();
     io.close();
     await new Promise((resolve) => httpServer.close(resolve));
-    if (redisPubClient) await redisPubClient.disconnect().catch(() => {});
-    if (redisSubClient) await redisSubClient.disconnect().catch(() => {});
     await mongoose.connection.close();
   } catch (err) {
     console.error("Shutdown error:", err.message);

@@ -835,8 +835,9 @@ export const checkout = async (req, res) => {
             });
         }
 
-        // 🏘 ZONE RESOLUTION — resolve zone from customer coordinates for service availability check.
+        // 🏘 ZONE & DISTRICT RESOLUTION — resolve zone and district from customer coordinates for service availability check.
         let resolvedZoneId = null;
+        let resolvedDistrictId = null;
         if (resolvedLocation.latitude && resolvedLocation.longitude) {
             const { zone } = await resolveZoneFromCoordinates(
                 resolvedLocation.latitude,
@@ -844,6 +845,15 @@ export const checkout = async (req, res) => {
             );
             if (zone) {
                 resolvedZoneId = zone._id;
+                resolvedDistrictId = zone.operationalCityId || null;
+            }
+            if (!resolvedDistrictId) {
+                const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
+                const opCity = await resolveOperationalCityFromCoordinates(
+                    resolvedLocation.latitude,
+                    resolvedLocation.longitude
+                );
+                if (opCity?._id) resolvedDistrictId = opCity._id;
             }
         }
 
@@ -983,30 +993,21 @@ export const checkout = async (req, res) => {
                 });
             }
 
-            // 🏘 ZONE-SERVICE CHECK — zone-restricted services need an active
-            // mapping in the resolved zone; non-restricted services are open.
-            if (service.zoneRestricted) {
-                if (!resolvedZoneId) {
-                    await session.abortTransaction();
-                    return res.status(400).json({
-                        success: false,
-                        message: `Service "${service.serviceName}" is only available in supported zones`,
-                        result: {},
-                    });
-                }
-                const mapping = await ZoneServiceMapping.findOne({
-                    zoneId: resolvedZoneId,
-                    serviceId: cartItem.itemId,
-                    active: true,
-                }).session(session).lean();
-                if (!mapping) {
-                    await session.abortTransaction();
-                    return res.status(400).json({
-                        success: false,
-                        message: `Service "${service?.serviceName || cartItem.itemId}" is not available in your area`,
-                        result: {},
-                    });
-                }
+            // 🏘 SERVICE AVAILABILITY CHECK (Zone & District)
+            const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
+            const avail = await resolveServiceAvailability({
+                serviceId: cartItem.itemId,
+                districtId: resolvedDistrictId,
+                cityId: resolvedZoneId,
+            });
+            if (!avail.available) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    message: avail.reason || `Service "${service?.serviceName || cartItem.itemId}" is not available in your area`,
+                    code: avail.code || "SERVICE_NOT_AVAILABLE",
+                    result: {},
+                });
             }
 
             // ─── Resolve schedule per item (same utility as GET /slots) ─────
@@ -1040,6 +1041,7 @@ export const checkout = async (req, res) => {
                 customerId,
                 quantity: cartItem.quantity || 1,
                 cityZoneId: resolvedZoneId,
+                districtId: resolvedDistrictId,
             });
 
             // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.

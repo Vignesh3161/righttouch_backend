@@ -188,27 +188,23 @@ export const createBooking = async (req, res) => {
 
     // 🏘 ZONE RESOLUTION — resolve zone from customer coordinates and check service availability.
     let resolvedZoneId = null;
+    let resolvedDistrictId = null;
     if (resolvedLocation.latitude && resolvedLocation.longitude) {
-      const { zone } = await resolveZoneFromCoordinates(
-        resolvedLocation.latitude,
-        resolvedLocation.longitude
-      );
-      if (zone) {
-        resolvedZoneId = zone._id;
-        // Check if service is approved in this zone
-        const mapping = await ZoneServiceMapping.findOne({
-          zoneId: zone._id,
-          serviceId,
-          active: true,
-        }).lean();
-        if (!mapping) {
-          return res.status(400).json({
-            success: false,
-            message: "This service is not available in your area",
-            result: {},
-          });
-        }
+      const zoneCheck = await resolveServiceZoneAvailability({
+        service,
+        latitude: resolvedLocation.latitude,
+        longitude: resolvedLocation.longitude,
+      });
+      if (!zoneCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: zoneCheck.error,
+          code: zoneCheck.code || "SERVICE_NOT_AVAILABLE",
+          result: {},
+        });
       }
+      resolvedZoneId = zoneCheck.zoneId;
+      resolvedDistrictId = zoneCheck.districtId;
     }
 
     // 💰 SERVER-SIDE SPLIT — commission on service amount only; GST separate;
@@ -277,6 +273,7 @@ export const createBooking = async (req, res) => {
       autoCancelAt: autoCancelAt,
       retryCount: 0,
       technicianRejectCount: 0,
+      districtId: resolvedDistrictId,
       cityZoneId: resolvedZoneId,
     };
 
@@ -285,6 +282,16 @@ export const createBooking = async (req, res) => {
     }
 
     const booking = await ServiceBooking.create(bookingDoc);
+
+    console.log(`\n======================================================================`);
+    console.log(`📦 [CUSTOMER BOOKING CREATED]`);
+    console.log(`   🆔 Booking ID: ${booking._id}`);
+    console.log(`   🛠 Service: ${service.serviceName || serviceId} (ID: ${serviceId})`);
+    console.log(`   📍 Customer GPS: [${resolvedLocation.longitude}, ${resolvedLocation.latitude}]`);
+    console.log(`   🏢 District ID: ${resolvedDistrictId || "N/A"} | Zone ID: ${resolvedZoneId || "N/A"}`);
+    console.log(`   🎯 Matching Radius: 10 KM (10,000 meters)`);
+    console.log(`   📅 Type: ${bookingDoc.bookingType} | Initial Status: ${initialStatus}`);
+    console.log(`======================================================================`);
 
     // 🚀 Socket.IO Emission — room-scoped DTO ONLY (Socket Analysis B1.1).
     // The raw booking doc must NEVER be broadcast globally: it contains
@@ -384,6 +391,7 @@ export const storeBookingSchedule = async (req, res) => {
       customerId: req.user.userId,
       faultProblem: faultProblem || null,
       cityZoneId: zoneCheck.zoneId,
+      districtId: zoneCheck.districtId,
     });
 
     // 💸 Fail fast: online payments require a total of ₹0 (free) or at least ₹1.

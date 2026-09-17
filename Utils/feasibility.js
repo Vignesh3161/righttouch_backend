@@ -20,35 +20,48 @@ const DEFAULT_CITY_SPEED_KMPH = 25; // city driving average for ETA estimates
 const DEFAULT_TRAVEL_BUFFER = 1.15; // +15% — deadline gate, not display ETA
 const DEFAULT_JOB_GRACE_MINUTES = 15;
 
-/* ------------------------- geometry helpers ------------------------- */
-
-/** Great-circle distance in meters (haversine). */
-export const haversineMeters = (from, to) => {
-  if (!from || !to) return null;
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const R = 6371000;
-  const dLat = toRad(to.latitude - from.latitude);
-  const dLng = toRad(to.longitude - from.longitude);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(from.latitude)) *
-      Math.cos(toRad(to.latitude)) *
-      Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-};
-
-/** Normalize a GeoJSON point [lng, lat] or {latitude, longitude} to {latitude, longitude}. */
-const toLatLng = (loc) => {
+/** Normalize a GeoJSON point [lng, lat], GeoJSON object, or {latitude, longitude} to {latitude, longitude}. */
+export const toLatLng = (loc) => {
   if (!loc) return null;
-  if (Array.isArray(loc.coordinates) && loc.coordinates.length === 2) {
-    return { longitude: loc.coordinates[0], latitude: loc.coordinates[1] };
+  if (Array.isArray(loc)) {
+    if (loc.length >= 2 && Number.isFinite(Number(loc[0])) && Number.isFinite(Number(loc[1]))) {
+      // GeoJSON standard: [longitude, latitude]
+      return { longitude: Number(loc[0]), latitude: Number(loc[1]) };
+    }
+    return null;
   }
-  const lat = Number(loc.latitude);
-  const lng = Number(loc.longitude);
+  if (loc.type === "Point" && Array.isArray(loc.coordinates) && loc.coordinates.length >= 2) {
+    return { longitude: Number(loc.coordinates[0]), latitude: Number(loc.coordinates[1]) };
+  }
+  if (Array.isArray(loc.coordinates) && loc.coordinates.length >= 2) {
+    return { longitude: Number(loc.coordinates[0]), latitude: Number(loc.coordinates[1]) };
+  }
+  const lat = Number(loc.latitude ?? loc.lat);
+  const lng = Number(loc.longitude ?? loc.lng ?? loc.lon);
   if (Number.isFinite(lat) && Number.isFinite(lng)) {
     return { latitude: lat, longitude: lng };
   }
   return null;
+};
+
+/** Great-circle distance in meters (haversine). Safely accepts any GeoJSON or coordinate format. */
+export const haversineMeters = (from, to) => {
+  const a = toLatLng(from);
+  const b = toLatLng(to);
+  if (!a || !b) return null;
+
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000; // Earth radius in meters
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLng = toRad(b.longitude - a.longitude);
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const h =
+    sinDLat * sinDLat +
+    Math.cos(toRad(a.latitude)) *
+      Math.cos(toRad(b.latitude)) *
+      sinDLng * sinDLng;
+  return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 };
 
 /* ------------------------- travel estimation ------------------------- */

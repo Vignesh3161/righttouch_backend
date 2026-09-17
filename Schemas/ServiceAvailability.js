@@ -35,6 +35,13 @@ const serviceAvailabilitySchema = new mongoose.Schema(
       index: true,
     },
 
+    cityId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CityZone",
+      default: null,
+      index: true,
+    },
+
     cityName: {
       type: String,
       trim: true,

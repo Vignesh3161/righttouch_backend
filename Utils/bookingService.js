@@ -36,37 +36,31 @@ export const resolveServiceZoneAvailability = async ({
   session,
 }) => {
   const resolved = await resolveZoneFromCoordinates(latitude, longitude, { session });
-
-  if (!resolved.zone) {
-    if (service?.zoneRestricted) {
-      return {
-        ok: false,
-        zoneId: null,
-        error: "Service is only available in supported zones. Location not recognized.",
-      };
-    }
-    return { ok: true, zoneId: null };
+  let districtId = resolved.zone?.operationalCityId || null;
+  if (!districtId && latitude && longitude) {
+    const { resolveOperationalCityFromCoordinates } = await import("./technicianMatching.js");
+    const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
+    if (city?._id) districtId = city._id;
   }
 
-  if (service?.zoneRestricted) {
-    const mapping = await ZoneServiceMapping.findOne({
-      zoneId: resolved.zone._id,
-      serviceId: service._id,
-      active: true,
-    })
-      .session(session || null)
-      .lean();
+  const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
+  const avail = await resolveServiceAvailability({
+    serviceId: service?._id,
+    districtId,
+    cityId: resolved.zone?._id || null,
+  });
 
-    if (!mapping) {
-      return {
-        ok: false,
-        zoneId: resolved.zone._id,
-        error: `Service "${service.serviceName}" is not available in your area`,
-      };
-    }
+  if (!avail.available) {
+    return {
+      ok: false,
+      zoneId: resolved.zone?._id || null,
+      districtId,
+      error: avail.reason || `Service "${service?.serviceName}" is not available in your area`,
+      code: avail.code || "SERVICE_NOT_AVAILABLE",
+    };
   }
 
-  return { ok: true, zoneId: resolved.zone._id };
+  return { ok: true, zoneId: resolved.zone?._id || null, districtId };
 };
 
 /**
@@ -143,6 +137,7 @@ export const buildServiceBookingDoc = async ({
   faultProblem = null,
   quantity = 1,
   cityZoneId = null,
+  districtId = null,
 }) => {
   const now = new Date();
   const baseAmount = (service.serviceCost || 0) * quantity;
@@ -160,6 +155,8 @@ export const buildServiceBookingDoc = async ({
   const doc = {
     customerId,
     serviceId: service._id,
+    districtId: districtId || null,
+    cityZoneId: cityZoneId || null,
     bookingType,
     baseAmount,
     financialSnapshot: snapshot,
