@@ -3,6 +3,7 @@ import NotificationDelivery from "../Schemas/NotificationDelivery.js";
 import NotificationOutbox from "../Schemas/NotificationOutbox.js";
 import { CHANNEL_POLICY, MAX_OUTBOX_ATTEMPTS } from "../Services/notificationService.js";
 import { dispatchByChannel } from "./notificationAdapters.js";
+import { notificationMetrics, logOutbox, logDelivery } from "./notificationMetrics.js";
 
 const TERMINAL = new Set(["provider_accepted", "device_received", "opened", "failed", "skipped", "dead_letter"]);
 const OUTBOX_BACKOFF_MS = 30000;
@@ -36,9 +37,12 @@ const buildPayload = (channel, notif) => {
 };
 
 const processOutboxRecord = async (ob) => {
+  const start = Date.now();
   const notif = await Notification.findById(ob.notificationId);
   if (!notif) {
     await NotificationOutbox.updateOne({ _id: ob._id }, { status: "failed", lastError: "notification_missing" });
+    logOutbox("missing_notification", ob._id, { durationMs: Date.now() - start });
+    notificationMetrics.increment("outbox_failed");
     return;
   }
 
@@ -57,6 +61,8 @@ const processOutboxRecord = async (ob) => {
       d.failureCode = "MAX_ATTEMPTS";
       d.failureReason = "Exceeded retry attempts";
       await d.save();
+      notificationMetrics.increment("delivery_dead_letter");
+      logOutbox("dead_letter", ob._id, { channel: d.channel, deliveryId: d._id });
       continue;
     }
 
@@ -74,11 +80,13 @@ const processOutboxRecord = async (ob) => {
       d.providerAcceptedAt = new Date();
       if (res.providerMessageId) d.providerMessageId = res.providerMessageId;
       if (res.providerResponse) d.providerResponse = res.providerResponse;
+      logDelivery(d.channel, res, { recipientId: notif.recipientId, recipientType: notif.recipientType }, Date.now() - start);
     } else if (res.permanent) {
       d.status = "failed";
       d.failureCode = "PERMANENT";
       d.failureReason = res.error || "permanent failure";
       d.failedAt = new Date();
+      logDelivery(d.channel, res, { recipientId: notif.recipientId, recipientType: notif.recipientType }, Date.now() - start);
     } else {
       d.status = "pending";
       d.nextAttemptAt = new Date(Date.now() + (policy.backoffMs || 5000));
@@ -95,21 +103,30 @@ const processOutboxRecord = async (ob) => {
         { _id: ob._id },
         { status: "failed", lastError: "max_outbox_attempts", attempts }
       );
+      logOutbox("max_attempts_failed", ob._id, { attempts, durationMs: Date.now() - start });
+      notificationMetrics.increment("outbox_failed");
     } else {
       await NotificationOutbox.updateOne(
         { _id: ob._id },
         { status: "pending", nextAttemptAt: new Date(Date.now() + OUTBOX_BACKOFF_MS), attempts }
       );
+      logOutbox("requeued", ob._id, { attempts, nextAttemptAt: new Date(Date.now() + OUTBOX_BACKOFF_MS), durationMs: Date.now() - start });
+      notificationMetrics.increment("outbox_retried");
     }
   } else {
     await NotificationOutbox.updateOne(
       { _id: ob._id },
       { status: "completed", completedAt: new Date() }
     );
+    logOutbox("completed", ob._id, { durationMs: Date.now() - start });
+    notificationMetrics.increment("outbox_completed");
   }
+  notificationMetrics.increment("outbox_processed");
+  notificationMetrics.recordLatency("outbox_tick", Date.now() - start);
 };
 
 const tick = async () => {
+  const start = Date.now();
   try {
     const now = new Date();
     const leaseCutoff = new Date(now.getTime() - LEASE_TTL_MS);
@@ -136,13 +153,35 @@ const tick = async () => {
     }
   } catch (e) {
     console.error("[notificationWorker] tick error:", e.message);
+  } finally {
+    notificationMetrics.recordLatency("outbox_tick", Date.now() - start);
   }
 };
 
 let timer = null;
+let metricsTimer = null;
 export const startNotificationWorker = (intervalMs = 5000) => {
   if (timer) return;
   timer = setInterval(tick, intervalMs);
   if (timer.unref) timer.unref();
+
+  // Periodic metrics logging (every 60s)
+  metricsTimer = setInterval(() => {
+    const summary = notificationMetrics.getSummary();
+    console.log("📊 [NOTIFICATION METRICS]", JSON.stringify(summary, null, 2));
+  }, 60000);
+  if (metricsTimer.unref) metricsTimer.unref();
+
   console.log(`🔔 Notification worker started (every ${intervalMs}ms)`);
+};
+
+export const stopNotificationWorker = () => {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  if (metricsTimer) {
+    clearInterval(metricsTimer);
+    metricsTimer = null;
+  }
 };

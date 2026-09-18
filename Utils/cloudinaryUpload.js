@@ -105,13 +105,40 @@ export const kycUpload = multer({
  * Cloudinary resource. Accepts either a public_id (new uploads) or a
  * legacy full URL (old public uploads) — legacy URLs are returned as-is.
  *
+ * For authenticated resources, if a full Cloudinary URL is provided,
+ * we extract the public_id and generate a proper signed URL.
+ *
  * @param {String} publicIdOrUrl Cloudinary public_id or full URL
  * @param {Number} ttlSeconds Default 300 (5 min)
  * @returns {String} Signed URL
  */
 export const getSignedKycUrl = (publicIdOrUrl, ttlSeconds = 300) => {
   if (!publicIdOrUrl) return publicIdOrUrl;
-  if (/^https?:\/\//.test(publicIdOrUrl)) return publicIdOrUrl; // legacy public URL
+
+  // If it's already a full URL, check if it's a Cloudinary URL
+  // For authenticated resources, we need to extract public_id and re-sign
+  if (/^https?:\/\//.test(publicIdOrUrl)) {
+    // Try to extract public_id from Cloudinary URL
+    // Format: https://res.cloudinary.com/<cloud_name>/<resource_type>/upload/v<version>/<public_id>.<ext>
+    // or: https://res.cloudinary.com/<cloud_name>/<resource_type>/upload/<public_id>.<ext>
+    const cloudinaryUrlMatch = publicIdOrUrl.match(
+      /\/upload\/(?:v\d+\/)?([^\/]+(?:\/[^\/]+)*)(?:\.[a-zA-Z0-9]+)?(?:\?|$)/
+    );
+    if (cloudinaryUrlMatch && cloudinaryUrlMatch[1]) {
+      const publicId = cloudinaryUrlMatch[1];
+      return cloudinary.url(publicId, {
+        sign_url: true,
+        type: "upload",
+        secure: true,
+        expires_at: Math.floor(Date.now() / 1000) + ttlSeconds,
+        fetch_format: "auto",
+      });
+    }
+    // Non-Cloudinary URL or unparseable — return as-is (legacy)
+    return publicIdOrUrl;
+  }
+
+  // It's a public_id — generate signed URL
   return cloudinary.url(publicIdOrUrl, {
     sign_url: true,
     type: "upload",

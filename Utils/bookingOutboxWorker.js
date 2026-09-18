@@ -56,7 +56,9 @@ const processRow = async (row) => {
     }
 
     if (verdict.status === "run") {
-      await matchAndBroadcastBooking(row.aggregateId, ioRef);
+      const traceId = verdict.traceId;
+      console.log(`[TRACE] ${traceId} OUTBOX_WORKER_BROADCAST bookingId=${row.aggregateId}`);
+      await matchAndBroadcastBooking(row.aggregateId, ioRef, traceId);
       await BookingOutbox.updateOne(
         { _id: row._id },
         { $set: { status: "done", completedAt: new Date() } }

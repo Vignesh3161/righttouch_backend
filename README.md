@@ -282,9 +282,14 @@ CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 
 # Firebase Push Notifications
-FIREBASE_PROJECT_ID=righttouch-firebase
-FIREBASE_CLIENT_EMAIL=firebase-adminsdk@righttouch.iam.gserviceaccount.com
-FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# Use service account JSON file (recommended):
+FCM_SERVICE_ACCOUNT_PATH=./config/firebase-credentials.json
+# OR inline JSON env var:
+# FIREBASE_SERVICE_ACCOUNT='{"project_id":"righttouchmessaging-401e9","private_key":"...","client_email":"..."}'
+# OR individual env vars (must match righttouchmessaging-401e9):
+# FIREBASE_PROJECT_ID=righttouchmessaging-401e9
+# FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@righttouchmessaging-401e9.iam.gserviceaccount.com
+# FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 
 # Messaging & Email
 SENDGRID_API_KEY=SG.xxxxxxxx

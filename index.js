@@ -10,9 +10,30 @@ import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { createClient } from "redis";
 
 // Load environment variables
 dotenv.config();
+
+// 🔴 Redis Socket.IO Adapter (multi-server support)
+// Initialized lazily; if Redis unavailable, runs single-node with warning.
+let redisPubClient = null;
+let redisSubClient = null;
+const initRedisAdapter = async (io) => {
+  const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+  try {
+    redisPubClient = createClient({ url: redisUrl });
+    redisSubClient = redisPubClient.duplicate();
+    await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
+    io.adapter(createAdapter(redisPubClient, redisSubClient));
+    console.log("🔴 Redis Socket.IO adapter connected — multi-server pub/sub enabled");
+  } catch (err) {
+    console.warn(`⚠️ Redis adapter unavailable (${err.message}) — running single-node`);
+    redisPubClient = null;
+    redisSubClient = null;
+  }
+};
 
 import { socketAuth } from "./Middleware/socketAuth.js";
 import { Auth, authorizeRoles } from "./Middleware/Auth.js";
@@ -20,6 +41,7 @@ import isTechnician from "./Middleware/isTechnician.js";
 import { createHandshakeLimiter } from "./Middleware/socketRateLimiter.js";
 import { startSocketMetricsLogger, recordLocationDrop } from "./Utils/socketMetrics.js";
 import TechnicianProfile from "./Schemas/TechnicianProfile.js";
+import { setIo } from "./Utils/ioAccess.js";
 
 /* ================= ROUTE IMPORTS ================= */
 // Admin Route Imports
@@ -357,14 +379,14 @@ import { handleLocationUpdate } from "./Utils/technicianLocation.js";
 import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
 import { initBookingCrons } from "./Utils/bookingCron.js";
 import { initPaymentCrons } from "./Utils/paymentCrons.js";
-import { setIo } from "./Utils/ioAccess.js";
+import { validateFcmConfig } from "./Utils/firebase.js";
 import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
 import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
 import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
 import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
 import { processQuotationDeliveries } from "./Services/quotationDeliveryService.js";
 import { expireQuotations } from "./Services/quotationService.js";
-import { startNotificationWorker } from "./Utils/notificationWorker.js";
+import { startNotificationWorker, stopNotificationWorker } from "./Utils/notificationWorker.js";
 import {
   refundWorker,
   reconcileRefunds,
@@ -504,6 +526,25 @@ App.get("/health/ready", async (req, res) => {
   return res.status(503).json({ status: "not_ready", mongo: mongoOk });
 });
 
+App.get("/health/fcm", async (req, res) => {
+  const { isFcmEnabled, validateFcmConfig } = await import("./Utils/firebase.js");
+  const fcmEnabled = isFcmEnabled();
+  const validation = fcmEnabled ? validateFcmConfig() : { valid: false, reason: "not_initialized" };
+  const status = fcmEnabled && validation.valid ? 200 : 503;
+  res.status(status).json({
+    fcmEnabled,
+    fcmProjectId: validation.projectId,
+    valid: validation.valid,
+    reason: validation.reason,
+    expectedProjectId: validation.expected,
+  });
+});
+
+App.get("/health/metrics", async (req, res) => {
+  const { notificationMetrics } = await import("./Utils/notificationMetrics.js");
+  res.status(200).json(notificationMetrics.getSummary());
+});
+
 /* ==========================================================================
    API ROUTE REGISTRATION (ORGANIZED BY ROLE & DOMAIN)
    ========================================================================== */
@@ -612,6 +653,17 @@ const startServer = async () => {
     });
     console.log("✅ Connected to MongoDB Atlas...");
 
+    // 1b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
+    await initRedisAdapter(io);
+
+    // 1c. Validate FCM configuration
+    const fcmValidation = validateFcmConfig();
+    if (!fcmValidation.valid) {
+      console.warn(`⚠️ FCM validation: ${fcmValidation.reason}`, fcmValidation);
+    } else {
+      console.log(`✅ FCM validated for project: ${fcmValidation.projectId}`);
+    }
+
     // 2. Start Background Workers & Crons
     await startBackgroundWorkers();
 
@@ -648,11 +700,16 @@ const shutdown = async (signal) => {
   console.log(`🛑 ${signal} received — shutting down gracefully...`);
   try {
     stopDispatchWorker();
+    stopBookingOutboxWorker();
     stopAttemptExpirySweeper();
     stopPaymentNotificationWorker();
+    stopNotificationWorker();
     io.close();
     await new Promise((resolve) => httpServer.close(resolve));
     await mongoose.connection.close();
+    // Close Redis adapter clients
+    if (redisPubClient?.isOpen) await redisPubClient.quit();
+    if (redisSubClient?.isOpen) await redisSubClient.quit();
   } catch (err) {
     console.error("Shutdown error:", err.message);
   }

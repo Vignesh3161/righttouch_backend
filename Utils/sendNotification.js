@@ -70,9 +70,43 @@ export const emitJobExpired = (io, technicianProfileId, { bookingId, expiresAt, 
  * @param {Object} [options] - { recipientType: "customer" | "technician" | "admin" }
  * @returns {Object} result
  */
-const INVALID_TOKEN_RE = /not-registered|invalid-argument|unregistered/i;
+/**
+ * FCM error codes that indicate a PERMANENTLY invalid token.
+ * These tokens will never work again and should be pruned.
+ * Source: https://firebase.google.com/docs/cloud-messaging/manage-tokens
+ */
+const PERMANENT_TOKEN_FAILURE_CODES = new Set([
+  "not-registered",      // App uninstalled, token expired
+  "unregistered",        // Alias for not-registered
+  "invalid-registration", // Token format invalid (malformed)
+]);
 
-const pruneInvalidTokens = async (recipientId, recipientType, tokens) => {
+/**
+ * FCM error codes that indicate TEMPORARY or CONFIG issues.
+ * These should NOT cause token pruning.
+ */
+const TEMPORARY_TOKEN_FAILURE_CODES = new Set([
+  "invalid-argument",    // Often project mismatch or config issue
+  "sender-id-mismatch",  // Project mismatch - CONFIG ISSUE
+  "quota-exceeded",      // Rate limiting - TEMPORARY
+  "unavailable",         // FCM service temporarily unavailable
+  "internal",            // FCM internal error - TEMPORARY
+  "third-party-auth-error", // APNs auth issue - TEMPORARY
+]);
+
+const isPermanentTokenFailure = (errorCode) => {
+  if (!errorCode) return false;
+  const code = String(errorCode).toLowerCase();
+  return PERMANENT_TOKEN_FAILURE_CODES.has(code);
+};
+
+const isTemporaryTokenFailure = (errorCode) => {
+  if (!errorCode) return false;
+  const code = String(errorCode).toLowerCase();
+  return TEMPORARY_TOKEN_FAILURE_CODES.has(code);
+};
+
+const pruneInvalidTokens = async (recipientId, recipientType, tokens, errorCodes = {}) => {
   if (!tokens || !tokens.length) return;
   const $pull = { fcmTokens: { $in: tokens } };
   try {
@@ -87,6 +121,7 @@ const pruneInvalidTokens = async (recipientId, recipientType, tokens) => {
     }
     // Also mark dead in DeviceToken collection
     await DeviceToken.updateMany({ fcmToken: { $in: tokens } }, { $set: { isActive: false } });
+    console.log(`🧹 Pruned ${tokens.length} permanently invalid FCM token(s) for ${recipientType} ${recipientId}`);
   } catch (err) {
     console.warn(`⚠️ Token prune warning for ${recipientId}:`, err.message);
   }
@@ -143,21 +178,32 @@ export const sendPushNotification = async (recipientId, payload, options = {}) =
 
     const result = await sendFcmMulticast(tokens, payload);
 
-    // 🧹 Prune tokens FCM rejected as dead
-    const invalid = (result.failedTokens || [])
-      .filter((f) => INVALID_TOKEN_RE.test(String(f.error)))
+    // 🧹 Prune tokens FCM rejected as PERMANENTLY invalid
+    // DO NOT prune for temporary/config errors (project mismatch, quota, etc.)
+    const permanentFailures = (result.failedTokens || [])
+      .filter((f) => isPermanentTokenFailure(f.error))
       .map((f) => f.token)
       .filter(Boolean);
 
-    if (invalid.length) {
-      await pruneInvalidTokens(recipientId, recipientType, invalid).catch((e) =>
+    const temporaryFailures = (result.failedTokens || [])
+      .filter((f) => isTemporaryTokenFailure(f.error))
+      .map((f) => ({ token: f.token, error: f.error }));
+
+    if (permanentFailures.length) {
+      await pruneInvalidTokens(recipientId, recipientType, permanentFailures).catch((e) =>
         console.warn(`⚠️ FCM token prune failed for ${recipientId}:`, e.message)
       );
-      await Promise.all(invalid.map((t) => deactivateTokenByValue(t))).catch(() => {});
-      console.log(`🧹 Pruned ${invalid.length} invalid FCM token(s) for ${recipientType} ${recipientId}`);
+      await Promise.all(permanentFailures.map((t) => deactivateTokenByValue(t))).catch(() => {});
     }
 
-    return { success: true, ...result };
+    if (temporaryFailures.length) {
+      console.warn(
+        `⚠️ FCM temporary/config failures (NOT pruning tokens): ${temporaryFailures.length}/${tokens.length}`,
+        temporaryFailures.slice(0, 3).map((f) => f.error)
+      );
+    }
+
+    return { success: true, ...result, permanentFailures: permanentFailures.length, temporaryFailures: temporaryFailures.length };
   } catch (error) {
     console.error("❌ Push notification error:", error.message);
     return { success: false, error: error.message };

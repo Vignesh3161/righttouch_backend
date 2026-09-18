@@ -203,9 +203,12 @@ export const buildServiceBookingDoc = async ({
  * Insert the booking + BOOKING_CREATED outbox row in the caller's transaction.
  * Caller owns commit/abort.
  *
- * @returns {{ booking: Object }}
+ * @returns {{ booking: Object, traceId: String }}
  */
 export const createBookingAndOutbox = async ({ doc, session }) => {
+  // Generate trace ID for end-to-end tracking
+  const traceId = `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
   const [booking] = await ServiceBooking.create([doc], { session });
 
   await BookingOutbox.create(
@@ -215,25 +218,31 @@ export const createBookingAndOutbox = async ({ doc, session }) => {
         eventType: "booking_created",
         idempotencyKey: `booking-created:${booking._id}`,
         version: booking.version || 1,
-        payload: { status: "pending", bookingType: booking.bookingType },
+        payload: { status: "pending", bookingType: booking.bookingType, traceId },
       },
     ],
     { session }
   );
 
-  return { booking };
+  console.log(`[TRACE] ${traceId} BOOKING_CREATED bookingId=${booking._id}`);
+  return { booking, traceId };
 };
 
 /**
  * Broadcast after commit: inline fast path + outbox worker as retry/audit.
  * Never called before the booking transaction commits.
  *
- * @returns {Promise<{count: number, outbox: boolean}>}
+ * @returns {Promise<{count: number, outbox: boolean, traceId: String}>}
  */
 export const broadcastCreatedBooking = async (bookingId, io) => {
   try {
-    const result = await matchAndBroadcastBooking(bookingId, io);
-    return { count: result?.count ?? 0, outbox: false };
+    // Try to get traceId from outbox
+    const outboxRow = await BookingOutbox.findOne({ aggregateId: bookingId, eventType: "booking_created" }).lean();
+    const traceId = outboxRow?.payload?.traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    console.log(`[TRACE] ${traceId} MATCHING_STARTED bookingId=${bookingId}`);
+    const result = await matchAndBroadcastBooking(bookingId, io, traceId);
+    return { count: result?.count ?? 0, outbox: false, traceId };
   } catch (err) {
     console.warn(`[BookingService] inline broadcast failed for ${bookingId}, outbox worker will retry: ${err.message}`);
     return { count: 0, outbox: true };
@@ -274,5 +283,8 @@ export const processBookingCreatedOutbox = async (booking) => {
     return { status: "done", reason: "already_broadcast" };
   }
 
-  return { status: "run" };
+  const traceId = booking.payload?.traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  console.log(`[TRACE] ${traceId} OUTBOX_WORKER_CLAIMED bookingId=${booking.aggregateId}`);
+
+  return { status: "run", traceId };
 };

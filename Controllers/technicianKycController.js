@@ -352,16 +352,21 @@ export const uploadTechnicianKycDocuments = async (req, res) => {
 
     // Store Cloudinary public_ids (files live in private/authenticated
     // storage); signed URLs are generated at read time.
+    // Use f.filename (public_id) or f.public_id — NEVER f.path (full URL)
+    // because getSignedKycUrl treats full URLs as legacy public URLs
+    // and returns them unsigned, which fails for authenticated resources.
+    const getPublicId = (file) => file.filename || file.public_id;
+
     if (req.files.aadhaarImage) {
-      kyc.documents.aadhaarUrl = req.files.aadhaarImage.map((f) => f.filename || f.path);
+      kyc.documents.aadhaarUrl = req.files.aadhaarImage.map(getPublicId);
     }
 
     if (req.files.panImage) {
-      kyc.documents.panUrl = req.files.panImage.map((f) => f.filename || f.path);
+      kyc.documents.panUrl = req.files.panImage.map(getPublicId);
     }
 
     if (req.files.dlImage) {
-      kyc.documents.dlUrl = req.files.dlImage.map((f) => f.filename || f.path);
+      kyc.documents.dlUrl = req.files.dlImage.map(getPublicId);
     }
 
     // Any document change invalidates the previous approval — force re-review.

@@ -59,6 +59,7 @@ const claimOne = async () => {
 
 const processRow = async (row) => {
   const { bookingId, technicianId, kind, broadcastId, version, payload } = row;
+  const traceId = payload?.traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   try {
     // 🛡 Pre-send booking status check: if booking was cancelled, accepted, or expired
     // while this outbox row was pending/inflight, skip notification entirely.
@@ -69,6 +70,7 @@ const processRow = async (row) => {
           { _id: row._id },
           { $set: { status: "done", completedAt: new Date(), lastError: `booking_${booking.status}` } }
         );
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_status_${booking.status}`);
         return;
       }
     }
@@ -84,6 +86,7 @@ const processRow = async (row) => {
         { _id: row._id },
         { $set: { status: "done", completedAt: new Date(), lastError: result.reason || "skipped" } }
       );
+      console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=${result.reason}`);
       return;
     }
     if (result?.success) {
@@ -91,6 +94,7 @@ const processRow = async (row) => {
         { _id: row._id },
         { $set: { status: "done", completedAt: new Date() } }
       );
+      console.log(`📬 [TRACE] ${traceId} DISPATCH_SUCCESS bookingId=${bookingId} tech=${technicianId} socket=${result.socket?.success} push=${!result.socket?.offline}`);
       return;
     }
     throw new Error(result?.error || `notify failed (kind=${kind})`);
@@ -142,8 +146,9 @@ const poll = async () => {
   }
 };
 
-export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, jobData, broadcastMap }) => {
+export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, jobData, broadcastMap, traceId }) => {
   if (!technicianIds?.length) return { count: 0 };
+  const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   const rows = technicianIds.map((techId) => {
     const idStr = String(techId);
     const broadcast = broadcastMap?.get(idStr);
@@ -153,7 +158,7 @@ export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, job
       kind: "job_new",
       broadcastId: broadcast?._id || null,
       version: broadcast?.version || 1,
-      payload: jobData,
+      payload: { ...jobData, traceId: trc },
       status: "pending",
       nextAttemptAt: new Date(),
     };

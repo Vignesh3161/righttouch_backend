@@ -835,8 +835,10 @@ export const findEligibleTechniciansForService = async ({
  *
  * @param {string} bookingId - The ID of the booking to process
  * @param {Object} io - Socket.io instance for real-time notifications
+ * @param {string} [traceId] - Optional trace ID for end-to-end tracking
  */
-export const matchAndBroadcastBooking = async (bookingId, io) => {
+export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
+  const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   try {
     const booking = await ServiceBooking.findById(bookingId);
     if (!booking) {
@@ -886,7 +888,7 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
     }
 
     console.log(`\n======================================================================`);
-    console.log(`🎯 [JOB MATCHING & BROADCAST PIPELINE]`);
+    console.log(`🎯 [JOB MATCHING & BROADCAST PIPELINE] traceId=${trc}`);
     console.log(`   🆔 Booking ID: ${bookingId}`);
     console.log(`   🛠 Service: ${service.serviceName || booking.serviceId} (ID: ${booking.serviceId})`);
     console.log(`   📍 Customer GPS: [${longitude}, ${latitude}]`);
@@ -1049,7 +1051,7 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
     technicianIds = validCandidateIds;
 
     if (technicianIds.length === 0) {
-      console.log(`⏱ No feasible technicians for booking ${bookingId}`);
+      console.log(`⏱ [TRACE] ${trc} NO_FEASIBLE_TECHS bookingId=${bookingId}`);
       return { success: true, count: 0, message: "No feasible technicians" };
     }
 
@@ -1152,6 +1154,7 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
           createdAt: new Date().toISOString(),
         });
       });
+      console.log(`📡 [TRACE] ${trc} SOCKET_EMIT bookingId=${bookingId} techCount=${technicianIds.length}`);
     }
 
     // Persistent outbox for background push notifications (FCM) & retries
@@ -1160,7 +1163,9 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       technicianIds,
       jobData: jobDataPayload,
       broadcastMap,
+      traceId: trc,
     });
+    console.log(`📤 [TRACE] ${trc} DISPATCH_OUTBOX_CREATED bookingId=${bookingId} techCount=${technicianIds.length}`);
 
     // 📍 Cursor bump for every matched technician (Socket Analysis Fix #5)
     try {
@@ -1174,7 +1179,7 @@ export const matchAndBroadcastBooking = async (bookingId, io) => {
       console.error("❌ matchAndBroadcastBooking: cursor bump failed:", e.message);
     }
 
-    console.log(`🚀 [MATCH SUCCESS] Broadcasted Booking ${bookingId} to ${technicianIds.length} technician(s) within 10 km radius:`);
+    console.log(`🚀 [TRACE] ${trc} MATCH_SUCCESS bookingId=${bookingId} techCount=${technicianIds.length}`);
     technicianIds.forEach((tid, i) => {
       const offer = offerRows.find(o => String(o.technicianId) === String(tid));
       console.log(`   [${i + 1}] Tech ${tid} -> Distance: ${offer ? `${(offer.distanceAtOffer / 1000).toFixed(2)} km (${Math.round(offer.distanceAtOffer)}m)` : "within 10km"}`);

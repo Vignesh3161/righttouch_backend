@@ -1,15 +1,19 @@
 /**
  * 🔥 FIREBASE CLOUD MESSAGING (FCM) — lazy-init singleton.
  *
- * Reads the service account credentials from:
+ * Reads the service account credentials from (priority order):
  * 1. `FIREBASE_SERVICE_ACCOUNT` or `FCM_SERVICE_ACCOUNT_JSON` (inline JSON string in environment)
- * 2. `FCM_SERVICE_ACCOUNT_PATH` (custom path)
- * 3. `config/firebase-credentials.json` (Standard location)
- * 4. `serverAccount.json` or `serviceAccount.json` in project root
+ * 2. Individual env vars: `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`
+ * 3. `FCM_SERVICE_ACCOUNT_PATH` (custom path)
+ * 4. `config/firebase-credentials.json` (Standard location - takes priority)
+ * 5. Other fallback paths in config/ and project root
  *
  * Lazy + guarded: if credential files/variables are missing, the server boots
  * normally and push calls return { skipped: true } — the socket channel remains
  * the live delivery path.
+ *
+ * PROJECT ID VALIDATION: The backend service account MUST match the project_id
+ * in config/google-services.json (mobile app config). Mismatch = push failures.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -19,6 +23,7 @@ import { getMessaging } from "firebase-admin/messaging";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_NAME = "fcm";
+const REQUIRED_PROJECT_ID = "righttouchmessaging-401e9"; // From config/google-services.json
 
 let app = null;
 let initError = null;
@@ -27,35 +32,20 @@ const isValidServiceAccount = (sa) => {
   return Boolean(sa && typeof sa === "object" && sa.project_id && sa.private_key && sa.client_email);
 };
 
-const loadServiceAccount = () => {
-  // 1. Direct environment variables (individual keys)
-  if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
-    let project_id = (process.env.FIREBASE_PROJECT_ID || "").trim();
-    if (!project_id) {
-      const googleServicesPath = path.join(__dirname, "..", "config", "google-services.json");
-      if (fs.existsSync(googleServicesPath)) {
-        try {
-          const gs = JSON.parse(fs.readFileSync(googleServicesPath, "utf8"));
-          project_id = gs.project_info?.project_id;
-        } catch (_) {}
-      }
-    }
-
-    let privateKey = process.env.FIREBASE_PRIVATE_KEY.trim();
-    if ((privateKey.startsWith('"') && privateKey.endsWith('"')) || (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
-      privateKey = privateKey.slice(1, -1);
-    }
-    privateKey = privateKey.replace(/\\n/g, "\n");
-
-    const sa = {
-      project_id: project_id || "righttouchmessaging-401e9",
-      client_email: process.env.FIREBASE_CLIENT_EMAIL.trim(),
-      private_key: privateKey,
-    };
-    if (isValidServiceAccount(sa)) return sa;
+const validateProjectMatch = (serviceAccount) => {
+  if (serviceAccount.project_id !== REQUIRED_PROJECT_ID) {
+    const msg = `[FCM CONFIG ERROR] Project ID mismatch!\n` +
+      `   Required (mobile app): "${REQUIRED_PROJECT_ID}"\n` +
+      `   Configured (backend):  "${serviceAccount.project_id}"\n` +
+      `   Push notifications WILL FAIL. Fix config/firebase-credentials.json or env vars.`;
+    console.error(`❌ ${msg}`);
+    return false;
   }
+  return true;
+};
 
-  // 2. Direct environment variable containing raw JSON string
+const loadServiceAccount = () => {
+  // 1. Inline JSON string from env (highest priority - container-friendly)
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FCM_SERVICE_ACCOUNT_JSON;
   if (rawJson && typeof rawJson === "string" && rawJson.trim().startsWith("{")) {
     try {
@@ -64,6 +54,22 @@ const loadServiceAccount = () => {
     } catch (e) {
       console.warn("⚠️ Failed to parse inline FIREBASE_SERVICE_ACCOUNT JSON:", e.message);
     }
+  }
+
+  // 2. Individual env vars (common in managed platforms like Render/Railway)
+  if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY.trim();
+    if ((privateKey.startsWith('"') && privateKey.endsWith('"')) || (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
+      privateKey = privateKey.slice(1, -1);
+    }
+    privateKey = privateKey.replace(/\\n/g, "\n");
+
+    const sa = {
+      project_id: (process.env.FIREBASE_PROJECT_ID || REQUIRED_PROJECT_ID).trim(),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL.trim(),
+      private_key: privateKey,
+    };
+    if (isValidServiceAccount(sa)) return sa;
   }
 
   // 3. Custom path from env
@@ -81,9 +87,19 @@ const loadServiceAccount = () => {
     }
   }
 
-  // 4. Default fallback paths in config/ and project root (config/ takes priority)
+  // 4. Standard config location (config/firebase-credentials.json) - RECOMMENDED
+  const standardPath = path.join(__dirname, "..", "config", "firebase-credentials.json");
+  if (fs.existsSync(standardPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(standardPath, "utf8"));
+      if (isValidServiceAccount(parsed)) return parsed;
+    } catch (e) {
+      console.warn(`⚠️ Error reading ${standardPath}:`, e.message);
+    }
+  }
+
+  // 5. Legacy fallback paths
   const candidates = [
-    path.join(__dirname, "..", "config", "firebase-credentials.json"),
     path.join(__dirname, "..", "config", "firebase-service-account.json"),
     path.join(__dirname, "..", "config", "serviceAccount.json"),
     path.join(__dirname, "..", "firebase-credentials.json"),
@@ -114,26 +130,15 @@ export const getFcmApp = () => {
   try {
     const serviceAccount = loadServiceAccount();
     if (!serviceAccount) {
-      initError = "Firebase service account credentials not found or missing private_key — FCM push disabled";
+      initError = `Firebase service account credentials not found. Expected project_id: "${REQUIRED_PROJECT_ID}". Add config/firebase-credentials.json or set FIREBASE_SERVICE_ACCOUNT env var.`;
       console.warn(`⚠️ ${initError}`);
       return null;
     }
 
-    // Check project match against config/google-services.json if present
-    const googleServicesPath = path.join(__dirname, "..", "config", "google-services.json");
-    if (fs.existsSync(googleServicesPath)) {
-      try {
-        const gs = JSON.parse(fs.readFileSync(googleServicesPath, "utf8"));
-        const clientProjectId = gs.project_info?.project_id;
-        if (clientProjectId && serviceAccount.project_id && clientProjectId !== serviceAccount.project_id) {
-          console.warn(
-            `⚠️ [FCM CONFIG WARNING] Project ID mismatch detected!\n` +
-            `   Mobile App Project (config/google-services.json): "${clientProjectId}"\n` +
-            `   Backend Admin Project: "${serviceAccount.project_id}"\n` +
-            `   -> Push notifications will fail until credentials for "${clientProjectId}" are added in config/firebase-credentials.json or .env.`
-          );
-        }
-      } catch (_) {}
+    // Strict project ID validation - fail fast if mismatch
+    if (!validateProjectMatch(serviceAccount)) {
+      initError = `Project ID mismatch: expected "${REQUIRED_PROJECT_ID}", got "${serviceAccount.project_id}"`;
+      return null;
     }
 
     if (getApps().length) {
@@ -146,7 +151,7 @@ export const getFcmApp = () => {
       app = initializeApp({ credential: cert(serviceAccount) }, APP_NAME);
     }
 
-    console.log(`✅ Firebase Cloud Messaging initialized successfully (Project: ${serviceAccount.project_id || "default"})`);
+    console.log(`✅ Firebase Cloud Messaging initialized (Project: ${serviceAccount.project_id})`);
     return app;
   } catch (err) {
     initError = err.message;
@@ -156,6 +161,19 @@ export const getFcmApp = () => {
 };
 
 export const isFcmEnabled = () => Boolean(getFcmApp());
+
+/** Validate FCM configuration at startup — call from index.js after imports */
+export const validateFcmConfig = () => {
+  const sa = loadServiceAccount();
+  if (!sa) {
+    console.warn("⚠️ FCM not configured — push notifications disabled");
+    return { valid: false, reason: "no_credentials" };
+  }
+  if (!validateProjectMatch(sa)) {
+    return { valid: false, reason: "project_mismatch", expected: REQUIRED_PROJECT_ID, actual: sa.project_id };
+  }
+  return { valid: true, projectId: sa.project_id };
+};
 
 /**
  * Send a notification to a batch of FCM tokens (multicast).

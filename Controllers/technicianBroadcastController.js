@@ -10,6 +10,8 @@ import { ensureTechnician } from "../Utils/ensureTechnician.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import { evaluateJobFeasibility, loadCommittedQueues } from "../Utils/technicianMatching.js";
 import { canArriveBy, computeLatestArrival, estimateTravelMinutes } from "../Utils/feasibility.js";
+import Service from "../Schemas/Service.js";
+import Category from "../Schemas/Category.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
 const DISPATCH_LOCK_MS = 3000;
@@ -235,7 +237,7 @@ export const respondToJob = async (req, res) => {
     // ⏱ Candidate booking snapshot (pre-claim, same transaction)
     const candidate = await ServiceBooking.findById(id)
       .session(session)
-      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId");
+      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
     if (!candidate) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: "Booking not found" });
