@@ -1254,18 +1254,6 @@ export const updateBookingStatus = async (req, res) => {
         result: { workStatus: technician.workStatus },
       });
     }
-    if (status === "completed") {
-      const beforeImage = booking.workImages?.beforeImage || null;
-      const afterImage = booking.workImages?.afterImage || null;
-      if (!beforeImage || !afterImage) {
-        return res.status(400).json({
-          success: false,
-          message: "Before and after work images are required before completion",
-          result: {},
-        });
-      }
-    }
-
     // 🔒 Optimistic concurrency: bump version atomically and key the update on
     // the version we loaded. A concurrent status write changes the version and
     // makes this a no-op (modifiedCount 0) instead of silently overwriting a
@@ -1274,8 +1262,8 @@ export const updateBookingStatus = async (req, res) => {
     // version — we match those via $exists:false so the update still works
     // (best-effort; fully safe only for versioned documents).
     const statusSet = { status };
-    if (status === "on_the_way") {
-      statusSet.autoCancelAt = null; // Disable auto-cancel once technician starts moving
+    if (status === "on_the_way" || status === "completed") {
+      statusSet.autoCancelAt = null; // Disable auto-cancel once technician starts moving or completes
     }
     if (status === "completed") {
       statusSet.completedAt = new Date();
