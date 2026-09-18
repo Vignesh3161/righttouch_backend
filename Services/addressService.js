@@ -100,14 +100,25 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
 
   const finalAddressLine = cleanAddressLine || "Pinned Location";
 
-  // Check current address count against the cap
-  const existingCount = await Address.countDocuments({ customerId });
-  if (existingCount >= ADDRESS_CAP) {
-    const err = new Error(`You can save at most ${ADDRESS_CAP} addresses. Delete an existing address to add a new one.`);
-    err.statusCode = 409;
-    throw err;
+  // Auto-rotate: When reaching the cap (3 addresses), delete oldest non-default address
+  const existingAddresses = await Address.find({ customerId }).sort({ createdAt: 1 });
+  if (existingAddresses.length >= ADDRESS_CAP) {
+    const countToDelete = existingAddresses.length - ADDRESS_CAP + 1;
+    // Prefer deleting non-default addresses first, sorted by oldest createdAt
+    const candidates = [...existingAddresses].sort((a, b) => {
+      if (a.isDefault === b.isDefault) {
+        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      }
+      return a.isDefault ? 1 : -1; // non-default (false) first
+    });
+
+    const idsToDelete = candidates.slice(0, countToDelete).map((a) => a._id);
+    if (idsToDelete.length > 0) {
+      await Address.deleteMany({ _id: { $in: idsToDelete } });
+    }
   }
 
+  const existingCount = await Address.countDocuments({ customerId });
   const isFirstAddress = existingCount === 0;
   const shouldBeDefault = Boolean(isDefault) || isFirstAddress;
 

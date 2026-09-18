@@ -261,12 +261,12 @@ export const respondToJob = async (req, res) => {
       ? candidate.assignmentAttempts.length
       : 0;
 
-    // ⏱ The claim must reference the current broadcast cycle.
-    if ((candidate.activeBroadcastVersion || 1) !== requestedVersion) {
+    // ⏱ The claim must reference an active unassigned booking.
+    if (candidate.technicianId || !["pending", "broadcasted"].includes(candidate.status)) {
       await session.abortTransaction();
       return res.status(409).json({
         success: false,
-        message: "This job was updated. Please refresh and try again.",
+        message: "Too late! Booking already taken or closed.",
       });
     }
 
@@ -449,7 +449,6 @@ export const respondToJob = async (req, res) => {
         _id: id,
         status: { $in: ["pending", "broadcasted"] },
         technicianId: null,
-        activeBroadcastVersion: requestedVersion,
       },
       acceptUpdate,
       { new: true, session }
