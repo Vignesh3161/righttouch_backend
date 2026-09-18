@@ -100,26 +100,23 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
 
   const finalAddressLine = cleanAddressLine || "Pinned Location";
 
-  // Atomic reservation of address slot
-  const slot = await AddressCounter.findOneAndUpdate(
-    { customerId, seq: { $lt: ADDRESS_CAP } },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true }
-  );
-
-  if (!slot) {
+  // Check current address count against the cap
+  const existingCount = await Address.countDocuments({ customerId });
+  if (existingCount >= ADDRESS_CAP) {
     const err = new Error(`You can save at most ${ADDRESS_CAP} addresses. Delete an existing address to add a new one.`);
     err.statusCode = 409;
     throw err;
   }
 
-  if (isDefault) {
+  const isFirstAddress = existingCount === 0;
+  const shouldBeDefault = Boolean(isDefault) || isFirstAddress;
+
+  if (shouldBeDefault) {
     await Address.updateMany({ customerId }, { isDefault: false });
   }
 
   const customer = await User.findById(customerId).select("fname lname mobileNumber email");
   if (!customer) {
-    await AddressCounter.updateOne({ customerId }, { $inc: { seq: -1 } }).catch(() => {});
     const err = new Error("Customer profile not found");
     err.statusCode = 404;
     throw err;
@@ -129,7 +126,6 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
   const profilePhone = customer.mobileNumber;
 
   if (!profileName || !profilePhone) {
-    await AddressCounter.updateOne({ customerId }, { $inc: { seq: -1 } }).catch(() => {});
     const err = new Error("Please complete your profile (fname, mobileNumber) before adding an address");
     err.statusCode = 400;
     throw err;
@@ -141,7 +137,6 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
   if (finalPhone) {
     const normalizedPhone = normalizeIndianMobile(finalPhone);
     if (!normalizedPhone) {
-      await AddressCounter.updateOne({ customerId }, { $inc: { seq: -1 } }).catch(() => {});
       const err = new Error("Phone must be 10 digits (optional +91 prefix)");
       err.statusCode = 400;
       throw err;
@@ -150,31 +145,33 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
   }
 
   if ((cleanLat !== undefined || cleanLng !== undefined) && (cleanLat === undefined || cleanLng === undefined)) {
-    await AddressCounter.updateOne({ customerId }, { $inc: { seq: -1 } }).catch(() => {});
     const err = new Error("Both latitude and longitude must be provided together");
     err.statusCode = 400;
     throw err;
   }
 
-  try {
-    const address = await Address.create({
-      customerId,
-      label: label || "home",
-      name: finalName,
-      phone: finalPhone,
-      addressLine: finalAddressLine,
-      city,
-      state,
-      pincode,
-      latitude: cleanLat,
-      longitude: cleanLng,
-      isDefault: Boolean(isDefault),
-    });
-    return address;
-  } catch (createErr) {
-    await AddressCounter.updateOne({ customerId }, { $inc: { seq: -1 } }).catch(() => {});
-    throw createErr;
-  }
+  const address = await Address.create({
+    customerId,
+    label: label || "home",
+    name: finalName,
+    phone: finalPhone,
+    addressLine: finalAddressLine,
+    city,
+    state,
+    pincode,
+    latitude: cleanLat,
+    longitude: cleanLng,
+    isDefault: shouldBeDefault,
+  });
+
+  // Keep AddressCounter synced safely
+  await AddressCounter.updateOne(
+    { customerId },
+    { $set: { seq: existingCount + 1 } },
+    { upsert: true }
+  ).catch(() => {});
+
+  return address;
 };
 
 /**
@@ -287,9 +284,11 @@ export const deleteAddressInternal = async ({ customerId, addressId }) => {
     throw err;
   }
 
+  const remainingCount = await Address.countDocuments({ customerId });
   await AddressCounter.updateOne(
-    { customerId, seq: { $gt: 0 } },
-    { $inc: { seq: -1 } }
+    { customerId },
+    { $set: { seq: remainingCount } },
+    { upsert: true }
   ).catch(() => {});
 
   return true;

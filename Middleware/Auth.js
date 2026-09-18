@@ -33,11 +33,20 @@ export const Auth = async (req, res, next) => {
       return res.status(403).json({ success: false, message: "This account has been blocked. Contact support.", result: {} });
     }
 
-    // 🔒 Extra check for technicians: also block if profile is soft-deleted
-    if (decoded.role === "Technician" && decoded.technicianProfileId) {
-      const techProfile = await TechnicianProfile.findById(decoded.technicianProfileId).select("workStatus").lean();
-      if (techProfile?.workStatus === "deleted") {
-        return res.status(403).json({ success: false, message: "User not found", result: {} });
+    let resolvedTechProfileId = decoded.technicianProfileId || null;
+
+    // 🔒 Extra check for technicians: also block if profile is soft-deleted, and auto-resolve profile ID if missing
+    if (decoded.role === "Technician") {
+      const techQuery = resolvedTechProfileId
+        ? TechnicianProfile.findById(resolvedTechProfileId)
+        : TechnicianProfile.findOne({ userId: decoded.userId });
+
+      const techProfile = await techQuery.select("_id workStatus").lean();
+      if (techProfile) {
+        resolvedTechProfileId = techProfile._id;
+        if (techProfile.workStatus === "deleted") {
+          return res.status(403).json({ success: false, message: "User not found", result: {} });
+        }
       }
     }
 
@@ -46,7 +55,7 @@ export const Auth = async (req, res, next) => {
       userId: decoded.userId,
       role: decoded.role,
       email: decoded.email,
-      technicianProfileId: decoded.technicianProfileId || null,
+      technicianProfileId: resolvedTechProfileId,
     };
 
     next();

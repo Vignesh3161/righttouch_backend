@@ -28,7 +28,34 @@ const isValidServiceAccount = (sa) => {
 };
 
 const loadServiceAccount = () => {
-  // 1. Direct environment variable containing raw JSON string
+  // 1. Direct environment variables (individual keys)
+  if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+    let project_id = (process.env.FIREBASE_PROJECT_ID || "").trim();
+    if (!project_id) {
+      const googleServicesPath = path.join(__dirname, "..", "config", "google-services.json");
+      if (fs.existsSync(googleServicesPath)) {
+        try {
+          const gs = JSON.parse(fs.readFileSync(googleServicesPath, "utf8"));
+          project_id = gs.project_info?.project_id;
+        } catch (_) {}
+      }
+    }
+
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY.trim();
+    if ((privateKey.startsWith('"') && privateKey.endsWith('"')) || (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
+      privateKey = privateKey.slice(1, -1);
+    }
+    privateKey = privateKey.replace(/\\n/g, "\n");
+
+    const sa = {
+      project_id: project_id || "righttouchmessaging-401e9",
+      client_email: process.env.FIREBASE_CLIENT_EMAIL.trim(),
+      private_key: privateKey,
+    };
+    if (isValidServiceAccount(sa)) return sa;
+  }
+
+  // 2. Direct environment variable containing raw JSON string
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FCM_SERVICE_ACCOUNT_JSON;
   if (rawJson && typeof rawJson === "string" && rawJson.trim().startsWith("{")) {
     try {
@@ -39,7 +66,7 @@ const loadServiceAccount = () => {
     }
   }
 
-  // 2. Custom path from env
+  // 3. Custom path from env
   if (process.env.FCM_SERVICE_ACCOUNT_PATH) {
     const customPath = path.isAbsolute(process.env.FCM_SERVICE_ACCOUNT_PATH)
       ? process.env.FCM_SERVICE_ACCOUNT_PATH
@@ -54,9 +81,12 @@ const loadServiceAccount = () => {
     }
   }
 
-  // 3. Default fallback paths in config/ and project root
+  // 4. Default fallback paths in config/ and project root (config/ takes priority)
   const candidates = [
     path.join(__dirname, "..", "config", "firebase-credentials.json"),
+    path.join(__dirname, "..", "config", "firebase-service-account.json"),
+    path.join(__dirname, "..", "config", "serviceAccount.json"),
+    path.join(__dirname, "..", "firebase-credentials.json"),
     path.join(__dirname, "..", "serverAccount.json"),
     path.join(__dirname, "..", "serviceAccount.json"),
     path.join(__dirname, "..", "firebase-service-account.json"),
@@ -87,6 +117,23 @@ export const getFcmApp = () => {
       initError = "Firebase service account credentials not found or missing private_key — FCM push disabled";
       console.warn(`⚠️ ${initError}`);
       return null;
+    }
+
+    // Check project match against config/google-services.json if present
+    const googleServicesPath = path.join(__dirname, "..", "config", "google-services.json");
+    if (fs.existsSync(googleServicesPath)) {
+      try {
+        const gs = JSON.parse(fs.readFileSync(googleServicesPath, "utf8"));
+        const clientProjectId = gs.project_info?.project_id;
+        if (clientProjectId && serviceAccount.project_id && clientProjectId !== serviceAccount.project_id) {
+          console.warn(
+            `⚠️ [FCM CONFIG WARNING] Project ID mismatch detected!\n` +
+            `   Mobile App Project (config/google-services.json): "${clientProjectId}"\n` +
+            `   Backend Admin Project: "${serviceAccount.project_id}"\n` +
+            `   -> Push notifications will fail until credentials for "${clientProjectId}" are added in config/firebase-credentials.json or .env.`
+          );
+        }
+      } catch (_) {}
     }
 
     if (getApps().length) {

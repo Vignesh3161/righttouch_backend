@@ -88,9 +88,85 @@ export const respondToJob = async (req, res) => {
   try {
     ensureTechnician(req);
     const { id } = req.params;
-    const { status, response } = req.body;
-    const finalStatus = (status || response || "").toLowerCase();
     const technicianProfileId = req.user.technicianProfileId;
+    const rawStatus =
+      req.body?.action ??
+      req.body?.status ??
+      req.body?.response ??
+      req.body?.decision ??
+      "";
+    const finalStatus = String(rawStatus).trim().toLowerCase();
+
+    const isAccept = ["accepted", "accept", "agree", "yes"].includes(finalStatus);
+    const isDecline = ["declined", "decline", "rejected", "reject", "no"].includes(finalStatus);
+
+    if (!isAccept && !isDecline) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: "Invalid response status" });
+    }
+
+    const broadcast = await JobBroadcast.findOne({
+      bookingId: id,
+      technicianId: technicianProfileId,
+      status: { $in: ["sent"] },
+    }).session(session);
+
+    if (!broadcast) {
+      await session.abortTransaction();
+      return res.status(403).json({ success: false, message: "Job not assigned to you or already closed" });
+    }
+
+    // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
+    if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
+      await session.abortTransaction();
+      return res.status(410).json({
+        success: false,
+        message: "This job offer has expired. Pull to refresh your job list.",
+        reason: "offer_expired",
+        expiresAt: broadcast.expiresAt,
+        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000),
+      });
+    }
+
+    // 🛑 Handle DECLINE / REJECT
+    if (isDecline) {
+      await JobBroadcast.updateOne(
+        { bookingId: id, technicianId: technicianProfileId },
+        { status: "rejected" },
+        { session }
+      );
+
+      const rejectedOffer = await TechnicianBookingOffer.findOneAndUpdate(
+        { bookingId: id, technicianId: technicianProfileId },
+        {
+          $set: {
+            decision: "rejected",
+            rejectReason: req.body?.reason || "declined_by_technician",
+            respondedAt: new Date(),
+          },
+        },
+        { new: true, session }
+      );
+
+      if (rejectedOffer) {
+        await TechnicianBookingOffer.updateOne(
+          { _id: rejectedOffer._id },
+          {
+            $set: {
+              responseLatencyMs: Date.now() - new Date(rejectedOffer.offeredAt).getTime(),
+            },
+          },
+          { session }
+        );
+      }
+
+      await session.commitTransaction();
+
+      return res.status(200).json({
+        success: true,
+        message: "Job declined successfully",
+      });
+    }
 
     // 🛡 Activation gate — suspended/unapproved/KYC-incomplete technicians
     // must not accept jobs, even with a lingering "sent" broadcast record.
@@ -104,9 +180,7 @@ export const respondToJob = async (req, res) => {
     }
 
     // 🔒 Per-technician dispatch mutex (self-expiring) — serializes
-    // concurrent accept requests for the SAME technician (e.g. two
-    // schedule accepts racing through different notification channels).
-    // Auto-expires after 3s so a crashed handler can never deadlock the tech.
+    // concurrent accept requests for the SAME technician
     dispatchLockAt = new Date(Date.now() + DISPATCH_LOCK_MS);
     const locked = await TechnicianProfile.findOneAndUpdate(
       {
@@ -132,52 +206,23 @@ export const respondToJob = async (req, res) => {
       technicianId: technicianProfileId,
       $or: [
         { status: { $in: ["on_the_way", "reached", "in_progress"] } },
-        { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" }
-      ]
-    }).session(session).select("_id status bookingType");
+        { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+      ],
+    })
+      .session(session)
+      .select("_id status bookingType");
 
     if (activeJob) {
       await session.abortTransaction();
-      const statusMsg = activeJob.status === "ACCEPTED" || activeJob.status === "accepted" 
-        ? "start travel for your current job" 
-        : "complete your current job";
+      const statusMsg =
+        activeJob.status === "ACCEPTED" || activeJob.status === "accepted"
+          ? "start travel for your current job"
+          : "complete your current job";
 
       return res.status(409).json({
         success: false,
         message: `Please ${statusMsg} before accepting a new one.`,
       });
-    }
-
-    const broadcast = await JobBroadcast.findOne({
-      bookingId: id,
-      technicianId: technicianProfileId,
-      status: { $in: ["sent"] },
-    }).session(session);
-
-    if (!broadcast) {
-      await session.abortTransaction();
-      return res.status(403).json({ success: false, message: "Job not assigned to you or already closed" });
-    }
-
-    // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
-    if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
-      await session.abortTransaction();
-      // Richer 410 (Location Pipeline P1.6): give the client the expiry facts
-      // so it can show "Expired — pull to refresh" with a countdown. The
-      // rebroadcast cron runs every 10 min, so the next attempt hint is the
-      // next 10-minute boundary.
-      return res.status(410).json({
-        success: false,
-        message: "This job offer has expired. Pull to refresh your job list.",
-        reason: "offer_expired",
-        expiresAt: broadcast.expiresAt,
-        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000),
-      });
-    }
-
-    if (finalStatus !== "accepted" && finalStatus !== "accept") {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: "Invalid response status" });
     }
 
     // 📡 Version the technician is claiming — client may pass the DTO's

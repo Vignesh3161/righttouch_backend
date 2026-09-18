@@ -180,10 +180,11 @@ export const checkTechnicianEligibility = async ({
     reasons.push("MISSING_LOCATION");
   }
 
-  // 7. GPS FRESHNESS CHECK (STALENESS THRESHOLD: 90s)
+  // 7. GPS FRESHNESS CHECK (STALENESS THRESHOLD: 90s for matching, 15m grace window for accept)
   if (STALENESS_SECONDS > 0) {
-    const cutoff = new Date(Date.now() - STALENESS_SECONDS * 1000);
-    const isFresh = tech.locationUpdatedAt && new Date(tech.locationUpdatedAt) >= cutoff;
+    const effectiveStalenessSeconds = booking ? Math.max(STALENESS_SECONDS, 900) : STALENESS_SECONDS;
+    const cutoff = new Date(Date.now() - effectiveStalenessSeconds * 1000);
+    const isFresh = tech.locationUpdatedAt ? new Date(tech.locationUpdatedAt) >= cutoff : hasTechCoords;
     details.gpsFresh = Boolean(isFresh);
     if (!isFresh) {
       reasons.push("GPS_STALE");

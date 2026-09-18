@@ -91,13 +91,28 @@ export const getMyProfileInternal = async ({ userId, role }) => {
 
     const result = profile.toObject();
     const kyc = await TechnicianKyc.findOne({ technicianId: profile._id }).select(
-      "bankDetails bankVerified bankUpdateRequired encryptedDek"
+      "bankDetails bankVerified bankVerificationStatus verificationStatus kycVerified bankUpdateRequired encryptedDek"
     );
 
+    const isKycApproved = Boolean(kyc && (kyc.verificationStatus === "approved" || kyc.kycVerified));
+    const isBankApproved = Boolean(kyc && (kyc.bankVerified === true || kyc.bankVerificationStatus === "approved"));
+    const isTrainingDone = Boolean(profile.trainingCompleted);
+
+    result.kycVerified = isKycApproved;
+    result.verificationStatus = kyc?.verificationStatus || "pending";
+    result.isBankVerified = isBankApproved;
+    result.bankVerified = isBankApproved;
+    result.bankVerificationStatus = kyc?.bankVerificationStatus || "pending";
+    result.trainingCompleted = isTrainingDone;
+    result.isActiveTechnician = isKycApproved && (isTrainingDone || profile.workStatus === "approved");
+
     if (kyc && kyc.bankDetails) {
-      const dek = await getDekForKycDoc(kyc);
-      result.bankDetails = decryptBankDetails(kyc.bankDetails, dek);
-      result.bankVerified = kyc.bankVerified || false;
+      try {
+        const dek = await getDekForKycDoc(kyc);
+        result.bankDetails = decryptBankDetails(kyc.bankDetails, dek);
+      } catch (decErr) {
+        console.error("Error decrypting bank details in getMyProfileInternal:", decErr.message);
+      }
       result.bankUpdateRequired = kyc.bankUpdateRequired || false;
     }
     return result;

@@ -946,15 +946,28 @@ export const verifyBankDetails = async (req, res) => {
     const dek = await getDekForKycDoc(kyc);
     const plainBank = decryptBankDetails(kyc.bankDetails, dek);
 
-    if (!plainBank?.accountNumber || !plainBank?.upiId) {
-      return res.status(400).json({
-        success: false,
-        message: "Incomplete details: Both Bank Account details and UPI ID are required for verification",
-        result: {
-          hasAccountNumber: Boolean(plainBank?.accountNumber),
-          hasUpiId: Boolean(plainBank?.upiId),
-        },
-      });
+    if (verified) {
+      // Re-use existing format validation
+      const bankValidation = validateBankDetails(plainBank);
+      if (!bankValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid bank details",
+          result: { errors: bankValidation.errors },
+        });
+      }
+
+      const hasUpi = Boolean(plainBank?.upiId);
+      const hasBankAccount =
+        Boolean(plainBank?.accountNumber) &&
+        Boolean(plainBank?.ifscCode);
+
+      if (!hasUpi && !hasBankAccount) {
+        return res.status(400).json({
+          success: false,
+          message: "Technician must provide either a valid UPI ID or Bank Account with IFSC code before verification",
+        });
+      }
     }
 
     const technician = await TechnicianProfile.findById(technicianId).select("trainingCompleted");

@@ -725,7 +725,7 @@ export const listAdminTechnicians = async (req, res) => {
 
     if (verificationStatus && verificationStatus !== "All") {
       if (verificationStatus.toLowerCase() === "verified") techQuery.workStatus = "approved";
-      else if (verificationStatus.toLowerCase() === "pending") techQuery.workStatus = "submitted";
+      else if (verificationStatus.toLowerCase() === "pending") techQuery.workStatus = "pending";
       else if (verificationStatus.toLowerCase() === "rejected") techQuery.workStatus = "rejected";
     }
 
@@ -843,7 +843,7 @@ export const listAdminTechnicians = async (req, res) => {
         coverageRadiusKm: radiusVal,
         radius: radiusVal,
         geofenceStatus: tech.zoneMismatch ? "Outside Zone" : (tech.location?.coordinates ? "GPS Defined" : "No GPS"),
-        status: tech.workStatus || "Active",
+        status: tech.workStatus || "pending",
         online: tech.availability?.isOnline ? "🟢 Online" : "🔴 Offline",
         isOnline: tech.availability?.isOnline || false,
         gpsFreshness: freshnessBadge,
