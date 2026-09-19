@@ -1563,6 +1563,14 @@ export const updateTechnician = async (req, res) => {
       // Remove from Redis GEO set so matching doesn't find stale positions
       const { geoRemove } = await import("../Utils/technicianGeo.js");
       geoRemove(technicianProfileId).catch(() => {});
+      
+      // 🔄 Revalidate active broadcasts - technician went offline
+      const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+      await revalidateActiveBroadcasts(technicianProfileId, 
+        technician.location?.coordinates?.[1] || 0, 
+        technician.location?.coordinates?.[0] || 0, 
+        req.io
+      ).catch(err => console.error("Offline revalidation error:", err));
     }
 
     // 🏘 ZONE RESOLUTION — assign technician to a city zone based on their location.

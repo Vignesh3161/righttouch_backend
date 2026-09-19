@@ -20,7 +20,6 @@ const jobBroadcastSchema = new mongoose.Schema(
     
     expiresAt: {
       type: Date,
-      index: true,
     },
 
     status: {
@@ -44,5 +43,9 @@ const jobBroadcastSchema = new mongoose.Schema(
 
 // 🚨 Prevent duplicate job sends
 jobBroadcastSchema.index({ bookingId: 1, technicianId: 1 }, { unique: true });
+
+// TTL index for automatic cleanup of expired broadcasts
+// MongoDB will automatically delete documents where expiresAt < now
+jobBroadcastSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export default mongoose.models.JobBroadcast || mongoose.model("JobBroadcast", jobBroadcastSchema);

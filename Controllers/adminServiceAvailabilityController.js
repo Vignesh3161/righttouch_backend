@@ -130,6 +130,13 @@ export const updateServiceAvailability = async (req, res) => {
       reason: `Admin updated service availability status to ${existing.status}`,
     }).catch(() => {});
 
+    // 🔄 Revalidate technicians affected by this service availability change
+    if (status === "DISABLED") {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      await revalidateTechniciansForService(existing.serviceId, existing.districtId, existing.cityId, req.io)
+        .catch(err => console.error("Service disable revalidation error:", err));
+    }
+
     return res.status(200).json({
       success: true,
       message: "Service availability updated successfully",
@@ -531,6 +538,13 @@ export const toggleZoneAvailability = async (req, res) => {
       reason: `Admin set ${targetScope} availability (zone: ${cityZoneId || "DISTRICT"}) for service ${serviceId} to ${finalStatus}`,
     }).catch((e) => console.warn("AuditLog error:", e.message));
 
+    // 🔄 Revalidate technicians affected by this zone availability change
+    if (finalStatus === "DISABLED") {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      await revalidateTechniciansForService(serviceId, districtId, targetZoneId, req.io)
+        .catch(err => console.error("Zone disable revalidation error:", err));
+    }
+
     return res.status(200).json({
       success: true,
       message: `${targetScope} availability set to ${finalStatus}`,
@@ -591,6 +605,15 @@ export const bulkToggleZoneAvailability = async (req, res) => {
       action: "SERVICE_ZONE_BULK_UPDATE",
       reason: `Admin bulk updated ${cityZoneIds.length} zones for service ${serviceId} to ${finalStatus}`,
     }).catch((e) => console.warn("AuditLog error:", e.message));
+
+    // 🔄 Revalidate technicians affected by this bulk zone availability change
+    if (finalStatus === "DISABLED") {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      for (const zoneId of cityZoneIds) {
+        await revalidateTechniciansForService(serviceId, districtId, zoneId, req.io)
+          .catch(err => console.error("Bulk zone disable revalidation error:", err));
+      }
+    }
 
     return res.status(200).json({
       success: true,

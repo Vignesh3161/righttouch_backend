@@ -7,15 +7,10 @@ import CityZone from "../Schemas/CityZone.js";
 import { resolveOperationalCityFromCoordinates } from "../Utils/technicianMatching.js";
 import { resolveServiceAvailability } from "./serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
+import { STALENESS_SECONDS, ACCEPT_GRACE_SECONDS, checkGpsFreshness, checkGpsValid } from "../Utils/locationConfig.js";
 
 const MAX_JOB_DISTANCE_KM = 10;
 const MAX_JOB_DISTANCE_METERS = 10000;
-const STALENESS_SECONDS = (() => {
-  const raw = Number(process.env.LOCATION_STALENESS_SECONDS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 90;
-})();
-
-const ACCEPT_GRACE_SECONDS = 15 * 60;
 
 /**
  * Get allowed district IDs for a technician (primary + enabled + allowed)
@@ -128,30 +123,6 @@ export const calculateDistanceMeters = (techLocation, jobLocation) => {
 export const getEffectiveRadiusMeters = (tech) => {
   const radiusKm = Number(tech?.serviceRadiusKm) > 0 ? Number(tech.serviceRadiusKm) : MAX_JOB_DISTANCE_KM;
   return radiusKm * 1000;
-};
-
-/**
- * Check GPS validity
- */
-export const checkGpsValid = (tech) => {
-  const coords = tech?.location?.coordinates;
-  return Array.isArray(coords) && coords.length === 2 &&
-    Number.isFinite(coords[0]) && Number.isFinite(coords[1]) &&
-    coords[1] >= -90 && coords[1] <= 90 &&
-    coords[0] >= -180 && coords[0] <= 180;
-};
-
-/**
- * Check GPS freshness with mode-specific threshold
- * mode: "BROADCAST" = 90s, "ACCEPT" = 15min (900s)
- */
-export const checkGpsFreshness = (tech, mode = "BROADCAST") => {
-  if (STALENESS_SECONDS <= 0) return true;
-  if (!tech?.locationUpdatedAt) return false;
-  
-  const threshold = mode === "ACCEPT" ? ACCEPT_GRACE_SECONDS : STALENESS_SECONDS;
-  const cutoff = new Date(Date.now() - threshold * 1000);
-  return new Date(tech.locationUpdatedAt) >= cutoff;
 };
 
 /**

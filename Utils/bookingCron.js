@@ -222,19 +222,30 @@ export const initBookingCrons = (io) => {
 
     /**
      * ─── CRON 2: RE-BROADCAST / REMINDERS (Every 10 mins) ──────────────────
-     * Oldest eligible unassigned bookings first. Lease-claimed. Each
-     * matchAndBroadcastBooking increments the broadcast version (so stale
-     * accept claims fail and notifications dedupe on the version).
+     * Only re-broadcast bookings that actually need it (dirty tracking).
+     * Uses lastRebroadcastAt and jobChangedAt to avoid unnecessary work.
      * ──────────────────────────────────────────────────────────────────────
      */
     cron.schedule("*/10 * * * *", async () => {
         try {
             if (!dbReady()) return;
             const now = new Date();
+            const tenMinsAgo = new Date(now.getTime() - 10 * 60 * 1000);
+            
+            // Only re-broadcast jobs that haven't been rebroadcast in 10 mins
+            // AND have had changes (new techs online, location updates, etc.)
+            // Track via jobChangedAt which is updated on tech location changes
             const jobsToBroadcast = await ServiceBooking.find({
                 status: { $in: ["pending", "broadcasted"] },
                 technicianId: null,
                 autoCancelAt: { $gt: now },
+                $or: [
+                  { lastRebroadcastAt: { $exists: false } },
+                  { lastRebroadcastAt: { $lt: tenMinsAgo } },
+                  { 
+                    $expr: { $gt: ["$jobChangedAt", "$lastRebroadcastAt"] }
+                  }
+                ],
             }).select("_id").sort({ createdAt: 1 }).limit(20);
 
             for (const { _id } of jobsToBroadcast) {
@@ -242,6 +253,11 @@ export const initBookingCrons = (io) => {
                 if (!claimed) continue;
                 try {
                     await matchAndBroadcastBooking(_id, io);
+                    // Update lastRebroadcastAt after successful rebroadcast
+                    await ServiceBooking.updateOne(
+                      { _id },
+                      { $set: { lastRebroadcastAt: new Date() } }
+                    );
                     console.log(`[Cron:Broadcast] Re-broadcasted job ${_id}`);
                 } finally {
                     await releaseLease(_id);
@@ -536,3 +552,30 @@ export const initBookingCrons = (io) => {
 
     console.log("✅ Consolidated booking crons are active.");
 };
+
+// 🧹 CRON 6: ORPHANED JOBBROADCAST CLEANUP (Every 30 min)
+cron.schedule("*/30 * * * *", async () => {
+    try {
+        if (!dbReady()) return;
+        
+        // Clean up broadcasts with null expiresAt that are older than 2 hours
+        // These are likely orphaned from failed broadcasts
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        
+        const result = await JobBroadcast.deleteMany({
+          status: "sent",
+          $or: [
+            { expiresAt: { $exists: false } },
+            { expiresAt: null },
+            { expiresAt: { $lt: twoHoursAgo } }
+          ],
+          createdAt: { $lt: twoHoursAgo }
+        });
+        
+        if (result.deletedCount > 0) {
+          console.log(`[Cron:Cleanup] Removed ${result.deletedCount} orphaned JobBroadcast(s)`);
+        }
+    } catch (err) {
+        console.error("[Cron:Cleanup Error]", err);
+    }
+});

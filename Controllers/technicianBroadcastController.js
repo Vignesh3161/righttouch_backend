@@ -244,14 +244,15 @@ export const respondToJob = async (req, res) => {
     }
 
     // 🎯 VERSION VALIDATION — reject stale broadcast versions
-    if (candidate.activeBroadcastVersion && requestedVersion !== candidate.activeBroadcastVersion) {
+    // Validate against JobBroadcast.version (single source of truth)
+    if (broadcast.version && requestedVersion !== broadcast.version) {
       await session.abortTransaction();
       return res.status(409).json({
         success: false,
         message: "This job offer has been updated. Please refresh and try again.",
         reason: "version_mismatch",
         requestedVersion,
-        currentVersion: candidate.activeBroadcastVersion,
+        currentVersion: broadcast.version,
       });
     }
 
@@ -387,6 +388,31 @@ export const respondToJob = async (req, res) => {
         }
       }
     } else {
+      // Check for ANY instant jobs in technician's queue (not just scheduled)
+      // Race condition fix: another instant job could have been accepted between broadcast and accept
+      const allInstantJobs = (techQueue?.schedules || []).filter(s => s.bookingType === "instant");
+      if (allInstantJobs.length > 0 && techProfileForCheck?.location) {
+        // Check feasibility against all instant jobs
+        for (const instantJob of allInstantJobs) {
+          const feasibility = evaluateJobFeasibility({
+            techLocation: techProfileForCheck.location,
+            candidateJob,
+            queue: { activeJob: null, schedules: [instantJob] },
+          });
+          if (!feasibility.feasible) {
+            await session.abortTransaction();
+            return res.status(409).json({
+              success: false,
+              message: "This job would make you late for another instant job you accepted.",
+              result: {
+                projectedArrival: feasibility.projectedArrival,
+                slackMinutes: feasibility.slackMinutes,
+              },
+            });
+          }
+        }
+      }
+
       const feasibility = evaluateJobFeasibility({
         techLocation: techProfileForCheck?.location || null,
         candidateJob: candidate,
