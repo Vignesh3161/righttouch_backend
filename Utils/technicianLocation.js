@@ -1,10 +1,13 @@
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianLocationHistory from "../Schemas/TechnicianLocationHistory.js";
+import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "./technicianMatching.js";
 import { geoAdd } from "./technicianGeo.js";
 import { resolveZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
 import { getDistrictFromCoordinates } from "../Services/districtService.js";
 import { recordLocationUpdate } from "./socketMetrics.js";
+import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { emitJobExpired, emitJobsChanged } from "./sendNotification.js";
 
 /**
  * Common logic to update technician location from HTTP or Socket.
@@ -140,6 +143,12 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
         console.error("Zone/District location resolution error:", zoneErr.message);
     }
 
+    // 🔄 REVALIDATE ACTIVE BROADCASTS — if technician moved, check if they're still
+    // eligible for previously broadcast jobs. Expire ones they no longer qualify for.
+    if (significantMove && isOnlineNow) {
+      await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io);
+    }
+
     // 2. Rate Limit Gate (Job matching once every 30 seconds)
     const lastMatch = profile.lastMatchingAt ? new Date(profile.lastMatchingAt).getTime() : 0;
     const now = Date.now();
@@ -172,3 +181,77 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
         memo: "Matching rate limited (30s)"
     };
 };
+
+/**
+ * Revalidate active JobBroadcasts when technician location changes.
+ * If technician is no longer eligible for a broadcast job, expire it and notify client.
+ */
+async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io) {
+  try {
+    // Get active broadcasts for this technician
+    const broadcasts = await JobBroadcast.find({
+      technicianId: technicianProfileId,
+      status: "sent",
+      expiresAt: { $gt: new Date() },
+    }).select("bookingId version").lean();
+
+    if (!broadcasts.length) return;
+
+    // Get technician profile with all fields needed for eligibility check
+    const tech = await TechnicianProfile.findById(technicianProfileId).lean();
+    if (!tech) return;
+
+    // Get bookings for these broadcasts
+    const bookingIds = broadcasts.map(b => b.bookingId);
+    const bookings = await ServiceBooking.find({
+      _id: { $in: bookingIds },
+      status: { $in: ["pending", "broadcasted"] },
+      technicianId: null,
+    }).lean();
+
+    if (!bookings.length) return;
+
+    const bookingById = new Map(bookings.map(b => [String(b._id), b]));
+    const expiredBroadcastIds = [];
+
+    for (const broadcast of broadcasts) {
+      const booking = bookingById.get(String(broadcast.bookingId));
+      if (!booking) continue;
+
+      // Check eligibility with current location
+      const eligibility = await evaluateTechnicianEligibility({
+        technician: tech,
+        booking,
+        mode: "BROADCAST",
+      });
+
+      if (!eligibility.eligible) {
+        expiredBroadcastIds.push(broadcast.bookingId);
+        console.log(`[REVALIDATE] Expired broadcast for tech ${technicianProfileId}, booking ${broadcast.bookingId}: ${eligibility.reasons.join(", ")}`);
+      }
+    }
+
+    if (expiredBroadcastIds.length > 0) {
+      // Expire the broadcasts
+      await JobBroadcast.updateMany(
+        { bookingId: { $in: expiredBroadcastIds }, technicianId: technicianProfileId },
+        { $set: { status: "expired" } }
+      );
+
+      // Notify technician via socket that jobs are no longer available
+      if (io) {
+        for (const bookingId of expiredBroadcastIds) {
+          emitJobExpired(io, technicianProfileId, { 
+            bookingId, 
+            expiresAt: new Date(), 
+            reason: "no_longer_eligible" 
+          });
+        }
+        // Also emit jobs_changed to trigger feed refresh
+        emitJobsChanged(io, technicianProfileId);
+      }
+    }
+  } catch (err) {
+    console.error(`[REVALIDATE] Error revalidating broadcasts for tech ${technicianProfileId}:`, err.message);
+  }
+}

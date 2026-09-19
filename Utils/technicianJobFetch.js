@@ -5,6 +5,7 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { haversineMeters } from "./feasibility.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
+import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
 const STALENESS_SECONDS = (() => {
   const raw = Number(process.env.LOCATION_STALENESS_SECONDS);
@@ -14,6 +15,7 @@ const STALENESS_SECONDS = (() => {
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
  * Enforces strict current distance (<= 10km), service availability, and fresh GPS.
+ * Uses unified eligibility engine for consistency with broadcast/accept.
  */
 export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
     const techId = new mongoose.Types.ObjectId(technicianProfileId);
@@ -35,7 +37,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
         return [];
     }
 
-    // 3. Location validity & freshness gate (<= 90s)
+    // 3. Location validity & freshness gate (<= 90s for fetch)
     const techCoords = technician.location?.coordinates;
     if (!Array.isArray(techCoords) || techCoords.length < 2 || !Number.isFinite(techCoords[0]) || !Number.isFinite(techCoords[1])) {
         return [];
@@ -77,101 +79,31 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
         .sort({ createdAt: -1 })
         .lean();
 
-    // Prepare allowed district set
-    const allowedDistricts = [
-        technician.primaryDistrictId,
-        technician.primaryCityId,
-        ...(technician.enabledDistrictIds || []),
-        ...(technician.allowedCityIds || []),
-    ].filter(Boolean).map(String);
-
-    const allowedZones = (technician.enabledCityZoneIds || []).map(String);
-    const techSkills = (technician.skills || []).map(s => String(s.serviceId?._id || s.serviceId));
-
     const validJobs = [];
-    const maxRadiusMeters = 10000; // Strict 10 KM limit
 
     for (const booking of bookings) {
         const bookingIdStr = String(booking._id);
-        const serviceIdStr = String(booking.serviceId?._id || booking.serviceId);
 
-        // 6A. CURRENT DISTANCE RECALCULATION (Haversine: Tech GPS -> Customer GPS)
-        const customerLocation = booking.location?.coordinates || 
-            (booking.addressSnapshot ? [booking.addressSnapshot.longitude, booking.addressSnapshot.latitude] : null);
-
-        if (!customerLocation) {
-            continue;
-        }
-
-        const distanceMeters = haversineMeters(technician.location, customerLocation);
-
-        if (distanceMeters == null || distanceMeters > maxRadiusMeters) {
-            console.log(`[fetchJobsInternal] 🚫 EXCLUDED out-of-radius job:`, {
-                technicianId: String(techId),
-                bookingId: bookingIdStr,
-                distanceMeters: Math.round(distanceMeters || 0),
-                maxAllowedMeters: maxRadiusMeters,
-                techCoords: technician.location?.coordinates,
-                customerCoords: customerLocation,
-                reason: "RADIUS_EXCEEDED"
-            });
-            continue;
-        }
-
-        // 6B. SERVICE AVAILABILITY REVALIDATION (Zone-level takes priority over district)
-        let targetDistrictId = booking.districtId ? String(booking.districtId._id || booking.districtId) : null;
-        let targetCityZoneId = booking.cityZoneId ? String(booking.cityZoneId._id || booking.cityZoneId) : null;
-
-        if (!targetDistrictId && customerLocation && customerLocation.length === 2) {
-            const [custLng, custLat] = customerLocation;
-            if (Number.isFinite(custLat) && Number.isFinite(custLng)) {
-                const resolvedCity = await resolveOperationalCityFromCoordinates(custLat, custLng);
-                if (resolvedCity?._id) targetDistrictId = String(resolvedCity._id);
-            }
-        }
-
-        const avail = await resolveServiceAvailability({
-            serviceId: serviceIdStr,
-            districtId: targetDistrictId,
-            cityZoneId: targetCityZoneId,
+        // Use unified eligibility check for fetch mode (same as broadcast)
+        const eligibility = await evaluateTechnicianEligibility({
+            technician,
+            booking,
+            mode: "BROADCAST",
         });
 
-        if (!avail.available) {
-            console.log(`[fetchJobsInternal] 🚫 EXCLUDED unavailable service job:`, {
+        if (!eligibility.eligible) {
+            console.log(`[fetchJobsInternal] 🚫 EXCLUDED job:`, {
                 technicianId: String(techId),
                 bookingId: bookingIdStr,
-                serviceId: serviceIdStr,
-                districtId: targetDistrictId,
-                cityZoneId: targetCityZoneId,
-                reason: avail.reason,
+                reasons: eligibility.reasons,
+                distanceMeters: eligibility.details.distanceMeters,
+                effectiveRadiusMeters: eligibility.details.effectiveRadiusMeters,
             });
-            continue;
-        }
-
-        // 6C. DISTRICT PERMISSION CHECK
-        if (targetDistrictId) {
-            if (allowedDistricts.length > 0 && !allowedDistricts.includes(targetDistrictId)) {
-                console.log(`[fetchJobsInternal] 🚫 EXCLUDED district permission denied:`, { bookingId: bookingIdStr, districtId: targetDistrictId });
-                continue;
-            }
-        }
-
-        // 6D. ZONE PERMISSION CHECK
-        if (booking.cityZoneId) {
-            const zoneStr = String(booking.cityZoneId._id || booking.cityZoneId);
-            if (allowedZones.length > 0 && !allowedZones.includes(zoneStr)) {
-                console.log(`[fetchJobsInternal] 🚫 EXCLUDED zone permission denied:`, { bookingId: bookingIdStr, cityZoneId: zoneStr });
-                continue;
-            }
-        }
-
-        // 6E. SKILL MATCH CHECK
-        if (techSkills.length > 0 && !techSkills.includes(serviceIdStr)) {
-            console.log(`[fetchJobsInternal] 🚫 EXCLUDED skill missing:`, { bookingId: bookingIdStr, serviceId: serviceIdStr });
             continue;
         }
 
         // All checks passed -> Eligible for display in Jobs.jsx
+        const distanceMeters = eligibility.details.distanceMeters;
         const distanceKm = (distanceMeters / 1000).toFixed(1);
         const customerName = booking.addressSnapshot?.name ||
             (booking.customerId ? `${booking.customerId.fname || ''} ${booking.customerId.lname || ''}`.trim() : "Customer");
@@ -196,7 +128,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             distanceMeters: Math.round(distanceMeters),
             jobRadiusKm: 10,
             maxRadiusKm: 10,
-            maxAllowedMeters: maxRadiusMeters,
+            maxAllowedMeters: eligibility.details.effectiveRadiusMeters,
             technicianAmount: booking.serviceId?.technicianAmount || booking.technicianAmount || 0,
             service: booking.serviceId || null,
             scheduledAt: booking.scheduledAt,

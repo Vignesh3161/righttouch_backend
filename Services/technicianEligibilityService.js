@@ -15,74 +15,187 @@ const STALENESS_SECONDS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 90;
 })();
 
+const ACCEPT_GRACE_SECONDS = 15 * 60;
+
 /**
- * 🎯 COMPREHENSIVE TECHNICIAN ELIGIBILITY ENGINE
- *
- * Implements the 12-step validation pipeline:
- * 1. Service Availability Check (District / City Scope)
- * 2. Technician Status & Verification (approved, not suspended)
- * 3. Technician Service Skill
- * 4. Online Status
- * 5. GPS Validity & Mocking
- * 6. GPS Freshness (< 90 seconds)
- * 7. Technician District Permission (primaryDistrictId / enabledDistrictIds ONLY — NO CITY ID PERMISSION)
- * 8. Current Physical GPS District Resolution (resolveOperationalCityFromCoordinates)
- * 9. Distance Calculation (Current GPS to Customer Job GPS)
- * 10. 10 KM Radius Gate (<= 10.0 KM)
- * 11. Feasibility / Active Job Lock
- * 12. Final Result & Machine-Readable Reasons
- *
- * @param {Object} params
- * @param {string|Object} params.technician - TechnicianProfile document or ID
- * @param {string|Object} params.serviceId - Service ID
- * @param {number} params.jobLatitude - Customer job latitude
- * @param {number} params.jobLongitude - Customer job longitude
- * @param {string|Object} [params.jobDistrictId=null] - Customer job district ID
- * @param {string|Object} [params.jobCityId=null] - Customer job city ID
- * @param {Object} [params.booking=null] - Optional ServiceBooking document
- * @param {boolean} [params.isMockLocation=false] - Mobile app mock location flag
- * @returns {Promise<Object>} Eligibility breakdown with machine-readable reasons
+ * Get allowed district IDs for a technician (primary + enabled + allowed)
  */
-export const checkTechnicianEligibility = async ({
+export const getAllowedDistrictIds = (tech) => {
+  if (!tech) return [];
+  let primaryId = tech.primaryDistrictId || tech.primaryCityId;
+  const allowedProfile = [
+    ...(tech.enabledDistrictIds || []),
+    ...(tech.allowedCityIds || []),
+  ].map((d) => String(d._id || d));
+  if (primaryId) allowedProfile.push(String(primaryId._id || primaryId));
+  return Array.from(new Set(allowedProfile.filter(Boolean)));
+};
+
+/**
+ * Get allowed zone IDs for a technician
+ */
+export const getAllowedZoneIds = (tech) => {
+  if (!tech) return [];
+  return (tech.enabledCityZoneIds || []).map((z) => String(z._id || z));
+};
+
+/**
+ * Check if technician has district permission for a target district
+ */
+export const hasDistrictPermission = (tech, targetDistrictId) => {
+  if (!targetDistrictId) return true;
+  if (!tech) return false;
+  const allowed = getAllowedDistrictIds(tech);
+  return allowed.includes(String(targetDistrictId._id || targetDistrictId));
+};
+
+/**
+ * Check if technician has zone permission for a target zone
+ * CRITICAL FIX: Only allow if zone is explicitly configured.
+ * Empty/non-existent enabledCityZoneIds = DENY (not allow all)
+ */
+export const hasZonePermission = (tech, targetZoneId) => {
+  if (!targetZoneId) return true;
+  if (!tech) return false;
+  const allowedZones = getAllowedZoneIds(tech);
+  if (allowedZones.length === 0) return false; // No zone config = DENY
+  return allowedZones.includes(String(targetZoneId._id || targetZoneId));
+};
+
+/**
+ * Check if technician's current physical GPS district matches allowed districts
+ */
+export const checkCurrentDistrictMatch = async (tech, targetDistrictId) => {
+  if (!tech?.location?.coordinates) return { match: true, currentDistrictId: null };
+  if (!targetDistrictId) return { match: true, currentDistrictId: null };
+  
+  const [techLng, techLat] = tech.location.coordinates;
+  const currentCity = await resolveOperationalCityFromCoordinates(techLat, techLng);
+  const currentDistIdStr = currentCity?._id ? String(currentCity._id) : null;
+  
+  if (!currentDistIdStr) return { match: true, currentDistrictId: null };
+  
+  const allowed = getAllowedDistrictIds(tech);
+  const match = allowed.includes(currentDistIdStr);
+  
+  return { match, currentDistrictId: currentDistIdStr };
+};
+
+/**
+ * Check if technician's current physical GPS zone matches allowed zones
+ */
+export const checkCurrentZoneMatch = async (tech, targetZoneId) => {
+  if (!tech?.location?.coordinates) return { match: true, currentZoneId: null };
+  if (!targetZoneId) return { match: true, currentZoneId: null };
+  
+  const [techLng, techLat] = tech.location.coordinates;
+  const currentZone = await CityZone.findOne({
+    polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: [techLng, techLat] } } },
+    active: true,
+  }).select("_id").lean();
+  
+  const currentZoneIdStr = currentZone?._id ? String(currentZone._id) : null;
+  if (!currentZoneIdStr) return { match: true, currentZoneId: null };
+  
+  const allowedZones = getAllowedZoneIds(tech);
+  const match = allowedZones.length === 0 ? true : allowedZones.includes(currentZoneIdStr);
+  
+  return { match, currentZoneId: currentZoneIdStr };
+};
+
+/**
+ * Calculate distance between technician and job in meters
+ * Uses single canonical haversine calculation
+ */
+export const calculateDistanceMeters = (techLocation, jobLocation) => {
+  if (!techLocation?.coordinates || !jobLocation?.coordinates) return null;
+  
+  const [techLng, techLat] = techLocation.coordinates;
+  const [jobLng, jobLat] = jobLocation.coordinates;
+  
+  if (!Number.isFinite(techLat) || !Number.isFinite(techLng) || 
+      !Number.isFinite(jobLat) || !Number.isFinite(jobLng)) return null;
+  
+  return haversineMeters(
+    { latitude: techLat, longitude: techLng },
+    { latitude: jobLat, longitude: jobLng }
+  );
+};
+
+/**
+ * Get effective radius for technician (per-tech config or global default)
+ */
+export const getEffectiveRadiusMeters = (tech) => {
+  const radiusKm = Number(tech?.serviceRadiusKm) > 0 ? Number(tech.serviceRadiusKm) : MAX_JOB_DISTANCE_KM;
+  return radiusKm * 1000;
+};
+
+/**
+ * Check GPS validity
+ */
+export const checkGpsValid = (tech) => {
+  const coords = tech?.location?.coordinates;
+  return Array.isArray(coords) && coords.length === 2 &&
+    Number.isFinite(coords[0]) && Number.isFinite(coords[1]) &&
+    coords[1] >= -90 && coords[1] <= 90 &&
+    coords[0] >= -180 && coords[0] <= 180;
+};
+
+/**
+ * Check GPS freshness with mode-specific threshold
+ * mode: "BROADCAST" = 90s, "ACCEPT" = 15min (900s)
+ */
+export const checkGpsFreshness = (tech, mode = "BROADCAST") => {
+  if (STALENESS_SECONDS <= 0) return true;
+  if (!tech?.locationUpdatedAt) return false;
+  
+  const threshold = mode === "ACCEPT" ? ACCEPT_GRACE_SECONDS : STALENESS_SECONDS;
+  const cutoff = new Date(Date.now() - threshold * 1000);
+  return new Date(tech.locationUpdatedAt) >= cutoff;
+};
+
+/**
+ * 🎯 SINGLE AUTHORITATIVE ELIGIBILITY ENGINE
+ * 
+ * Used by BOTH broadcast matching and acceptance validation.
+ * Mode parameter controls strictness:
+ * - "BROADCAST": 90s GPS freshness, strict zone/district
+ * - "ACCEPT": 15min GPS grace, re-validates everything
+ * - "FETCH": Same as BROADCAST but for job feed refresh
+ * 
+ * @param {Object} params
+ * @param {Object|string} params.technician - TechnicianProfile doc or ID
+ * @param {Object} params.booking - ServiceBooking doc (required)
+ * @param {string} params.mode - "BROADCAST" | "ACCEPT" | "FETCH"
+ * @returns {Promise<Object>} { eligible, reasons, details, distanceMeters, effectiveRadiusMeters }
+ */
+export const evaluateTechnicianEligibility = async ({
   technician,
-  serviceId,
-  jobLatitude,
-  jobLongitude,
-  jobDistrictId = null,
-  jobCityId = null,
-  booking = null,
-  isMockLocation = false,
+  booking,
+  mode = "BROADCAST",
 }) => {
   const reasons = [];
   const details = {
     serviceAvailable: false,
     districtPermission: false,
     currentDistrictMatch: false,
+    zonePermission: false,
+    currentZoneMatch: true,
     online: false,
     verified: false,
     hasSkill: false,
     gpsFresh: false,
     validGps: false,
+    distanceMeters: null,
     distanceKm: null,
+    effectiveRadiusMeters: MAX_JOB_DISTANCE_METERS,
     radiusPassed: false,
-    technicianDistrictId: null,
+    technicianDistrictIds: [],
     currentDistrictId: null,
     jobDistrictId: null,
+    jobZoneId: null,
+    feasibility: null,
   };
-
-  // Extract booking details if booking is passed
-  if (booking) {
-    serviceId = serviceId || booking.serviceId;
-    if (booking.location?.coordinates) {
-      jobLongitude = jobLongitude ?? booking.location.coordinates[0];
-      jobLatitude = jobLatitude ?? booking.location.coordinates[1];
-    }
-    jobDistrictId = jobDistrictId || booking.districtId;
-    jobCityId = jobCityId || booking.cityZoneId;
-  }
-
-  const jobLat = Number(jobLatitude);
-  const jobLng = Number(jobLongitude);
 
   // Load technician profile if ID passed
   let tech = technician;
@@ -97,36 +210,48 @@ export const checkTechnicianEligibility = async ({
     return { eligible: false, reasons, details };
   }
 
-  // 1. RESOLVE JOB DISTRICT IF NOT PROVIDED
-  let targetDistrictId = jobDistrictId ? String(jobDistrictId._id || jobDistrictId) : null;
-  if (!targetDistrictId && Number.isFinite(jobLat) && Number.isFinite(jobLng)) {
+  // Extract job location
+  const jobLat = booking.location?.coordinates?.[1];
+  const jobLng = booking.location?.coordinates?.[0];
+  const hasJobCoords = Number.isFinite(jobLat) && Number.isFinite(jobLng);
+
+  // 1. RESOLVE JOB DISTRICT/ZONE
+  let targetDistrictId = booking.districtId ? String(booking.districtId._id || booking.districtId) : null;
+  let targetZoneId = booking.cityZoneId ? String(booking.cityZoneId._id || booking.cityZoneId) : null;
+
+  if (!targetDistrictId && hasJobCoords) {
     const resolvedCity = await resolveOperationalCityFromCoordinates(jobLat, jobLng);
     if (resolvedCity?._id) targetDistrictId = String(resolvedCity._id);
   }
-  details.jobDistrictId = targetDistrictId;
+  if (!targetZoneId && hasJobCoords) {
+    const resolvedZone = await CityZone.findOne({
+      polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: [jobLng, jobLat] } } },
+      active: true,
+    }).select("_id").lean();
+    if (resolvedZone?._id) targetZoneId = String(resolvedZone._id);
+  }
 
-  // 2. CHECK SERVICE AVAILABILITY AT JOB LOCATION
-  if (serviceId && targetDistrictId) {
+  details.jobDistrictId = targetDistrictId;
+  details.jobZoneId = targetZoneId;
+
+  // 2. SERVICE AVAILABILITY AT JOB LOCATION
+  if (booking.serviceId && targetDistrictId) {
     const avail = await resolveServiceAvailability({
-      serviceId,
+      serviceId: booking.serviceId,
       districtId: targetDistrictId,
-      cityId: jobCityId,
+      cityZoneId: targetZoneId,
     });
     details.serviceAvailable = avail.available;
     if (!avail.available) {
       const primaryReason = avail.reason || "SERVICE_NOT_AVAILABLE";
-      if (!reasons.includes(primaryReason)) {
-        reasons.push(primaryReason);
-      }
-      if (
-        (avail.code === "SERVICE_DISABLED" || avail.code === "ZONE_RESTRICTION" || avail.status === "DISABLED") &&
-        !reasons.includes("SERVICE_DISABLED")
-      ) {
+      if (!reasons.includes(primaryReason)) reasons.push(primaryReason);
+      if ((avail.code === "SERVICE_DISABLED" || avail.code === "ZONE_RESTRICTION" || avail.status === "DISABLED") &&
+          !reasons.includes("SERVICE_DISABLED")) {
         reasons.push("SERVICE_DISABLED");
       }
     }
   } else {
-    details.serviceAvailable = true; // Fallback if no service/district specified
+    details.serviceAvailable = true;
   }
 
   // 3. TECHNICIAN WORK STATUS & VERIFICATION
@@ -142,155 +267,130 @@ export const checkTechnicianEligibility = async ({
 
   // 4. TECHNICIAN ONLINE STATUS
   details.online = tech.availability?.isOnline === true;
-  if (!details.online) {
-    reasons.push("TECHNICIAN_OFFLINE");
-  }
+  if (!details.online) reasons.push("TECHNICIAN_OFFLINE");
 
   // 5. SERVICE SKILL CHECK
-  if (serviceId) {
-    const targetServiceIdStr = String(serviceId._id || serviceId);
+  if (booking.serviceId) {
+    const targetServiceIdStr = String(booking.serviceId._id || booking.serviceId);
     const hasSkill = (tech.skills || []).some((s) => {
       const sid = String(s.serviceId?._id || s.serviceId);
       return sid === targetServiceIdStr;
     });
     details.hasSkill = hasSkill;
-    if (!hasSkill) {
-      reasons.push("SERVICE_SKILL_MISSING");
-    }
+    if (!hasSkill) reasons.push("SERVICE_SKILL_MISSING");
   }
 
-  // 6. GPS VALIDATION & MOCK LOCATION GUARD
-  if (isMockLocation) {
-    reasons.push("MOCK_LOCATION");
-  }
+  // 6. GPS VALIDITY
+  details.validGps = checkGpsValid(tech);
+  if (!details.validGps) reasons.push("MISSING_LOCATION");
 
-  const techCoords = tech.location?.coordinates;
-  const hasTechCoords =
-    Array.isArray(techCoords) &&
-    techCoords.length === 2 &&
-    Number.isFinite(techCoords[0]) &&
-    Number.isFinite(techCoords[1]) &&
-    techCoords[1] >= -90 &&
-    techCoords[1] <= 90 &&
-    techCoords[0] >= -180 &&
-    techCoords[0] <= 180;
+  // 7. GPS FRESHNESS (mode-dependent threshold)
+  details.gpsFresh = checkGpsFreshness(tech, mode);
+  if (!details.gpsFresh) reasons.push("GPS_STALE");
 
-  details.validGps = hasTechCoords;
-  if (!hasTechCoords) {
-    reasons.push("MISSING_LOCATION");
-  }
-
-  // 7. GPS FRESHNESS CHECK (STALENESS THRESHOLD: 90s for matching, 15m grace window for accept)
-  if (STALENESS_SECONDS > 0) {
-    const effectiveStalenessSeconds = booking ? Math.max(STALENESS_SECONDS, 900) : STALENESS_SECONDS;
-    const cutoff = new Date(Date.now() - effectiveStalenessSeconds * 1000);
-    const isFresh = tech.locationUpdatedAt ? new Date(tech.locationUpdatedAt) >= cutoff : hasTechCoords;
-    details.gpsFresh = Boolean(isFresh);
-    if (!isFresh) {
-      reasons.push("GPS_STALE");
-    }
-  } else {
-    details.gpsFresh = true;
-  }
-
-  // 8. DISTRICT & ZONE PERMISSION CHECK
-  const primaryId = tech.primaryDistrictId || tech.primaryCityId;
-  const enabledDistricts = [
-    ...(tech.enabledDistrictIds || []),
-    ...(tech.allowedCityIds || []),
-  ].map((d) => String(d._id || d));
-
-  if (primaryId) enabledDistricts.push(String(primaryId._id || primaryId));
-
-  const allowedDistrictIds = Array.from(new Set(enabledDistricts.filter(Boolean)));
-  details.technicianDistrictId = allowedDistrictIds[0] || null;
-
+  // 8. DISTRICT PERMISSION
+  const allowedDistrictIds = getAllowedDistrictIds(tech);
+  details.technicianDistrictIds = allowedDistrictIds;
+  
   if (targetDistrictId) {
-    const hasDistAccess = allowedDistrictIds.includes(targetDistrictId);
-    details.districtPermission = hasDistAccess;
-    if (!hasDistAccess) {
-      reasons.push("DISTRICT_PERMISSION_DENIED");
-    }
+    details.districtPermission = allowedDistrictIds.includes(targetDistrictId);
+    if (!details.districtPermission) reasons.push("DISTRICT_PERMISSION_DENIED");
   } else {
     details.districtPermission = allowedDistrictIds.length > 0;
   }
 
-  // Check Zone Permission if job specifies a CityZone
-  if (jobCityId && Array.isArray(tech.enabledCityZoneIds)) {
-    const targetZoneIdStr = String(jobCityId._id || jobCityId);
-    const hasZoneAccess = tech.enabledCityZoneIds.some((z) => String(z._id || z) === targetZoneIdStr);
-    details.zonePermission = hasZoneAccess;
-    if (!hasZoneAccess) {
-      reasons.push("ZONE_PERMISSION_DENIED");
+  // 9. CURRENT PHYSICAL GPS DISTRICT MATCH
+  if (details.validGps && targetDistrictId) {
+    const { match, currentDistrictId } = await checkCurrentDistrictMatch(tech, targetDistrictId);
+    details.currentDistrictMatch = match;
+    details.currentDistrictId = currentDistrictId;
+    if (!match) reasons.push("CURRENT_LOCATION_OUTSIDE_DISTRICT");
+  }
+
+  // 10. ZONE PERMISSION
+  if (targetZoneId) {
+    details.zonePermission = hasZonePermission(tech, targetZoneId);
+    if (!details.zonePermission) reasons.push("ZONE_PERMISSION_DENIED");
+  }
+
+  // 11. CURRENT PHYSICAL GPS ZONE MATCH
+  if (details.validGps && targetZoneId) {
+    const { match, currentZoneId } = await checkCurrentZoneMatch(tech, targetZoneId);
+    details.currentZoneMatch = match;
+    // Only add reason if zone permission was explicitly configured
+    if (!match && getAllowedZoneIds(tech).length > 0) {
+      reasons.push("CURRENT_LOCATION_OUTSIDE_ZONE");
     }
   }
 
-  // 9. CURRENT PHYSICAL GPS DISTRICT CHECK
-  if (hasTechCoords) {
-    const techLat = techCoords[1];
-    const techLng = techCoords[0];
-
-    const currentCity = await resolveOperationalCityFromCoordinates(techLat, techLng);
-    const currentDistIdStr = currentCity?._id ? String(currentCity._id) : null;
-    details.currentDistrictId = currentDistIdStr;
-
-    if (currentDistIdStr) {
-      const isCurrentInAllowed = allowedDistrictIds.includes(currentDistIdStr);
-      details.currentDistrictMatch = isCurrentInAllowed;
-      if (!isCurrentInAllowed) {
-        reasons.push("CURRENT_LOCATION_OUTSIDE_DISTRICT");
-      }
-    }
-  }
-
-  // 10. DYNAMIC TECHNICIAN RADIUS GATE (CURRENT GPS TO CUSTOMER JOB GPS)
-  if (hasTechCoords && Number.isFinite(jobLat) && Number.isFinite(jobLng)) {
-    const distMeters = haversineMeters(
-      { latitude: techCoords[1], longitude: techCoords[0] },
-      { latitude: jobLat, longitude: jobLng }
-    );
-    const distKm = Number((distMeters / 1000).toFixed(2));
-    details.distanceKm = distKm;
-
-    // Use per-technician configured radius or fallback to 10 KM default
-    const maxRadiusKm = Number(tech.serviceRadiusKm) > 0 ? Number(tech.serviceRadiusKm) : MAX_JOB_DISTANCE_KM;
-    const maxRadiusMeters = maxRadiusKm * 1000;
-    details.configuredRadiusKm = maxRadiusKm;
-
-    const withinRadius = distMeters <= maxRadiusMeters;
-    details.radiusPassed = withinRadius;
-
-    if (!withinRadius) {
+  // 12. DYNAMIC RADIUS GATE (single canonical haversine)
+  if (details.validGps && hasJobCoords) {
+    const distMeters = calculateDistanceMeters(tech.location, booking.location);
+    details.distanceMeters = distMeters;
+    details.distanceKm = distMeters != null ? Number((distMeters / 1000).toFixed(2)) : null;
+    
+    const maxRadiusMeters = getEffectiveRadiusMeters(tech);
+    details.effectiveRadiusMeters = maxRadiusMeters;
+    
+    details.radiusPassed = distMeters != null && distMeters <= maxRadiusMeters;
+    if (!details.radiusPassed) {
       reasons.push("RADIUS_EXCEEDED");
       reasons.push("TECHNICIAN_OUTSIDE_RADIUS");
     }
   }
 
-  // 11. ACTIVE JOB / ASSIGNMENT LOCK CHECK
-  if (booking && booking.technicianId && String(booking.technicianId) !== String(tech._id)) {
+  // 13. JOB ALREADY ASSIGNED CHECK
+  if (booking.technicianId && String(booking.technicianId) !== String(tech._id)) {
     reasons.push("JOB_ALREADY_ASSIGNED");
   }
 
   const eligible = reasons.length === 0;
 
-  console.log("ACCEPT ELIGIBILITY DEBUG", JSON.stringify({
-    technicianId: tech?._id,
-    bookingId: booking?._id,
+  // Structured logging for traceability
+  console.log(`[ELIGIBILITY:${mode}]`, JSON.stringify({
+    technicianId: tech._id,
+    bookingId: booking._id,
+    mode,
     eligible,
     reasons,
-    distanceMeters: details.distanceKm != null ? Math.round(details.distanceKm * 1000) : null,
-    maxDistanceMeters: MAX_JOB_DISTANCE_METERS,
-    serviceAvailable: details.serviceAvailable,
+    distanceMeters: details.distanceMeters,
+    effectiveRadiusMeters: details.effectiveRadiusMeters,
     districtPermission: details.districtPermission,
     currentDistrictMatch: details.currentDistrictMatch,
+    zonePermission: details.zonePermission,
+    currentZoneMatch: details.currentZoneMatch,
     gpsFresh: details.gpsFresh,
     online: details.online,
     verified: details.verified,
+    hasSkill: details.hasSkill,
+    serviceAvailable: details.serviceAvailable,
   }));
 
+  return { eligible, reasons, details };
+};
+
+/**
+ * Backward compatibility wrapper for existing callers
+ * @deprecated Use evaluateTechnicianEligibility({ mode: "ACCEPT" }) instead
+ */
+export const checkTechnicianEligibility = async (params) => {
+  const result = await evaluateTechnicianEligibility({
+    technician: params.technician,
+    booking: params.booking,
+    mode: "ACCEPT",
+  });
+  // Transform to old format for compatibility
   return {
-    eligible,
-    reasons,
-    details,
+    eligible: result.eligible,
+    reasons: result.reasons,
+    details: {
+      ...result.details,
+      distanceKm: result.details.distanceKm,
+      maxDistanceMeters: MAX_JOB_DISTANCE_METERS,
+      configuredRadiusKm: result.details.effectiveRadiusMeters / 1000,
+      technicianDistrictId: result.details.technicianDistrictIds[0] || null,
+      currentDistrictId: result.details.currentDistrictId,
+      jobDistrictId: result.details.jobDistrictId,
+    },
   };
 };
