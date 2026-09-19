@@ -33,14 +33,25 @@ export const hasLiveSocket = (io, technicianId) => {
 /**
  * 🛰 JOBS-CHANGED PUSH (Socket Analysis — anti-polling fix)
  */
-export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, broadcastId, reasons } = {}) => {
+export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, broadcastId, reasons, userId } = {}) => {
   try {
     if (!io || !technicianProfileId) return;
+    
+    // PRIMARY: Technician operational room
     io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
       SOCKET_EVENTS.TECH_JOBS_CHANGED,
       { changed: true, at: new Date().toISOString() }
     );
-    // Also emit the flat jobs_changed event for client compatibility
+    
+    // SECONDARY: User room if userId provided
+    if (userId) {
+      io.to(SOCKET_ROOMS.USER(userId)).emit(
+        SOCKET_EVENTS.TECH_JOBS_CHANGED,
+        { changed: true, at: new Date().toISOString() }
+      );
+    }
+    
+    // Backward compatibility flat event
     if (action || bookingId) {
       io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
         "jobs_changed",
@@ -52,6 +63,16 @@ export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, br
           at: new Date().toISOString()
         }
       );
+      
+      if (userId) {
+        io.to(SOCKET_ROOMS.USER(userId)).emit("jobs_changed", {
+          action: action || "changed",
+          bookingId: bookingId ? String(bookingId) : undefined,
+          broadcastId: broadcastId ? String(broadcastId) : undefined,
+          reasons: reasons || [],
+          at: new Date().toISOString()
+        });
+      }
     }
   } catch (err) {
     console.error("emitJobsChanged error:", err.message);
@@ -61,30 +82,39 @@ export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, br
 /**
  * 🛰 JOB-EXPIRED PUSH
  */
-export const emitJobExpired = (io, technicianProfileId, { bookingId, broadcastId, expiresAt, reason, reasons } = {}) => {
+export const emitJobExpired = (io, technicianProfileId, { bookingId, broadcastId, expiresAt, reason, reasons, userId } = {}) => {
   try {
     if (!io || !technicianProfileId || !bookingId) return;
-    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
-      SOCKET_EVENTS.JOB_EXPIRED,
-      {
-        bookingId: String(bookingId),
-        broadcastId: broadcastId ? String(broadcastId) : undefined,
-        expiresAt: expiresAt ? new Date(expiresAt).toISOString() : new Date().toISOString(),
-        reason: reason || "offer_expired",
-        reasons: reasons || [reason || "offer_expired"],
-      }
-    );
-    // Also emit jobs_changed with action removed for client to remove from list
-    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
-      "jobs_changed",
-      {
-        action: "removed",
-        bookingId: String(bookingId),
-        broadcastId: broadcastId ? String(broadcastId) : undefined,
-        reasons: reasons || [reason || "offer_expired"],
-        at: new Date().toISOString()
-      }
-    );
+    
+    const payload = {
+      bookingId: String(bookingId),
+      broadcastId: broadcastId ? String(broadcastId) : undefined,
+      expiresAt: expiresAt ? new Date(expiresAt).toISOString() : new Date().toISOString(),
+      reason: reason || "offer_expired",
+      reasons: reasons || [reason || "offer_expired"],
+    };
+    
+    // PRIMARY: Technician room
+    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(SOCKET_EVENTS.JOB_EXPIRED, payload);
+    
+    // SECONDARY: User room
+    if (userId) {
+      io.to(SOCKET_ROOMS.USER(userId)).emit(SOCKET_EVENTS.JOB_EXPIRED, payload);
+    }
+    
+    // Feed removal event
+    const jobsChangedPayload = {
+      action: "removed",
+      bookingId: String(bookingId),
+      broadcastId: broadcastId ? String(broadcastId) : undefined,
+      reasons: reasons || [reason || "offer_expired"],
+      at: new Date().toISOString()
+    };
+    
+    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit("jobs_changed", jobsChangedPayload);
+    if (userId) {
+      io.to(SOCKET_ROOMS.USER(userId)).emit("jobs_changed", jobsChangedPayload);
+    }
   } catch (err) {
     console.error("emitJobExpired error:", err.message);
   }

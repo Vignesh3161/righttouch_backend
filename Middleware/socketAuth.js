@@ -32,15 +32,39 @@ export const socketAuth = (socket, next) => {
             if (user.status === "Blocked") {
                 return next(new Error("Authentication error: Account blocked"));
             }
-            if (decoded.role === "Technician" && decoded.technicianProfileId) {
-                const tech = await TechnicianProfile.findById(decoded.technicianProfileId)
-                    .select("workStatus")
-                    .lean();
-                if (tech?.workStatus === "deleted") {
-                    return next(new Error("Authentication error: Account not found"));
+
+            let resolvedTechProfileId = decoded.technicianProfileId || null;
+
+            if (decoded.role === "Technician") {
+                // Resolve technicianProfileId from User if missing or validate consistency
+                const techQuery = resolvedTechProfileId
+                    ? TechnicianProfile.findById(resolvedTechProfileId)
+                    : TechnicianProfile.findOne({ userId: decoded.userId });
+
+                const techProfile = await techQuery.select("_id workStatus userId").lean();
+
+                if (techProfile) {
+                    // VALIDATION: Ensure techProfile.userId matches decoded.userId
+                    if (String(techProfile.userId) !== String(decoded.userId)) {
+                        console.error(`❌ [AUTH VALIDATION] Token techProfileId ${techProfile._id} belongs to user ${techProfile.userId}, but token userId is ${decoded.userId}`);
+                        resolvedTechProfileId = techProfile._id;
+                    } else {
+                        resolvedTechProfileId = techProfile._id;
+                    }
+
+                    if (techProfile.workStatus === "deleted") {
+                        return next(new Error("Authentication error: Account not found"));
+                    }
                 }
             }
-            socket.user = decoded;
+
+            socket.user = {
+                _id: decoded.userId,
+                userId: decoded.userId,
+                role: decoded.role,
+                email: decoded.email,
+                technicianProfileId: resolvedTechProfileId,
+            };
             next();
         } catch (e) {
             return next(new Error("Authentication error"));

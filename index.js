@@ -198,9 +198,9 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   const role = socket.user?.role;
   const techProfileId = socket.user?.technicianProfileId;
 
-  console.log(`🔌 [SOCKET CONNECTED] SocketID: ${socket.id} (User: ${userId}, Role: ${role})`);
+  console.log(`🔌 [SOCKET CONNECTED] SocketID: ${socket.id} (User: ${userId}, Role: ${role}, TechProfile: ${techProfileId})`);
 
-  // 🏠 Standardized User & Role Rooms (User ID and Role)
+  // 🏠 Standardized User & Role Rooms — ALWAYS use userId
   if (userId) {
     socket.join(SOCKET_ROOMS.USER(userId));
     if (role) {
@@ -212,9 +212,10 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   }
 
   if (role === "Technician" && techProfileId) {
+    // Technician operational room — uses techProfileId
     socket.join(SOCKET_ROOMS.TECHNICIAN(techProfileId));
-    socket.join(SOCKET_ROOMS.USER(techProfileId));
-    console.log(`🏠 [TECH ROOM] Joined: technician_${techProfileId}, user:${techProfileId}`);
+    // DO NOT join user_{techProfileId} — causes ID confusion
+    console.log(`🏠 [TECH ROOM] Joined: technician_${techProfileId}`);
   }
 
   // Admin/Owner dashboard feed (replaces the old global new_booking io.emit —
@@ -224,6 +225,22 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     socket.join(SOCKET_ROOMS.ADMIN_ROOM);
     socket.join(SOCKET_ROOMS.ADMIN);
   }
+
+  // 🔍 DIAGNOSTIC: Verify room membership
+  setImmediate(() => {
+    const rooms = Array.from(socket.rooms);
+    console.log(`🔍 [SOCKET ROOMS] ${socket.id} (User: ${userId}, TechProfile: ${techProfileId}) joined:`, rooms);
+    
+    if (role === "Technician" && techProfileId) {
+      const inTechRoom = rooms.includes(`technician_${techProfileId}`);
+      const inUserRoom = rooms.includes(`user:${userId}`);
+      const inWrongUserRoom = rooms.includes(`user:${techProfileId}`);
+      
+      if (!inTechRoom) console.error(`❌ [ROOM VERIFY] Missing technician_${techProfileId}`);
+      if (!inUserRoom) console.error(`❌ [ROOM VERIFY] Missing user:${userId}`);
+      if (inWrongUserRoom) console.warn(`⚠️ [ROOM VERIFY] Incorrectly in user:${techProfileId}`);
+    }
+  });
 
   // 🛡 SINGLE ACTIVE SESSION (Socket Analysis Fix #9 / B3.4):
   // one user = one live socket. A new device silently kicks the older one so
@@ -550,6 +567,50 @@ App.get("/health/fcm", async (req, res) => {
 App.get("/health/metrics", async (req, res) => {
   const { notificationMetrics } = await import("./Utils/notificationMetrics.js");
   res.status(200).json(notificationMetrics.getSummary());
+});
+
+App.get("/health/socket-rooms/:userId", async (req, res) => {
+  const { userId } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return res.status(400).json({ success: false, message: "Invalid userId" });
+  }
+
+  const techProfile = await TechnicianProfile.findOne({ userId }).select("_id workStatus").lean();
+  const techProfileId = techProfile?._id?.toString();
+
+  const expectedRooms = [
+    `user:${userId}`,
+    `role:technician`,
+    `customer_${userId}`,
+  ];
+
+  if (techProfileId) {
+    expectedRooms.push(`technician_${techProfileId}`);
+  }
+
+  // Check actual socket rooms
+  const actualRooms = new Set();
+  io.sockets.sockets.forEach(socket => {
+    if (socket.user?.userId === userId) {
+      socket.rooms.forEach(r => actualRooms.add(r));
+    }
+  });
+
+  const missing = expectedRooms.filter(r => !actualRooms.has(r));
+  const unexpected = Array.from(actualRooms).filter(r => 
+    !expectedRooms.includes(r) && !r.startsWith("socket:") && r !== socket.id
+  );
+
+  res.json({
+    success: true,
+    userId,
+    techProfileId,
+    expectedRooms,
+    actualRooms: Array.from(actualRooms),
+    missingRooms: missing,
+    unexpectedRooms: unexpected,
+    healthy: missing.length === 0 && unexpected.length === 0
+  });
 });
 
 /* ==========================================================================
