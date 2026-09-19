@@ -1,6 +1,7 @@
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianLocationHistory from "../Schemas/TechnicianLocationHistory.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
+import ServiceBooking from "../Schemas/ServiceBooking.js";
 import { broadcastPendingJobsToTechnician } from "./technicianMatching.js";
 import { geoAdd } from "./technicianGeo.js";
 import { resolveZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
@@ -195,8 +196,17 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
 /**
  * Revalidate active JobBroadcasts when technician location changes.
  * If technician is no longer eligible for a broadcast job, expire it and notify client.
+ * Exported so it can be triggered from other events (service availability, permissions, work status changes).
  */
-async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io) {
+export async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io) {
+  const startTime = Date.now();
+  console.log("[REVALIDATE_START]", {
+    technicianId: technicianProfileId,
+    latitude,
+    longitude,
+    timestamp: new Date().toISOString()
+  });
+
   try {
     // Get active broadcasts for this technician
     const broadcasts = await JobBroadcast.find({
@@ -205,11 +215,23 @@ async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitu
       expiresAt: { $gt: new Date() },
     }).select("bookingId version").lean();
 
-    if (!broadcasts.length) return;
+    console.log("[REVALIDATE_BROADCASTS_LOADED]", {
+      technicianId: technicianProfileId,
+      count: broadcasts.length,
+      broadcastIds: broadcasts.map(b => String(b.bookingId))
+    });
+
+    if (!broadcasts.length) {
+      console.log("[REVALIDATE_COMPLETE]", { technicianId: technicianProfileId, action: "NONE", reason: "no_active_broadcasts", durationMs: Date.now() - startTime });
+      return;
+    }
 
     // Get technician profile with all fields needed for eligibility check
     const tech = await TechnicianProfile.findById(technicianProfileId).lean();
-    if (!tech) return;
+    if (!tech) {
+      console.log("[REVALIDATE_COMPLETE]", { technicianId: technicianProfileId, action: "NONE", reason: "technician_not_found", durationMs: Date.now() - startTime });
+      return;
+    }
 
     // Get bookings for these broadcasts
     const bookingIds = broadcasts.map(b => b.bookingId);
@@ -219,10 +241,19 @@ async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitu
       technicianId: null,
     }).lean();
 
-    if (!bookings.length) return;
+    console.log("[REVALIDATE_BOOKINGS_LOADED]", {
+      technicianId: technicianProfileId,
+      bookingCount: bookings.length,
+      bookingIds: bookings.map(b => String(b._id))
+    });
+
+    if (!bookings.length) {
+      console.log("[REVALIDATE_COMPLETE]", { technicianId: technicianProfileId, action: "NONE", reason: "no_valid_bookings", durationMs: Date.now() - startTime });
+      return;
+    }
 
     const bookingById = new Map(bookings.map(b => [String(b._id), b]));
-    const expiredBroadcastIds = [];
+    const expiredBroadcasts = [];
 
     for (const broadcast of broadcasts) {
       const booking = bookingById.get(String(broadcast.bookingId));
@@ -235,42 +266,114 @@ async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitu
         mode: "BROADCAST",
       });
 
+      console.log("[ELIGIBILITY_RESULT]", {
+        technicianId: technicianProfileId,
+        bookingId: String(booking._id),
+        broadcastId: String(broadcast._id),
+        eligible: eligibility.eligible,
+        reasons: eligibility.reasons,
+        distanceMeters: eligibility.details?.distanceMeters,
+        effectiveRadiusMeters: eligibility.details?.effectiveRadiusMeters,
+        gpsFresh: eligibility.details?.gpsFresh,
+        online: eligibility.details?.online,
+        zonePermission: eligibility.details?.zonePermission,
+        districtPermission: eligibility.details?.districtPermission,
+        currentDistrictMatch: eligibility.details?.currentDistrictMatch,
+        currentZoneMatch: eligibility.details?.currentZoneMatch,
+        serviceAvailable: eligibility.details?.serviceAvailable,
+        hasSkill: eligibility.details?.hasSkill,
+        verified: eligibility.details?.verified
+      });
+
       if (!eligibility.eligible) {
-        expiredBroadcastIds.push(broadcast.bookingId);
-        console.log(`[REVALIDATE] Expired broadcast for tech ${technicianProfileId}, booking ${broadcast.bookingId}: ${eligibility.reasons.join(", ")}`);
+        expiredBroadcasts.push({
+          bookingId: broadcast.bookingId,
+          broadcastId: broadcast._id,
+          reasons: eligibility.reasons
+        });
       }
     }
 
-    if (expiredBroadcastIds.length > 0) {
-      // Expire the broadcasts
-      await JobBroadcast.updateMany(
-        { bookingId: { $in: expiredBroadcastIds }, technicianId: technicianProfileId },
-        { $set: { status: "expired" } }
+    if (expiredBroadcasts.length > 0) {
+      const expiredBookingIds = expiredBroadcasts.map(e => e.bookingId);
+      const expiredBroadcastIds = expiredBroadcasts.map(e => e.broadcastId);
+
+      // Expire the broadcasts with atomic condition (status: "sent") to prevent race conditions
+      const updateResult = await JobBroadcast.updateMany(
+        { 
+          _id: { $in: expiredBroadcastIds },
+          status: "sent"  // Atomic condition - only expire if still in "sent" state
+        },
+        { 
+          $set: { 
+            status: "expired",
+            expiredAt: new Date(),
+            expiredReason: expiredBroadcasts.map(e => e.reasons.join(", ")).join("; ")
+          } 
+        }
       );
+
+      console.log("[REVALIDATE_ACTION]", {
+        technicianId: technicianProfileId,
+        action: "EXPIRE",
+        expiredCount: expiredBroadcasts.length,
+        matchedCount: updateResult.matchedCount,
+        modifiedCount: updateResult.modifiedCount,
+        bookingIds: expiredBookingIds.map(String),
+        reasons: expiredBroadcasts.flatMap(e => e.reasons)
+      });
 
       // Notify technician via socket that jobs are no longer available
       if (io) {
-        for (const bookingId of expiredBroadcastIds) {
+        for (const expired of expiredBroadcasts) {
           emitJobExpired(io, technicianProfileId, { 
-            bookingId, 
+            bookingId: expired.bookingId, 
+            broadcastId: expired.broadcastId,
             expiresAt: new Date(), 
-            reason: "no_longer_eligible" 
+            reason: "no_longer_eligible",
+            reasons: expired.reasons
           });
         }
         // Also emit jobs_changed to trigger feed refresh
         emitJobsChanged(io, technicianProfileId);
       }
+    } else {
+      console.log("[REVALIDATE_ACTION]", {
+        technicianId: technicianProfileId,
+        action: "KEEP",
+        checkedCount: broadcasts.length,
+        message: "All broadcasts still eligible"
+      });
     }
+
+    console.log("[REVALIDATE_COMPLETE]", { 
+      technicianId: technicianProfileId, 
+      durationMs: Date.now() - startTime,
+      expiredCount: expiredBroadcasts.length
+    });
   } catch (err) {
-    console.error(`[REVALIDATE] Error revalidating broadcasts for tech ${technicianProfileId}:`, err.message);
+    console.error("[REVALIDATE_ERROR]", { 
+      technicianId: technicianProfileId, 
+      error: err.message,
+      stack: err.stack,
+      durationMs: Date.now() - startTime
+    });
   }
 }
 
 /**
  * Revalidate all technicians who might be affected by a service availability change.
- * Called when a service is disabled in a district/zone.
+ * Called when a service availability changes (enabled/disabled) in a district/zone.
  */
 export async function revalidateTechniciansForService(serviceId, districtId, cityZoneId, io) {
+  const startTime = Date.now();
+  console.log("[REVALIDATE_SERVICE_START]", {
+    serviceId,
+    districtId,
+    cityZoneId,
+    timestamp: new Date().toISOString()
+  });
+
   try {
     if (!serviceId || !districtId) return;
 
@@ -295,9 +398,16 @@ export async function revalidateTechniciansForService(serviceId, districtId, cit
       .select("_id location locationUpdatedAt")
       .lean();
 
-    if (!technicians.length) return;
+    if (!technicians.length) {
+      console.log("[REVALIDATE_SERVICE_COMPLETE]", { serviceId, durationMs: Date.now() - startTime, technicianCount: 0, action: "NONE" });
+      return;
+    }
 
-    console.log(`[REVALIDATE] Service ${serviceId} disabled, revalidating ${technicians.length} technicians`);
+    console.log("[REVALIDATE_SERVICE_TECHS_LOADED]", {
+      serviceId,
+      technicianCount: technicians.length,
+      technicianIds: technicians.map(t => String(t._id))
+    });
 
     for (const tech of technicians) {
       if (!tech.location?.coordinates) continue;
@@ -342,24 +452,62 @@ export async function revalidateTechniciansForService(serviceId, districtId, cit
       }
 
       if (expiredBroadcastIds.length > 0) {
-        await JobBroadcast.updateMany(
-          { bookingId: { $in: expiredBroadcastIds }, technicianId: tech._id },
-          { $set: { status: "expired" } }
+        const expiredBroadcasts = broadcasts.filter(b => expiredBroadcastIds.includes(b.bookingId));
+        const expiredBroadcastIdsFull = expiredBroadcasts.map(b => b._id);
+
+        // Expire the broadcasts with atomic condition (status: "sent") to prevent race conditions
+        const updateResult = await JobBroadcast.updateMany(
+          { 
+            _id: { $in: expiredBroadcastIdsFull },
+            status: "sent"  // Atomic condition - only expire if still in "sent" state
+          },
+          { 
+            $set: { 
+              status: "expired",
+              expiredAt: new Date(),
+              expiredReason: "service_disabled"
+            } 
+          }
         );
 
+        console.log("[REVALIDATE_SERVICE_ACTION]", {
+          serviceId,
+          technicianId: tech._id,
+          action: "EXPIRE",
+          expiredCount: expiredBroadcasts.length,
+          matchedCount: updateResult.matchedCount,
+          modifiedCount: updateResult.modifiedCount,
+          bookingIds: expiredBroadcastIds.map(String)
+        });
+
         if (io) {
-          for (const bookingId of expiredBroadcastIds) {
+          for (const broadcast of expiredBroadcasts) {
             emitJobExpired(io, tech._id, { 
-              bookingId, 
+              bookingId: broadcast.bookingId,
+              broadcastId: broadcast._id,
               expiresAt: new Date(), 
-              reason: "service_disabled" 
+              reason: "service_disabled",
+              reasons: ["SERVICE_DISABLED"]
             });
           }
-          emitJobsChanged(io, tech._id);
+          // Also emit jobs_changed to trigger feed refresh
+          emitJobsChanged(io, tech._id, { action: "removed", bookingId: expiredBroadcastIds[0], broadcastId: expiredBroadcasts[0]?._id, reasons: ["SERVICE_DISABLED"] });
         }
       }
     }
+
+    console.log("[REVALIDATE_SERVICE_COMPLETE]", { 
+      serviceId, 
+      durationMs: Date.now() - startTime,
+      techniciansProcessed: technicians.length,
+      totalExpired: 0 // Could track this if needed
+    });
   } catch (err) {
-    console.error(`[REVALIDATE] Error revalidating technicians for service ${serviceId}:`, err.message);
+    console.error("[REVALIDATE_SERVICE_ERROR]", { 
+      serviceId, 
+      error: err.message,
+      stack: err.stack,
+      durationMs: Date.now() - startTime
+    });
   }
 }

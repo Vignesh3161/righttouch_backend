@@ -81,6 +81,10 @@ import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
 import DevRoutes from "./Routes/dev.js";
 import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
 
+// Swagger API Documentation
+import swaggerUi from "swagger-ui-express";
+import swaggerSpec from "./swagger.js";
+
 // 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
 const activeSocketByUser = new Map(); // userId -> socket.id
 
@@ -118,7 +122,9 @@ const sanitizeNoSqlPayload = (value) => {
 App.use(cors({
   exposedHeaders: ["x-new-token", "x-rtb-fingerprint-id", "request-id", "x-request-id"]
 }));
-App.use(helmet());
+App.use(helmet({
+  contentSecurityPolicy: false,
+}));
 
 // 🔒 Security Hardening - Apply globally
 
@@ -600,6 +606,13 @@ App.use("/api", razorpayXWebhookRoutes);
 App.use("/api/dev", DevRoutes);
 App.use("/api/admin/dispatch", adminDispatchRoutes);
 App.use("/dev-inspector", express.static(path.join(process.cwd(), "frontend")));
+
+// 📖 Swagger API Documentation
+App.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+App.get("/api-docs.json", (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.send(swaggerSpec);
+});
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
 App.use((err, req, res, next) => {

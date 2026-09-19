@@ -1696,6 +1696,14 @@ export const updateTechnicianStatus = async (req, res) => {
       revokeSocketSession(req.io, technicianId, `workStatus: ${workStatus}`);
     }
 
+    // 🔄 Revalidate active broadcasts for this technician (work status changed)
+    const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+    if (technician.location?.coordinates) {
+      const [lng, lat] = technician.location.coordinates;
+      await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
+        .catch(err => console.error("Work status change revalidation error:", err));
+    }
+
     const result = technician.toObject();
     delete result.password;
 
