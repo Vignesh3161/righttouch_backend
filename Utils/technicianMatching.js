@@ -15,7 +15,19 @@ import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibilit
 import { geoSearch } from "./technicianGeo.js";
 import { enqueueJobNewNotifications } from "./dispatchQueue.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
-import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { 
+  evaluateTechnicianEligibility, 
+  getAllowedDistrictIds,
+  getAllowedZoneIds,
+  hasDistrictPermission,
+  hasZonePermission,
+  checkCurrentDistrictMatch,
+  checkCurrentZoneMatch,
+  calculateDistanceMeters,
+  getEffectiveRadiusMeters,
+  checkGpsValid,
+  checkGpsFreshness,
+} from "../Services/technicianEligibilityService.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 
@@ -25,7 +37,7 @@ const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
    DISPATCH FILTERS (staleness / operational polygon)
    — cheap & selective first: geo radius, staleness,
    polygon, availability — feasibility math LAST.
-===================================================== */
+ ===================================================== */
 
 const STALENESS_SECONDS = (() => {
   const raw = Number(process.env.LOCATION_STALENESS_SECONDS);
@@ -133,93 +145,6 @@ export const getAllowedDistrictIdsForTechnician = async (techProfile) => {
   return Array.from(new Set(allIds));
 };
 
-/**
- * 1. District Permission Check
- */
-export const hasDistrictAccess = (technician, districtId) => {
-  if (!districtId) return true;
-  if (!technician) return false;
-
-  const targetDistStr = String(districtId._id || districtId);
-  const primaryDistStr = technician.primaryDistrictId
-    ? String(technician.primaryDistrictId._id || technician.primaryDistrictId)
-    : technician.primaryCityId
-    ? String(technician.primaryCityId._id || technician.primaryCityId)
-    : null;
-
-  if (primaryDistStr && primaryDistStr === targetDistStr) {
-    return true;
-  }
-
-  const enabledDistricts = [
-    ...(technician.enabledDistrictIds || []),
-    ...(technician.allowedCityIds || []),
-  ].map((d) => String(d._id || d));
-
-  return enabledDistricts.includes(targetDistStr);
-};
-
-/**
- * 3. City Zone Permission Check
- */
-export const hasCityZoneAccess = (technician, cityZoneId) => {
-  if (!cityZoneId) return true;
-  if (!technician) return false;
-
-  const targetZoneStr = String(cityZoneId._id || cityZoneId);
-  const enabledZoneIds = (technician.enabledCityZoneIds || []).map((z) => String(z._id || z));
-
-  if (enabledZoneIds.length > 0) {
-    return enabledZoneIds.includes(targetZoneStr);
-  }
-
-  if (technician.cityZoneId) {
-    return String(technician.cityZoneId._id || technician.cityZoneId) === targetZoneStr;
-  }
-
-  return true;
-};
-
-/**
- * 8. Final Matching & Job Eligibility Engine
- * Checks District Permission -> Current District -> City Zone Permission -> Current City Zone
- */
-export const isTechnicianEligible = (technician, booking) => {
-  if (!technician || !booking) return false;
-
-  // 1. District permission
-  if (!hasDistrictAccess(technician, booking.districtId)) {
-    return false;
-  }
-
-  // 2. Physical current district
-  if (
-    technician.currentDistrictId &&
-    booking.districtId &&
-    String(technician.currentDistrictId._id || technician.currentDistrictId) !==
-      String(booking.districtId._id || booking.districtId)
-  ) {
-    return false;
-  }
-
-  // 3. City zone permission
-  if (!hasCityZoneAccess(technician, booking.cityZoneId)) {
-    return false;
-  }
-
-  // 4. Physical current city zone
-  if (
-    technician.currentCityZoneId &&
-    booking.cityZoneId &&
-    String(technician.currentCityZoneId._id || technician.currentCityZoneId) !==
-      String(booking.cityZoneId._id || booking.cityZoneId)
-  ) {
-    return false;
-  }
-
-  return true;
-};
-
 /** Drop technicians whose last ping is older than the staleness threshold. */
 export const filterStaleTechnicians = (techs) => {
   const cutoff = stalenessCutoff();
@@ -248,6 +173,11 @@ export const filterByOperationalPolygon = async (techIds) => {
   return inside.map((t) => t._id);
 };
 
+/**
+ * Filter technicians by booking zone using unified eligibility logic.
+ * CRITICAL FIX: Only allow if zone is explicitly configured.
+ * Empty/non-existent enabledCityZoneIds = DENY (not allow all)
+ */
 export const filterByBookingZone = async (techIds, bookingId) => {
   if (!techIds.length) return techIds;
 
@@ -259,19 +189,15 @@ export const filterByBookingZone = async (techIds, bookingId) => {
 
   const eligibleTechs = await TechnicianProfile.find({
     _id: { $in: techIds },
-    $or: [
-      { enabledCityZoneIds: booking.cityZoneId },
-      { cityZoneId: booking.cityZoneId },
-      { enabledCityZoneIds: { $exists: false } },
-      { enabledCityZoneIds: { $size: 0 } },
-    ],
+    enabledCityZoneIds: booking.cityZoneId,  // FIX: Only match if zone explicitly configured
   })
     .select("_id primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds currentDistrictId currentCityZoneId")
     .lean();
 
   const finalTechIds = [];
   for (const tech of eligibleTechs) {
-    if (isTechnicianEligible(tech, booking)) {
+    // Use unified zone permission check
+    if (hasZonePermission(tech, booking.cityZoneId)) {
       finalTechIds.push(tech._id);
     }
   }
@@ -508,7 +434,8 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           for (const ub of unassignedSample) {
             const uCoords = ub.location.coordinates;
             const d = haversineMeters({ latitude: lat, longitude: lng }, { latitude: uCoords[1], longitude: uCoords[0] });
-            console.log(`      • Booking ${ub._id}: Customer GPS [${uCoords[0]}, ${uCoords[1]}] | Distance: ${(d / 1000).toFixed(2)} km (${Math.round(d)}m) -> ❌ EXCEEDS 10 km radius limit`);
+            const status = d <= 10000 ? "✅ WITHIN" : "❌ EXCEEDS";
+            console.log(`      • Booking ${ub._id}: Customer GPS [${uCoords[0]}, ${uCoords[1]}] | Distance: ${(d / 1000).toFixed(2)} km (${Math.round(d)}m) -> ${status} 10 km radius limit`);
           }
         }
       } catch (e) {}
@@ -577,6 +504,18 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           continue;
         }
 
+        // Use unified eligibility check for broadcast mode
+        const eligibility = await evaluateTechnicianEligibility({
+          technician: tech,
+          booking,
+          mode: "BROADCAST",
+        });
+
+        if (!eligibility.eligible) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — ${eligibility.reasons.join(", ")}`);
+          continue;
+        }
+
         const existing = await JobBroadcast.findOne({
           bookingId: booking._id,
           technicianId: tech._id,
@@ -589,13 +528,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         offerRows.push({
           bookingId: booking._id,
           technicianId: tech._id,
-          distanceAtOffer: haversineMeters(
-            { latitude: lat, longitude: lng },
-            {
-              latitude: booking.location?.coordinates?.[1],
-              longitude: booking.location?.coordinates?.[0],
-            }
-          ),
+          distanceAtOffer: eligibility.details.distanceMeters,
           feasibilitySnapshot: feasibility,
         });
 
@@ -839,6 +772,24 @@ export const findEligibleTechniciansForService = async ({
  */
 export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  
+  // 🔒 MATCHING LEASE — prevents duplicate matching for same booking across workers
+  // Uses the same lease pattern as bookingCron.js for consistency
+  const MATCH_LEASE_TTL_MS = 30 * 1000; // 30 second lease
+  const leaseClaimed = await ServiceBooking.findOneAndUpdate(
+    {
+      _id: bookingId,
+      $or: [{ matchingLeaseUntil: null }, { matchingLeaseUntil: { $lte: new Date() } }],
+    },
+    { $set: { matchingLeaseUntil: new Date(Date.now() + MATCH_LEASE_TTL_MS), matchingLeaseOwner: trc } },
+    { new: true, select: "_id matchingLeaseOwner" }
+  );
+  
+  if (!leaseClaimed) {
+    console.log(`🔒 [MATCH LEASE] Booking ${bookingId} already being matched by another worker, skipping`);
+    return { success: true, count: 0, message: "Matching already in progress" };
+  }
+  
   try {
     const booking = await ServiceBooking.findById(bookingId);
     if (!booking) {
@@ -935,7 +886,8 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           for (const st of sampleTechs) {
             const sCoords = st.location.coordinates;
             const dist = haversineMeters({ latitude, longitude }, { latitude: sCoords[1], longitude: sCoords[0] });
-            console.log(`      • Tech ${st._id}: GPS [${sCoords[0]}, ${sCoords[1]}] | Distance: ${(dist / 1000).toFixed(2)} km (${Math.round(dist)}m) -> ❌ EXCEEDS 10 km radius limit`);
+            const status = dist <= 10000 ? "✅ WITHIN" : "❌ EXCEEDS";
+            console.log(`      • Tech ${st._id}: GPS [${sCoords[0]}, ${sCoords[1]}] | Distance: ${(dist / 1000).toFixed(2)} km (${Math.round(dist)}m) -> ${status} 10 km radius limit`);
           }
         } else {
           console.log(`   ℹ️ No online approved technicians found in the system.`);
@@ -977,49 +929,18 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         continue;
       }
 
-      const [tLng, tLat] = techProfile.location.coordinates;
-      const techCoords = { latitude: tLat, longitude: tLng };
-      const customerCoords = { latitude, longitude };
-      const distMeters = haversineMeters(techCoords, customerCoords);
+      // Use unified eligibility check for broadcast mode
+      const eligibility = await evaluateTechnicianEligibility({
+        technician: techProfile,
+        booking,
+        mode: "BROADCAST",
+      });
 
-      const hasDist = hasDistrictAccess(techProfile, targetDistrictId);
-      const hasZone = hasCityZoneAccess(techProfile, booking.cityZoneId);
-      const isFresh = techProfile.locationUpdatedAt && new Date(techProfile.locationUpdatedAt) >= stalenessCutoff();
-      const isOnline = techProfile.availability?.isOnline === true;
-      const distPassed = distMeters != null && distMeters <= 10000;
-
-      console.log(`TECHNICIAN MATCH DEBUG`, JSON.stringify({
-        technicianId: techId,
-        bookingId: booking._id,
-        serviceId: booking.serviceId,
-        districtId: targetDistrictId,
-        cityZoneId: booking.cityZoneId,
-        technicianCoordinates: [tLng, tLat],
-        customerCoordinates: [longitude, latitude],
-        distanceMeters: Math.round(distMeters || 0),
-        maxDistanceMeters: 10000,
-        serviceAvailable: avail.available,
-        zoneOverrideStatus: avail.status || null,
-        zoneServiceMappingActive: avail.scope !== "DEFAULT",
-        districtPermission: hasDist,
-        zonePermission: hasZone,
-        currentDistrictMatch: true,
-        gpsFresh: Boolean(isFresh),
-        online: isOnline,
-      }));
-
-      const rejectReasons = [];
-      if (!distPassed) rejectReasons.push("RADIUS_EXCEEDED");
-      if (!hasDist) rejectReasons.push("DISTRICT_PERMISSION_DENIED");
-      if (!hasZone) rejectReasons.push("ZONE_PERMISSION_DENIED");
-      if (!isFresh) rejectReasons.push("GPS_STALE");
-      if (!isOnline) rejectReasons.push("TECHNICIAN_OFFLINE");
-
-      if (rejectReasons.length > 0) {
+      if (!eligibility.eligible) {
         console.log(`REJECT TECHNICIAN`, JSON.stringify({
           technicianId: techId,
           bookingId: booking._id,
-          reasons: rejectReasons
+          reasons: eligibility.reasons
         }));
         continue;
       }
@@ -1042,7 +963,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       offerRows.push({
         bookingId: booking._id,
         technicianId: techId,
-        distanceAtOffer: distMeters,
+        distanceAtOffer: eligibility.details.distanceMeters,
         feasibilitySnapshot: feasibility,
       });
       validCandidateIds.push(techId);
@@ -1190,5 +1111,11 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   } catch (error) {
     console.error("❌ matchAndBroadcastBooking Error:", error);
     return { success: false, error: error.message };
+  } finally {
+    // 🔓 Release matching lease
+    await ServiceBooking.updateOne(
+      { _id: bookingId, matchingLeaseOwner: trc },
+      { $set: { matchingLeaseUntil: null, matchingLeaseOwner: null } }
+    ).catch(() => {});
   }
 };

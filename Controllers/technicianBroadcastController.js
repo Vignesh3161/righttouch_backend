@@ -14,7 +14,7 @@ import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 
-const DISPATCH_LOCK_MS = 3000;
+const DISPATCH_LOCK_MS = 10000;
 
 /* ================= GET MY JOBS (LIVE FEED) ================= */
 export const getMyJobs = async (req, res) => {
@@ -241,6 +241,18 @@ export const respondToJob = async (req, res) => {
     if (!candidate) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    // 🎯 VERSION VALIDATION — reject stale broadcast versions
+    if (candidate.activeBroadcastVersion && requestedVersion !== candidate.activeBroadcastVersion) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        success: false,
+        message: "This job offer has been updated. Please refresh and try again.",
+        reason: "version_mismatch",
+        requestedVersion,
+        currentVersion: candidate.activeBroadcastVersion,
+      });
     }
 
     // 🎯 RE-VALIDATE ELIGIBILITY (District Permission, Service Availability, 10km Radius) AT ACCEPT TIME
