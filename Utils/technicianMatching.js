@@ -972,11 +972,13 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // Load full profiles and queues for candidates
     const [techProfiles, queueMap] = await Promise.all([
       TechnicianProfile.find({ _id: { $in: technicianIds } })
-        .select("_id location locationUpdatedAt workStatus availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
+        .select("_id userId location locationUpdatedAt workStatus availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
         .lean(),
       loadCommittedQueues(technicianIds),
     ]);
     const profileById = new Map(techProfiles.map((t) => [String(t._id), t]));
+    // Build userId map for correct room targeting
+    const techUserIds = new Map(techProfiles.map((t) => [String(t._id), String(t.userId)]));
 
     const offerRows = [];
     const validCandidateIds = [];
@@ -1145,8 +1147,16 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           maxRadiusKm: 10,
           maxAllowedMeters: 10000,
         }, b);
+        // PRIMARY: Technician operational room (always correct)
         io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-        io.to(SOCKET_ROOMS.USER(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        
+        // SECONDARY: User room — use actual User ID
+        const userId = techUserIds.get(String(techId));
+        if (userId) {
+          io.to(SOCKET_ROOMS.USER(userId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        }
+        
+        // Notification event
         io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
           id: `job-${jobDTO.bookingId}`,
           type: "JOB_NEW",
@@ -1171,7 +1181,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         { $set: { lastJobsChangeAt: new Date() } }
       );
       // 🛰 Push: every matched tech's feed changed (anti-polling fix).
-      technicianIds.forEach((techId) => emitJobsChanged(io, techId));
+      technicianIds.forEach((techId) => {
+        const userId = techUserIds.get(String(techId));
+        emitJobsChanged(io, techId, { userId });
+      });
     } catch (e) {
       console.error("❌ matchAndBroadcastBooking: cursor bump failed:", e.message);
     }

@@ -150,14 +150,18 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
       const stalenessCutoff = new Date(Date.now() - STALENESS_SECONDS * 1000);
       if (new Date(profile.locationUpdatedAt) < stalenessCutoff) {
         console.log(`⚠️ Tech ${technicianProfileId} GPS is stale, revalidating broadcasts`);
-        await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io);
+        const techProfile = await TechnicianProfile.findById(technicianProfileId).select("userId").lean();
+        const userId = techProfile?.userId?.toString();
+        await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io, userId);
       }
     }
 
     // 🔄 REVALIDATE ACTIVE BROADCASTS — if technician moved, check if they're still
     // eligible for previously broadcast jobs. Expire ones they no longer qualify for.
     if (significantMove && isOnlineNow) {
-      await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io);
+      const techProfile = await TechnicianProfile.findById(technicianProfileId).select("userId").lean();
+      const userId = techProfile?.userId?.toString();
+      await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io, userId);
     }
 
     // 2. Rate Limit Gate (Job matching once every 30 seconds)
@@ -198,7 +202,7 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
  * If technician is no longer eligible for a broadcast job, expire it and notify client.
  * Exported so it can be triggered from other events (service availability, permissions, work status changes).
  */
-export async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io) {
+export async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io, userId = null) {
   const startTime = Date.now();
   console.log("[REVALIDATE_START]", {
     technicianId: technicianProfileId,
@@ -331,11 +335,12 @@ export async function revalidateActiveBroadcasts(technicianProfileId, latitude, 
             broadcastId: expired.broadcastId,
             expiresAt: new Date(), 
             reason: "no_longer_eligible",
-            reasons: expired.reasons
+            reasons: expired.reasons,
+            userId
           });
         }
         // Also emit jobs_changed to trigger feed refresh
-        emitJobsChanged(io, technicianProfileId);
+        emitJobsChanged(io, technicianProfileId, { userId });
       }
     } else {
       console.log("[REVALIDATE_ACTION]", {
@@ -414,6 +419,9 @@ export async function revalidateTechniciansForService(serviceId, districtId, cit
 
       const [lng, lat] = tech.location.coordinates;
       
+      // Get userId for this technician
+      const userId = tech.userId?.toString();
+      
       // Find active broadcasts for this service
       const broadcasts = await JobBroadcast.find({
         technicianId: tech._id,
@@ -487,11 +495,12 @@ export async function revalidateTechniciansForService(serviceId, districtId, cit
               broadcastId: broadcast._id,
               expiresAt: new Date(), 
               reason: "service_disabled",
-              reasons: ["SERVICE_DISABLED"]
+              reasons: ["SERVICE_DISABLED"],
+              userId
             });
           }
           // Also emit jobs_changed to trigger feed refresh
-          emitJobsChanged(io, tech._id, { action: "removed", bookingId: expiredBroadcastIds[0], broadcastId: expiredBroadcasts[0]?._id, reasons: ["SERVICE_DISABLED"] });
+          emitJobsChanged(io, tech._id, { action: "removed", bookingId: expiredBroadcastIds[0], broadcastId: expiredBroadcasts[0]?._id, reasons: ["SERVICE_DISABLED"], userId });
         }
       }
     }
