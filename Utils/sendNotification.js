@@ -33,13 +33,26 @@ export const hasLiveSocket = (io, technicianId) => {
 /**
  * 🛰 JOBS-CHANGED PUSH (Socket Analysis — anti-polling fix)
  */
-export const emitJobsChanged = (io, technicianProfileId) => {
+export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, broadcastId, reasons } = {}) => {
   try {
     if (!io || !technicianProfileId) return;
     io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
       SOCKET_EVENTS.TECH_JOBS_CHANGED,
       { changed: true, at: new Date().toISOString() }
     );
+    // Also emit the flat jobs_changed event for client compatibility
+    if (action || bookingId) {
+      io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
+        "jobs_changed",
+        {
+          action: action || "changed",
+          bookingId: bookingId ? String(bookingId) : undefined,
+          broadcastId: broadcastId ? String(broadcastId) : undefined,
+          reasons: reasons || [],
+          at: new Date().toISOString()
+        }
+      );
+    }
   } catch (err) {
     console.error("emitJobsChanged error:", err.message);
   }
@@ -48,15 +61,28 @@ export const emitJobsChanged = (io, technicianProfileId) => {
 /**
  * 🛰 JOB-EXPIRED PUSH
  */
-export const emitJobExpired = (io, technicianProfileId, { bookingId, expiresAt, reason } = {}) => {
+export const emitJobExpired = (io, technicianProfileId, { bookingId, broadcastId, expiresAt, reason, reasons } = {}) => {
   try {
     if (!io || !technicianProfileId || !bookingId) return;
     io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
       SOCKET_EVENTS.JOB_EXPIRED,
       {
         bookingId: String(bookingId),
+        broadcastId: broadcastId ? String(broadcastId) : undefined,
         expiresAt: expiresAt ? new Date(expiresAt).toISOString() : new Date().toISOString(),
         reason: reason || "offer_expired",
+        reasons: reasons || [reason || "offer_expired"],
+      }
+    );
+    // Also emit jobs_changed with action removed for client to remove from list
+    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
+      "jobs_changed",
+      {
+        action: "removed",
+        bookingId: String(bookingId),
+        broadcastId: broadcastId ? String(broadcastId) : undefined,
+        reasons: reasons || [reason || "offer_expired"],
+        at: new Date().toISOString()
       }
     );
   } catch (err) {

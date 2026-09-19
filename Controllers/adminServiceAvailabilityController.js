@@ -75,6 +75,11 @@ export const createServiceAvailability = async (req, res) => {
       reason: `Admin created ${finalScope} level service availability for ${service.serviceName} in ${district.name}`,
     }).catch(() => {});
 
+    // 🔄 Revalidate technicians affected by this service availability change
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+    await revalidateTechniciansForService(config.serviceId, config.districtId, config.cityId, req.io)
+      .catch(err => console.error("Service availability create revalidation error:", err));
+
     return res.status(201).json({
       success: true,
       message: `Service availability created (${finalScope} - ${config.status})`,
@@ -131,11 +136,10 @@ export const updateServiceAvailability = async (req, res) => {
     }).catch(() => {});
 
     // 🔄 Revalidate technicians affected by this service availability change
-    if (status === "DISABLED") {
-      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
-      await revalidateTechniciansForService(existing.serviceId, existing.districtId, existing.cityId, req.io)
-        .catch(err => console.error("Service disable revalidation error:", err));
-    }
+    // Trigger on ANY status change (ENABLED or DISABLED) or scope change
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+    await revalidateTechniciansForService(existing.serviceId, existing.districtId, existing.cityId, req.io)
+      .catch(err => console.error("Service availability update revalidation error:", err));
 
     return res.status(200).json({
       success: true,
@@ -225,6 +229,11 @@ export const deleteServiceAvailability = async (req, res) => {
       oldValue: existing.toObject(),
       reason: "Admin deleted service availability configuration",
     }).catch(() => {});
+
+    // 🔄 Revalidate technicians affected by this service availability deletion
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+    await revalidateTechniciansForService(existing.serviceId, existing.districtId, existing.cityId, req.io)
+      .catch(err => console.error("Service availability delete revalidation error:", err));
 
     return res.status(200).json({
       success: true,

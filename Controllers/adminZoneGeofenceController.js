@@ -290,6 +290,14 @@ export const grantDistrictPermission = async (req, res) => {
       reason,
     });
 
+    // 🔄 Revalidate active broadcasts for this technician (district permission changed)
+    const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+    if (tech.location?.coordinates) {
+      const [lng, lat] = tech.location.coordinates;
+      await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
+        .catch(err => console.error("District permission grant revalidation error:", err));
+    }
+
     return res.status(200).json({
       success: true,
       message: `District permission granted for ${district.name}`,
@@ -333,6 +341,14 @@ export const revokeDistrictPermission = async (req, res) => {
       adminId: req.user._id,
       reason,
     });
+
+    // 🔄 Revalidate active broadcasts for this technician (district permission revoked)
+    const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+    if (tech.location?.coordinates) {
+      const [lng, lat] = tech.location.coordinates;
+      await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
+        .catch(err => console.error("District permission revoke revalidation error:", err));
+    }
 
     return res.status(200).json({
       success: true,

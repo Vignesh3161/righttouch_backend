@@ -216,6 +216,15 @@ export const enableTechnicianZonePermission = async (req, res) => {
     }));
     await TechnicianZonePermissionAudit.insertMany(auditDocs).catch(() => {});
 
+    // 🔄 Revalidate active broadcasts for this technician (zone permission enabled)
+    const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+    const techProfile = await TechnicianProfile.findById(technicianId).select("location").lean();
+    if (techProfile?.location?.coordinates) {
+      const [lng, lat] = techProfile.location.coordinates;
+      await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
+        .catch(err => console.error("Zone permission enable revalidation error:", err));
+    }
+
     console.log(`✅ Granted ${validZoneIds.length} zone(s) permission for tech ${technicianId}`);
     return getTechnicianZonePermissions(req, res);
   } catch (error) {
@@ -260,6 +269,15 @@ export const disableTechnicianZonePermission = async (req, res) => {
       reason: reason || "Admin revoked zone work permission",
     }));
     await TechnicianZonePermissionAudit.insertMany(auditDocs).catch(() => {});
+
+    // 🔄 Revalidate active broadcasts for this technician (zone permission disabled)
+    const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
+    const tech = await TechnicianProfile.findById(technicianId).select("location").lean();
+    if (tech?.location?.coordinates) {
+      const [lng, lat] = tech.location.coordinates;
+      await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
+        .catch(err => console.error("Zone permission disable revalidation error:", err));
+    }
 
     console.log(`🚫 Revoked ${targetZoneIds.length} zone(s) permission for tech ${technicianId}`);
     return getTechnicianZonePermissions(req, res);
