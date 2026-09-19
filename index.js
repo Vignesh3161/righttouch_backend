@@ -79,6 +79,7 @@ import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
 import notificationRoutes from "./Routes/notificationRoutes.js";
 import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
 import DevRoutes from "./Routes/dev.js";
+import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
 
 // 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
 const activeSocketByUser = new Map(); // userId -> socket.id
@@ -597,6 +598,7 @@ App.use("/api", userZoneRoutes);
    -------------------------------------------------------------------------- */
 App.use("/api", razorpayXWebhookRoutes);
 App.use("/api/dev", DevRoutes);
+App.use("/api/admin/dispatch", adminDispatchRoutes);
 App.use("/dev-inspector", express.static(path.join(process.cwd(), "frontend")));
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)

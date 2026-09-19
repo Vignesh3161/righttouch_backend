@@ -5,6 +5,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
+import DispatchOutbox from "../Schemas/DispatchOutbox.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
 import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
@@ -13,7 +14,6 @@ import { findNearbyTechnicians } from "./findNearbyTechnicians.js";
 import { emitJobsChanged } from "./sendNotification.js";
 import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibility.js";
 import { geoSearch } from "./technicianGeo.js";
-import { enqueueJobNewNotifications } from "./dispatchQueue.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { 
   evaluateTechnicianEligibility, 
@@ -25,11 +25,12 @@ import {
   checkCurrentZoneMatch,
   calculateDistanceMeters,
   getEffectiveRadiusMeters,
-  checkGpsValid,
-  checkGpsFreshness,
 } from "../Services/technicianEligibilityService.js";
+import { checkGpsValid, checkGpsFreshness } from "./locationConfig.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
+import { STALENESS_SECONDS, stalenessCutoff } from "./locationConfig.js";
+import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -38,13 +39,6 @@ const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
    — cheap & selective first: geo radius, staleness,
    polygon, availability — feasibility math LAST.
  ===================================================== */
-
-const STALENESS_SECONDS = (() => {
-  const raw = Number(process.env.LOCATION_STALENESS_SECONDS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 90;
-})();
-
-const stalenessCutoff = () => new Date(Date.now() - STALENESS_SECONDS * 1000);
 
 // Active operational polygon — cached in memory (changes rarely), invalidated
 // after a TTL so polygon edits propagate without a restart.
@@ -460,6 +454,24 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
 
     // Create or revive broadcast records for each matched job
     for (const booking of eligibleBookings) {
+      const bookingTraceId = `loc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      
+      // 🔒 MATCHING LEASE — prevents duplicate matching for same booking across workers
+      const LOC_MATCH_LEASE_TTL_MS = 30 * 1000; // 30 second lease
+      const leaseClaimed = await ServiceBooking.findOneAndUpdate(
+        {
+          _id: booking._id,
+          $or: [{ matchingLeaseUntil: null }, { matchingLeaseUntil: { $lte: new Date() } }],
+        },
+        { $set: { matchingLeaseUntil: new Date(Date.now() + LOC_MATCH_LEASE_TTL_MS), matchingLeaseOwner: bookingTraceId } },
+        { new: true, select: "_id matchingLeaseOwner" }
+      );
+      
+      if (!leaseClaimed) {
+        console.log(`🔒 [LOC MATCH LEASE] Booking ${booking._id} already being matched by another worker, skipping`);
+        continue;
+      }
+      
       try {
         if (booking.technicianId) {
           continue;
@@ -489,8 +501,15 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           continue;
         }
 
-        if (!isTechnicianEligible(tech, booking)) {
-          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — failed district/city zone permission or physical location check`);
+        // Use unified eligibility check for broadcast mode (replaces legacy isTechnicianEligible)
+        const eligibility = await evaluateTechnicianEligibility({
+          technician: tech,
+          booking,
+          mode: "BROADCAST",
+        });
+
+        if (!eligibility.eligible) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — ${eligibility.reasons.join(", ")}`);
           continue;
         }
 
@@ -501,18 +520,6 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         });
         if (!feasibility.feasible) {
           console.log(`⏱ Skipped job ${booking._id} for tech ${tech._id} — ${feasibility.reason} (arrives ${feasibility.projectedArrival})`);
-          continue;
-        }
-
-        // Use unified eligibility check for broadcast mode
-        const eligibility = await evaluateTechnicianEligibility({
-          technician: tech,
-          booking,
-          mode: "BROADCAST",
-        });
-
-        if (!eligibility.eligible) {
-          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — ${eligibility.reasons.join(", ")}`);
           continue;
         }
 
@@ -575,6 +582,12 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         if (err.code !== 11000) {
           console.error(`❌ Error broadcasting job ${booking._id} to tech ${tech._id}:`, err);
         }
+      } finally {
+        // 🔓 Release matching lease
+        await ServiceBooking.updateOne(
+          { _id: booking._id, matchingLeaseOwner: bookingTraceId },
+          { $set: { matchingLeaseUntil: null, matchingLeaseOwner: null } }
+        ).catch(() => {});
       }
     }
 
@@ -703,25 +716,63 @@ export const findEligibleTechniciansForService = async ({
   }
 
   if (enableGeo && hasCoords) {
-    const geoQuery = {
-      ...baseQuery,
-      "location.type": "Point",
-      "location.coordinates.0": { $type: "number" },
-      "location.coordinates.1": { $type: "number" },
-      location: {
-        $nearSphere: {
-          $geometry: {
-            type: "Point",
-            coordinates: [lng, lat],
+    // Try Redis GEO pre-filter first (fast candidate discovery)
+    let nearby = [];
+    const geoResults = await geoSearch(lng, lat, radiusMeters, limit * 2); // Get more candidates for filtering
+    
+    if (geoResults && geoResults.length > 0) {
+      // Filter by base query criteria (workStatus, skills, etc.) using the geo results
+      const geoTechIds = geoResults.map(r => r.technicianId);
+      const geoTechObjects = await TechnicianProfile.find({
+        _id: { $in: geoTechIds },
+        ...baseQuery,
+      }).select("_id location").lean();
+      
+      nearby = geoTechObjects.filter(tech => {
+        const geoResult = geoResults.find(g => g.technicianId === tech._id.toString());
+        if (!geoResult) return false;
+        
+        // Double check Haversine distance
+        const d = haversineMeters(
+          { latitude: tech.location?.coordinates?.[1], longitude: tech.location?.coordinates?.[0] },
+          { latitude: lat, longitude: lng }
+        );
+        return d != null && d <= radiusMeters;
+      });
+    }
+    
+    if (nearby.length === 0) {
+      // Fallback to MongoDB $nearSphere if Redis GEO unavailable or no results
+      const polygon = await getActiveOperationalPolygon();
+      
+      const geoQuery = {
+        ...baseQuery,
+        "location.type": "Point",
+        "location.coordinates.0": { $type: "number" },
+        "location.coordinates.1": { $type: "number" },
+        location: {
+          $nearSphere: {
+            $geometry: {
+              type: "Point",
+              coordinates: [lng, lat],
+            },
+            $maxDistance: radiusMeters,
           },
-          $maxDistance: radiusMeters,
         },
-      },
-    };
+      };
 
-    let nearbyQuery = TechnicianProfile.find(geoQuery).select("_id location").limit(limit);
-    if (session) nearbyQuery = nearbyQuery.session(session);
-    const nearby = await nearbyQuery;
+      // Combine polygon filter in geo query (single query with $and)
+      if (polygon) {
+        geoQuery.$and = geoQuery.$and || [];
+        geoQuery.$and.push({
+          location: { $geoIntersects: { $geometry: polygon } }
+        });
+      }
+
+      const nearbyQuery = TechnicianProfile.find(geoQuery).select("_id location").limit(limit);
+      if (session) nearbyQuery = nearbyQuery.session(session);
+      nearby = await nearbyQuery;
+    }
 
     if (nearby.length > 0) {
       // Double check Haversine distance <= radiusMeters (10,000m)
@@ -736,7 +787,8 @@ export const findEligibleTechniciansForService = async ({
       });
 
       const verifiedIds = await filterByApprovedKyc(withinRadiusTechs.map((t) => t._id));
-      return filterByOperationalPolygon(verifiedIds);
+      // Polygon already filtered in query, skip redundant filter
+      return verifiedIds;
     }
 
     // STRICT: When coordinates are present and enableGeo is true, never fall back to state/city wide search!
@@ -772,6 +824,9 @@ export const findEligibleTechniciansForService = async ({
  */
 export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const matchStartTime = Date.now();
+  
+  recordMetric(METRIC_KEYS.MATCHING_STARTED);
   
   // 🔒 MATCHING LEASE — prevents duplicate matching for same booking across workers
   // Uses the same lease pattern as bookingCron.js for consistency
@@ -786,14 +841,18 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   );
   
   if (!leaseClaimed) {
+    recordMetric(METRIC_KEYS.MATCHING_LEASE_CONFLICT);
     console.log(`🔒 [MATCH LEASE] Booking ${bookingId} already being matched by another worker, skipping`);
     return { success: true, count: 0, message: "Matching already in progress" };
   }
+  
+  recordMetric(METRIC_KEYS.MATCHING_LEASE_ACQUIRED);
   
   try {
     const booking = await ServiceBooking.findById(bookingId);
     if (!booking) {
       console.error(`❌ matchAndBroadcastBooking: Booking ${bookingId} not found`);
+      recordMetric(METRIC_KEYS.MATCHING_ERROR);
       return { success: false, message: "Booking not found" };
     }
 
@@ -872,6 +931,8 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     let technicianIds = eligibleTechnicians.map(t => t._id.toString());
 
+    recordMetric(METRIC_KEYS.TECHS_FOUND, technicianIds.length);
+
     if (technicianIds.length === 0) {
       console.log(`   ⚠️ [RADIUS SCAN] 0 technicians found within 10 km of customer GPS [${longitude}, ${latitude}] for Booking ${bookingId}`);
       try {
@@ -902,8 +963,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       technicianIds = await filterByBookingZone(technicianIds, bookingId);
       if (technicianIds.length === 0) {
         console.log(`⚠️ No technicians in zone for booking ${bookingId}`);
+        recordMetric(METRIC_KEYS.TECHS_FILTERED_ZONE);
         return { success: true, count: 0, message: "No technicians in your zone" };
       }
+      recordMetric(METRIC_KEYS.TECHS_FILTERED_ZONE, technicianIds.length);
     }
 
     // Load full profiles and queues for candidates
@@ -942,8 +1005,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           bookingId: booking._id,
           reasons: eligibility.reasons
         }));
+        recordMetric(METRIC_KEYS.TECHS_FILTERED_OTHER);
         continue;
       }
+      recordMetric(METRIC_KEYS.TECHS_ELIGIBLE);
 
       const feasibility = evaluateJobFeasibility({
         techLocation: techProfile.location,
@@ -957,8 +1022,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           bookingId: booking._id,
           reasons: [feasibility.reason || "FEASIBILITY_FAILED"]
         }));
+        recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
         continue;
       }
+      recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
 
       offerRows.push({
         bookingId: booking._id,
@@ -983,57 +1050,71 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       channel: "broadcast",
     });
 
-    // 3. Create JobBroadcast Records
-    const jobBroadcastDocs = technicianIds.map(technicianId => ({
-      bookingId: booking._id,
-      technicianId,
-      status: "sent",
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour expiry to match Cron
-    }));
-
-    try {
-      // Update existing or create new broadcasts (upsert)
-      const bulkOps = technicianIds.map(technicianId => ({
-        updateOne: {
-          filter: { bookingId: booking._id, technicianId },
-          update: { 
-            status: "sent", 
-            expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-            $inc: { version: 1 }, // version increments on every re-send
-          },
-          upsert: true
-        }
-      }));
-      await JobBroadcast.bulkWrite(bulkOps);
-    } catch (e) {
-      console.error(`❌ matchAndBroadcastBooking: Error in bulkWrite for broadcasts:`, e);
-    }
-
-    // Build broadcastId/version map for the job:new DTOs (one query, shared by all emits)
+    // 3. Create JobBroadcast Records + Update Booking Status + Create DispatchOutbox
+    // All in a single transaction for atomicity
+    const session = await mongoose.startSession();
     let broadcastMap = new Map();
+    
     try {
-      const broadcastRows = await JobBroadcast.find({
-        bookingId: booking._id,
-        technicianId: { $in: technicianIds },
-      }).select("_id version technicianId");
-      broadcastMap = new Map(
-        broadcastRows.map(b => [b.technicianId ? b.technicianId.toString() : "", b])
-      );
-    } catch (e) {
-      console.error("❌ matchAndBroadcastBooking: broadcast map query failed:", e.message);
+      await session.withTransaction(async () => {
+        // 3a. Create/update JobBroadcast records
+        const bulkOps = technicianIds.map(technicianId => ({
+          updateOne: {
+            filter: { bookingId: booking._id, technicianId },
+            update: { 
+              status: "sent", 
+              expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+              $inc: { version: 1 },
+            },
+            upsert: true
+          }
+        }));
+        await JobBroadcast.bulkWrite(bulkOps, { session });
+
+        // 3b. Update Booking Status
+        await ServiceBooking.updateOne(
+          { _id: booking._id },
+          {
+            $set: { status: "broadcasted", broadcastedAt: new Date(), assignmentStatus: "broadcasted" },
+            $inc: { activeBroadcastVersion: 1, version: 1 },
+          },
+          { session }
+        );
+
+        // 3c. Create DispatchOutbox entries for FCM retry (inside transaction)
+        // Use version from JobBroadcast after bulkWrite
+        const broadcastRows = await JobBroadcast.find({
+          bookingId: booking._id,
+          technicianId: { $in: technicianIds },
+        }).select("_id version technicianId").session(session).lean();
+        
+        broadcastMap = new Map(
+          broadcastRows.map(b => [b.technicianId ? b.technicianId.toString() : "", b])
+        );
+
+        const dispatchOutboxRows = technicianIds.map(techId => {
+          const b = broadcastMap.get(String(techId));
+          return {
+            bookingId: booking._id,
+            technicianId: techId,
+            kind: "job_new",
+            broadcastId: b?._id || null,
+            version: b?.version || 1,
+            payload: { ...jobDataPayload, traceId: trc },
+            status: "pending",
+            nextAttemptAt: new Date(),
+          };
+        });
+        await DispatchOutbox.insertMany(dispatchOutboxRows, { session, ordered: false }).catch(() => {});
+      });
+    } finally {
+      await session.endSession();
     }
 
-    // 4. Update Booking Status (canonical only; bump broadcast version so
-    //    acceptance can verify the exact version it is claiming)
-    await ServiceBooking.updateOne(
-      { _id: booking._id },
-      {
-        $set: { status: "broadcasted", broadcastedAt: new Date(), assignmentStatus: "broadcasted" },
-        $inc: { activeBroadcastVersion: 1, version: 1 },
-      }
-    );
+    recordMetric(METRIC_KEYS.BROADCAST_CREATED, technicianIds.length);
+    recordHistogram(METRIC_KEYS.MATCHING_LATENCY_MS, Date.now() - matchStartTime);
 
-    // 5. Send Notifications (Immediate Socket + Background Push)
+    // 4. Send Notifications (AFTER transaction commit for durability)
     const jobDataPayload = {
       bookingId: booking._id,
       serviceId: service._id,
@@ -1047,7 +1128,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       scheduledAt: booking.scheduledAt,
     };
 
-    // ⚡ INSTANT DIRECT SOCKET DISPATCH (<1ms latency)
+    // ⚡ INSTANT DIRECT SOCKET DISPATCH (after commit)
     if (io) {
       technicianIds.forEach((techId) => {
         const b = broadcastMap.get(String(techId));
@@ -1076,17 +1157,12 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         });
       });
       console.log(`📡 [TRACE] ${trc} SOCKET_EMIT bookingId=${bookingId} techCount=${technicianIds.length}`);
+      recordMetric(METRIC_KEYS.SOCKET_EMITTED, technicianIds.length);
     }
 
-    // Persistent outbox for background push notifications (FCM) & retries
-    await enqueueJobNewNotifications({
-      bookingId: booking._id,
-      technicianIds,
-      jobData: jobDataPayload,
-      broadcastMap,
-      traceId: trc,
-    });
-    console.log(`📤 [TRACE] ${trc} DISPATCH_OUTBOX_CREATED bookingId=${bookingId} techCount=${technicianIds.length}`);
+    // DispatchOutbox already created in transaction; worker will process for FCM
+    console.log(`📤 [TRACE] ${trc} DISPATCH_OUTBOX_COMMITTED bookingId=${bookingId} techCount=${technicianIds.length}`);
+    recordMetric(METRIC_KEYS.OUTBOX_CREATED, technicianIds.length);
 
     // 📍 Cursor bump for every matched technician (Socket Analysis Fix #5)
     try {

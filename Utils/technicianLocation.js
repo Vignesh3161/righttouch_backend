@@ -8,6 +8,7 @@ import { getDistrictFromCoordinates } from "../Services/districtService.js";
 import { recordLocationUpdate } from "./socketMetrics.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { emitJobExpired, emitJobsChanged } from "./sendNotification.js";
+import { STALENESS_SECONDS, checkGpsFreshness } from "./locationConfig.js";
 
 /**
  * Common logic to update technician location from HTTP or Socket.
@@ -143,6 +144,15 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
         console.error("Zone/District location resolution error:", zoneErr.message);
     }
 
+    // 🔄 GPS STALENESS CHECK — if GPS is stale, revalidate broadcasts
+    if (isOnlineNow && STALENESS_SECONDS > 0 && profile.locationUpdatedAt) {
+      const stalenessCutoff = new Date(Date.now() - STALENESS_SECONDS * 1000);
+      if (new Date(profile.locationUpdatedAt) < stalenessCutoff) {
+        console.log(`⚠️ Tech ${technicianProfileId} GPS is stale, revalidating broadcasts`);
+        await revalidateActiveBroadcasts(technicianProfileId, latitude, longitude, io);
+      }
+    }
+
     // 🔄 REVALIDATE ACTIVE BROADCASTS — if technician moved, check if they're still
     // eligible for previously broadcast jobs. Expire ones they no longer qualify for.
     if (significantMove && isOnlineNow) {
@@ -253,5 +263,103 @@ async function revalidateActiveBroadcasts(technicianProfileId, latitude, longitu
     }
   } catch (err) {
     console.error(`[REVALIDATE] Error revalidating broadcasts for tech ${technicianProfileId}:`, err.message);
+  }
+}
+
+/**
+ * Revalidate all technicians who might be affected by a service availability change.
+ * Called when a service is disabled in a district/zone.
+ */
+export async function revalidateTechniciansForService(serviceId, districtId, cityZoneId, io) {
+  try {
+    if (!serviceId || !districtId) return;
+
+    // Find all online, approved technicians with this skill in the district/zone
+    const techQuery = {
+      workStatus: "approved",
+      "availability.isOnline": true,
+      "skills.serviceId": serviceId,
+      $or: [
+        { primaryDistrictId: districtId },
+        { primaryCityId: districtId },
+        { enabledDistrictIds: districtId },
+        { allowedCityIds: districtId },
+      ],
+    };
+
+    if (cityZoneId) {
+      techQuery.enabledCityZoneIds = cityZoneId;
+    }
+
+    const technicians = await TechnicianProfile.find(techQuery)
+      .select("_id location locationUpdatedAt")
+      .lean();
+
+    if (!technicians.length) return;
+
+    console.log(`[REVALIDATE] Service ${serviceId} disabled, revalidating ${technicians.length} technicians`);
+
+    for (const tech of technicians) {
+      if (!tech.location?.coordinates) continue;
+
+      const [lng, lat] = tech.location.coordinates;
+      
+      // Find active broadcasts for this service
+      const broadcasts = await JobBroadcast.find({
+        technicianId: tech._id,
+        status: "sent",
+        expiresAt: { $gt: new Date() },
+      }).select("bookingId").lean();
+
+      if (!broadcasts.length) continue;
+
+      const bookingIds = broadcasts.map(b => b.bookingId);
+      const bookings = await ServiceBooking.find({
+        _id: { $in: bookingIds },
+        serviceId: serviceId,
+        status: { $in: ["pending", "broadcasted"] },
+        technicianId: null,
+      }).lean();
+
+      if (!bookings.length) continue;
+
+      const bookingById = new Map(bookings.map(b => [String(b._id), b]));
+      const expiredBroadcastIds = [];
+
+      for (const broadcast of broadcasts) {
+        const booking = bookingById.get(String(broadcast.bookingId));
+        if (!booking) continue;
+
+        const eligibility = await evaluateTechnicianEligibility({
+          technician: tech,
+          booking,
+          mode: "BROADCAST",
+        });
+
+        if (!eligibility.eligible) {
+          expiredBroadcastIds.push(broadcast.bookingId);
+        }
+      }
+
+      if (expiredBroadcastIds.length > 0) {
+        await JobBroadcast.updateMany(
+          { bookingId: { $in: expiredBroadcastIds }, technicianId: tech._id },
+          { $set: { status: "expired" } }
+        );
+
+        if (io) {
+          for (const bookingId of expiredBroadcastIds) {
+            emitJobExpired(io, tech._id, { 
+              bookingId, 
+              expiresAt: new Date(), 
+              reason: "service_disabled" 
+            });
+          }
+          emitJobsChanged(io, tech._id);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[REVALIDATE] Error revalidating technicians for service ${serviceId}:`, err.message);
   }
 }

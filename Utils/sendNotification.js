@@ -8,6 +8,7 @@ import User from "../Schemas/User.js";
 import DeviceToken from "../Schemas/DeviceToken.js";
 import Notification from "../Schemas/Notification.js";
 import { deactivateTokenByValue } from "./permissionService.js";
+import { getRedisClient, isRedisAvailable } from "./redisDedupe.js";
 
 /**
  * 📢 NOTIFICATION UTILITY
@@ -231,24 +232,40 @@ export const sendSocketNotification = (io, technicianId, event, data) => {
 
 /* ============================================================
    🛡 DEDUPE CACHE — closes the "double-fire" match race
+   Uses Redis for multi-instance safety with in-memory fallback
    ============================================================ */
-const recentBroadcastCache = new Map();
 const DEDUPE_WINDOW_MS = 5 * 60 * 1000;
+const IN_MEMORY_FALLBACK = new Map();
+const FALLBACK_CLEANUP_INTERVAL = 60000;
 
-const alreadySent = (broadcastId, technicianId) => {
+async function alreadySent(broadcastId, technicianId) {
   if (!broadcastId || !technicianId) return false;
-  const key = `${broadcastId}:${technicianId}`;
-  if (recentBroadcastCache.has(key)) return true;
-  recentBroadcastCache.set(key, Date.now());
+  const key = `dedupe:jobnew:${broadcastId}:${technicianId}`;
+  
+  // Try Redis first
+  if (isRedisAvailable()) {
+    try {
+      const client = await getRedisClient();
+      const result = await client.set(key, '1', { NX: true, EX: Math.ceil(DEDUPE_WINDOW_MS / 1000) });
+      return result === null; // null means key already existed
+    } catch (err) {
+      console.warn('[Dedupe] Redis error, falling back to memory:', err.message);
+    }
+  }
+  
+  // In-memory fallback
+  if (IN_MEMORY_FALLBACK.has(key)) return true;
+  IN_MEMORY_FALLBACK.set(key, Date.now());
   return false;
-};
+}
 
+// Fallback cleanup
 setInterval(() => {
   const cutoff = Date.now() - DEDUPE_WINDOW_MS;
-  for (const [key, ts] of recentBroadcastCache) {
-    if (ts < cutoff) recentBroadcastCache.delete(key);
+  for (const [key, ts] of IN_MEMORY_FALLBACK) {
+    if (ts < cutoff) IN_MEMORY_FALLBACK.delete(key);
   }
-}, 60000).unref?.();
+}, FALLBACK_CLEANUP_INTERVAL).unref?.();
 
 /**
  * Notify a single technician about a new job

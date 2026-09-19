@@ -6,11 +6,7 @@ import { haversineMeters } from "./feasibility.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
-
-const STALENESS_SECONDS = (() => {
-  const raw = Number(process.env.LOCATION_STALENESS_SECONDS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 90;
-})();
+import { STALENESS_SECONDS } from "./locationConfig.js";
 
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
