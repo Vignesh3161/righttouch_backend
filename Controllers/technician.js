@@ -6,7 +6,7 @@ import Service from "../Schemas/Service.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
-import { handleLocationUpdate } from "../Utils/technicianLocation.js";
+import { handleLocationUpdate, revalidateActiveBroadcasts } from "../Utils/technicianLocation.js";
 import { revokeSocketSession } from "../Utils/socketSessionControl.js";
 import {
   resolveZoneFromCoordinates,
@@ -1565,7 +1565,6 @@ export const updateTechnician = async (req, res) => {
       geoRemove(technicianProfileId).catch(() => {});
       
       // 🔄 Revalidate active broadcasts - technician went offline
-      const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
       await revalidateActiveBroadcasts(technicianProfileId, 
         technician.location?.coordinates?.[1] || 0, 
         technician.location?.coordinates?.[0] || 0, 
