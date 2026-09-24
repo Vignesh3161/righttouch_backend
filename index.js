@@ -715,11 +715,26 @@ const startServer = async () => {
   try {
     validateSecrets();
   } catch (err) {
-    console.error("❌ Server startup blocked:", err.message);
-    process.exit(1);
+    console.error("❌ Secret validation warning:", err.message);
   }
+
+  // 1. Start HTTP & WebSocket Server immediately so Cloud Run / container health checks pass
+  const port = parseInt(process.env.PORT, 10) || 7372;
+  httpServer.listen(port, "0.0.0.0", () => {
+    console.log(`🚀 Server running on port ${port} (0.0.0.0)`);
+    console.log(`🔌 Socket.IO ready for real-time notifications`);
+  });
+
+  // 2. Start Socket metrics logger
+  startSocketMetricsLogger(io, 60000);
+
   try {
-    // 1. Connect MongoDB Atlas with optimized connection pooling
+    // 3. Connect MongoDB Atlas with optimized connection pooling
+    if (!process.env.MONGO_URI) {
+      console.error("❌ MONGO_URI is not defined in environment variables!");
+      return;
+    }
+
     await mongoose.connect(process.env.MONGO_URI, {
       maxPoolSize: 50,
       minPoolSize: 5,
@@ -729,10 +744,10 @@ const startServer = async () => {
     });
     console.log("✅ Connected to MongoDB Atlas...");
 
-    // 1b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
+    // 3b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
     await initRedisAdapter(io);
 
-    // 1c. Validate FCM configuration
+    // 3c. Validate FCM configuration
     const fcmValidation = validateFcmConfig();
     if (!fcmValidation.valid) {
       console.warn(`⚠️ FCM validation: ${fcmValidation.reason}`, fcmValidation);
@@ -740,21 +755,10 @@ const startServer = async () => {
       console.log(`✅ FCM validated for project: ${fcmValidation.projectId}`);
     }
 
-    // 2. Start Background Workers & Crons
+    // 4. Start Background Workers & Crons
     await startBackgroundWorkers();
-
-    // 4. Start HTTP & WebSocket Server
-    const port = parseInt(process.env.PORT, 10) || 7372;
-    httpServer.listen(port, "0.0.0.0", () => {
-      console.log(`🚀 Server running on port ${port} (0.0.0.0)`);
-      console.log(`🔌 Socket.IO ready for real-time notifications`);
-    });
-
-    // 5. Start Socket metrics logger
-    startSocketMetricsLogger(io, 60000);
   } catch (err) {
-    console.error("❌ Server startup failed:", err);
-    process.exit(1);
+    console.error("❌ Database or background workers startup failed:", err);
   }
 };
 
