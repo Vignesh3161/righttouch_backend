@@ -37,6 +37,19 @@ export const resolveServiceZoneAvailability = async ({
   session,
 }) => {
   const FRIENDLY = "Service unavailable in this area. This service is currently not available at the selected address.";
+  // Strict: an address without resolvable coordinates can never pass geo gates.
+  const latNum = Number(latitude);
+  const lngNum = Number(longitude);
+  if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
+    return {
+      ok: false,
+      zoneId: null,
+      districtId: null,
+      error: FRIENDLY,
+      code: "SERVICE_NOT_AVAILABLE",
+      reason: "LOCATION_REQUIRED",
+    };
+  }
   // Joint resolution: zone lookup is scoped to the district polygon, so a
   // zone whose operationalCityId disagrees with the geo district (stale
   // parent link / zone sticking outside its district) cannot silently pass.

@@ -201,7 +201,7 @@ export const createBooking = async (req, res) => {
           success: false,
           message: zoneCheck.error,
           code: zoneCheck.code || "SERVICE_NOT_AVAILABLE",
-          result: {},
+          result: { reason: zoneCheck.reason },
         });
       }
       resolvedZoneId = zoneCheck.zoneId;
@@ -387,7 +387,12 @@ export const storeBookingSchedule = async (req, res) => {
       longitude: resolvedLocation.longitude,
     });
     if (!zoneCheck.ok) {
-      return res.status(400).json({ success: false, message: zoneCheck.error, result: {} });
+      return res.status(400).json({
+        success: false,
+        message: zoneCheck.error,
+        code: zoneCheck.code || "SERVICE_NOT_AVAILABLE",
+        result: { reason: zoneCheck.reason },
+      });
     }
 
     // ─── Build immutable financial snapshot + booking doc (server-side) ────

@@ -492,6 +492,28 @@ export const getAllServices = async (req, res) => {
         });
       }
 
+      // STRICT DEFAULT-ADDRESS RULE: an authenticated Customer with no
+      // explicit location and no usable default address sees NO services.
+      // Availability is derived from the default address only.
+      if (
+        req.user?.role === "Customer" &&
+        !hasExplicitLocation &&
+        (locationSource === "no_default_address" || locationSource === "address_lookup_failed")
+      ) {
+        return res.status(200).json({
+          success: true,
+          message: "Service unavailable in this area",
+          availabilityPrompt: "Add a default address to check service availability.",
+          locationContext: {
+            source: locationSource,
+            zoneId: null,
+            districtId: null,
+            defaultAddressId,
+          },
+          result: [],
+        });
+      }
+
       let services = await Service.find(query)
         .populate("categoryId", "category categoryType description")
         .sort({ createdAt: -1 })
