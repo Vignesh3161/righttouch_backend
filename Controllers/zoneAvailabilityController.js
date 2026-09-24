@@ -40,6 +40,12 @@ export const resolveCustomerZone = async (req, res) => {
     // and ServiceAvailability ZONE/DISTRICT overrides). Raw
     // ZoneServiceMapping-only listing would ignore DISABLED overrides.
     const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
+    const mappings = await ZoneServiceMapping.find({
+      zoneId: zone._id,
+      active: true,
+    })
+      .populate({ path: "serviceId", select: "_id serviceName serviceType isActive" })
+      .lean();
     const availableServices = [];
     for (const m of mappings) {
       if (!m.serviceId || m.serviceId.isActive === false) continue;

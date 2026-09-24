@@ -17,7 +17,7 @@
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import BookingOutbox from "../Schemas/BookingOutbox.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
-import { resolveZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
+import { resolveDistrictAndZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
 import { resolveCommissionSnapshot } from "./commission.js";
 import { paiseToRupees } from "./money.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
@@ -37,60 +37,70 @@ export const resolveServiceZoneAvailability = async ({
   session,
 }) => {
   const FRIENDLY = "Service unavailable in this area. This service is currently not available at the selected address.";
-  const resolved = await resolveZoneFromCoordinates(latitude, longitude, { session, includeInactive: true });
-  if (resolved.zone && resolved.zone.active === false) {
+  // Joint resolution: zone lookup is scoped to the district polygon, so a
+  // zone whose operationalCityId disagrees with the geo district (stale
+  // parent link / zone sticking outside its district) cannot silently pass.
+  const { district, zone } = await resolveDistrictAndZoneFromCoordinates(
+    latitude,
+    longitude,
+    { session, includeInactiveZone: true }
+  );
+  if (zone && zone.active === false) {
     return {
       ok: false,
-      zoneId: resolved.zone?._id || null,
-      districtId: resolved.zone?.operationalCityId || null,
+      zoneId: zone?._id || null,
+      districtId: district?._id || zone?.operationalCityId || null,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
+      reason: "ZONE_INACTIVE",
     };
   }
-  // FINAL RULE: no zone polygon → block (no district fallback for booking).
-  if (!resolved.zone?._id) {
-    let districtId = null;
-    if (latitude && longitude) {
-      const { resolveOperationalCityFromCoordinates } = await import("./technicianMatching.js");
-      const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
-      if (city?._id) districtId = city._id;
-    }
+  // FINAL RULE: address must resolve to BOTH District AND Zone.
+  // No zone polygon → block (no district fallback for booking).
+  if (!zone?._id || !district?._id) {
     return {
       ok: false,
-      zoneId: null,
-      districtId,
+      zoneId: zone?._id || null,
+      districtId: district?._id || null,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
+      reason: !zone?._id ? "ZONE_REQUIRED" : "DISTRICT_REQUIRED",
     };
   }
-  let districtId = resolved.zone?.operationalCityId || null;
-  if (!districtId && latitude && longitude) {
-    const { resolveOperationalCityFromCoordinates } = await import("./technicianMatching.js");
-    const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
-    if (city?._id) districtId = city._id;
+  // Parent-link guard: the resolved zone must belong to the resolved
+  // district. Without this, booking stores district A while broadcast
+  // re-resolves district B and availability/broadcast mismatches (count 0).
+  if (String(zone.operationalCityId) !== String(district._id)) {
+    return {
+      ok: false,
+      zoneId: zone?._id || null,
+      districtId: district?._id || null,
+      error: FRIENDLY,
+      code: "SERVICE_NOT_AVAILABLE",
+      reason: "ZONE_DISTRICT_MISMATCH",
+    };
   }
-  if (!districtId) {
-    return { ok: false, zoneId: resolved.zone?._id || null, districtId, error: FRIENDLY, code: "SERVICE_NOT_AVAILABLE" };
-  }
+  const districtId = district._id;
 
   const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
   const avail = await resolveServiceAvailability({
     serviceId: service?._id,
     districtId,
-    cityId: resolved.zone?._id || null,
+    cityZoneId: zone?._id || null,
   });
 
   if (!avail.available) {
     return {
       ok: false,
-      zoneId: resolved.zone?._id || null,
+      zoneId: zone?._id || null,
       districtId,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
+      reason: avail.reason,
     };
   }
 
-  return { ok: true, zoneId: resolved.zone?._id || null, districtId };
+  return { ok: true, zoneId: zone?._id || null, districtId };
 };
 
 /**

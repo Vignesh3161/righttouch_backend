@@ -14,7 +14,7 @@ import mongoose from "mongoose";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { ensureCustomer } from "../Utils/ensureCustomer.js";
-import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import { resolveDistrictAndZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import {
     SERVICE_BOOKING_STATUS,
@@ -841,14 +841,13 @@ export const checkout = async (req, res) => {
         let resolvedDistrictId = null;
         let resolvedZoneActive = null;
         if (resolvedLocation.latitude && resolvedLocation.longitude) {
-            const { zone } = await resolveZoneFromCoordinates(
+            const { district, zone } = await resolveDistrictAndZoneFromCoordinates(
                 resolvedLocation.latitude,
                 resolvedLocation.longitude,
-                { includeInactive: true }
+                { includeInactiveZone: true }
             );
             if (zone) {
                 resolvedZoneId = zone._id;
-                resolvedDistrictId = zone.operationalCityId || null;
                 resolvedZoneActive = zone.active !== false;
                 if (resolvedZoneActive === false) {
                     await session.abortTransaction();
@@ -860,14 +859,7 @@ export const checkout = async (req, res) => {
                     });
                 }
             }
-            if (!resolvedDistrictId) {
-                const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
-                const opCity = await resolveOperationalCityFromCoordinates(
-                    resolvedLocation.latitude,
-                    resolvedLocation.longitude
-                );
-                if (opCity?._id) resolvedDistrictId = opCity._id;
-            }
+            if (district?._id) resolvedDistrictId = district._id;
             // FINAL RULE: booking address must resolve to BOTH District AND Zone.
             // No zone (outside all zone polygons) → block, no district fallback.
             if (!resolvedZoneId || !resolvedDistrictId) {
@@ -877,6 +869,16 @@ export const checkout = async (req, res) => {
                     code: "SERVICE_NOT_AVAILABLE",
                     message: "Service unavailable in this area. This service is currently not available at the selected address.",
                     result: { reason: !resolvedZoneId ? "ZONE_REQUIRED" : "DISTRICT_REQUIRED" },
+                });
+            }
+            // Parent-link guard: zone must belong to the geo district.
+            if (zone && district && String(zone.operationalCityId) !== String(district._id)) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    code: "SERVICE_NOT_AVAILABLE",
+                    message: "Service unavailable in this area. This service is currently not available at the selected address.",
+                    result: { reason: "ZONE_DISTRICT_MISMATCH" },
                 });
             }
         }
@@ -1022,7 +1024,7 @@ export const checkout = async (req, res) => {
             const avail = await resolveServiceAvailability({
                 serviceId: cartItem.itemId,
                 districtId: resolvedDistrictId,
-                cityId: resolvedZoneId,
+                cityZoneId: resolvedZoneId,
             });
             if (!avail.available) {
                 await session.abortTransaction();

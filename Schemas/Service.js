@@ -213,8 +213,9 @@ const serviceSchema = new mongoose.Schema(
         type: String,
         enum: ["Polygon", "MultiPolygon"],
       },
+      // Mixed so MultiPolygon coverage survives (see CityZone fix).
       coordinates: {
-        type: [[[Number]]],
+        type: mongoose.Schema.Types.Mixed,
       },
     },
   },

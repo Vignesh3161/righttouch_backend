@@ -40,29 +40,55 @@ const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
    polygon, availability — feasibility math LAST.
  ===================================================== */
 
-// Active operational polygon — cached in memory (changes rarely), invalidated
+// District polygons — cached per district (changes rarely), invalidated
 // after a TTL so polygon edits propagate without a restart.
-let polygonCache = { geometry: null, fetchedAt: 0 };
+// NOTE: the old implementation cached a SINGLE most-recently-updated
+// district polygon and applied it to every technician/job. In a
+// multi-district deployment that filtered out all technicians not inside
+// that one district, so bookings in other districts got count 0.
+const polygonCacheByDistrict = new Map(); // districtId -> { geometry, fetchedAt }
+let activeDistrictCountCache = { count: null, fetchedAt: 0 };
 const POLYGON_CACHE_TTL_MS = 30 * 60 * 1000;
 
-export const getActiveOperationalPolygon = async () => {
-  if (
-    polygonCache.geometry &&
-    Date.now() - polygonCache.fetchedAt < POLYGON_CACHE_TTL_MS
-  ) {
-    return polygonCache.geometry;
+export const getOperationalPolygonForDistrict = async (districtId) => {
+  if (!districtId) return null;
+  const key = String(districtId);
+  const cached = polygonCacheByDistrict.get(key);
+  if (cached && Date.now() - cached.fetchedAt < POLYGON_CACHE_TTL_MS) {
+    return cached.geometry;
   }
-  const city = await OperationalCity.findOne({ active: true })
-    .sort({ updatedAt: -1 })
-    .select("polygon")
-    .lean();
-  polygonCache = { geometry: city?.polygon || null, fetchedAt: Date.now() };
-  return polygonCache.geometry;
+  const city = await OperationalCity.findById(districtId).select("polygon active").lean();
+  const geometry = city?.active !== false ? city?.polygon || null : null;
+  polygonCacheByDistrict.set(key, { geometry, fetchedAt: Date.now() });
+  return geometry;
+};
+
+export const getActiveOperationalPolygon = async (districtId = null) => {
+  // District-scoped caller: exact polygon for that district.
+  if (districtId) return getOperationalPolygonForDistrict(districtId);
+  // Legacy global caller: only safe when exactly ONE active district exists.
+  // With multiple districts there is no single polygon — return null so the
+  // caller skips polygon filtering instead of wrongly dropping technicians.
+  const now = Date.now();
+  if (activeDistrictCountCache.count == null || now - activeDistrictCountCache.fetchedAt > POLYGON_CACHE_TTL_MS) {
+    activeDistrictCountCache = {
+      count: await OperationalCity.countDocuments({ active: true }),
+      fetchedAt: now,
+    };
+  }
+  if (activeDistrictCountCache.count !== 1) return null;
+  const city = await OperationalCity.findOne({ active: true }).select("polygon").lean();
+  return city?.polygon || null;
 };
 
 /** Invalidate the in-memory polygon cache so edits propagate immediately. */
-export const invalidateOperationalPolygonCache = () => {
-  polygonCache = { geometry: null, fetchedAt: 0 };
+export const invalidateOperationalPolygonCache = (districtId = null) => {
+  if (districtId) {
+    polygonCacheByDistrict.delete(String(districtId));
+    return;
+  }
+  polygonCacheByDistrict.clear();
+  activeDistrictCountCache = { count: null, fetchedAt: 0 };
 };
 
 /**
@@ -152,9 +178,12 @@ export const filterStaleTechnicians = (techs) => {
  * $geoIntersects query). No polygon configured → everything passes (backward
  * compatible until polygons are seeded).
  */
-export const filterByOperationalPolygon = async (techIds) => {
+export const filterByOperationalPolygon = async (techIds, districtId = null) => {
   if (!techIds.length) return techIds;
-  const polygon = await getActiveOperationalPolygon();
+  // District-scoped when the caller knows the job district; global call
+  // returns null under multi-district (no filtering) instead of the wrong
+  // single-district polygon.
+  const polygon = await getActiveOperationalPolygon(districtId);
   if (!polygon) return techIds;
 
   const inside = await TechnicianProfile.find({
@@ -494,7 +523,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         const avail = await resolveServiceAvailability({
           serviceId: booking.serviceId,
           districtId: booking.districtId,
-          cityId: booking.cityZoneId,
+          cityZoneId: booking.cityZoneId,
         });
 
         if (!avail.available) {
@@ -743,9 +772,11 @@ export const findEligibleTechniciansForService = async ({
     }
     
     if (nearby.length === 0) {
-      // Fallback to MongoDB $nearSphere if Redis GEO unavailable or no results
-      const polygon = await getActiveOperationalPolygon();
-      
+      // Fallback to MongoDB $nearSphere if Redis GEO unavailable or no results.
+      // NOTE: $nearSphere and $geoIntersects on the same `location` field
+      // must NOT be combined in one query (Mongo picks one predicate and
+      // the other silently mis-filters). So: radius first, then intersect
+      // with the JOB district polygon in a second query.
       const geoQuery = {
         ...baseQuery,
         "location.type": "Point",
@@ -762,17 +793,25 @@ export const findEligibleTechniciansForService = async ({
         },
       };
 
-      // Combine polygon filter in geo query (single query with $and)
-      if (polygon) {
-        geoQuery.$and = geoQuery.$and || [];
-        geoQuery.$and.push({
-          location: { $geoIntersects: { $geometry: polygon } }
-        });
-      }
-
       const nearbyQuery = TechnicianProfile.find(geoQuery).select("_id location").limit(limit);
       if (session) nearbyQuery = nearbyQuery.session(session);
       nearby = await nearbyQuery;
+
+      // Second step: keep only techs inside the JOB district polygon
+      // (district-scoped, never the old single-global-district polygon).
+      if (nearby.length > 0 && jobDistrictId) {
+        const districtPolygon = await getOperationalPolygonForDistrict(jobDistrictId);
+        if (districtPolygon) {
+          const inside = await TechnicianProfile.find({
+            _id: { $in: nearby.map((t) => t._id) },
+            location: { $geoIntersects: { $geometry: districtPolygon } },
+          })
+            .select("_id")
+            .lean();
+          const insideSet = new Set(inside.map((t) => String(t._id)));
+          nearby = nearby.filter((t) => insideSet.has(String(t._id)));
+        }
+      }
     }
 
     if (nearby.length > 0) {
@@ -788,7 +827,6 @@ export const findEligibleTechniciansForService = async ({
       });
 
       const verifiedIds = await filterByApprovedKyc(withinRadiusTechs.map((t) => t._id));
-      // Polygon already filtered in query, skip redundant filter
       return verifiedIds;
     }
 
@@ -812,7 +850,7 @@ export const findEligibleTechniciansForService = async ({
   if (session) fallbackFindQuery = fallbackFindQuery.session(session);
   const fallbackTechs = await fallbackFindQuery;
   const verifiedFallbackIds = await filterByApprovedKyc(fallbackTechs.map((t) => t._id));
-  return filterByOperationalPolygon(verifiedFallbackIds);
+  return filterByOperationalPolygon(verifiedFallbackIds, jobDistrictId);
 };
 
 /**
@@ -909,7 +947,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     const avail = await resolveServiceAvailability({
       serviceId: booking.serviceId,
       districtId: targetDistrictId,
-      cityId: booking.cityZoneId,
+      cityZoneId: booking.cityZoneId,
     });
 
     if (!avail.available) {

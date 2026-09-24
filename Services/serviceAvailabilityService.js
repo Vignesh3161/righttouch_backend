@@ -100,9 +100,35 @@ export const resolveServiceAvailability = async ({
   // 1. ZONE-LEVEL VALIDATION & OVERRIDE CHECK (Priority 1: ZONE > DISTRICT)
   let pricingMultiplier = 1.0;
   if (zoneObjId) {
-    // 1A0. Zone itself must exist and be active — inactive zone = unavailable
-    const zoneDoc = await CityZone.findById(zoneObjId).select("active").lean();
-    if (zoneDoc && zoneDoc.active === false) {
+    // 1A0. Zone itself must exist, be active, AND belong to the district.
+    // A stale zone.operationalCityId (zone outside its district) previously
+    // passed here while broadcast re-resolved a different district → count 0.
+    const zoneDoc = await CityZone.findById(zoneObjId).select("active operationalCityId").lean();
+    if (!zoneDoc) {
+      return {
+        available: false,
+        scope: "ZONE",
+        districtId: String(districtObjId),
+        cityZoneId: String(zoneObjId),
+        cityId: String(zoneObjId),
+        pricingMultiplier: 1.0,
+        status: "DISABLED",
+        reason: "ZONE_NOT_FOUND",
+      };
+    }
+    if (String(zoneDoc.operationalCityId) !== String(districtObjId)) {
+      return {
+        available: false,
+        scope: "ZONE",
+        districtId: String(districtObjId),
+        cityZoneId: String(zoneObjId),
+        cityId: String(zoneObjId),
+        pricingMultiplier: 1.0,
+        status: "DISABLED",
+        reason: "ZONE_DISTRICT_MISMATCH",
+      };
+    }
+    if (zoneDoc.active === false) {
       return {
         available: false,
         scope: "ZONE",
