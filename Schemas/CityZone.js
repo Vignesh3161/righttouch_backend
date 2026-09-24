@@ -38,8 +38,13 @@ const cityZoneSchema = new mongoose.Schema(
         enum: ["Polygon", "MultiPolygon"],
         required: true,
       },
+      // Mixed so BOTH Polygon (3-deep) and MultiPolygon (4-deep)
+      // GeoJSON survive Mongoose casting. Validated at the
+      // controller layer by validateAndSanitizePolygon(). The old
+      // [[[Number]]] type silently stripped MultiPolygon rings so
+      // $geoIntersects never matched and bookings were blocked.
       coordinates: {
-        type: [[[Number]]],
+        type: mongoose.Schema.Types.Mixed,
         required: true,
       },
     },

@@ -29,8 +29,9 @@ const polygonVersionSchema = new mongoose.Schema(
         enum: ["Polygon", "MultiPolygon"],
         required: true,
       },
+      // Mixed so MultiPolygon history survives (see CityZone fix).
       coordinates: {
-        type: [[[Number]]],
+        type: mongoose.Schema.Types.Mixed,
         required: true,
       },
     },

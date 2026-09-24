@@ -54,8 +54,10 @@ const operationalCitySchema = new mongoose.Schema(
         enum: ["Polygon", "MultiPolygon"],
         required: true,
       },
+      // Mixed so BOTH Polygon (3-deep) and MultiPolygon (4-deep)
+      // GeoJSON survive Mongoose casting (see CityZone fix).
       coordinates: {
-        type: [[[Number]]],
+        type: mongoose.Schema.Types.Mixed,
         required: true,
       },
     },
