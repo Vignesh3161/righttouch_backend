@@ -111,6 +111,7 @@ const serviceBookingSchema = new mongoose.Schema(
     },
 
     addressSnapshot: {
+      label: { type: String, default: null },
       addressLine: String,
       city: String,
       state: String,

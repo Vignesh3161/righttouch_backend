@@ -184,13 +184,39 @@ const completePayout = async (outbox, payout) => {
       const withdrawal = await WithdrawalRequest.findById(outbox.withdrawalId).session(session);
       if (!withdrawal) throw new Error("Withdrawal not found for outbox entry");
 
+      // Idempotent: engine may have already marked paid — never double-release
+      // the reserve. Just ensure the outbox reflects completion.
+      if (withdrawal.status === "paid") {
+        outbox.status = "completed";
+        outbox.razorpayPayoutId = outbox.razorpayPayoutId || payout?.id || null;
+        outbox.payoutPayload = payout || outbox.payoutPayload;
+        outbox.completedAt = outbox.completedAt || new Date();
+        await outbox.save({ session });
+        return;
+      }
+
       const alreadyDebited = await WalletTransaction.findOne(
         { withdrawalId: withdrawal._id, type: "debit", source: "withdraw" },
         null,
         { session }
       );
 
-      const amountPaiseNum = toPaise(withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount));
+      // Align with settlePayoutSuccess: reserve moves by gross requested,
+      // lifetime + ledger move by net (after deductions).
+      const totalRequestedPaise = toPaise(
+        withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount)
+      );
+      const netPayoutAmountPaise = Math.max(
+        0,
+        toPaise(
+          withdrawal.netPayoutAmountPaise ??
+            (totalRequestedPaise -
+              toPaise(withdrawal.commissionDeductionPaise || 0) -
+              toPaise(withdrawal.penaltyDeductionPaise || 0) -
+              toPaise(withdrawal.otherDeductionsPaise || 0))
+        )
+      );
+      const amountPaiseNum = totalRequestedPaise;
 
       withdrawal.status = "paid";
       withdrawal.paidAt = new Date();
@@ -198,6 +224,10 @@ const completePayout = async (outbox, payout) => {
       withdrawal.payoutProvider = "razorpay_x";
       withdrawal.payoutReference = outbox.razorpayPayoutId || payout?.id || null;
       withdrawal.adminNote = withdrawal.adminNote || `Paid via Razorpay X reconciliation`;
+      withdrawal.requestedAmountPaise = totalRequestedPaise;
+      withdrawal.netPayoutAmountPaise = netPayoutAmountPaise;
+      withdrawal.amountPaise = netPayoutAmountPaise;
+      withdrawal.amount = paiseToRupees(netPayoutAmountPaise);
       await withdrawal.save({ session });
 
       // Legacy/edge path: if the reserve debit was never recorded
@@ -208,30 +238,35 @@ const completePayout = async (outbox, payout) => {
           { $inc: { availableBalancePaise: -amountPaiseNum } },
           { session }
         );
-        await WalletTransaction.create(
-          [
-            {
-              technicianId: withdrawal.technicianId,
-              amountPaise: amountPaiseNum,
-              amount: paiseToRupees(amountPaiseNum),
-              type: "debit",
-              source: "withdraw",
-              withdrawalId: withdrawal._id,
-              idempotencyKey: `withdrawal:${withdrawal._id}`,
-              note: `Razorpay X payout ${outbox.razorpayPayoutId} (reconciled) – withdrawal #${withdrawal._id}`,
-            },
-          ],
-          { session }
-        );
+        try {
+          await WalletTransaction.create(
+            [
+              {
+                technicianId: withdrawal.technicianId,
+                amountPaise: amountPaiseNum,
+                amount: paiseToRupees(amountPaiseNum),
+                type: "debit",
+                source: "withdraw",
+                withdrawalId: withdrawal._id,
+                idempotencyKey: `withdrawal:${withdrawal._id}`,
+                note: `Razorpay X payout ${outbox.razorpayPayoutId} (reconciled) – withdrawal #${withdrawal._id}`,
+              },
+            ],
+            { session }
+          );
+        } catch (e) {
+          if (e?.code !== 11000) throw e; // concurrent reconciler won the race
+        }
       }
 
-      // Release the reserve + record lifetime withdrawn (reserve model)
+      // Release the reserve (gross) + record lifetime withdrawn (net) —
+      // mirrors settlePayoutSuccess so both paths agree.
       await TechnicianProfile.updateOne(
         { _id: withdrawal.technicianId },
         {
           $inc: {
             reservedBalancePaise: -amountPaiseNum,
-            lifetimeWithdrawnPaise: amountPaiseNum,
+            lifetimeWithdrawnPaise: netPayoutAmountPaise,
           },
         },
         { session }
@@ -277,6 +312,38 @@ const revertPayout = async (outbox, payout, errorMsg) => {
         withdrawal.decisionNote = `Payout ${payout?.id || outbox.razorpayPayoutId} failed at Razorpay: ${errorMsg}`;
         withdrawal.failedAt = new Date();
         await withdrawal.save({ session });
+
+        // 🔓 Release the reserve back to available in the SAME txn —
+        // otherwise the technician's money stays frozen in reservedBalancePaise
+        // forever (mirrors releaseFailedWithdrawalReserve, kept inline so the
+        // status flip + reserve move stay atomic).
+        const amt = toPaise(withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount));
+        if (amt > 0) {
+          await TechnicianProfile.updateOne(
+            { _id: withdrawal.technicianId },
+            { $inc: { availableBalancePaise: amt, reservedBalancePaise: -amt } },
+            { session }
+          );
+          try {
+            await WalletTransaction.create(
+              [
+                {
+                  technicianId: withdrawal.technicianId,
+                  amountPaise: amt,
+                  amount: paiseToRupees(amt),
+                  type: "credit",
+                  source: "adjustment",
+                  withdrawalId: withdrawal._id,
+                  idempotencyKey: `withdrawal-refund:${withdrawal._id}`,
+                  note: `Refund for failed withdrawal #${withdrawal._id}: ${errorMsg}`,
+                },
+              ],
+              { session }
+            );
+          } catch (e) {
+            if (e?.code !== 11000) throw e; // replay-safe no-op
+          }
+        }
       }
 
       outbox.status = "failed";
@@ -524,8 +591,20 @@ export const reconcileDailyLedger = async () => {
   }
 
   // ── 4. Wallet balances vs wallet-transaction sums (per technician) ──
+  // amountPaise is always stored >= 0 — the sign comes from `type`.
+  // Summing absolutes flags every technician with both credits and debits,
+  // so net credits − debits here (mirrors available = net − reserved).
   const txnSums = await WalletTransaction.aggregate([
-    { $group: { _id: "$technicianId", totalPaise: { $sum: "$amountPaise" } } },
+    {
+      $group: {
+        _id: "$technicianId",
+        totalPaise: {
+          $sum: {
+            $cond: [{ $eq: ["$type", "credit"] }, "$amountPaise", { $multiply: ["$amountPaise", -1] }],
+          },
+        },
+      },
+    },
     { $limit: 500 },
   ]);
   summary.checked += txnSums.length;

@@ -186,7 +186,8 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 🏘 ZONE RESOLUTION — resolve zone from customer coordinates and check service availability.
+    // 🏘 ZONE RESOLUTION — FINAL RULE: every booking needs coordinates that
+    // resolve to District + active Zone + enabled service. No coords → block.
     let resolvedZoneId = null;
     let resolvedDistrictId = null;
     if (resolvedLocation.latitude && resolvedLocation.longitude) {
@@ -205,6 +206,13 @@ export const createBooking = async (req, res) => {
       }
       resolvedZoneId = zoneCheck.zoneId;
       resolvedDistrictId = zoneCheck.districtId;
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "Service unavailable in this area. This service is currently not available at the selected address.",
+        code: "SERVICE_NOT_AVAILABLE",
+        result: { reason: "LOCATION_REQUIRED" },
+      });
     }
 
     // 💰 SERVER-SIDE SPLIT — commission on service amount only; GST separate;

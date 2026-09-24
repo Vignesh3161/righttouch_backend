@@ -1,5 +1,4 @@
 import express from "express";
-import path from "path";
 import bodyParser from "body-parser";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
@@ -28,6 +27,7 @@ const initRedisAdapter = async (io) => {
     await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
     io.adapter(createAdapter(redisPubClient, redisSubClient));
     console.log("🔴 Redis Socket.IO adapter connected — multi-server pub/sub enabled");
+    console.warn("⚠️ Presence/rate-limit maps remain per-process: single-session kick and socket budgets are best-effort across replicas until moved to a shared store.");
   } catch (err) {
     console.warn(`⚠️ Redis adapter unavailable (${err.message}) — running single-node`);
     redisPubClient = null;
@@ -78,7 +78,6 @@ import { makePermissionRouter } from "./Routes/permissionRoutes.js";
 import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
 import notificationRoutes from "./Routes/notificationRoutes.js";
 import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
-import DevRoutes from "./Routes/dev.js";
 import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
 
 // Swagger API Documentation
@@ -87,6 +86,38 @@ import swaggerSpec from "./swagger.js";
 
 // 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
 const activeSocketByUser = new Map(); // userId -> socket.id
+// NOTE: single-session + the limiters below are per-process. The Redis adapter
+// fans out emits cross-server, but presence/buckets don't — with ≥2 replicas
+// the same user can hold one socket per replica and budgets multiply by N.
+// Full multi-server presence needs a shared store (Redis); see socketRateLimiter.
+
+// 📍 Tech-location budget shared across reconnects (module scope, NOT per-socket).
+// 1 ping / 5s == 12/min. Keyed by techProfileId so connectionStateRecovery or a
+// reconnect can't reset the budget. Swept by ONE global timer (not per-socket).
+const TECH_LOC_LIMIT = { max: 12, windowMs: 60000 };
+const techLocationBuckets = new Map(); // techProfileId -> number[] (timestamps)
+setInterval(() => {
+  const cutoff = Date.now() - TECH_LOC_LIMIT.windowMs;
+  for (const [techId, stamps] of techLocationBuckets) {
+    const kept = stamps.filter((t) => t > cutoff);
+    if (kept.length) techLocationBuckets.set(techId, kept);
+    else techLocationBuckets.delete(techId);
+  }
+}, 60000).unref?.();
+
+const checkTechLocationBudget = (techProfileId) => {
+  const now = Date.now();
+  const stamps = (techLocationBuckets.get(techProfileId) || []).filter(
+    (t) => now - t < TECH_LOC_LIMIT.windowMs
+  );
+  if (stamps.length >= TECH_LOC_LIMIT.max) {
+    recordLocationDrop();
+    return false;
+  }
+  stamps.push(now);
+  techLocationBuckets.set(techProfileId, stamps);
+  return true;
+};
 
 const App = express();
 
@@ -260,43 +291,6 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     activeSocketByUser.set(userId, socket.id);
   }
 
-  // 🛡 PER-TECH LOCATION LIMITER (Location Pipeline — Layer 2a).
-  // Promoted from the inline handler check to socket.use() so junk pings are
-  // dropped BEFORE the handler body runs (no parse/sanitize/Mongo cost).
-  // Keyed by techProfileId — survives connectionStateRecovery socket-id
-  // changes, and single-active-session makes per-socket ≈ per-tech anyway.
-  // Cadence kept at 1 per 5s (12/min) — identical to the old inline check.
-  const locLimiter = new Map();
-  const LOC_LIMIT = { max: 12, windowMs: 60000 };
-  socket.use((packet, next) => {
-    if (!Array.isArray(packet) || packet[0] !== SOCKET_EVENTS.TECH_LOCATION_UPDATE) {
-      return next();
-    }
-    if (role !== "Technician" || !techProfileId) return next(); // role gate already applied by socketAuth
-
-    const now = Date.now();
-    const stamps = (locLimiter.get(techProfileId) || []).filter((t) => now - t < LOC_LIMIT.windowMs);
-    if (stamps.length >= LOC_LIMIT.max) {
-      // Silent drop + telemetry. Do NOT next(new Error(...)) — that fires the
-      // client's error handler and can crash unguarded app builds.
-      recordLocationDrop();
-      return;
-    }
-    stamps.push(now);
-    locLimiter.set(techProfileId, stamps);
-    next();
-  });
-
-  // Periodic sweep instead of delete-on-disconnect — recovery reuses sessions.
-  setInterval(() => {
-    const cutoff = Date.now() - LOC_LIMIT.windowMs;
-    for (const [techId, stamps] of locLimiter) {
-      const kept = stamps.filter((t) => t > cutoff);
-      if (kept.length) locLimiter.set(techId, kept);
-      else locLimiter.delete(techId);
-    }
-  }, 60000).unref?.();
-
   // 🛡 RATE LIMITER for Socket Events (simple memory-based)
   const socketRateLimit = new Map();
   const checkRateLimit = (event, limit = 10, windowMs = 1000) => {
@@ -310,13 +304,16 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   };
 
   // 📍 Location Update Listener (Real-time)
+  // Budget is per-tech (module-scope) so reconnects can't reset it, and every
+  // drop is acked (the old socket.use() layer dropped silently, hanging
+  // client emit(..., ack) until timeout → retry storms).
   socket.on(SOCKET_EVENTS.TECH_LOCATION_UPDATE, async (data, ack) => {
     try {
       if (role !== "Technician" || !techProfileId) return;
 
-      // Rate limit protection - Prevent spamming DB updates
-      if (!checkRateLimit(SOCKET_EVENTS.TECH_LOCATION_UPDATE, 1, 5000)) {
-        return ack?.({ success: false, message: "Too frequent updates" });
+      // Rate limit protection - Prevent spamming DB updates (1/5s, 12/min)
+      if (!checkTechLocationBudget(techProfileId)) {
+        return ack?.({ success: false, throttled: true, retryAfterMs: 5000, message: "Too frequent updates" });
       }
 
       const { latitude, longitude } = data;
@@ -664,9 +661,7 @@ App.use("/api", userZoneRoutes);
    4. SHARED, SYSTEM & WEBHOOK ROUTES
    -------------------------------------------------------------------------- */
 App.use("/api", razorpayXWebhookRoutes);
-App.use("/api/dev", DevRoutes);
 App.use("/api/admin/dispatch", adminDispatchRoutes);
-App.use("/dev-inspector", express.static(path.join(process.cwd(), "frontend")));
 
 // 📖 Swagger API Documentation
 App.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -717,7 +712,12 @@ App.use((err, req, res, next) => {
 
 // 🚀 UNIFIED SERVER STARTUP SEQUENCE
 const startServer = async () => {
-  validateSecrets();
+  try {
+    validateSecrets();
+  } catch (err) {
+    console.error("❌ Server startup blocked:", err.message);
+    process.exit(1);
+  }
   try {
     // 1. Connect MongoDB Atlas with optimized connection pooling
     await mongoose.connect(process.env.MONGO_URI, {

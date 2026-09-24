@@ -2,28 +2,29 @@ import mongoose from "mongoose";
 import ServiceAvailability from "../Schemas/ServiceAvailability.js";
 import Service from "../Schemas/Service.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
+import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 
 /**
  * 🗺 RESOLVE SERVICE AVAILABILITY FOR CUSTOMER LOCATION
  *
- * Implements Rule:
- * 1. Check CITY-level override for matching (serviceId, districtId, cityId).
- *    - If status === "ENABLED" → AVAILABLE (scope: "CITY")
- *    - If status === "DISABLED" → UNAVAILABLE (reason: "CITY_RESTRICTION")
+ * Required RightTouch rule (strict):
+ *   Service.isActive + Zone.active + ZoneServiceMapping.active = available.
+ *   When a zone context exists, an active mapping is MANDATORY — "no mapping"
+ *   never means available. New zones are created with every service DISABLED,
+ *   admin explicitly enables required services.
+ *   A deactivated zone (active=false) returns ZONE_INACTIVE and must BLOCK
+ *   checkout/booking — callers must resolve the zone with includeInactive:true
+ *   so the inactive polygon is detected instead of falling back to district.
  *
- * 2. If no CITY override exists, check DISTRICT-level configuration (serviceId, districtId, cityId: null).
- *    - If status === "ENABLED" → AVAILABLE (scope: "DISTRICT")
- *    - If status === "DISABLED" → UNAVAILABLE (reason: "SERVICE_DISABLED")
- *
- * 3. If no explicit ServiceAvailability document exists:
- *    - Check base Service.isActive flag. If Service.isActive === true and no district availability is restricted,
- *      default to AVAILABLE (scope: "DISTRICT"). If restrictions exist, UNAVAILABLE (reason: "SERVICE_NOT_AVAILABLE").
+ * Precedence inside a zone: ZONE/CITY DISABLED override > mapping gate >
+ *   ZONE/CITY ENABLED override > DISTRICT default.
  *
  * @param {Object} params
  * @param {string|ObjectId} params.serviceId
  * @param {string|ObjectId} params.districtId
- * @param {string|ObjectId} [params.cityId=null]
+ * @param {string|ObjectId} [params.cityId=null] (legacy alias of zone)
+ * @param {string|ObjectId} [params.cityZoneId=null]
  * @returns {Promise<Object>} { available, scope, districtId, cityId, status, reason }
  */
 export const resolveServiceAvailability = async ({
@@ -43,7 +44,7 @@ export const resolveServiceAvailability = async ({
     };
   }
 
-  const service = await Service.findById(serviceId).select("isActive serviceName").lean();
+  const service = await Service.findById(serviceId).select("isActive zoneRestricted serviceName").lean();
   if (!service || !service.isActive) {
     return {
       available: false,
@@ -99,14 +100,9 @@ export const resolveServiceAvailability = async ({
   // 1. ZONE-LEVEL VALIDATION & OVERRIDE CHECK (Priority 1: ZONE > DISTRICT)
   let pricingMultiplier = 1.0;
   if (zoneObjId) {
-    // 1A. Validate ZoneServiceMapping (Service must be mapped to this zone and active)
-    const mapping = await ZoneServiceMapping.findOne({
-      zoneId: zoneObjId,
-      serviceId,
-      active: true,
-    }).lean();
-
-    if (!mapping) {
+    // 1A0. Zone itself must exist and be active — inactive zone = unavailable
+    const zoneDoc = await CityZone.findById(zoneObjId).select("active").lean();
+    if (zoneDoc && zoneDoc.active === false) {
       return {
         available: false,
         scope: "ZONE",
@@ -115,19 +111,44 @@ export const resolveServiceAvailability = async ({
         cityId: String(zoneObjId),
         pricingMultiplier: 1.0,
         status: "DISABLED",
-        reason: "ZONE_SERVICE_NOT_MAPPED",
+        reason: "ZONE_INACTIVE",
       };
     }
 
-    if (mapping.pricingMultiplier) {
-      pricingMultiplier = Number(mapping.pricingMultiplier) || 1.0;
+    // 1A. ZoneServiceMapping gate — MANDATORY when zone context exists
+    // (required architecture: no mapping = DISABLED, new zones default DISABLED).
+    // zoneRestricted flag is retained only for the customer listing pre-filter;
+    // the booking/checkout gate does not bypass on it.
+    {
+      const mapping = await ZoneServiceMapping.findOne({
+        zoneId: zoneObjId,
+        serviceId,
+        active: true,
+      }).lean();
+
+      if (!mapping) {
+        return {
+          available: false,
+          scope: "ZONE",
+          districtId: String(districtObjId),
+          cityZoneId: String(zoneObjId),
+          cityId: String(zoneObjId),
+          pricingMultiplier: 1.0,
+          status: "DISABLED",
+          reason: "ZONE_SERVICE_NOT_MAPPED",
+        };
+      }
+
+      if (mapping.pricingMultiplier) {
+        pricingMultiplier = Number(mapping.pricingMultiplier) || 1.0;
+      }
     }
 
-    // 1B. Zone-Level ServiceAvailability Override
+    // 1B. Zone-Level ServiceAvailability Override (supports legacy cityId docs).
     const zoneOverride = await ServiceAvailability.findOne({
       serviceId,
       districtId: districtObjId,
-      cityZoneId: zoneObjId,
+      $or: [{ cityZoneId: zoneObjId }, { cityId: zoneObjId }],
       scope: { $in: ["ZONE", "CITY"] },
     }).lean();
 

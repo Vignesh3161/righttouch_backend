@@ -171,13 +171,25 @@ export const listDistricts = async (req, res) => {
 
 export const createCityZone = async (req, res) => {
   try {
-    const { operationalCityId, zoneName, state, polygon } = req.body;
+    // Accept both canonical (name/zoneCode/description/active) and legacy
+    // (zoneName/state) payloads so older admin UIs keep working.
+    const { operationalCityId, districtId } = req.body;
+    const parentId = operationalCityId || districtId;
+    const zoneName = req.body.name || req.body.zoneName;
+    const zoneCode = req.body.zoneCode || req.body.code;
+    const { polygon, description, active = true } = req.body;
 
-    if (!operationalCityId || !zoneName || !polygon) {
-      return res.status(400).json({ success: false, message: "operationalCityId, zoneName, and polygon are required." });
+    if (!parentId || !zoneName || !polygon) {
+      return res.status(400).json({ success: false, message: "operationalCityId, zoneName (name), and polygon are required." });
+    }
+    if (!mongoose.Types.ObjectId.isValid(parentId)) {
+      return res.status(400).json({ success: false, message: "Invalid operationalCityId." });
+    }
+    if (!zoneCode || !String(zoneCode).trim()) {
+      return res.status(400).json({ success: false, message: "zoneCode is required (e.g. ND-NORTH-01)." });
     }
 
-    const parentDistrict = await OperationalCity.findById(operationalCityId);
+    const parentDistrict = await OperationalCity.findById(parentId);
     if (!parentDistrict) return res.status(404).json({ success: false, message: "Parent Operational District not found." });
 
     const validation = validateAndSanitizePolygon(polygon);
@@ -198,26 +210,33 @@ export const createCityZone = async (req, res) => {
     }
 
     // Overlap Detection: Verify zone polygon does not overlap existing active zones in district
-    const existingZones = await CityZone.find({ operationalCityId, active: true }).lean();
+    const existingZones = await CityZone.find({ operationalCityId: parentId, active: true }).lean();
     for (const ez of existingZones) {
       if (ez.polygon && checkZoneOverlap(validation.sanitizedPolygon, ez.polygon)) {
         return res.status(409).json({
           success: false,
           code: "ZONE_OVERLAP_DETECTED",
-          message: `Zone polygon overlaps geographically with existing active zone "${ez.name || ez.zoneName || "Zone"}" in the same district.`,
+          message: `Zone polygon overlaps geographically with existing active zone "${ez.name || "Zone"}" in the same district.`,
         });
       }
     }
 
-    const zone = await CityZone.create({
-      operationalCityId,
-      zoneName,
-      state: state || parentDistrict.state,
-      polygon: validation.sanitizedPolygon,
-      active: true,
-      createdBy: req.user._id,
-      updatedBy: req.user._id,
-    });
+    let zone;
+    try {
+      zone = await CityZone.create({
+        operationalCityId: parentId,
+        name: String(zoneName).trim(),
+        zoneCode: String(zoneCode).trim().toUpperCase(),
+        polygon: validation.sanitizedPolygon,
+        active: true,
+        description: description || null,
+      });
+    } catch (e) {
+      if (e.code === 11000) {
+        return res.status(409).json({ success: false, code: "ZONE_CODE_EXISTS", message: "Zone code already exists. Use a unique zoneCode." });
+      }
+      throw e;
+    }
 
     await PolygonVersion.create({
       entityType: "CITY_ZONE",
@@ -236,12 +255,18 @@ export const createCityZone = async (req, res) => {
 
 export const listCityZones = async (req, res) => {
   try {
-    const { districtId, search } = req.query;
+    const { districtId, operationalCityId, search } = req.query;
     const query = {};
-    if (districtId) query.operationalCityId = districtId;
-    if (search) query.zoneName = { $regex: search, $options: "i" };
+    const parentFilter = districtId || operationalCityId;
+    if (parentFilter) {
+      if (!mongoose.Types.ObjectId.isValid(parentFilter)) {
+        return res.status(400).json({ success: false, message: "Invalid districtId" });
+      }
+      query.operationalCityId = parentFilter;
+    }
+    if (search) query.name = { $regex: search, $options: "i" };
 
-    const zones = await CityZone.find(query).populate("operationalCityId", "name code state").sort({ zoneName: 1 }).lean();
+    const zones = await CityZone.find(query).populate("operationalCityId", "name code state").sort({ name: 1 }).lean();
     return res.status(200).json({ success: true, result: zones });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -447,7 +472,9 @@ export const getSpatialHierarchy = async (req, res) => {
         .filter((z) => String(z.operationalCityId) === String(d._id))
         .map((z) => ({
           zoneId: z._id,
-          zoneName: z.zoneName,
+          zoneName: z.name,
+          name: z.name,
+          zoneCode: z.zoneCode,
           active: z.active,
         })),
     }));

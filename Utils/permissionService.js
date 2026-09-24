@@ -21,7 +21,7 @@ export const PERMISSION_STATUSES = ["not_requested", "granted", "denied", "restr
 // Permission keys allowed per role. Unknown keys are rejected (section 8).
 export const ROLE_PERMISSIONS = {
   Technician: ["location", "camera", "notification"],
-  Customer: ["notification"],
+  Customer: ["location", "notification"],
 };
 
 export const ALL_PERMISSION_KEYS = ["location", "camera", "notification", "microphone"];
@@ -299,6 +299,21 @@ export const canUseTechnicianLocation = async ({ userId, deviceId, requireBackgr
     deviceId,
     permission: "location",
     requireBackground,
+  });
+};
+
+/**
+ * Feature check: can this customer use location-dependent features on the
+ * given device? (e.g., finding nearby technicians, tracking booking)
+ * Does NOT validate the location payload itself.
+ */
+export const canUseCustomerLocation = async ({ userId, deviceId }) => {
+  return isGrantedOnDevice({
+    userId,
+    role: "Customer",
+    deviceId,
+    permission: "location",
+    requireBackground: false,
   });
 };
 

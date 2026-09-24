@@ -27,7 +27,14 @@ export const createHandshakeLimiter = ({
 } = {}) => {
     return (socket, next) => {
         const now = Date.now();
-        const ip = socket.handshake.address || "unknown";
+        // Consistent with HTTP getClientIp(): prefer X-Forwarded-For when behind
+        // a proxy (Render/Nginx), else the direct socket address.
+        // NOTE: still per-process — move to Redis for true multi-server limits.
+        const xff = socket.handshake.headers?.["x-forwarded-for"];
+        const ip =
+          (typeof xff === "string" && xff.split(",")[0].trim()) ||
+          socket.handshake.address ||
+          "unknown";
 
         const timestamps = (attemptBuckets.get(ip) || []).filter(
             (t) => now - t < windowMs

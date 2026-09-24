@@ -17,7 +17,7 @@ import OperationalCity from "../Schemas/OperationalCity.js";
 export const resolveZoneFromCoordinates = async (
   latitude,
   longitude,
-  { operationalCityId, session } = {}
+  { operationalCityId, session, includeInactive = false } = {}
 ) => {
   const lat = Number(latitude);
   const lng = Number(longitude);
@@ -30,8 +30,12 @@ export const resolveZoneFromCoordinates = async (
     return { zone: null, error: "Coordinates out of range" };
   }
 
+  // Required architecture: deactivated zones must BLOCK booking.
+  // Callers that enforce checkout/listing must pass includeInactive:true so an
+  // inactive polygon is still detected (otherwise active-only lookup returns
+  // null and the resolver would fall back to district and wrongly allow).
   const query = {
-    active: true,
+    ...(includeInactive ? {} : { active: true }),
     polygon: {
       $geoIntersects: {
         $geometry: { type: "Point", coordinates: [lng, lat] },
@@ -89,7 +93,7 @@ export const resolveAllZonesFromCoordinates = async (
 export const resolveDistrictAndZoneFromCoordinates = async (
   latitude,
   longitude,
-  { session } = {}
+  { session, includeInactiveZone = false } = {}
 ) => {
   const lat = Number(latitude);
   const lng = Number(longitude);
@@ -116,17 +120,17 @@ export const resolveDistrictAndZoneFromCoordinates = async (
   const district = await distQuery;
 
   let zoneQuery = null;
+  const zoneFilter = {
+    ...(includeInactiveZone ? {} : { active: true }),
+    polygon: pointGeo,
+  };
   if (district) {
     zoneQuery = CityZone.findOne({
       operationalCityId: district._id,
-      active: true,
-      polygon: pointGeo,
+      ...zoneFilter,
     }).lean();
   } else {
-    zoneQuery = CityZone.findOne({
-      active: true,
-      polygon: pointGeo,
-    }).lean();
+    zoneQuery = CityZone.findOne(zoneFilter).lean();
   }
   if (session && zoneQuery) zoneQuery = zoneQuery.session(session);
   const zone = zoneQuery ? await zoneQuery : null;

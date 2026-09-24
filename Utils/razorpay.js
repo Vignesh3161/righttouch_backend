@@ -146,7 +146,10 @@ export const verifyRazorpaySignature = ({
     .update(`${orderId}|${paymentId}`)
     .digest("hex");
 
-  return expected === signature;
+  const a = Buffer.from(String(signature || ""), "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 };
 
 export const verifyWebhookSignature = (rawBody, signature) => {
@@ -162,5 +165,8 @@ export const verifyWebhookSignature = (rawBody, signature) => {
     .update(rawBody || "")
     .digest("hex");
 
-  return expected === signature;
+  const a = Buffer.from(String(signature || ""), "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 };

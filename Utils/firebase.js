@@ -98,14 +98,23 @@ const loadServiceAccount = () => {
     }
   }
 
-  // 5. Legacy fallback paths
+  // 5. Legacy root-level firebase-credentials.json (kept for local dev only).
+  // NOTE: serverAccount.json / serviceAccount.json fallbacks were REMOVED —
+  // that key was committed to git history and must be treated as compromised.
+  // Use env vars or config/firebase-credentials.json (git-ignored) instead.
+  for (const legacy of ["serverAccount.json", "serviceAccount.json"]) {
+    const legacyPath = path.join(__dirname, "..", legacy);
+    if (fs.existsSync(legacyPath)) {
+      console.error(
+        `❌ Compromised legacy credential file still on disk: ${legacy} — ` +
+        `it is in git history. Rotate the key in GCP, delete this file, and purge history. ` +
+        `It will NOT be loaded.`
+      );
+    }
+  }
+
   const candidates = [
-    path.join(__dirname, "..", "config", "firebase-service-account.json"),
-    path.join(__dirname, "..", "config", "serviceAccount.json"),
     path.join(__dirname, "..", "firebase-credentials.json"),
-    path.join(__dirname, "..", "serverAccount.json"),
-    path.join(__dirname, "..", "serviceAccount.json"),
-    path.join(__dirname, "..", "firebase-service-account.json"),
   ];
 
   for (const p of candidates) {

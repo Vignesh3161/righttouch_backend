@@ -835,17 +835,30 @@ export const checkout = async (req, res) => {
             });
         }
 
-        // 🏘 ZONE & DISTRICT RESOLUTION — resolve zone and district from customer coordinates for service availability check.
+        // 🏘 ZONE & DISTRICT RESOLUTION — strict: include inactive zones so a
+        // deactivated zone BLOCKS checkout instead of falling back to district.
         let resolvedZoneId = null;
         let resolvedDistrictId = null;
+        let resolvedZoneActive = null;
         if (resolvedLocation.latitude && resolvedLocation.longitude) {
             const { zone } = await resolveZoneFromCoordinates(
                 resolvedLocation.latitude,
-                resolvedLocation.longitude
+                resolvedLocation.longitude,
+                { includeInactive: true }
             );
             if (zone) {
                 resolvedZoneId = zone._id;
                 resolvedDistrictId = zone.operationalCityId || null;
+                resolvedZoneActive = zone.active !== false;
+                if (resolvedZoneActive === false) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        success: false,
+                        code: "SERVICE_NOT_AVAILABLE",
+                        message: "Services are currently unavailable in your area (zone deactivated)",
+                        result: { zoneId: zone._id, reason: "ZONE_INACTIVE" },
+                    });
+                }
             }
             if (!resolvedDistrictId) {
                 const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
@@ -854,6 +867,17 @@ export const checkout = async (req, res) => {
                     resolvedLocation.longitude
                 );
                 if (opCity?._id) resolvedDistrictId = opCity._id;
+            }
+            // FINAL RULE: booking address must resolve to BOTH District AND Zone.
+            // No zone (outside all zone polygons) → block, no district fallback.
+            if (!resolvedZoneId || !resolvedDistrictId) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    code: "SERVICE_NOT_AVAILABLE",
+                    message: "Service unavailable in this area. This service is currently not available at the selected address.",
+                    result: { reason: !resolvedZoneId ? "ZONE_REQUIRED" : "DISTRICT_REQUIRED" },
+                });
             }
         }
 
@@ -1004,9 +1028,9 @@ export const checkout = async (req, res) => {
                 await session.abortTransaction();
                 return res.status(400).json({
                     success: false,
-                    message: avail.reason || `Service "${service?.serviceName || cartItem.itemId}" is not available in your area`,
-                    code: avail.code || "SERVICE_NOT_AVAILABLE",
-                    result: {},
+                    message: "Service unavailable in this area. This service is currently not available at the selected address.",
+                    code: "SERVICE_NOT_AVAILABLE",
+                    result: { reason: avail.reason || "SERVICE_NOT_AVAILABLE" },
                 });
             }
 

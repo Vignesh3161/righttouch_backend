@@ -139,29 +139,33 @@ export const settleProductPayment = async ({
     }
   }
 
-  // Ledger entry & Receipt creation
+  // Ledger entry & Receipt creation (schema-valid, idempotent, no silent swallow)
   try {
     await PlatformLedgerEntry.create({
-      bookingId: booking._id,
-      itemType: "product",
-      entryType: "PRODUCT_SALE",
+      type: "customer_payment",
+      direction: "credit",
       amountPaise: targetPaise,
       currency: "INR",
+      bookingId: booking._id,
       paymentId: payment._id,
-      source,
-      notes: `Settlement for product booking ${booking._id}`
-    }).catch(() => {});
+      idempotencyKey: `product-settlement:${booking._id}:${payment._id}`,
+      description: `Settlement for product booking ${booking._id}`,
+      metadata: { source, itemType: "product" },
+    });
 
     await Receipt.create({
       bookingId: booking._id,
       paymentId: payment._id,
-      receiptNumber: `RCP-${Date.now()}`,
+      receiptNumber: `RCP-${booking._id}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       amountPaise: targetPaise,
       issuedAt: new Date(),
       status: "issued"
-    }).catch(() => {});
+    });
   } catch (e) {
-    console.error("Ledger/Receipt posting non-fatal error:", e);
+    // Duplicate (11000) = replay-safe no-op; anything else must be visible.
+    if (e?.code !== 11000) {
+      console.error("Ledger/Receipt posting non-fatal error:", e.message);
+    }
   }
 
   // Audit Log

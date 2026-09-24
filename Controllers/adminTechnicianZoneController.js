@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import CityZone from "../Schemas/CityZone.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
@@ -250,12 +251,17 @@ export const disableTechnicianZonePermission = async (req, res) => {
       return res.status(400).json({ success: false, message: "technicianId and zoneId(s) are required" });
     }
 
+    // Convert to ObjectIds so $pull matches the stored ObjectId array entries
+    const targetZoneObjIds = targetZoneIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
     // 1. Pull zones from enabledCityZoneIds
     await TechnicianProfile.updateOne(
       { _id: technicianId },
       {
         $pull: {
-          enabledCityZoneIds: { $in: targetZoneIds },
+          enabledCityZoneIds: { $in: targetZoneObjIds.length ? targetZoneObjIds : targetZoneIds },
         },
       }
     );

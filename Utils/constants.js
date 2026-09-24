@@ -45,7 +45,7 @@ export const LOCATION_TYPE = {
 // Address Label
 export const ADDRESS_LABEL = {
   HOME: "home",
-  OFFICE: "office",
+  WORK: "work",
   OTHER: "other",
 };
 
