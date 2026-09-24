@@ -27,11 +27,25 @@ export const getAllowedDistrictIds = (tech) => {
 };
 
 /**
- * Get allowed zone IDs for a technician
+ * Get allowed zone IDs for a technician — REQUIRED ARCHITECTURE:
+ * Registration (cityZoneId/currentCityZoneId) NEVER grants permission.
+ * Only Admin-approved enabledCityZoneIds grant job eligibility.
+ * Use getRegistrationZoneIds() for display/candidate purposes.
  */
 export const getAllowedZoneIds = (tech) => {
   if (!tech) return [];
-  return (tech.enabledCityZoneIds || []).map((z) => String(z._id || z));
+  const ids = [...(tech.enabledCityZoneIds || [])].map((z) => String(z._id || z));
+  return Array.from(new Set(ids.filter(Boolean)));
+};
+
+/** Registration/current zones (display only — not permission). */
+export const getRegistrationZoneIds = (tech) => {
+  if (!tech) return [];
+  const ids = [
+    ...(tech.cityZoneId ? [tech.cityZoneId] : []),
+    ...(tech.currentCityZoneId ? [tech.currentCityZoneId] : []),
+  ].map((z) => String(z._id || z));
+  return Array.from(new Set(ids.filter(Boolean)));
 };
 
 /**
@@ -282,6 +296,9 @@ export const evaluateTechnicianEligibility = async ({
   if (targetZoneId) {
     details.zonePermission = hasZonePermission(tech, targetZoneId);
     if (!details.zonePermission) reasons.push("ZONE_PERMISSION_DENIED");
+  } else {
+    // No zone context for this job → zone gate passes (district gate still applies)
+    details.zonePermission = true;
   }
 
   // 11. CURRENT PHYSICAL GPS ZONE MATCH

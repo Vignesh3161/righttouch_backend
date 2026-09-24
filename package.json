@@ -8,7 +8,7 @@
     "test": "node --test \"test/*.test.js\"",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "generate-postman": "node scripts/generateAllPostman.js"
+    "generate-postman": "node postman/generate_zone_wise_complete.js && node postman/generate_technician_collection.js"
   },
   "repository": {
     "type": "git",

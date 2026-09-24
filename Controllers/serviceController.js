@@ -330,6 +330,55 @@ export const getAllServices = async (req, res) => {
   try {
     const { search, categoryId, latitude, longitude, zoneId, districtId, cityId } = req.query;
 
+    // Required architecture: NO customer API change.
+    // Explicit query location (admin/testing/selected address) wins; otherwise
+    // resolve the authenticated CUSTOMER's DEFAULT address server-side.
+    // TECHNICIAN HAS NO DEFAULT ADDRESS (by design): technicians never resolve
+    // Address({ customerId, isDefault }) — their location model is
+    // registration (primaryDistrictId/cityZoneId) + live GPS
+    // (currentDistrictId/currentCityZoneId/location) + Admin-approved
+    // enabledCityZoneIds. Job eligibility is GPS + permissions, never a saved
+    // default address. So the lookup below runs for Customer context only
+    // (anonymous browse or Customer role); Technician/Admin/Owner with no
+    // explicit location fall straight through to the full-catalog browse path.
+    let effLat = latitude != null ? Number(latitude) : null;
+    let effLng = longitude != null ? Number(longitude) : null;
+    let knownZoneId = zoneId || cityId || null;
+    let resolvedDistrictId = districtId || null;
+    // Explicit caller-supplied location (selected address / map pin / admin filter).
+    // Used to distinguish "explicit location that resolved to nothing → empty"
+    // from "no location at all → browse full catalog".
+    const hasExplicitLocation =
+      latitude != null || longitude != null || Boolean(zoneId || cityId || districtId);
+    let locationSource = "query";
+    let defaultAddressId = null;
+
+    if ((!Number.isFinite(effLat) || !Number.isFinite(effLng)) && !knownZoneId && !resolvedDistrictId) {
+      // Customer-only: technicians have no default address — skip Address lookup.
+      const callerRole = req.user?.role;
+      const isCustomerContext = !callerRole || callerRole === "Customer";
+      const customerUserId = isCustomerContext ? req.user?.userId : null;
+      if (customerUserId && mongoose.Types.ObjectId.isValid(String(customerUserId))) {
+        try {
+          const { default: Address } = await import("../Schemas/Address.js");
+          const defAddr =
+            (await Address.findOne({ customerId: customerUserId, isDefault: true }).select("_id latitude longitude").lean()) ||
+            null;
+          if (defAddr && Number.isFinite(Number(defAddr.latitude)) && Number.isFinite(Number(defAddr.longitude))) {
+            effLat = Number(defAddr.latitude);
+            effLng = Number(defAddr.longitude);
+            defaultAddressId = String(defAddr._id);
+            locationSource = "default_address";
+          } else {
+            locationSource = "no_default_address";
+          }
+        } catch (e) {
+          locationSource = "address_lookup_failed";
+        }
+      }
+    }
+    const hasCoords = Number.isFinite(effLat) && Number.isFinite(effLng);
+
     let query = { isActive: true };
 
     // Category filter
@@ -352,42 +401,151 @@ export const getAllServices = async (req, res) => {
       ];
     }
 
-    // 🏘 ZONE FILTER — services that are NOT zone-restricted are always shown.
-    let zoneRestrictedIds = null;
-    let knownZoneId = zoneId || null;
-    if (!knownZoneId && latitude && longitude) {
+    // Required architecture: resolve zone/district from effective location
+    // (explicit query OR customer default address), INCLUDING inactive zones
+    // so a deactivated zone can BLOCK instead of falling back to district.
+    if (knownZoneId && !mongoose.Types.ObjectId.isValid(String(knownZoneId))) {
+      return res.status(400).json({ success: false, message: "Invalid zoneId", result: {} });
+    }
+    let zoneDocForGate = null;
+    if (!knownZoneId && hasCoords) {
       const { resolveZoneFromCoordinates } = await import("../Utils/resolveZoneFromCoordinates.js");
-      const { zone } = await resolveZoneFromCoordinates(Number(latitude), Number(longitude));
-      knownZoneId = zone?._id || null;
+      const { zone } = await resolveZoneFromCoordinates(effLat, effLng, { includeInactive: true });
+      if (zone?._id) {
+        knownZoneId = String(zone._id);
+        zoneDocForGate = zone;
+      }
+    }
+    if (knownZoneId && !zoneDocForGate) {
+      const { default: CityZone } = await import("../Schemas/CityZone.js");
+      zoneDocForGate = await CityZone.findById(knownZoneId).select("_id active operationalCityId").lean();
     }
 
-    if (knownZoneId) {
-      const { default: ZoneServiceMapping } = await import("../Schemas/ZoneServiceMapping.js");
-      const mappings = await ZoneServiceMapping.find({
-        zoneId: knownZoneId,
-        active: true,
-      })
-        .select("serviceId")
-        .lean();
-      const mappedServiceIds = mappings.map((m) => m.serviceId);
+    // Zone deactivation is STRICT: address inside inactive zone → no services.
+    if (zoneDocForGate && zoneDocForGate.active === false) {
+      return res.status(200).json({
+        success: true,
+        message: "Services are currently unavailable in this area",
+        availabilityPrompt: null,
+        locationContext: {
+          source: locationSource,
+          zoneId: String(zoneDocForGate._id),
+          zoneActive: false,
+          districtId: resolvedDistrictId || String(zoneDocForGate.operationalCityId || "") || null,
+          defaultAddressId,
+        },
+        result: [],
+      });
+    }
 
-      if (mappedServiceIds.length > 0) {
-        const restrictedServices = await Service.find({
-          isActive: true,
-          zoneRestricted: true,
-        })
-          .select("_id")
-          .lean();
-        zoneRestrictedIds = restrictedServices
-          .map((s) => s._id.toString())
-          .filter((id) => !mappedServiceIds.some((m) => m.toString() === id));
+    // INVALID ZONE: explicit zoneId that does not resolve to any zone → no services.
+    if (knownZoneId && !zoneDocForGate) {
+      return res.status(200).json({
+        success: true,
+        message: "Services are currently unavailable in this area",
+        availabilityPrompt: null,
+        locationContext: {
+          source: locationSource,
+          zoneId: String(knownZoneId),
+          districtId: resolvedDistrictId || null,
+          defaultAddressId,
+        },
+        result: [],
+      });
+    }
+
+    if (!resolvedDistrictId) {
+      if (zoneDocForGate?.operationalCityId) {
+        resolvedDistrictId = String(zoneDocForGate.operationalCityId);
+      } else if (hasCoords) {
+        const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
+        const resolvedCity = await resolveOperationalCityFromCoordinates(effLat, effLng);
+        if (resolvedCity?._id) resolvedDistrictId = String(resolvedCity._id);
       }
     }
 
-    if (zoneRestrictedIds !== null) {
-      query._id = { $nin: zoneRestrictedIds };
-    } else if (!knownZoneId && !districtId) {
-      query.zoneRestricted = { $ne: true };
+    // PRE-ADDRESS CATALOG RULE:
+    // No location context (no explicit query location + no usable CUSTOMER
+    // default address, e.g. logged-out browsing, or Technician/Admin/Owner
+    // with no explicit location — technicians have no default address by
+    // design) → show ALL active services so the caller can browse the
+    // complete catalog. Address-based filtering only applies once an
+    // address/location context exists. Booking restrictions are unchanged
+    // and still enforced at booking time. Technician job eligibility never
+    // uses this path — it is GPS (TechnicianProfile.location) +
+    // Admin-approved enabledCityZoneIds via fetchTechnicianJobsInternal.
+    if (!knownZoneId && !resolvedDistrictId) {
+      // Explicit location was supplied but resolved to nothing (outside all
+      // polygons / unsupported area) → empty, NOT the full catalog.
+      if (hasExplicitLocation) {
+        return res.status(200).json({
+          success: true,
+          message: "No services available in your area",
+          availabilityPrompt: null,
+          locationContext: {
+            source: locationSource,
+            zoneId: null,
+            districtId: null,
+            defaultAddressId,
+          },
+          result: [],
+        });
+      }
+
+      let services = await Service.find(query)
+        .populate("categoryId", "category categoryType description")
+        .sort({ createdAt: -1 })
+        .lean();
+
+      // Hide pricing fields for technicians (same as filtered path)
+      if (req.user?.role === "Technician") {
+        services = services.map(
+          ({
+            serviceCost,
+            commissionPercentage,
+            commissionAmount,
+            serviceDiscountPercentage,
+            discountAmount,
+            discountedPrice,
+            minimumVisitCharge,
+            ...service
+          }) => ({
+            ...service,
+            technicianAmount: service.technicianAmount || 0,
+          })
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Services fetched successfully",
+        availabilityPrompt: "Select an address to check exact service availability.",
+        locationContext: {
+          source: locationSource,
+          zoneId: null,
+          districtId: null,
+          defaultAddressId,
+        },
+        result: services,
+      });
+    }
+
+    // POST-ADDRESS RULE: address must resolve to BOTH valid District AND valid Zone.
+    // District-only (gap outside all zone polygons) or outside supported area
+    // → no services. No district fallback for listing.
+    if (!knownZoneId || !resolvedDistrictId) {
+      return res.status(200).json({
+        success: true,
+        message: "No services available in your area",
+        availabilityPrompt: null,
+        locationContext: {
+          source: locationSource,
+          zoneId: knownZoneId || null,
+          districtId: resolvedDistrictId || null,
+          defaultAddressId,
+        },
+        result: [],
+      });
     }
 
     const services = await Service.find(query)
@@ -395,38 +553,22 @@ export const getAllServices = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    // 🗺 DISTRICT / CITY SERVICE AVAILABILITY RESOLUTION
-    let resolvedDistrictId = districtId || null;
-    if (!resolvedDistrictId && latitude && longitude) {
-      const { resolveOperationalCityFromCoordinates } = await import("../Utils/technicianMatching.js");
-      const resolvedCity = await resolveOperationalCityFromCoordinates(Number(latitude), Number(longitude));
-      if (resolvedCity?._id) resolvedDistrictId = String(resolvedCity._id);
-    }
-
     const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
 
+    // FINAL RULE: every returned service passed
+    // isActive + district active + zone active + enabled-for-zone.
     let filteredServices = [];
     for (const s of services) {
-      if (resolvedDistrictId) {
-        const avail = await resolveServiceAvailability({
-          serviceId: s._id,
-          districtId: resolvedDistrictId,
-          cityId,
-        });
-        if (avail.available) {
-          filteredServices.push({
-            ...s,
-            availabilityMetadata: avail,
-          });
-        }
-      } else {
+      const avail = await resolveServiceAvailability({
+        serviceId: s._id,
+        districtId: resolvedDistrictId,
+        cityId: cityId || knownZoneId,
+        cityZoneId: knownZoneId || cityId,
+      });
+      if (avail.available) {
         filteredServices.push({
           ...s,
-          availabilityMetadata: {
-            available: true,
-            scope: "DEFAULT",
-            reason: "NO_ADDRESS_SELECTED",
-          },
+          availabilityMetadata: avail,
         });
       }
     }
@@ -454,6 +596,12 @@ export const getAllServices = async (req, res) => {
       success: true,
       message: "Services fetched successfully",
       availabilityPrompt: resolvedDistrictId ? null : "Select an address to check exact service availability.",
+      locationContext: {
+        source: locationSource,
+        zoneId: knownZoneId || null,
+        districtId: resolvedDistrictId || null,
+        defaultAddressId,
+      },
       result: filteredServices,
     });
 

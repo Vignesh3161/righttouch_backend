@@ -234,7 +234,9 @@ const performSettlement = async ({ booking, payment, session = null }) => {
           `reconciliation: existing job credit ${existing.amountPaise} !== expected ${row.amountPaise} for booking ${booking._id}`
         );
       }
-      if (row.source === "job") createdJob = true; // already credited — fast path below handles
+      // Row already exists → it was already credited by the winning run.
+      // Do NOT mark createdJob/createdTip here; only rows created in THIS run
+      // may credit (prevents concurrent settlers double-crediting the wallet).
       continue;
     }
     try {

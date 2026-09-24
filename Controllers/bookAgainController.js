@@ -243,7 +243,17 @@ export const rebookService = async (req, res) => {
     }
 
     const customerId = req.user.userId;
-    const { previousBookingId } = req.body;
+    // Accept the canonical field plus the ids the history endpoints actually
+    // return (grouped → lastBookingId, list → bookingId). Endpoint and success
+    // response are unchanged; this only tolerates the client's field name.
+    const rawPreviousBookingId =
+      req.body?.previousBookingId ??
+      req.body?.bookingId ??
+      req.body?.lastBookingId ??
+      req.body?.previousBooking ??
+      req.body?.id;
+    const previousBookingId =
+      typeof rawPreviousBookingId === "string" ? rawPreviousBookingId.trim() : rawPreviousBookingId;
 
     // 🔒 Input Validation
     if (!previousBookingId || !mongoose.Types.ObjectId.isValid(previousBookingId)) {
@@ -403,6 +413,20 @@ export const rebookService = async (req, res) => {
       });
     }
 
+    // 🏷 Address label — saved addresses carry their own label (home/work/
+    // other) as source of truth; for GPS/pinned locations the client may pass
+    // `addressLabel` (e.g. "home"). Invalid values are ignored, never a 400,
+    // so existing clients are unaffected. Legacy "office" is normalized to "work".
+    let rawLabel = typeof req.body?.addressLabel === "string" ? req.body.addressLabel.trim().toLowerCase() : null;
+    if (rawLabel === "office") rawLabel = "work";
+    const validLabels = new Set(["home", "work", "other", "address", "current_location"]);
+    if (rawLabel && validLabels.has(rawLabel) && !resolvedLocation.addressId) {
+      resolvedLocation.addressSnapshot = {
+        ...(resolvedLocation.addressSnapshot || {}),
+        label: rawLabel,
+      };
+    }
+
     // 🏘 ZONE AVAILABILITY — zone-restricted services need an active mapping
     const zoneCheck = await resolveServiceZoneAvailability({
       service,
@@ -417,7 +441,9 @@ export const rebookService = async (req, res) => {
     const faultProblemInput = typeof req.body?.faultProblem === "string" ? req.body.faultProblem.trim() : previousBooking.faultProblem || null;
 
     // 🆕 Build brand-new booking via the SHARED creation pipeline
-    // (immutable snapshot, server-side pricing, outbox row, canonical statuses)
+    // (immutable snapshot, server-side pricing, outbox row, canonical statuses).
+    // Pass the live discounted base so the stored booking matches the price
+    // shown in history/pricingSummary (builder defaults to serviceCost).
     const doc = await buildServiceBookingDoc({
       service,
       resolvedLocation,
@@ -426,6 +452,8 @@ export const rebookService = async (req, res) => {
       customerId,
       faultProblem: faultProblemInput,
       cityZoneId: zoneCheck.zoneId,
+      districtId: zoneCheck.districtId,
+      baseAmountOverride: latestBaseAmount,
     });
     doc.radius = radiusInput;
 
@@ -472,6 +500,7 @@ export const rebookService = async (req, res) => {
         newBooking,
         previousBookingId,
         broadcastCount: broadcastResult.count ?? 0,
+        addressLabel: newBooking?.addressSnapshot?.label ?? null,
         pricingSummary: {
           originalBaseAmount: previousBooking.baseAmount,
           newBaseAmount: latestBaseAmount,

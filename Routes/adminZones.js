@@ -10,6 +10,7 @@ import {
   createZoneServiceMappings,
   deleteZoneServiceMapping,
   toggleZoneServices,
+  listZoneTechnicianCandidates,
 } from "../Controllers/cityZoneController.js";
 
 const router = express.Router();
@@ -44,5 +45,8 @@ router.delete("/zone-mappings/:zoneId/:serviceId", Auth, deleteZoneServiceMappin
 
 // Bulk toggle all services in a zone
 router.put("/zones/:zoneId/services/toggle", Auth, toggleZoneServices);
+
+// Technician candidates inside zone polygon but not yet approved (registration ≠ approval)
+router.get("/zones/:zoneId/technician-candidates", Auth, listZoneTechnicianCandidates);
 
 export default router;

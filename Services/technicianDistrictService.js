@@ -126,22 +126,29 @@ export const isTechnicianAllowedInDistrict = async (technicianId, districtId) =>
  * Admin action: Adds an additional district permission to a technician.
  */
 export const addDistrictPermission = async ({ technicianId, districtId, adminUserId, adminRole }) => {
+  const fail = (code, message, statusCode = 400) => {
+    const err = new Error(message);
+    err.code = code;
+    err.statusCode = statusCode;
+    throw err;
+  };
+
   const profile = await TechnicianProfile.findById(technicianId);
   if (!profile || profile.workStatus === "deleted" || profile.workStatus === "suspended") {
-    throw new Error("Technician does not exist or is not active");
+    fail("TECHNICIAN_INACTIVE", "Technician does not exist or is not active");
   }
 
   const district = await OperationalCity.findById(districtId);
   if (!district || district.active === false || district.isActive === false) {
-    throw new Error("District does not exist or is inactive");
+    fail("DISTRICT_INACTIVE", "District does not exist or is inactive");
   }
 
   if (district.isJobEnabled === false) {
-    throw new Error("District job assignment is currently disabled");
+    fail("DISTRICT_JOBS_DISABLED", "District job assignment is currently disabled");
   }
 
   if (profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    throw new Error("District is already technician's primary district");
+    fail("ALREADY_PRIMARY_DISTRICT", "District is already technician's primary district");
   }
 
   const existing = await TechnicianDistrictPermission.findOne({
@@ -151,7 +158,7 @@ export const addDistrictPermission = async ({ technicianId, districtId, adminUse
 
   if (existing) {
     if (existing.isEnabled) {
-      throw new Error("District permission already granted for this technician");
+      fail("PERMISSION_ALREADY_GRANTED", "District permission already granted for this technician");
     }
     existing.isEnabled = true;
     existing.enabledBy = adminUserId;
@@ -188,27 +195,34 @@ export const addDistrictPermission = async ({ technicianId, districtId, adminUse
  * Admin action: Enables or disables an additional district permission for a technician.
  */
 export const toggleDistrictPermission = async ({ technicianId, districtId, isEnabled, adminUserId, adminRole }) => {
+  const fail = (code, message, statusCode = 400) => {
+    const err = new Error(message);
+    err.code = code;
+    err.statusCode = statusCode;
+    throw err;
+  };
+
   const profile = await TechnicianProfile.findById(technicianId);
   if (!profile) {
-    throw new Error("Technician not found");
+    fail("TECHNICIAN_NOT_FOUND", "Technician not found", 404);
   }
 
   if (profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    throw new Error("Cannot disable technician's primary district permission via additional permissions");
+    fail("PRIMARY_DISTRICT_PROTECTED", "Cannot disable technician's primary district permission via additional permissions");
   }
 
   const permission = await TechnicianDistrictPermission.findOne({ technicianId, districtId });
   if (!permission) {
-    throw new Error("District permission record not found");
+    fail("PERMISSION_NOT_FOUND", "District permission record not found for this technician and district", 404);
   }
 
   if (isEnabled) {
     const district = await OperationalCity.findById(districtId);
     if (!district || district.active === false || district.isActive === false) {
-      throw new Error("Cannot enable permission: District does not exist or is inactive");
+      fail("DISTRICT_INACTIVE", "Cannot enable permission: District does not exist or is inactive");
     }
     if (district.isJobEnabled === false) {
-      throw new Error("Cannot enable permission: District job assignment is disabled");
+      fail("DISTRICT_JOBS_DISABLED", "Cannot enable permission: District job assignment is disabled");
     }
     permission.isEnabled = true;
     permission.enabledBy = adminUserId;
@@ -238,14 +252,21 @@ export const toggleDistrictPermission = async ({ technicianId, districtId, isEna
  * Admin action: Removes an additional district permission.
  */
 export const removeDistrictPermission = async ({ technicianId, districtId, adminUserId, adminRole }) => {
+  const fail = (code, message, statusCode = 400) => {
+    const err = new Error(message);
+    err.code = code;
+    err.statusCode = statusCode;
+    throw err;
+  };
+
   const profile = await TechnicianProfile.findById(technicianId);
   if (profile && profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    throw new Error("Cannot remove primary district permission");
+    fail("PRIMARY_DISTRICT_PROTECTED", "Cannot remove primary district permission");
   }
 
   const res = await TechnicianDistrictPermission.findOneAndDelete({ technicianId, districtId });
   if (!res) {
-    throw new Error("District permission record not found");
+    fail("PERMISSION_NOT_FOUND", "District permission record not found for this technician and district — nothing to remove", 404);
   }
 
   await syncAllowedCityIds(technicianId);

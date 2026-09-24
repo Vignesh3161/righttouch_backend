@@ -12,8 +12,13 @@ const addressSchema = new mongoose.Schema(
     
     label: {
       type: String,
-      enum: ["home", "office", "other"],
+      enum: ["home", "work", "other"],
       default: "home",
+      // Backward compat: legacy clients/DB may still send "office" — normalize to "work".
+      set: (v) => {
+        if (typeof v === "string" && v.trim().toLowerCase() === "office") return "work";
+        return typeof v === "string" ? v.trim().toLowerCase() : v;
+      },
     },
 
     name: {

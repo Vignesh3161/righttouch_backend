@@ -34,6 +34,21 @@ export const validateSecrets = () => {
     }
   }
 
+  // RazorpayX payout webhooks fail closed (see razorpayXWebhookController) —
+  // require at least one of the two supported variable names.
+  if (!process.env.RAZORPAYX_WEBHOOK_SECRET && !process.env.RAZORPAY_X_WEBHOOK_SECRET) {
+    errors.push(
+      "Missing required secret/env: RAZORPAYX_WEBHOOK_SECRET (or RAZORPAY_X_WEBHOOK_SECRET)"
+    );
+  } else {
+    const xSecret = process.env.RAZORPAYX_WEBHOOK_SECRET || process.env.RAZORPAY_X_WEBHOOK_SECRET;
+    if (isPlaceholder(xSecret)) {
+      errors.push(
+        "Insecure/placeholder secret rejected: RAZORPAYX_WEBHOOK_SECRET (must be >=16 chars and not a placeholder)"
+      );
+    }
+  }
+
   // GCP service-account key should never be tracked in the repo.
   const gcpKey = process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (gcpKey && gcpKey.includes("serverAccount.json")) {
@@ -53,6 +68,11 @@ export const validateSecrets = () => {
     for (const err of errors) {
       console.error(`  - ${err}`);
     }
-    console.error("⚠️ Server will bind HTTP port to satisfy Cloud Run container health checks, but missing/placeholder secrets MUST be configured in environment variables!");
+    // Fail-closed in production: never boot with missing/placeholder secrets.
+    // Non-production keeps running so local dev still works, but loudly.
+    if (isProd) {
+      throw new Error(`Refusing to start: ${errors.length} missing/insecure secret(s). See logs above.`);
+    }
+    console.error("⚠️ Non-production: continuing with missing/placeholder secrets for local dev only.");
   }
 };

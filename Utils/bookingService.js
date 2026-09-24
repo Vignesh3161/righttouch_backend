@@ -26,7 +26,8 @@ import { normalizeBookingStatus } from "./bookingStatus.js";
 
 /**
  * Validate that a service may be booked from the given zone.
- * Zone-restricted services require an active ZoneServiceMapping.
+ * FINAL RULE: address must resolve to BOTH District AND Zone, zone must be
+ * active, service globally active, and an active ZoneServiceMapping must exist.
  * @returns {{ ok: boolean, zoneId: mongoose.Types.ObjectId|null, error?: string }}
  */
 export const resolveServiceZoneAvailability = async ({
@@ -35,12 +36,41 @@ export const resolveServiceZoneAvailability = async ({
   longitude,
   session,
 }) => {
-  const resolved = await resolveZoneFromCoordinates(latitude, longitude, { session });
+  const FRIENDLY = "Service unavailable in this area. This service is currently not available at the selected address.";
+  const resolved = await resolveZoneFromCoordinates(latitude, longitude, { session, includeInactive: true });
+  if (resolved.zone && resolved.zone.active === false) {
+    return {
+      ok: false,
+      zoneId: resolved.zone?._id || null,
+      districtId: resolved.zone?.operationalCityId || null,
+      error: FRIENDLY,
+      code: "SERVICE_NOT_AVAILABLE",
+    };
+  }
+  // FINAL RULE: no zone polygon → block (no district fallback for booking).
+  if (!resolved.zone?._id) {
+    let districtId = null;
+    if (latitude && longitude) {
+      const { resolveOperationalCityFromCoordinates } = await import("./technicianMatching.js");
+      const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
+      if (city?._id) districtId = city._id;
+    }
+    return {
+      ok: false,
+      zoneId: null,
+      districtId,
+      error: FRIENDLY,
+      code: "SERVICE_NOT_AVAILABLE",
+    };
+  }
   let districtId = resolved.zone?.operationalCityId || null;
   if (!districtId && latitude && longitude) {
     const { resolveOperationalCityFromCoordinates } = await import("./technicianMatching.js");
     const city = await resolveOperationalCityFromCoordinates(latitude, longitude);
     if (city?._id) districtId = city._id;
+  }
+  if (!districtId) {
+    return { ok: false, zoneId: resolved.zone?._id || null, districtId, error: FRIENDLY, code: "SERVICE_NOT_AVAILABLE" };
   }
 
   const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
@@ -55,8 +85,8 @@ export const resolveServiceZoneAvailability = async ({
       ok: false,
       zoneId: resolved.zone?._id || null,
       districtId,
-      error: avail.reason || `Service "${service?.serviceName}" is not available in your area`,
-      code: avail.code || "SERVICE_NOT_AVAILABLE",
+      error: FRIENDLY,
+      code: "SERVICE_NOT_AVAILABLE",
     };
   }
 
@@ -126,6 +156,9 @@ export const computeAutoCancelAt = (bookingType, scheduledAt, now = new Date()) 
  * @param {string} [args.addressId]
  * @param {string} [args.faultProblem]
  * @param {number} [args.quantity=1]   — cart quantity multiplier
+ * @param {number} [args.baseAmountOverride=null] — chargeable base (e.g. live
+ *   discounted price already resolved by the caller). Defaults to
+ *   serviceCost × quantity so existing schedule/cart callers are unaffected.
  */
 export const buildServiceBookingDoc = async ({
   service,
@@ -138,9 +171,13 @@ export const buildServiceBookingDoc = async ({
   quantity = 1,
   cityZoneId = null,
   districtId = null,
+  baseAmountOverride = null,
 }) => {
   const now = new Date();
-  const baseAmount = (service.serviceCost || 0) * quantity;
+  const baseAmount =
+    baseAmountOverride !== null && baseAmountOverride !== undefined
+      ? baseAmountOverride
+      : (service.serviceCost || 0) * quantity;
 
   const snapshot = await resolveCommissionSnapshot({
     booking: { baseAmount, itemType: "service" },

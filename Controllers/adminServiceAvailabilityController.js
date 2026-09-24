@@ -271,13 +271,28 @@ export const dispatchDiagnostics = async (req, res) => {
       return res.status(404).json({ success: false, message: "Technician profile not found" });
     }
 
+    // Build a synthetic booking when only adhoc coords/service are supplied —
+    // evaluateTechnicianEligibility requires a booking-shaped object.
+    if (!booking) {
+      if (!serviceId && (!latitude || !longitude)) {
+        return res.status(400).json({ success: false, message: "bookingId OR (serviceId + latitude/longitude) is required" });
+      }
+      const jobLat = latitude != null ? Number(latitude) : null;
+      const jobLng = longitude != null ? Number(longitude) : null;
+      booking = {
+        _id: null,
+        serviceId: serviceId || null,
+        districtId: districtId || null,
+        cityZoneId: cityId || null,
+        location: Number.isFinite(jobLat) && Number.isFinite(jobLng)
+          ? { type: "Point", coordinates: [jobLng, jobLat] }
+          : undefined,
+        technicianId: null,
+      };
+    }
+
     const eligibility = await checkTechnicianEligibility({
       technician: tech,
-      serviceId: serviceId || booking?.serviceId,
-      jobLatitude: latitude || booking?.location?.coordinates?.[1] || booking?.addressSnapshot?.latitude,
-      jobLongitude: longitude || booking?.location?.coordinates?.[0] || booking?.addressSnapshot?.longitude,
-      jobDistrictId: districtId || booking?.districtId,
-      jobCityId: cityId || booking?.cityZoneId,
       booking,
     });
 
@@ -327,12 +342,27 @@ export const getServiceZoneMatrix = async (req, res) => {
     const districts = await OperationalCity.find().lean();
     const cityZones = await CityZone.find().lean();
     const availabilities = await ServiceAvailability.find().lean();
+    const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
+    const mappings = await ZoneServiceMapping.find({ active: true }).select("zoneId serviceId").lean();
+    const mappedSet = new Set(mappings.map((m) => `${String(m.serviceId)}_${String(m.zoneId)}`));
 
     const availMap = new Map();
     availabilities.forEach((a) => {
       const key = `${a.serviceId}_${a.districtId}_${a.cityZoneId || a.cityId || "DISTRICT"}`;
       availMap.set(key, a.status);
     });
+
+    const isZoneEffectivelyEnabled = (srv, distId, zone) => {
+      const key = `${srv._id}_${distId}_${zone._id}`;
+      const distKey = `${srv._id}_${distId}_DISTRICT`;
+      // Explicit ServiceAvailability override wins first
+      const override = availMap.get(key) || availMap.get(distKey);
+      if (override) return override === "ENABLED";
+      // No override → zoneRestricted services need an active mapping; others follow isActive + zone/district flags
+      if (srv.zoneRestricted) return mappedSet.has(`${String(srv._id)}_${String(zone._id)}`);
+      if (!srv.isActive || zone.active === false) return false;
+      return true;
+    };
 
     const result = services.map((srv) => {
       let activeZonesCount = 0;
@@ -352,11 +382,9 @@ export const getServiceZoneMatrix = async (req, res) => {
 
         if (distZones.length > 0) {
           distZones.forEach((z) => {
-            const key = `${srv._id}_${distId}_${z._id}`;
-            const distKey = `${srv._id}_${distId}_DISTRICT`;
-            const zoneStat = availMap.get(key) || availMap.get(distKey) || (srv.isActive ? "ENABLED" : "DISABLED");
+            const enabled = isZoneEffectivelyEnabled(srv, distId, z);
 
-            if (zoneStat === "ENABLED") {
+            if (enabled) {
               activeZonesCount++;
               districtSet.add(distId);
             } else {
@@ -426,6 +454,9 @@ export const getServiceZoneDetail = async (req, res) => {
     const districts = await OperationalCity.find().sort({ name: 1 }).lean();
     const cityZones = await CityZone.find().sort({ name: 1 }).lean();
     const availabilities = await ServiceAvailability.find({ serviceId }).lean();
+    const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
+    const zoneMappings = await ZoneServiceMapping.find({ serviceId }).select("zoneId active").lean();
+    const mappingByZone = new Map(zoneMappings.map((m) => [String(m.zoneId), m.active]));
 
     const availMap = new Map();
     availabilities.forEach((a) => {
@@ -447,7 +478,17 @@ export const getServiceZoneDetail = async (req, res) => {
 
       const formattedZones = zonesInDistrict.map((z) => {
         const zoneKey = `${dist._id}_${z._id}`;
-        const status = availMap.get(zoneKey) || (isDistrictEnabled && z.active ? "ENABLED" : "DISABLED");
+        const override = availMap.get(zoneKey);
+        // Effective status: explicit override wins; otherwise zoneRestricted
+        // services follow the mapping, others follow district+zone active flags.
+        let status;
+        if (override) {
+          status = override;
+        } else if (service.zoneRestricted) {
+          status = mappingByZone.get(String(z._id)) === true ? "ENABLED" : "DISABLED";
+        } else {
+          status = isDistrictEnabled && z.active ? "ENABLED" : "DISABLED";
+        }
 
         if (status === "ENABLED") {
           activeZonesCount++;
@@ -461,6 +502,8 @@ export const getServiceZoneDetail = async (req, res) => {
           zoneCode: z.zoneCode,
           isDistrictActive: dist.active !== false && dist.isJobEnabled !== false,
           isZoneActive: z.active !== false,
+          isMapped: mappingByZone.has(String(z._id)),
+          isMappingActive: mappingByZone.get(String(z._id)) === true,
           status, // "ENABLED" or "DISABLED"
         };
       });
@@ -537,6 +580,24 @@ export const toggleZoneAvailability = async (req, res) => {
       { upsert: true, new: true }
     );
 
+    // Keep ZoneServiceMapping in sync for ZONE scope so both admin UIs
+    // (zone-mappings + availability matrix) reflect the same state.
+    if (!isDistrictScope) {
+      try {
+        const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
+        await ZoneServiceMapping.updateOne(
+          { zoneId: targetZoneId, serviceId },
+          {
+            $set: { active: finalStatus === "ENABLED" },
+            $setOnInsert: { zoneId: targetZoneId, serviceId, approvedBy: adminId || null, approvedAt: new Date() },
+          },
+          { upsert: true }
+        );
+      } catch (e) {
+        console.warn("ZoneServiceMapping sync warning:", e.message);
+      }
+    }
+
     await AuditLog.create({
       targetType: "ServiceAvailability",
       targetId: config._id,
@@ -604,6 +665,27 @@ export const bulkToggleZoneAvailability = async (req, res) => {
 
     if (operations.length > 0) {
       await ServiceAvailability.bulkWrite(operations);
+    }
+
+    // Sync ZoneServiceMapping rows for zone-scope entries
+    try {
+      const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
+      const zoneIds = cityZoneIds.filter((z) => z && z !== "DISTRICT" && mongoose.Types.ObjectId.isValid(z));
+      if (zoneIds.length) {
+        const mapOps = zoneIds.map((zoneId) => ({
+          updateOne: {
+            filter: { zoneId, serviceId },
+            update: {
+              $set: { active: finalStatus === "ENABLED" },
+              $setOnInsert: { zoneId, serviceId, approvedBy: adminId || null, approvedAt: new Date() },
+            },
+            upsert: true,
+          },
+        }));
+        await ZoneServiceMapping.bulkWrite(mapOps, { ordered: false });
+      }
+    } catch (e) {
+      console.warn("Bulk ZoneServiceMapping sync warning:", e.message);
     }
 
     await AuditLog.create({

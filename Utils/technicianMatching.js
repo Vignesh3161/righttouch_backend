@@ -168,9 +168,9 @@ export const filterByOperationalPolygon = async (techIds) => {
 };
 
 /**
- * Filter technicians by booking zone using unified eligibility logic.
- * CRITICAL FIX: Only allow if zone is explicitly configured.
- * Empty/non-existent enabledCityZoneIds = DENY (not allow all)
+ * Filter technicians by booking zone — REQUIRED ARCHITECTURE:
+ * only Admin-approved enabledCityZoneIds grant eligibility.
+ * Registration zone (cityZoneId) alone does NOT qualify.
  */
 export const filterByBookingZone = async (techIds, bookingId) => {
   if (!techIds.length) return techIds;
@@ -181,11 +181,12 @@ export const filterByBookingZone = async (techIds, bookingId) => {
 
   if (!booking?.cityZoneId) return techIds;
 
+  const zoneObjId = new mongoose.Types.ObjectId(booking.cityZoneId);
   const eligibleTechs = await TechnicianProfile.find({
     _id: { $in: techIds },
-    enabledCityZoneIds: booking.cityZoneId,  // FIX: Only match if zone explicitly configured
+    enabledCityZoneIds: zoneObjId,
   })
-    .select("_id primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds currentDistrictId currentCityZoneId")
+    .select("_id primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds cityZoneId currentCityZoneId currentDistrictId currentCityZoneId")
     .lean();
 
   const finalTechIds = [];

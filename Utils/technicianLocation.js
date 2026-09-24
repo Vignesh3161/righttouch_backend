@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianLocationHistory from "../Schemas/TechnicianLocationHistory.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
@@ -395,8 +396,10 @@ export async function revalidateTechniciansForService(serviceId, districtId, cit
       ],
     };
 
-    if (cityZoneId) {
-      techQuery.enabledCityZoneIds = cityZoneId;
+    if (cityZoneId && mongoose.Types.ObjectId.isValid(String(cityZoneId))) {
+      const zoneObjId = new mongoose.Types.ObjectId(String(cityZoneId));
+      // Strict: only Admin-approved enabledCityZoneIds qualify.
+      techQuery.enabledCityZoneIds = zoneObjId;
     }
 
     const technicians = await TechnicianProfile.find(techQuery)

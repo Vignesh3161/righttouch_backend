@@ -12,25 +12,35 @@ export const handleRazorpayXWebhook = async (req, res) => {
     const webhookSecret =
       process.env.RAZORPAYX_WEBHOOK_SECRET || process.env.RAZORPAY_X_WEBHOOK_SECRET;
 
+    // 🔒 Fail-closed: never process payouts without a configured secret.
     if (!webhookSecret) {
-      console.warn("⚠️ RAZORPAYX_WEBHOOK_SECRET is not configured");
-    } else {
-      const signature = req.headers["x-razorpay-signature"];
-      const rawBody = req.rawBody || JSON.stringify(req.body);
+      console.error("❌ RAZORPAYX_WEBHOOK_SECRET is not configured — rejecting webhook");
+      return res.status(500).json({ success: false, message: "Webhook secret not configured" });
+    }
 
-      if (!signature) {
-        return res.status(400).json({ success: false, message: "Missing Razorpay signature header" });
-      }
+    const signature = req.headers["x-razorpay-signature"];
+    // req.rawBody is captured by express.json({ verify }) in index.js — never
+    // fall back to re-serialized JSON (key order/whitespace changes the HMAC).
+    const rawBody = req.rawBody;
 
-      const expectedSignature = crypto
-        .createHmac("sha256", webhookSecret)
-        .update(rawBody)
-        .digest("hex");
+    if (!signature) {
+      return res.status(400).json({ success: false, message: "Missing Razorpay signature header" });
+    }
 
-      if (signature !== expectedSignature) {
-        console.error("❌ Invalid RazorpayX webhook signature");
-        return res.status(400).json({ success: false, message: "Invalid webhook signature" });
-      }
+    if (!rawBody) {
+      return res.status(400).json({ success: false, message: "Missing raw request body" });
+    }
+
+    const expectedHex = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(rawBody)
+      .digest("hex");
+
+    const sigBuf = Buffer.from(String(signature), "utf8");
+    const expBuf = Buffer.from(expectedHex, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      console.error("❌ Invalid RazorpayX webhook signature");
+      return res.status(400).json({ success: false, message: "Invalid webhook signature" });
     }
 
     const { event, payload } = req.body || {};

@@ -6,6 +6,17 @@ import technicianDistrictService from "../Services/technicianDistrictService.js"
 
 const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
 const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
+// Path params arrive as strings — a frontend null/undefined id becomes the
+// literal strings "null"/"undefined" (e.g. DELETE .../districts/null).
+// Detect those explicitly so the error tells the caller what actually
+// happened instead of a generic "Invalid ID".
+const isMissingId = (v) =>
+  v === undefined ||
+  v === null ||
+  ["", "null", "undefined"].includes(String(v).trim().toLowerCase());
+
+const idError = (res, code, message) =>
+  res.status(400).json({ success: false, code, message, result: {} });
 
 /* =====================================================
    GET TECHNICIAN DISTRICT PERMISSIONS
@@ -40,13 +51,21 @@ export const getTechnicianDistricts = async (req, res) => {
       .populate("disabledBy", "name email")
       .lean();
 
+    // Orphaned rows: permission references a district that was deleted
+    // (populated districtId === null). They must NOT be rendered as removable
+    // district chips — the UI has no districtId to send, which is exactly how
+    // DELETE .../districts/null happens. Surface them separately instead.
+    const orphanedPermissions = permissions.filter((p) => !p.districtId);
+    const activePermissions = permissions.filter((p) => p.districtId);
+
     return res.status(200).json({
       success: true,
       message: "Technician district permissions fetched",
       result: {
         technicianId,
         primaryDistrict: profile.primaryCityId || null,
-        additionalPermissions: permissions,
+        additionalPermissions: activePermissions,
+        orphanedPermissions,
         allowedDistrictIds: await technicianDistrictService.getAllowedDistrictsForTechnician(profile),
       },
     });
@@ -67,8 +86,14 @@ export const addTechnicianDistrictPermission = async (req, res) => {
     const { technicianId } = req.params;
     const { districtId } = req.body;
 
-    if (!isValidObjectId(technicianId) || !isValidObjectId(districtId)) {
-      return res.status(400).json({ success: false, message: "Invalid technician or district ID", result: {} });
+    if (!isValidObjectId(technicianId)) {
+      return idError(res, "INVALID_TECHNICIAN_ID", "Invalid technician ID");
+    }
+    if (isMissingId(districtId)) {
+      return idError(res, "MISSING_DISTRICT_ID", "districtId is required in the request body");
+    }
+    if (!isValidObjectId(districtId)) {
+      return idError(res, "INVALID_DISTRICT_ID", "Invalid district ID");
     }
 
     const result = await technicianDistrictService.addDistrictPermission({
@@ -80,7 +105,9 @@ export const addTechnicianDistrictPermission = async (req, res) => {
 
     return res.status(200).json({ success: true, message: result.message });
   } catch (err) {
-    return res.status(400).json({ success: false, message: err.message, result: {} });
+    return res
+      .status(err.statusCode || 400)
+      .json({ success: false, code: err.code || "DISTRICT_PERMISSION_ERROR", message: err.message, result: {} });
   }
 };
 
@@ -96,8 +123,18 @@ export const toggleTechnicianDistrictPermission = async (req, res) => {
     const { technicianId, districtId } = req.params;
     const { isEnabled } = req.body;
 
-    if (!isValidObjectId(technicianId) || !isValidObjectId(districtId)) {
-      return res.status(400).json({ success: false, message: "Invalid technician or district ID", result: {} });
+    if (!isValidObjectId(technicianId)) {
+      return idError(res, "INVALID_TECHNICIAN_ID", "Invalid technician ID");
+    }
+    if (isMissingId(districtId)) {
+      return idError(
+        res,
+        "MISSING_DISTRICT_ID",
+        "districtId path param is missing (got 'null'/empty). The UI likely tried to toggle the primary district or an orphaned permission whose district was deleted — refresh permissions and retry with a real district ID."
+      );
+    }
+    if (!isValidObjectId(districtId)) {
+      return idError(res, "INVALID_DISTRICT_ID", "Invalid district ID");
     }
     if (isEnabled === undefined) {
       return res.status(400).json({ success: false, message: "isEnabled boolean parameter is required", result: {} });
@@ -113,7 +150,9 @@ export const toggleTechnicianDistrictPermission = async (req, res) => {
 
     return res.status(200).json({ success: true, message: result.message });
   } catch (err) {
-    return res.status(400).json({ success: false, message: err.message, result: {} });
+    return res
+      .status(err.statusCode || 400)
+      .json({ success: false, code: err.code || "DISTRICT_PERMISSION_ERROR", message: err.message, result: {} });
   }
 };
 
@@ -128,8 +167,18 @@ export const removeTechnicianDistrictPermission = async (req, res) => {
     }
     const { technicianId, districtId } = req.params;
 
-    if (!isValidObjectId(technicianId) || !isValidObjectId(districtId)) {
-      return res.status(400).json({ success: false, message: "Invalid technician or district ID", result: {} });
+    if (!isValidObjectId(technicianId)) {
+      return idError(res, "INVALID_TECHNICIAN_ID", "Invalid technician ID");
+    }
+    if (isMissingId(districtId)) {
+      return idError(
+        res,
+        "MISSING_DISTRICT_ID",
+        "districtId path param is missing (got 'null'/empty). The UI likely tried to remove the primary district (which can never be removed this way) or an orphaned permission whose district was deleted — refresh permissions and retry with a real district ID."
+      );
+    }
+    if (!isValidObjectId(districtId)) {
+      return idError(res, "INVALID_DISTRICT_ID", "Invalid district ID");
     }
 
     const result = await technicianDistrictService.removeDistrictPermission({
@@ -141,6 +190,8 @@ export const removeTechnicianDistrictPermission = async (req, res) => {
 
     return res.status(200).json({ success: true, message: result.message });
   } catch (err) {
-    return res.status(400).json({ success: false, message: err.message, result: {} });
+    return res
+      .status(err.statusCode || 400)
+      .json({ success: false, code: err.code || "DISTRICT_PERMISSION_ERROR", message: err.message, result: {} });
   }
 };

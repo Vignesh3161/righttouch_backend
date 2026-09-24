@@ -12,6 +12,21 @@ import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
 
 const ADDRESS_CAP = 3;
 
+export const ADDRESS_LABELS = ["home", "work", "other"];
+
+/**
+ * Normalize address label: lowercase + trim.
+ * Legacy "office" is mapped to "work" for backward compatibility.
+ * Returns null for invalid values so callers can 400.
+ */
+export const normalizeAddressLabel = (raw) => {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "office") return "work";
+  return ADDRESS_LABELS.includes(v) ? v : null;
+};
+
 const AddressCounter =
   mongoose.models.AddressCounter ||
   mongoose.model(
@@ -161,9 +176,20 @@ export const createAddressInternal = async ({ customerId, label, name, phone, ad
     throw err;
   }
 
+  let finalLabel = "home";
+  if (label !== undefined && label !== null && String(label).trim() !== "") {
+    const normalized = normalizeAddressLabel(label);
+    if (!normalized) {
+      const err = new Error(`Invalid label. Allowed: ${ADDRESS_LABELS.join(", ")}`);
+      err.statusCode = 400;
+      throw err;
+    }
+    finalLabel = normalized;
+  }
+
   const address = await Address.create({
     customerId,
-    label: label || "home",
+    label: finalLabel,
     name: finalName,
     phone: finalPhone,
     addressLine: finalAddressLine,
@@ -253,7 +279,15 @@ export const updateAddressInternal = async ({ customerId, addressId, body }) => 
 
   for (const key of allowed) {
     if (body[key] !== undefined) {
-      if (key === "phone" && body[key]) {
+      if (key === "label" && body[key] !== null) {
+        const normalized = normalizeAddressLabel(body[key]);
+        if (!normalized) {
+          const err = new Error(`Invalid label. Allowed: ${ADDRESS_LABELS.join(", ")}`);
+          err.statusCode = 400;
+          throw err;
+        }
+        address[key] = normalized;
+      } else if (key === "phone" && body[key]) {
         const normalizedPhone = normalizeIndianMobile(body[key]);
         if (!normalizedPhone) {
           const err = new Error("Phone must be 10 digits (optional +91 prefix)");
