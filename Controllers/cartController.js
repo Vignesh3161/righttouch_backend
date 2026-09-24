@@ -881,6 +881,17 @@ export const checkout = async (req, res) => {
                     result: { reason: "ZONE_DISTRICT_MISMATCH" },
                 });
             }
+        } else {
+            // STRICT: booking requires a resolvable address location.
+            // Saved addresses without coordinates cannot be zone-resolved,
+            // so block instead of bypassing geo restrictions.
+            await session.abortTransaction();
+            return res.status(400).json({
+                success: false,
+                code: "SERVICE_NOT_AVAILABLE",
+                message: "Service unavailable in this area. This service is currently not available at the selected address.",
+                result: { reason: "LOCATION_REQUIRED" },
+            });
         }
 
         // Address Snapshot for both Products and Services

@@ -434,7 +434,12 @@ export const rebookService = async (req, res) => {
       longitude: resolvedLocation.longitude,
     });
     if (!zoneCheck.ok) {
-      return res.status(400).json({ success: false, message: zoneCheck.error, result: {} });
+      return res.status(400).json({
+        success: false,
+        message: zoneCheck.error,
+        code: zoneCheck.code || "SERVICE_NOT_AVAILABLE",
+        result: { reason: zoneCheck.reason },
+      });
     }
 
     const radiusInput = toFiniteNumber(req.body?.radius) ?? previousBooking.radius ?? 500;

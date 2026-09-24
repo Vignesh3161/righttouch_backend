@@ -21,7 +21,9 @@ export const resolveCustomerZone = async (req, res) => {
       });
     }
 
-    const { zone, error } = await resolveZoneFromCoordinates(lat, lng);
+    // Include inactive zones so a deactivated zone is detected and reported
+    // as unavailable instead of "no zone found".
+    const { zone, error } = await resolveZoneFromCoordinates(lat, lng, { includeInactive: true });
 
     if (error) {
       return res.status(400).json({ success: false, message: error, result: {} });
@@ -97,7 +99,18 @@ export const checkServiceAvailability = async (req, res) => {
       });
     }
 
-    const { zone } = await resolveZoneFromCoordinates(lat, lng);
+    const { zone } = await resolveZoneFromCoordinates(lat, lng, { includeInactive: true });
+
+    if (zone && zone.active === false) {
+      return res.status(200).json({
+        success: true,
+        result: {
+          available: false,
+          reason: "zone_inactive",
+          message: "Service unavailable in this area",
+        },
+      });
+    }
 
     if (!zone) {
       return res.status(200).json({
@@ -215,6 +228,16 @@ export const getServicesInMyZone = async (req, res) => {
         success: true,
         result: [],
         message: "No zone assigned",
+      });
+    }
+
+    // Deactivated zone → no services, regardless of cached mappings.
+    const assignedZone = await CityZone.findById(profile.cityZoneId).select("active").lean();
+    if (!assignedZone || assignedZone.active === false) {
+      return res.status(200).json({
+        success: true,
+        result: [],
+        message: "Service unavailable in this area",
       });
     }
 
