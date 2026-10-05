@@ -8,7 +8,7 @@ import multer from "multer";
 import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
+import { SOCKET_EVENTS, SOCKET_ROOMS } from "./shared/utils/socketConstants.js";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { createClient } from "redis";
 
@@ -19,6 +19,7 @@ dotenv.config();
 // Initialized lazily; if Redis unavailable, runs single-node with warning.
 let redisPubClient = null;
 let redisSubClient = null;
+let redisRevokeSubClient = null;
 const initRedisAdapter = async (io) => {
   const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
   try {
@@ -35,50 +36,50 @@ const initRedisAdapter = async (io) => {
   }
 };
 
-import { socketAuth } from "./Middleware/socketAuth.js";
-import { Auth, authorizeRoles } from "./Middleware/Auth.js";
-import isTechnician from "./Middleware/isTechnician.js";
-import { createHandshakeLimiter } from "./Middleware/socketRateLimiter.js";
-import { startSocketMetricsLogger, recordLocationDrop } from "./Utils/socketMetrics.js";
-import TechnicianProfile from "./Schemas/TechnicianProfile.js";
-import { setIo } from "./Utils/ioAccess.js";
+import { socketAuth } from "./shared/middleware/socketAuth.js";
+import { Auth, authorizeRoles } from "./shared/middleware/Auth.js";
+import isTechnician from "./shared/middleware/isTechnician.js";
+import { createHandshakeLimiter } from "./shared/middleware/socketRateLimiter.js";
+import { startSocketMetricsLogger, recordLocationDrop } from "./shared/utils/socketMetrics.js";
+import TechnicianProfile from "./modules/technician/models/TechnicianProfile.js";
+import { setIo } from "./shared/utils/ioAccess.js";
 
 /* ================= ROUTE IMPORTS ================= */
 // Admin Route Imports
-import adminWalletRoutes from "./Routes/adminWalletRoutes.js";
-import adminKycRoutes from "./Routes/adminKycRoutes.js";
-import adminPaymentRoutes from "./Routes/adminPaymentRoutes.js";
-import operationalCityRoutes from "./Routes/operationalCityRoutes.js";
-import adminTechnicianDistrictRoutes from "./Routes/adminTechnicianDistrictRoutes.js";
-import adminZoneRoutes from "./Routes/adminZones.js";
-import adminPermissionRoutes from "./Routes/adminPermissionRoutes.js";
-import adminProductDashboardRoutes from "./Routes/adminProductDashboardRoutes.js";
-import adminServiceAvailabilityRoutes from "./Routes/adminServiceAvailabilityRoutes.js";
-import adminSkillRequestRoutes from "./Routes/adminSkillRequestRoutes.js";
-import adminZoneGeofenceRoutes from "./Routes/adminZoneGeofenceRoutes.js";
-import adminRefundsRoutes from "./Routes/adminRefunds.js";
-import adminQuotationRoutes from "./Routes/adminQuotationRoutes.js";
+import adminWalletRoutes from "./modules/payouts/routes/adminWalletRoutes.js";
+import adminKycRoutes from "./modules/technician/routes/adminKycRoutes.js";
+import adminPaymentRoutes from "./modules/payments/routes/adminPaymentRoutes.js";
+import operationalCityRoutes from "./modules/geo/routes/operationalCityRoutes.js";
+import adminTechnicianDistrictRoutes from "./modules/geo/routes/adminTechnicianDistrictRoutes.js";
+import adminZoneRoutes from "./modules/geo/routes/adminZones.js";
+import adminPermissionRoutes from "./modules/geo/routes/adminPermissionRoutes.js";
+import adminProductDashboardRoutes from "./modules/support-system/routes/adminProductDashboardRoutes.js";
+import adminServiceAvailabilityRoutes from "./modules/geo/routes/adminServiceAvailabilityRoutes.js";
+import adminSkillRequestRoutes from "./modules/technician/routes/adminSkillRequestRoutes.js";
+import adminZoneGeofenceRoutes from "./modules/geo/routes/adminZoneGeofenceRoutes.js";
+import adminRefundsRoutes from "./modules/refunds/routes/adminRefunds.js";
+import adminQuotationRoutes from "./modules/quote-product/routes/adminQuotationRoutes.js";
 
 // Technician Route Imports
-import TechnicianRoutes from "./Routes/technician.js";
-import technicianWalletRoutes from "./Routes/technicianWalletRoutes.js";
-import technicianRefundsRoutes from "./Routes/technicianRefunds.js";
+import TechnicianRoutes from "./modules/technician/routes/technician.js";
+import technicianWalletRoutes from "./modules/payouts/routes/technicianWalletRoutes.js";
+import technicianRefundsRoutes from "./modules/refunds/routes/technicianRefunds.js";
 
 // Customer / User Route Imports
-import UserRoutes from "./Routes/User.js";
-import AddressRoutes from "./Routes/address.js";
-import customerPaymentsRoutes from "./Routes/customerPayments.js";
-import userZoneRoutes from "./Routes/userZones.js";
-import userReportsRoutes from "./Routes/userReports.js";
-import productQuoteRoutes from "./Routes/productQuoteRoutes.js";
+import UserRoutes from "./modules/identity/routes/User.js";
+import AddressRoutes from "./modules/cart-address/routes/address.js";
+import customerPaymentsRoutes from "./modules/payments/routes/customerPayments.js";
+import userZoneRoutes from "./modules/geo/routes/userZones.js";
+import userReportsRoutes from "./modules/support-system/routes/userReports.js";
+import productQuoteRoutes from "./modules/quote-product/routes/productQuoteRoutes.js";
 
 // Shared / System Route Imports
-import { adminFinanceRoutes, technicianFinanceRoutes } from "./Routes/financeRoutes.js";
-import { makePermissionRouter } from "./Routes/permissionRoutes.js";
-import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
-import notificationRoutes from "./Routes/notificationRoutes.js";
-import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
-import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
+import { adminFinanceRoutes, technicianFinanceRoutes } from "./modules/payouts/routes/financeRoutes.js";
+import { makePermissionRouter } from "./modules/geo/routes/permissionRoutes.js";
+import { makeDeviceRouter } from "./modules/notifications/routes/deviceRoutes.js";
+import notificationRoutes from "./modules/notifications/routes/notificationRoutes.js";
+import razorpayXWebhookRoutes from "./modules/payouts/routes/razorpayXWebhookRoutes.js";
+import adminDispatchRoutes from "./modules/booking/routes/adminDispatchRoutes.js";
 
 // Swagger API Documentation
 import swaggerUi from "swagger-ui-express";
@@ -396,27 +397,27 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
   });
 });
 
-import { handleLocationUpdate } from "./Utils/technicianLocation.js";
-import { fetchTechnicianJobsInternal } from "./Utils/technicianJobFetch.js";
-import { initBookingCrons } from "./Utils/bookingCron.js";
-import { initPaymentCrons } from "./Utils/paymentCrons.js";
-import { validateFcmConfig } from "./Utils/firebase.js";
-import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
-import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
-import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
-import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
-import { processQuotationDeliveries } from "./Services/quotationDeliveryService.js";
-import { expireQuotations } from "./Services/quotationService.js";
-import { startNotificationWorker, stopNotificationWorker } from "./Utils/notificationWorker.js";
+import { handleLocationUpdate } from "./modules/technician/utils/technicianLocation.js";
+import { fetchTechnicianJobsInternal } from "./modules/technician/utils/technicianJobFetch.js";
+import { initBookingCrons } from "./modules/booking/utils/bookingCron.js";
+import { initPaymentCrons } from "./modules/payments/utils/paymentCrons.js";
+import { validateFcmConfig } from "./modules/notifications/utils/firebase.js";
+import { startDispatchWorker, stopDispatchWorker } from "./modules/booking/utils/dispatchQueue.js";
+import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./modules/booking/utils/bookingOutboxWorker.js";
+import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./modules/payments/utils/attemptExpirySweeper.js";
+import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./modules/payments/utils/paymentNotificationWorker.js";
+import { processQuotationDeliveries } from "./modules/quote-product/services/quotationDeliveryService.js";
+import { expireQuotations } from "./modules/quote-product/services/quotationService.js";
+import { startNotificationWorker, stopNotificationWorker } from "./modules/notifications/utils/notificationWorker.js";
 import {
   refundWorker,
   reconcileRefunds,
   classARefundScanner,
   complaintSlaEscalation,
-} from "./Utils/refundEngine.js";
-import { releaseExpiredHolds } from "./Utils/complaintFreeze.js";
-import { getRefundPolicy } from "./Utils/refundPolicy.js";
-import { validateSecrets } from "./Utils/secretValidation.js";
+} from "./modules/refunds/utils/refundEngine.js";
+import { releaseExpiredHolds } from "./modules/refunds/utils/complaintFreeze.js";
+import { getRefundPolicy } from "./modules/refunds/utils/refundPolicy.js";
+import { validateSecrets } from "./shared/utils/secretValidation.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -548,7 +549,7 @@ App.get("/health/ready", async (req, res) => {
 });
 
 App.get("/health/fcm", async (req, res) => {
-  const { isFcmEnabled, validateFcmConfig } = await import("./Utils/firebase.js");
+  const { isFcmEnabled, validateFcmConfig } = await import("./modules/notifications/utils/firebase.js");
   const fcmEnabled = isFcmEnabled();
   const validation = fcmEnabled ? validateFcmConfig() : { valid: false, reason: "not_initialized" };
   const status = fcmEnabled && validation.valid ? 200 : 503;
@@ -562,7 +563,7 @@ App.get("/health/fcm", async (req, res) => {
 });
 
 App.get("/health/metrics", async (req, res) => {
-  const { notificationMetrics } = await import("./Utils/notificationMetrics.js");
+  const { notificationMetrics } = await import("./modules/notifications/utils/notificationMetrics.js");
   res.status(200).json(notificationMetrics.getSummary());
 });
 
@@ -715,7 +716,9 @@ const startServer = async () => {
   try {
     validateSecrets();
   } catch (err) {
-    console.error("❌ Secret validation warning:", err.message);
+    // validateSecrets() throws in production — fail closed, do not bind.
+    console.error("❌ Secret validation failed:", err.message);
+    if (process.env.NODE_ENV === "production") process.exit(1);
   }
 
   // 1. Start HTTP & WebSocket Server immediately so Cloud Run / container health checks pass
@@ -746,6 +749,26 @@ const startServer = async () => {
 
     // 3b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
     await initRedisAdapter(io);
+
+    // 3b2. P5 — session-revocation fan-out over the existing Redis client.
+    // Best-effort: single-instance/test runs without Redis keep fully
+    // deterministic local revocation (see socketSessionControl).
+    try {
+      const { warmRevokePublisher, setRevokePublisher, revokeChannelName, handleRemoteSessionRevocation } =
+        await import("./shared/utils/socketSessionControl.js");
+      await warmRevokePublisher();
+      if (redisSubClient?.isOpen) {
+        redisRevokeSubClient = redisSubClient.duplicate();
+        await redisRevokeSubClient.connect();
+        await redisRevokeSubClient.subscribe(revokeChannelName(), (message) => {
+          try {
+            handleRemoteSessionRevocation(io, JSON.parse(message));
+          } catch {}
+        });
+      }
+    } catch (err) {
+      console.warn(`⚠️ Session-revoke subscriber unavailable (${err.message}) — local revocation only`);
+    }
 
     // 3c. Validate FCM configuration
     const fcmValidation = validateFcmConfig();
@@ -790,6 +813,7 @@ const shutdown = async (signal) => {
     // Close Redis adapter clients
     if (redisPubClient?.isOpen) await redisPubClient.quit();
     if (redisSubClient?.isOpen) await redisSubClient.quit();
+    if (redisRevokeSubClient?.isOpen) await redisRevokeSubClient.quit();
   } catch (err) {
     console.error("Shutdown error:", err.message);
   }

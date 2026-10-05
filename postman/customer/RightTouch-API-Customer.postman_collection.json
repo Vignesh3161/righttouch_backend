@@ -1,0 +1,6056 @@
+{
+  "info": {
+    "name": "RightTouch API - Customer & User Application",
+    "description": "Complete Customer suite covering GPS Zone Resolution, Serviceability, Bookings, Cart, Payments, Addresses, and Quotations.\n\n[Synchronized & Validated: 2026-09-16T12:11:30.660Z]",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:7372",
+      "type": "string"
+    },
+    {
+      "key": "adminToken",
+      "value": "YOUR_ADMIN_OR_OWNER_JWT_TOKEN",
+      "type": "string"
+    },
+    {
+      "key": "technicianToken",
+      "value": "YOUR_TECHNICIAN_JWT_TOKEN",
+      "type": "string"
+    },
+    {
+      "key": "customerToken",
+      "value": "YOUR_CUSTOMER_JWT_TOKEN",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "YOUR_FALLBACK_JWT_TOKEN",
+      "type": "string"
+    },
+    {
+      "key": "serviceId",
+      "value": "66d8f1e2a59c62121432a104",
+      "type": "string"
+    },
+    {
+      "key": "districtId",
+      "value": "6a9922f0c98ce3395c7abe62",
+      "type": "string"
+    },
+    {
+      "key": "cityZoneId",
+      "value": "66d8f1e2a59c62121432a103",
+      "type": "string"
+    },
+    {
+      "key": "technicianId",
+      "value": "6aa527501f8f19a97e995365",
+      "type": "string"
+    },
+    {
+      "key": "bookingId",
+      "value": "66d8f1e2a59c62121432a106",
+      "type": "string"
+    },
+    {
+      "key": "id",
+      "value": "66d8f1e2a59c62121432a101",
+      "type": "string"
+    },
+    {
+      "key": "addressId",
+      "value": "66d8f1e2a59c62121432a108",
+      "type": "string"
+    },
+    {
+      "key": "categoryId",
+      "value": "66d8f1e2a59c62121432a109",
+      "type": "string"
+    },
+    {
+      "key": "quoteRequestId",
+      "value": "66d8f1e2a59c62121432a110",
+      "type": "string"
+    },
+    {
+      "key": "withdrawalId",
+      "value": "66d8f1e2a59c62121432a111",
+      "type": "string"
+    },
+    {
+      "key": "availabilityId",
+      "value": "REPLACE_WITH_AVAILABILITY_ID",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Customer Services & Bookings (/api/user)",
+      "item": [
+        {
+          "name": "POST /api/user/auth/login/request-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/login/request-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "login",
+                "request-otp"
+              ]
+            },
+            "description": "Handler: requestLoginOtp\nPath: /api/user/auth/login/request-otp\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobileNumber\": \"9876543210\",\n  \"role\": \"Customer\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/auth/login/verify-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/login/verify-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "login",
+                "verify-otp"
+              ]
+            },
+            "description": "Handler: verifyLoginOtp\nPath: /api/user/auth/login/verify-otp\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobileNumber\": \"9876543210\",\n  \"otp\": \"123456\",\n  \"role\": \"Customer\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/auth/accept-terms",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/accept-terms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "accept-terms"
+              ]
+            },
+            "description": "Handler: acceptTerms\nPath: /api/user/auth/accept-terms\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"version\": \"1.0\",\n  \"accepted\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/delete-my-account",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/delete-my-account",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "delete-my-account"
+              ]
+            },
+            "description": "Handler: deleteMyAccount\nPath: /api/user/delete-my-account\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/signup",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/signup",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "signup"
+              ]
+            },
+            "description": "Handler: signupAndSendOtp\nPath: /api/user/signup\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fname\": \"John\",\n  \"lname\": \"Doe\",\n  \"mobileNumber\": \"9876543210\",\n  \"email\": \"john@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/resend-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/resend-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "resend-otp"
+              ]
+            },
+            "description": "Handler: resendOtp\nPath: /api/user/resend-otp\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobileNumber\": \"9876543210\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/verify-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/verify-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "verify-otp"
+              ]
+            },
+            "description": "Handler: verifyOtp\nPath: /api/user/verify-otp\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobileNumber\": \"9876543210\",\n  \"otp\": \"123456\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/set-password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/set-password",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "set-password"
+              ]
+            },
+            "description": "Handler: setPassword\nPath: /api/user/set-password\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"password\": \"Password@123\",\n  \"confirmPassword\": \"Password@123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "login"
+              ]
+            },
+            "description": "Handler: login\nPath: /api/user/login\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@righttouch.com\",\n  \"password\": \"Password@123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/signup/customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/signup/customer",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "signup",
+                "customer"
+              ]
+            },
+            "description": "Handler: next\nPath: /api/user/signup/customer\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fname\": \"John\",\n  \"lname\": \"Doe\",\n  \"mobileNumber\": \"9876543210\",\n  \"email\": \"john@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/signup/customer/verify-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/signup/customer/verify-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "signup",
+                "customer",
+                "verify-otp"
+              ]
+            },
+            "description": "Handler: verifyOtp\nPath: /api/user/signup/customer/verify-otp\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fname\": \"John\",\n  \"lname\": \"Doe\",\n  \"mobileNumber\": \"9876543210\",\n  \"email\": \"john@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/login/customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/login/customer",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "login",
+                "customer"
+              ]
+            },
+            "description": "Handler: next\nPath: /api/user/login/customer\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@righttouch.com\",\n  \"password\": \"Password@123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/login/customer/verify-otp",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/login/customer/verify-otp",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "login",
+                "customer",
+                "verify-otp"
+              ]
+            },
+            "description": "Handler: verifyOtp\nPath: /api/user/login/customer/verify-otp\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@righttouch.com\",\n  \"password\": \"Password@123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/debug/check-user/{{identifier}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/debug/check-user/{{identifier}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "debug",
+                "check-user",
+                "{{identifier}}"
+              ]
+            },
+            "description": "Handler: checkUserByIdentifier\nPath: /api/user/debug/check-user/:identifier\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/me",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "me"
+              ]
+            },
+            "description": "Handler: getMyProfile\nPath: /api/user/me\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/complete-profile",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/complete-profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "complete-profile"
+              ]
+            },
+            "description": "Handler: completeProfile\nPath: /api/user/complete-profile\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/me",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "me"
+              ]
+            },
+            "description": "Handler: updateMyProfile\nPath: /api/user/me\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/users/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/users/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "users",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteUserById\nPath: /api/user/users/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/category",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/category",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "category"
+              ]
+            },
+            "description": "Handler: serviceCategory\nPath: /api/user/category\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/category/upload-image",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/category/upload-image",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "category",
+                "upload-image"
+              ]
+            },
+            "description": "Handler: uploadCategoryImage\nPath: /api/user/category/upload-image\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/category/remove-image",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/category/remove-image",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "category",
+                "remove-image"
+              ]
+            },
+            "description": "Handler: removeCategoryImage\nPath: /api/user/category/remove-image\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getAllcategory",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllcategory",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllcategory"
+              ]
+            },
+            "description": "Handler: getAllCategory\nPath: /api/user/getAllcategory\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getByIdcategory/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getByIdcategory/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getByIdcategory",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getByIdCategory\nPath: /api/user/getByIdcategory/:id\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/updatecategory/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/updatecategory/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "updatecategory",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateCategory\nPath: /api/user/updatecategory/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/deletecategory/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/deletecategory/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "deletecategory",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteCategory\nPath: /api/user/deletecategory/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/report",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "report"
+              ]
+            },
+            "description": "Handler: userReport\nPath: /api/user/report\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getAllReports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllReports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllReports"
+              ]
+            },
+            "description": "Handler: getAllReports\nPath: /api/user/getAllReports\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/get-my-reports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/get-my-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "get-my-reports"
+              ]
+            },
+            "description": "Handler: getMyReports\nPath: /api/user/get-my-reports\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getReportById/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getReportById/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getReportById",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getReportById\nPath: /api/user/getReportById/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/report/resolve/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/report/resolve/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "report",
+                "resolve",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: resolveReport\nPath: /api/user/report/resolve/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/service",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service"
+              ]
+            },
+            "description": "Handler: createService\nPath: /api/user/service\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/services/upload-images",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/services/upload-images",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "services",
+                "upload-images"
+              ]
+            },
+            "description": "Handler: uploadServiceImages\nPath: /api/user/services/upload-images\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/services/remove-image",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/services/remove-image",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "services",
+                "remove-image"
+              ]
+            },
+            "description": "Handler: removeServiceImage\nPath: /api/user/services/remove-image\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/services/replace-images",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/services/replace-images",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "services",
+                "replace-images"
+              ]
+            },
+            "description": "Handler: replaceServiceImages\nPath: /api/user/services/replace-images\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getAllServices",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ]
+            },
+            "description": "GET /api/user/getAllServices \u2014 CUSTOMER SERVICE CATALOG (auth optional). PRE-ADDRESS (no ?latitude/?longitude/?zoneId/?districtId + no usable customer default address, incl. logged-out and Technician \u2014 technicians have NO default address): returns ALL active services + availabilityPrompt. POST-ADDRESS (explicit location params or customer default address): zone-filtered, District + Zone both required. Explicit point outside all polygons => [] \"No services available in your area\". Inactive/invalid zone => [] \"Services are currently unavailable in this area\". Supports ?search & ?categoryId. Technician tokens get pricing hidden. Booking gates unchanged."
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getServiceById/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getServiceById/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getServiceById",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getServiceById\nPath: /api/user/getServiceById/:id\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/updateService/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/updateService/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "updateService",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateService\nPath: /api/user/updateService/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/service/{{id}}/zone-restriction",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/{{id}}/zone-restriction",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "{{id}}",
+                "zone-restriction"
+              ]
+            },
+            "description": "Handler: toggleZoneRestriction\nPath: /api/user/service/:id/zone-restriction\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"zoneRestricted\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/services/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/services/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "services",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteService\nPath: /api/user/services/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/service/{{id}}/polygon",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/{{id}}/polygon",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "{{id}}",
+                "polygon"
+              ]
+            },
+            "description": "Handler: getServicePolygon\nPath: /api/user/service/:id/polygon\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/service/{{id}}/polygon",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/{{id}}/polygon",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "{{id}}",
+                "polygon"
+              ]
+            },
+            "description": "Handler: setServicePolygon\nPath: /api/user/service/:id/polygon\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/service/{{id}}/polygon",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/{{id}}/polygon",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "{{id}}",
+                "polygon"
+              ]
+            },
+            "description": "Handler: removeServicePolygon\nPath: /api/user/service/:id/polygon\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/service/booking",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/booking",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "booking"
+              ]
+            },
+            "description": "Handler: getBookings\nPath: /api/user/service/booking\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/slots",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/slots",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "slots"
+              ]
+            },
+            "description": "Handler: getBookingSchedule\nPath: /api/user/booking/slots\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/booking/schedule",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/schedule",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "schedule"
+              ]
+            },
+            "description": "Handler: storeBookingSchedule\nPath: /api/user/booking/schedule\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558,\n  \"bookingType\": \"instant\",\n  \"addressId\": \"{{addressId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/booking/cancel/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/cancel/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "cancel",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: cancelBooking\nPath: /api/user/booking/cancel/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/reasons",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/reasons",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "reasons"
+              ]
+            },
+            "description": "Handler: getCancellationReasons\nPath: /api/user/booking/reasons\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/getCustomerBookings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/getCustomerBookings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "getCustomerBookings"
+              ]
+            },
+            "description": "Handler: getCustomerBookings\nPath: /api/user/booking/getCustomerBookings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/booking/deleteAll",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/deleteAll",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "deleteAll"
+              ]
+            },
+            "description": "Handler: deleteAllCustomerBookings\nPath: /api/user/booking/deleteAll\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/booking/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteServiceBooking\nPath: /api/user/booking/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/completed-services",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/completed-services?active=true&latitude=11.1085&longitude=77.3411",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "completed-services"
+              ],
+              "query": [
+                {
+                  "key": "active",
+                  "value": "true",
+                  "description": "Filter active items"
+                },
+                {
+                  "key": "latitude",
+                  "value": "11.1085",
+                  "description": "WGS84 Latitude"
+                },
+                {
+                  "key": "longitude",
+                  "value": "77.3411",
+                  "description": "WGS84 Longitude"
+                }
+              ]
+            },
+            "description": "Handler: getCompletedServices\nPath: /api/user/booking/completed-services\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/booking/book-again",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/book-again",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "book-again"
+              ]
+            },
+            "description": "Handler: rebookService\nPath: /api/user/booking/book-again\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/getAllBookings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/getAllBookings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "getAllBookings"
+              ]
+            },
+            "description": "Handler: getOwnerAllBookings\nPath: /api/user/booking/getAllBookings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/booking/getBookingById/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/getBookingById/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "getBookingById",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getOwnerBookingById\nPath: /api/user/booking/getBookingById/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/rating",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/rating",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "rating"
+              ]
+            },
+            "description": "Handler: userRating\nPath: /api/user/rating\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getAllRatings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllRatings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllRatings"
+              ]
+            },
+            "description": "Handler: getAllRatings\nPath: /api/user/getAllRatings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/ratings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/ratings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "ratings"
+              ]
+            },
+            "description": "Handler: getMyRatings\nPath: /api/user/ratings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/ratings/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/ratings/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "ratings",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getRatingById\nPath: /api/user/ratings/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getRatingById/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getRatingById/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getRatingById",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getRatingById\nPath: /api/user/getRatingById/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/updateRating/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/updateRating/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "updateRating",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateRatingController\nPath: /api/user/updateRating/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/deleteRating/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/deleteRating/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "deleteRating",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteRatingController\nPath: /api/user/deleteRating/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/get-my-ratings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/get-my-ratings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "get-my-ratings"
+              ]
+            },
+            "description": "Handler: getMyRatings\nPath: /api/user/get-my-ratings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/product",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product"
+              ]
+            },
+            "description": "Handler: createProduct\nPath: /api/user/product\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/product/upload-images",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product/upload-images",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product",
+                "upload-images"
+              ]
+            },
+            "description": "Handler: uploadProductImages\nPath: /api/user/product/upload-images\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/product/remove-image",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product/remove-image",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product",
+                "remove-image"
+              ]
+            },
+            "description": "Handler: removeProductImage\nPath: /api/user/product/remove-image\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/product/replace-images",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product/replace-images",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product",
+                "replace-images"
+              ]
+            },
+            "description": "Handler: replaceProductImages\nPath: /api/user/product/replace-images\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getProduct",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getProduct",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getProduct"
+              ]
+            },
+            "description": "Handler: getProduct\nPath: /api/user/getProduct\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getOneProduct/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getOneProduct/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getOneProduct",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getOneProduct\nPath: /api/user/getOneProduct/:id\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/updateProduct/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/updateProduct/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "updateProduct",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateProduct\nPath: /api/user/updateProduct/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/deleteProduct/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/deleteProduct/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "deleteProduct",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: deleteProduct\nPath: /api/user/deleteProduct/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/getAllProductBooking",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllProductBooking",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllProductBooking"
+              ]
+            },
+            "description": "Handler: getAllProductBooking\nPath: /api/user/getAllProductBooking\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/productBookingUpdate/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/productBookingUpdate/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "productBookingUpdate",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: productBookingUpdate\nPath: /api/user/productBookingUpdate/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/productBookingCancel/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/productBookingCancel/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "productBookingCancel",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: productBookingCancel\nPath: /api/user/productBookingCancel/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payment/order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/order",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "order"
+              ]
+            },
+            "description": "Handler: createPaymentOrder\nPath: /api/user/payment/order\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payment/verify",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/verify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "verify"
+              ]
+            },
+            "description": "Handler: verifyPayment\nPath: /api/user/payment/verify\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payment/webhook/razorpay",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/webhook/razorpay",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "webhook",
+                "razorpay"
+              ]
+            },
+            "description": "Handler: razorpayWebhook\nPath: /api/user/payment/webhook/razorpay\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/payment/{{id}}/status",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/{{id}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "{{id}}",
+                "status"
+              ]
+            },
+            "description": "Handler: updatePaymentStatus\nPath: /api/user/payment/:id/status\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/payment/{{bookingId}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/{{bookingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "{{bookingId}}"
+              ]
+            },
+            "description": "Handler: getPaymentByBooking\nPath: /api/user/payment/:bookingId\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payment/retry-settlement",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payment/retry-settlement",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payment",
+                "retry-settlement"
+              ]
+            },
+            "description": "Handler: retryPaymentSettlement\nPath: /api/user/payment/retry-settlement\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/cart/add",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/add",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "add"
+              ]
+            },
+            "description": "Handler: addToCart\nPath: /api/user/cart/add\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"itemId\": \"{{serviceId}}\",\n  \"itemType\": \"service\",\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/cart/my-cart",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/my-cart",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "my-cart"
+              ]
+            },
+            "description": "Handler: getMyCart\nPath: /api/user/cart/my-cart\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/cart/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getCartById\nPath: /api/user/cart/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/cart/update",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/update",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "update"
+              ]
+            },
+            "description": "Handler: updateCartItem\nPath: /api/user/cart/update\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/user/cart/{{id}}",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateCartById\nPath: /api/user/cart/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/cart/set-schedule",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/set-schedule",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "set-schedule"
+              ]
+            },
+            "description": "Handler: setCartItemSchedule\nPath: /api/user/cart/set-schedule\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/cart/remove/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/remove/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "remove",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: removeFromCart\nPath: /api/user/cart/remove/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/carts/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/carts/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "carts",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getCartByIdUnrestricted\nPath: /api/user/carts/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/cart/removed/{{id}}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/removed/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "removed",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: removeFromCartUnrestricted\nPath: /api/user/cart/removed/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/checkout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/checkout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "checkout"
+              ]
+            },
+            "description": "Handler: checkout\nPath: /api/user/checkout\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"locationType\": \"gps\",\n  \"latitude\": 11.1085,\n  \"longitude\": 77.3411,\n  \"addressLine\": \"123 Main Street, Tirupur\",\n  \"paymentMethod\": \"online\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Payments & Refunds (/api/user/payments)",
+      "item": [
+        {
+          "name": "GET /api/user/payments",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments"
+              ]
+            },
+            "description": "Handler: listMyPayments\nPath: /api/user/payments\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/payments/summary",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/summary",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "summary"
+              ]
+            },
+            "description": "Handler: getMyPaymentSummary\nPath: /api/user/payments/summary\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/payments/{{bookingId}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}"
+              ]
+            },
+            "description": "Handler: getMyPaymentDetail\nPath: /api/user/payments/:bookingId\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/payments/{{bookingId}}/receipt",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}/receipt",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}",
+                "receipt"
+              ]
+            },
+            "description": "Handler: getReceipt\nPath: /api/user/payments/:bookingId/receipt\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/payments/{{bookingId}}/refunds",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}/refunds",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}",
+                "refunds"
+              ]
+            },
+            "description": "Handler: getRefunds\nPath: /api/user/payments/:bookingId/refunds\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payments/{{bookingId}}/order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}/order",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}",
+                "order"
+              ]
+            },
+            "description": "Handler: initiatePayment\nPath: /api/user/payments/:bookingId/order\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payments/{{bookingId}}/retry",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}/retry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}",
+                "retry"
+              ]
+            },
+            "description": "Handler: retryMyPayment\nPath: /api/user/payments/:bookingId/retry\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/payments/{{bookingId}}/cash/declare",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/payments/{{bookingId}}/cash/declare",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "payments",
+                "{{bookingId}}",
+                "cash",
+                "declare"
+              ]
+            },
+            "description": "Handler: declareCashPayment\nPath: /api/user/payments/:bookingId/cash/declare\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Reports & Complaints (/api/user/reports)",
+      "item": [
+        {
+          "name": "POST /api/user/reports",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "reports"
+              ]
+            },
+            "description": "Handler: customerCreateReport\nPath: /api/user/reports\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/reports/mine",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/reports/mine",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "reports",
+                "mine"
+              ]
+            },
+            "description": "Handler: customerGetMyReports\nPath: /api/user/reports/mine\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/reports/categories",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/reports/categories",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "reports",
+                "categories"
+              ]
+            },
+            "description": "Handler: listReportCategories\nPath: /api/user/reports/categories\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/reports/{{id}}/withdraw",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/reports/{{id}}/withdraw",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "reports",
+                "{{id}}",
+                "withdraw"
+              ]
+            },
+            "description": "Handler: customerWithdrawComplaint\nPath: /api/user/reports/:id/withdraw\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Product Quotations (/api/user)",
+      "item": [
+        {
+          "name": "POST /api/user/product-quote-requests",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quote-requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quote-requests"
+              ]
+            },
+            "description": "Handler: createQuoteRequestController\nPath: /api/user/product-quote-requests\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/product-quotes/request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quotes/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quotes",
+                "request"
+              ]
+            },
+            "description": "Handler: createQuoteRequestController\nPath: /api/user/product-quotes/request\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/user/product-quote-requests/{{id}}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quote-requests/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quote-requests",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateMyQuoteRequestController\nPath: /api/user/product-quote-requests/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/user/product-quotes/{{id}}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quotes/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quotes",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: updateMyQuoteRequestController\nPath: /api/user/product-quotes/:id\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-quote-requests",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quote-requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quote-requests"
+              ]
+            },
+            "description": "Handler: listMyQuoteRequestsController\nPath: /api/user/product-quote-requests\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-quotes",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quotes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quotes"
+              ]
+            },
+            "description": "Handler: listMyQuoteRequestsController\nPath: /api/user/product-quotes\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-quote-requests/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quote-requests/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quote-requests",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getMyQuoteRequestController\nPath: /api/user/product-quote-requests/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-quotes/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quotes/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quotes",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getMyQuoteRequestController\nPath: /api/user/product-quotes/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/product-quote-requests/{{id}}/cancel",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-quote-requests/{{id}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-quote-requests",
+                "{{id}}",
+                "cancel"
+              ]
+            },
+            "description": "Handler: cancelMyQuoteRequestController\nPath: /api/user/product-quote-requests/:id/cancel\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/quotations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations"
+              ]
+            },
+            "description": "Handler: customerListQuotationsController\nPath: /api/user/quotations\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/quotations/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: customerGetQuotationController\nPath: /api/user/quotations/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/quotations/{{id}}/view",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations/{{id}}/view",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations",
+                "{{id}}",
+                "view"
+              ]
+            },
+            "description": "Handler: customerViewQuotationController\nPath: /api/user/quotations/:id/view\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/quotations/{{id}}/accept",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations/{{id}}/accept",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations",
+                "{{id}}",
+                "accept"
+              ]
+            },
+            "description": "Handler: customerAcceptQuotationController\nPath: /api/user/quotations/:id/accept\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/quotations/{{id}}/reject",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations/{{id}}/reject",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations",
+                "{{id}}",
+                "reject"
+              ]
+            },
+            "description": "Handler: customerRejectQuotationController\nPath: /api/user/quotations/:id/reject\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/quotations/{{id}}/decline",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/quotations/{{id}}/decline",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "quotations",
+                "{{id}}",
+                "decline"
+              ]
+            },
+            "description": "Handler: customerRejectQuotationController\nPath: /api/user/quotations/:id/decline\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-bookings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-bookings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-bookings"
+              ]
+            },
+            "description": "Handler: getAllProductBooking\nPath: /api/user/product-bookings\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/product-bookings/{{id}}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/product-bookings/{{id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "product-bookings",
+                "{{id}}"
+              ]
+            },
+            "description": "Handler: getProductBookingById\nPath: /api/user/product-bookings/:id\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Notifications (/api/user/notifications)",
+      "item": [
+        {
+          "name": "GET /api/user/notifications/unread-counts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/unread-counts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "unread-counts"
+              ]
+            },
+            "description": "Handler: getAdminUnreadCounts\nPath: /api/user/notifications/unread-counts\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/user/notifications/mark-read",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/mark-read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "mark-read"
+              ]
+            },
+            "description": "Handler: markAdminItemRead\nPath: /api/user/notifications/mark-read\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/notifications",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications"
+              ]
+            },
+            "description": "Handler: listNotifications\nPath: /api/user/notifications\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/notifications/unread-count",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/unread-count",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "unread-count"
+              ]
+            },
+            "description": "Handler: unreadCount\nPath: /api/user/notifications/unread-count\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/user/notifications/{{id}}/read",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/{{id}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "{{id}}",
+                "read"
+              ]
+            },
+            "description": "Handler: markRead\nPath: /api/user/notifications/:id/read\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/user/notifications/read-all",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/read-all",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "read-all"
+              ]
+            },
+            "description": "Handler: markReadAll\nPath: /api/user/notifications/read-all\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/notifications/{{id}}/received",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/{{id}}/received",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "{{id}}",
+                "received"
+              ]
+            },
+            "description": "Handler: markReceived\nPath: /api/user/notifications/:id/received\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/user/notifications/{{id}}/opened",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/notifications/{{id}}/opened",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "notifications",
+                "{{id}}",
+                "opened"
+              ]
+            },
+            "description": "Handler: markOpened\nPath: /api/user/notifications/:id/opened\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Permissions (/api/user/permissions)",
+      "item": [
+        {
+          "name": "PUT /api/user/permissions",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/permissions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "permissions"
+              ]
+            },
+            "description": "Handler: updatePermissions\nPath: /api/user/permissions\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notificationsEnabled\": true,\n  \"locationEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/user/permissions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/permissions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "permissions"
+              ]
+            },
+            "description": "Handler: getMyPermissions\nPath: /api/user/permissions\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Device Tokens (/api/user/device-token)",
+      "item": [
+        {
+          "name": "POST /api/user/device-token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/device-token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "device-token"
+              ]
+            },
+            "description": "Handler: registerDeviceHandler\nPath: /api/user/device-token\nAuthentication: Optional/Public",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceId\": \"device_abc_12345\",\n  \"platform\": \"android\",\n  \"fcmToken\": \"eXample_FCM_Token_1234567890\",\n  \"appVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/user/device-token",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/device-token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "device-token"
+              ]
+            },
+            "description": "Handler: unregisterDeviceHandler\nPath: /api/user/device-token\nAuthentication: Optional/Public"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer Address Management (/api/addresses)",
+      "item": [
+        {
+          "name": "GET /api/addresses/search",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/search",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "search"
+              ]
+            },
+            "description": "Handler: searchAddress\nPath: /api/addresses/search\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/addresses/reverse",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/reverse",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "reverse"
+              ]
+            },
+            "description": "Handler: reverseAddress\nPath: /api/addresses/reverse\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/addresses",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            },
+            "description": "Handler: createAddress\nPath: /api/addresses\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressType\": \"Home\",\n  \"addressLine\": \"123 Main St, Near Bus Stand\",\n  \"city\": \"Tirupur\",\n  \"state\": \"Tamil Nadu\",\n  \"pincode\": \"641601\",\n  \"latitude\": 11.1085,\n  \"longitude\": 77.3411\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/addresses",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            },
+            "description": "Handler: getMyAddresses\nPath: /api/addresses\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/addresses/default",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/default",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "default"
+              ]
+            },
+            "description": "Handler: getDefaultAddress\nPath: /api/addresses/default\nAuthentication: Required"
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/addresses",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            },
+            "description": "Handler: updateAddress\nPath: /api/addresses\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressType\": \"Home\",\n  \"addressLine\": \"123 Main St, Near Bus Stand\",\n  \"city\": \"Tirupur\",\n  \"state\": \"Tamil Nadu\",\n  \"pincode\": \"641601\",\n  \"latitude\": 11.1085,\n  \"longitude\": 77.3411\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "PUT /api/addresses/default",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/default",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "default"
+              ]
+            },
+            "description": "Handler: setDefaultAddress\nPath: /api/addresses/default\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressType\": \"Home\",\n  \"addressLine\": \"123 Main St, Near Bus Stand\",\n  \"city\": \"Tirupur\",\n  \"state\": \"Tamil Nadu\",\n  \"pincode\": \"641601\",\n  \"latitude\": 11.1085,\n  \"longitude\": 77.3411\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "DELETE /api/addresses",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            },
+            "description": "Handler: deleteAddress\nPath: /api/addresses\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressId\": \"{{addressId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer GPS Zone Resolution (/api)",
+      "item": [
+        {
+          "name": "POST /api/zones/resolve",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/zones/resolve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "zones",
+                "resolve"
+              ]
+            },
+            "description": "Handler: resolveCustomerZone\nPath: /api/zones/resolve\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationalCityId\": \"{{districtId}}\",\n  \"name\": \"Tirupur North Zone\",\n  \"zoneCode\": \"TP-NORTH\",\n  \"active\": true,\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          77.3,\n          11.05\n        ],\n        [\n          77.4,\n          11.05\n        ],\n        [\n          77.4,\n          11.15\n        ],\n        [\n          77.3,\n          11.15\n        ],\n        [\n          77.3,\n          11.05\n        ]\n      ]\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /api/zones/check-service",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/zones/check-service",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "zones",
+                "check-service"
+              ]
+            },
+            "description": "Handler: checkServiceAvailability\nPath: /api/zones/check-service\nAuthentication: Required",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationalCityId\": \"{{districtId}}\",\n  \"name\": \"Tirupur North Zone\",\n  \"zoneCode\": \"TP-NORTH\",\n  \"active\": true,\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          77.3,\n          11.05\n        ],\n        [\n          77.4,\n          11.05\n        ],\n        [\n          77.4,\n          11.15\n        ],\n        [\n          77.3,\n          11.15\n        ],\n        [\n          77.3,\n          11.05\n        ]\n      ]\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "status": "200",
+              "name": "Response",
+              "binary": false,
+              "comment": [],
+              "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

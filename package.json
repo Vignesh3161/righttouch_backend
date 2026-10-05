@@ -6,6 +6,14 @@
   "type": "module",
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
+    "test:contract": "node test/contract/run.mjs",
+    "test:contract:record": "node test/contract/run.mjs --record",
+    "test:socket-auth": "node --test test/contract/socket.auth.test.mjs",
+    "test:repos": "node --test test/contract/repos.test.mjs",
+    "test:validators": "node --test test/contract/validators.test.mjs",
+    "test:p0": "node test/contract/run.mjs && node --test test/contract/socket.auth.test.mjs",
+    "test:p4": "node --test test/contract/p4-profile-computation.test.mjs test/contract/p4-bank-kyc-computation.test.mjs",
+    "test:p5": "node --test test/contract/p5-session.test.mjs test/contract/p5-socket-session.test.mjs",
     "start": "node index.js",
     "dev": "nodemon index.js",
     "generate-postman": "node postman/generate_zone_wise_complete.js && node postman/generate_technician_collection.js"
@@ -33,7 +41,7 @@
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
     "express-mongo-sanitize": "^2.2.0",
     "express-rate-limit": "^8.2.1",
     "firebase-admin": "^14.2.0",
@@ -54,5 +62,8 @@
     "swagger-ui-express": "^5.0.1",
     "twilio": "^5.9.0",
     "xss-clean": "^0.1.4"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.3.0"
   }
 }

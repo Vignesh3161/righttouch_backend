@@ -1,39 +1,52 @@
-# Node.js dependencies
+# Node.js dependencies (NOTE: package-lock.json MUST stay committed —
+# it is intentionally NOT ignored so installs are reproducible)
 /node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+# Environment variables & secrets — never commit real credentials.
+# `.env.example` (template without secrets) stays committable.
+.env*
+!.env.example
+!.env.sample
 
+# Private key material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets/
+credentials.json
+*-credentials.json
+firebase-credentials.json
+**/firebase-credentials.json
+service-account*.json
+*service-account*.json
+*Account.json
+serverAccount.json
+serviceAccount.json
+GoogleService-Info.plist
 
-# Logs
-logs
+# Logs & crash reports
+logs/
 *.log
-logs/*
-pids
+!*.log.example
+pids/
 *.pid
-*.seed
 *.pid.lock
+firebase-debug.log
+firestore-debug.log
+database-debug.log
 
-# OS files
+# OS / editor files
 .DS_Store
 Thumbs.db
-
-# Build artifacts
-/dist
-/build
-/coverage
-/.next
-/out
-
-# IDE / Editor files
+*~
+*.swp
 .vscode/
 .idea/
 *.suo
@@ -41,30 +54,44 @@ Thumbs.db
 *.njsproj
 *.sln
 
-# Temporary & Scratch Files
-scratch_*.js
-*.scratch.js
-*.tmp
-*.tmp.js
-
-# Runtime data
+# Build / coverage / deploy artifacts
+/dist/
+/build/
+/coverage/
+.nyc_output/
+/.next/
+/out/
 *.tgz
 .cache/
 .temporary/
-node_modules/.cache/
-.vercel
-.env*.local
+.vercel/
+.netlify/
+.serverless/
+.firebase/
+docker-compose.override.yml
 
-# lock file
-package-lock.json
+# Uploads & local runtime data (multer tmp, local file storage)
+/uploads/
+/tmp/
+/temp/
+*.seed
 
-postman/
-docs/
+# Temporary & scratch files (local debugging only)
+scratch_*.js
+*.scratch.js
+debug-*.js
+debug-*.mjs
+*-debug.js
+*-debug.mjs
+*-debug-*.js
+*-debug-*.mjs
+*.tmp
+*.tmp.js
 
-scripts/
-Scripts/
-test/
-config/firebase-credentials.json
-*Account.json
-serverAccount.json
-serviceAccount.json
+test
+
+# Contract test harness + fixtures (compatibility baselines for all
+# rewrite phases — MUST be committed). Nothing under test/ is ignored;
+# keep local throwaway test scripts out of the repo instead.
+# (NOTE: postman/, docs/ and scripts/ are source artifacts and are
+# intentionally NOT ignored — commit collections, docs and migrations.)

@@ -1,0 +1,2780 @@
+{
+  "info": {
+    "_postman_id": "rt-zone-wise-all-roles-v3",
+    "name": "RightTouch Zone-Wise — All Roles (FINAL rules)",
+    "description": "Zone-wise endpoints per role. FINAL catalog rules: (1) PRE-ADDRESS (no explicit location + no usable customer default address, incl. logged-out) => FULL active catalog + availabilityPrompt. (2) POST-ADDRESS (explicit lat/lng/zoneId or customer default address) => zone-filtered, District + Zone both required. (3) Explicit location outside all polygons => [] 'No services available in your area'. (4) Inactive/invalid zone => [] 'Services are currently unavailable in this area'. (5) New zones seed every service DISABLED. (6) Technicians register anywhere, have NO default address (Address lookup is Customer-only); jobs only in Admin-approved zones. Set baseUrl + role tokens in variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:7372",
+      "type": "string"
+    },
+    {
+      "key": "adminToken",
+      "value": "PASTE_ADMIN_OR_OWNER_JWT",
+      "type": "string"
+    },
+    {
+      "key": "technicianToken",
+      "value": "PASTE_TECHNICIAN_JWT",
+      "type": "string"
+    },
+    {
+      "key": "customerToken",
+      "value": "PASTE_CUSTOMER_JWT",
+      "type": "string"
+    },
+    {
+      "key": "districtId",
+      "value": "REPLACE_WITH_OPERATIONAL_CITY_ID",
+      "type": "string"
+    },
+    {
+      "key": "cityZoneId",
+      "value": "REPLACE_WITH_CITY_ZONE_ID",
+      "type": "string"
+    },
+    {
+      "key": "serviceId",
+      "value": "REPLACE_WITH_SERVICE_ID",
+      "type": "string"
+    },
+    {
+      "key": "technicianId",
+      "value": "REPLACE_WITH_TECHNICIAN_PROFILE_ID",
+      "type": "string"
+    },
+    {
+      "key": "bookingId",
+      "value": "REPLACE_WITH_BOOKING_ID",
+      "type": "string"
+    },
+    {
+      "key": "addressId",
+      "value": "REPLACE_WITH_ADDRESS_ID",
+      "type": "string"
+    },
+    {
+      "key": "availabilityId",
+      "value": "REPLACE_WITH_AVAILABILITY_ID",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "ADMIN — zones CRUD + mappings (adminToken)",
+      "item": [
+        {
+          "name": "List zones",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones?operationalCityId={{districtId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones"
+              ],
+              "query": [
+                {
+                  "key": "operationalCityId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                },
+                {
+                  "key": "active",
+                  "value": "true",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get zone",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones/{{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones",
+                "{{cityZoneId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create zone (seeds DISABLED)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones"
+              ]
+            },
+            "description": "Response includes seededDisabledServices. Every active service starts DISABLED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationalCityId\": \"{{districtId}}\",\n  \"name\": \"Gandhipuram\",\n  \"zoneCode\": \"CBE-GANDHI-01\",\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          76.95,\n          11.01\n        ],\n        [\n          76.96,\n          11.01\n        ],\n        [\n          76.96,\n          11.02\n        ],\n        [\n          76.95,\n          11.02\n        ],\n        [\n          76.95,\n          11.01\n        ]\n      ]\n    ]\n  },\n  \"active\": true,\n  \"description\": \"Gandhipuram micro-zone\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Update zone / deactivate",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones/{{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones",
+                "{{cityZoneId}}"
+              ]
+            },
+            "description": "active:false deactivates — listing [] + checkout blocked inside.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Gandhipuram\",\n  \"active\": true,\n  \"description\": \"Updated\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete zone (cascades)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones/{{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones",
+                "{{cityZoneId}}"
+              ]
+            },
+            "description": "Deletes mappings + ZONE overrides; pulls tech approvals; nulls registrations."
+          }
+        },
+        {
+          "name": "Zone technician candidates",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones/{{cityZoneId}}/technician-candidates",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones",
+                "{{cityZoneId}}",
+                "technician-candidates"
+              ]
+            },
+            "description": "GPS-inside but NOT approved. Approve via technicians/:id/city-zones."
+          }
+        },
+        {
+          "name": "List zone-service mappings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-mappings?zoneId={{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-mappings"
+              ],
+              "query": [
+                {
+                  "key": "zoneId",
+                  "value": "{{cityZoneId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Enable services in zone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-mappings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-mappings"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"zoneId\": \"{{cityZoneId}}\",\n  \"serviceIds\": [\n    \"{{serviceId}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete zone-service mapping",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-mappings/{{cityZoneId}}/{{serviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-mappings",
+                "{{cityZoneId}}",
+                "{{serviceId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Bulk toggle zone services",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zones/{{cityZoneId}}/services/toggle",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zones",
+                "{{cityZoneId}}",
+                "services",
+                "toggle"
+              ]
+            },
+            "description": "Syncs ServiceAvailability ZONE overrides too.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"active\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ADMIN — districts + geofence (adminToken)",
+      "item": [
+        {
+          "name": "List districts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts?active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts"
+              ],
+              "query": [
+                {
+                  "key": "active",
+                  "value": "true",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get district",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Active operational city",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/operational-cities/active",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "operational-cities",
+                "active"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Active polygons",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/operational-cities/polygons",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "operational-cities",
+                "polygons"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create district",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Coimbatore\",\n  \"city\": \"Coimbatore\",\n  \"state\": \"Tamil Nadu\",\n  \"country\": \"India\",\n  \"code\": \"CBE\",\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          76.95,\n          11.01\n        ],\n        [\n          76.96,\n          11.01\n        ],\n        [\n          76.96,\n          11.02\n        ],\n        [\n          76.95,\n          11.02\n        ],\n        [\n          76.95,\n          11.01\n        ]\n      ]\n    ]\n  },\n  \"isRegistrationEnabled\": true,\n  \"isJobEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Update district",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Coimbatore\",\n  \"isRegistrationEnabled\": true,\n  \"isJobEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "District status",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}",
+                "status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"active\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "District registration flag",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}/registration",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}",
+                "registration"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"isRegistrationEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "District jobs flag",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}/jobs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}",
+                "jobs"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"isJobEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "District technicians",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}/technicians",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}",
+                "technicians"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete district",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/districts/{{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "districts",
+                "{{districtId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Geofence create city-zone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/city-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "city-zones"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationalCityId\": \"{{districtId}}\",\n  \"name\": \"RS Puram\",\n  \"zoneCode\": \"CBE-RSP-01\",\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          76.95,\n          11.01\n        ],\n        [\n          76.96,\n          11.01\n        ],\n        [\n          76.96,\n          11.02\n        ],\n        [\n          76.95,\n          11.02\n        ],\n        [\n          76.95,\n          11.01\n        ]\n      ]\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Geofence list city-zones",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/city-zones?districtId={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "city-zones"
+              ],
+              "query": [
+                {
+                  "key": "districtId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Geofence create district",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "districts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Coimbatore\",\n  \"state\": \"Tamil Nadu\",\n  \"polygon\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [\n          76.95,\n          11.01\n        ],\n        [\n          76.96,\n          11.01\n        ],\n        [\n          76.96,\n          11.02\n        ],\n        [\n          76.95,\n          11.02\n        ],\n        [\n          76.95,\n          11.01\n        ]\n      ]\n    ]\n  },\n  \"isRegistrationEnabled\": true,\n  \"isJobEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Geofence list districts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "districts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Grant district to tech",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/technicians/grant-district",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "technicians",
+                "grant-district"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"technicianId\": \"{{technicianId}}\",\n  \"districtId\": \"{{districtId}}\",\n  \"reason\": \"Coverage expansion\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Revoke district from tech",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/technicians/revoke-district",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "technicians",
+                "revoke-district"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"technicianId\": \"{{technicianId}}\",\n  \"districtId\": \"{{districtId}}\",\n  \"reason\": \"Coverage revoked\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Spatial hierarchy",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/spatial-hierarchy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "spatial-hierarchy"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Impact analysis",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/impact-analysis?type=district&id={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "impact-analysis"
+              ],
+              "query": [
+                {
+                  "key": "type",
+                  "value": "district",
+                  "description": ""
+                },
+                {
+                  "key": "id",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "District dashboard",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/districts/{{districtId}}/dashboard",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "districts",
+                "{{districtId}}",
+                "dashboard"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Inspect job location",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/jobs/{{bookingId}}/location-inspect",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "jobs",
+                "{{bookingId}}",
+                "location-inspect"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Job broadcast audit",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/jobs/{{bookingId}}/broadcast-audit",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "jobs",
+                "{{bookingId}}",
+                "broadcast-audit"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Zone health dashboard",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/zone-health-dashboard",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "zone-health-dashboard"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Geofence technicians",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/technicians?districtId={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "technicians"
+              ],
+              "query": [
+                {
+                  "key": "districtId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Geofence tech details",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/technicians/{{technicianId}}/details",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "technicians",
+                "{{technicianId}}",
+                "details"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tech verification action",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/technicians/{{technicianId}}/verification",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "technicians",
+                "{{technicianId}}",
+                "verification"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\",\n  \"reason\": \"Docs verified\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Polygon rollback",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/zone-geofence/polygons/rollback",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "zone-geofence",
+                "polygons",
+                "rollback"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"entityType\": \"CITY_ZONE\",\n  \"entityId\": \"{{cityZoneId}}\",\n  \"targetVersion\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ADMIN — service availability (adminToken)",
+      "item": [
+        {
+          "name": "Service-zone matrix",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/matrix?districtId={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "matrix"
+              ],
+              "query": [
+                {
+                  "key": "districtId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Service zone detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/service/{{serviceId}}/detail",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "service",
+                "{{serviceId}}",
+                "detail"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Toggle single zone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/toggle-zone",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "toggle-zone"
+              ]
+            },
+            "description": "Writes BOTH ServiceAvailability and ZoneServiceMapping.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"districtId\": \"{{districtId}}\",\n  \"cityZoneId\": \"{{cityZoneId}}\",\n  \"status\": \"ENABLED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Bulk toggle zones",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/bulk-toggle-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "bulk-toggle-zones"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"districtId\": \"{{districtId}}\",\n  \"cityZoneIds\": [\n    \"{{cityZoneId}}\"\n  ],\n  \"status\": \"ENABLED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Clear district zones",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/clear-district-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "clear-district-zones"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"districtId\": \"{{districtId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Toggle global service",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/toggle-service-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "toggle-service-status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"isActive\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Toggle zone-restriction flag",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/service/{{serviceId}}/zone-restriction",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "service",
+                "{{serviceId}}",
+                "zone-restriction"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"zoneRestricted\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Create availability config",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"districtId\": \"{{districtId}}\",\n  \"scope\": \"DISTRICT\",\n  \"status\": \"ENABLED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "List availability configs",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability?districtId={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability"
+              ],
+              "query": [
+                {
+                  "key": "districtId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update availability config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/{{availabilityId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "{{availabilityId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"DISABLED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete availability config",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/service-availability/{{availabilityId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "service-availability",
+                "{{availabilityId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Dispatch diagnostics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/dispatch-debug?technicianId={{technicianId}}&bookingId={{bookingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "dispatch-debug"
+              ],
+              "query": [
+                {
+                  "key": "technicianId",
+                  "value": "{{technicianId}}",
+                  "description": ""
+                },
+                {
+                  "key": "bookingId",
+                  "value": "{{bookingId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ADMIN — technician approval (adminToken)",
+      "description": "STRICT: only enabledCityZoneIds grants jobs; cityZoneId alone never qualifies.",
+      "item": [
+        {
+          "name": "Tech district permissions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "districts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Add tech district",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "districts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"districtId\": \"{{districtId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Toggle tech district",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/districts/{{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "districts",
+                "{{districtId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"isEnabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Remove tech district",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/districts/{{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "districts",
+                "{{districtId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tech zone permissions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/city-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "city-zones"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Approve zone(s)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/city-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "city-zones"
+              ]
+            },
+            "description": "Parent district permission required first.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cityZoneIds\": [\n    \"{{cityZoneId}}\"\n  ],\n  \"reason\": \"Assigned coverage for Gandhipuram cluster\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Revoke single zone",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/city-zones/{{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "city-zones",
+                "{{cityZoneId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Bulk revoke zones",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/technicians/{{technicianId}}/city-zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "technicians",
+                "{{technicianId}}",
+                "city-zones"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cityZoneIds\": [\n    \"{{cityZoneId}}\"\n  ],\n  \"reason\": \"Coverage area updated\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "TECHNICIAN — zone endpoints (technicianToken)",
+      "description": "Technicians have NO default address: service browse with no explicit location returns the FULL catalog (pricing hidden). Job eligibility is live GPS + Admin-approved enabledCityZoneIds only.",
+      "item": [
+        {
+          "name": "Registration districts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/registration/districts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "registration",
+                "districts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Registration zones",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/registration/zones?districtId={{districtId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "registration",
+                "zones"
+              ],
+              "query": [
+                {
+                  "key": "districtId",
+                  "value": "{{districtId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Validate location",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/registration/validate-location",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "registration",
+                "validate-location"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558,\n  \"selectedDistrictId\": \"{{districtId}}\",\n  \"selectedZoneId\": \"{{cityZoneId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Zone services",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/registration/zone-services?zoneId={{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "registration",
+                "zone-services"
+              ],
+              "query": [
+                {
+                  "key": "zoneId",
+                  "value": "{{cityZoneId}}",
+                  "description": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "My zone + mismatch",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/zone/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "zone",
+                "me"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Services in my zone",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/zone/services",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "zone",
+                "services"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Browse services (no default address → FULL catalog)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ]
+            },
+            "description": "No Address lookup for technicians. Returns ALL active services with pricing hidden (technicianAmount only). Pass ?latitude & longitude or ?zoneId to zone-filter instead."
+          }
+        },
+        {
+          "name": "Browse services (explicit zone → filtered)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices?zoneId={{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ],
+              "query": [
+                {
+                  "key": "zoneId",
+                  "value": "{{cityZoneId}}",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Zone-filtered by ?zoneId; pricing hidden for technicians."
+          }
+        },
+        {
+          "name": "Add skills (zone-gated)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/technician/skills/add",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "technician",
+                "skills",
+                "add"
+              ]
+            },
+            "description": "zoneRestricted services need mapping in ANY of my zones.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceIds\": [\n    \"{{serviceId}}\"\n  ],\n  \"experienceYears\": 2\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Update live location",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/technician/location",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "technician",
+                "location"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "CUSTOMER — zone endpoints (customerToken)",
+      "description": "PRE-ADDRESS: no params => FULL catalog. POST-ADDRESS: default address or explicit location => zone-filtered. Booking/checkout gates unchanged.",
+      "item": [
+        {
+          "name": "Create address",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"label\": \"home\",\n  \"name\": \"Test Customer\",\n  \"phone\": \"9876543210\",\n  \"addressLine\": \"100 Gandhipuram, Coimbatore\",\n  \"city\": \"Coimbatore\",\n  \"state\": \"Tamil Nadu\",\n  \"pincode\": \"641012\",\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558,\n  \"isDefault\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "My addresses",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Default address",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/default",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "default"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Set default address",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/addresses/default",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "addresses",
+                "default"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressId\": \"{{addressId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "List services (PRE-ADDRESS → FULL catalog, no auth needed)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ]
+            },
+            "description": "No token, no params: returns ALL active services + availabilityPrompt 'Select an address to check exact service availability.' Same for a logged-in customer with no default address."
+          }
+        },
+        {
+          "name": "List services (default address → filtered)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ]
+            },
+            "description": "Backend resolves the customer default address internally. Only zone-enabled services returned (District + Zone both required); none in area => [] 'No services available in your area'."
+          }
+        },
+        {
+          "name": "List services (explicit point → filtered)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices?latitude=11.0168&longitude=76.9558",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ],
+              "query": [
+                {
+                  "key": "latitude",
+                  "value": "11.0168",
+                  "description": ""
+                },
+                {
+                  "key": "longitude",
+                  "value": "76.9558",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Selected-address / map-pin flow: filters by resolved District + Zone, default address ignored."
+          }
+        },
+        {
+          "name": "List services (explicit zone → filtered)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices?zoneId={{cityZoneId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ],
+              "query": [
+                {
+                  "key": "zoneId",
+                  "value": "{{cityZoneId}}",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Filters by ?zoneId (+ derived district). Unknown zoneId => [] 'Services are currently unavailable in this area'."
+          }
+        },
+        {
+          "name": "List services (outside area → [])",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/getAllServices?latitude=0&longitude=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "getAllServices"
+              ],
+              "query": [
+                {
+                  "key": "latitude",
+                  "value": "0",
+                  "description": ""
+                },
+                {
+                  "key": "longitude",
+                  "value": "0",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Explicit point outside all polygons => [] 'No services available in your area' (NOT the full catalog)."
+          }
+        },
+        {
+          "name": "Resolve zone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/zones/resolve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "zones",
+                "resolve"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Check service at location",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/zones/check-service",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "zones",
+                "check-service"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558,\n  \"serviceId\": \"{{serviceId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Add to cart (no gate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/cart/add",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "cart",
+                "add"
+              ]
+            },
+            "description": "Cart is location-agnostic; gate is at checkout.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"itemId\": \"{{serviceId}}\",\n  \"itemType\": \"service\",\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Checkout (hard gate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/checkout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "checkout"
+              ]
+            },
+            "description": "Inactive/no-zone/disabled => 400 SERVICE_NOT_AVAILABLE. No booking created.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressId\": \"{{addressId}}\",\n  \"paymentMethod\": \"online\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Direct booking (hard gate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/booking/schedule",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "booking",
+                "schedule"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"latitude\": 11.0168,\n  \"longitude\": 76.9558,\n  \"bookingType\": \"instant\",\n  \"addressId\": \"{{addressId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

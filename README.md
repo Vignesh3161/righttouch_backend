@@ -281,12 +281,18 @@ CLOUDINARY_CLOUD_NAME=your_cloud_name
 CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 
-# Firebase Push Notifications
-# Use service account JSON file (recommended):
+# Firebase Push Notifications (project: righttouchmessaging-401e9)
+# Mint the key in Firebase console → righttouchmessaging-401e9 → Project settings → Service accounts.
+# Use service account JSON file (recommended, git-ignored):
 FCM_SERVICE_ACCOUNT_PATH=./config/firebase-credentials.json
 # OR inline JSON env var:
 # FIREBASE_SERVICE_ACCOUNT='{"project_id":"righttouchmessaging-401e9","private_key":"...","client_email":"..."}'
-# OR individual env vars (must match righttouchmessaging-401e9):
+# OR individual env vars. ALL THREE RULES ARE MANDATORY:
+#  1. FIREBASE_CLIENT_EMAIL must end @righttouchmessaging-401e9.iam.gserviceaccount.com
+#     (a key from any other GCP project fails with sender-id-mismatch).
+#  2. FIREBASE_PRIVATE_KEY must be ONE quoted line with literal \n sequences
+#     including the BEGIN/END armor (bare base64 is auto-wrapped, but prefer full PEM).
+#  3. Verify with: GET /health/fcm → 200 (not 503).
 # FIREBASE_PROJECT_ID=righttouchmessaging-401e9
 # FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@righttouchmessaging-401e9.iam.gserviceaccount.com
 # FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
