@@ -12,18 +12,43 @@ export const GEO_KEY = "tech_locations";
 
 let redisClient = null;
 let isGeoAvailable = false;
+let geoDisabledLogged = false;
+
+const isRedisEnabled = () => {
+  const v = String(process.env.REDIS_ENABLED ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+};
 
 async function getRedisClient() {
+  if (!isRedisEnabled()) {
+    if (!geoDisabledLogged) {
+      console.log("[Redis GEO] disabled via REDIS_ENABLED (using MongoDB-only)");
+      geoDisabledLogged = true;
+    }
+    return null;
+  }
   if (redisClient?.isOpen) return redisClient;
   
   const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-  redisClient = createClient({ 
+  if (redisClient) {
+    try { await redisClient.quit().catch(() => {}); } catch {}
+    redisClient = null;
+  }
+  redisClient = createClient({
     url: redisUrl,
-    socket: { connectTimeout: 3000 }
+    socket: {
+      connectTimeout: 3000,
+      reconnectStrategy: (retries) => (retries >= 2 ? false : 500),
+    },
+    disableOfflineQueue: true,
   });
-  
+
+  let warned = false;
   redisClient.on('error', (err) => {
-    console.warn('[Redis GEO] Client error:', err.message);
+    if (!warned) {
+      console.warn('[Redis GEO] unavailable, using MongoDB-only:', err.message);
+      warned = true;
+    }
     isGeoAvailable = false;
   });
   

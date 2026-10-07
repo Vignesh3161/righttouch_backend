@@ -40,6 +40,7 @@ import {
   deviceFromRequest,
 } from "../services/sessionService.js";
 import { getIo } from "../../../shared/utils/ioAccess.js";
+import { emitSecurityEvent, hashIdentifier, ipHashFromRequest } from "../utils/securityEvents.js";
 import {
   revokeSocketsForSession,
   revokeSocketsForUser,
@@ -99,6 +100,9 @@ export const deleteUserById = async (req, res) => {
       adminUser: req.user,
       targetUserId: req.params.id,
     });
+    // P9: DB sessions are purged inside the service; live sockets must die
+    // too (a deleted account must not hold an open socket).
+    revokeSocketsForUser(getIo(), req.params.id);
     return res.status(200).json({
       success: true,
       message: "User deleted successfully",
@@ -243,11 +247,26 @@ export const verifyOtp = async (req, res) => {
       const isSignup = result.user.profileComplete === false; // Or signup flag
       const status = isSignup && !result.user.lastLoginAt ? 201 : 200;
       const message = status === 201 ? "Account created successfully" : "Login successful";
+      // P9: observable auth lifecycle (fire-and-forget, never secrets).
+      emitSecurityEvent({
+        actor: result.user.userId || result.user._id || null,
+        actorRole: result.user.role || role || null,
+        action: "OTP_VERIFY_SUCCESS",
+        metadata: { purpose: req.otpScope?.purpose || null },
+      });
       return ok(res, status, message, result);
     }
 
     return ok(res, 200, "OTP verified successfully", result);
   } catch (err) {
+    // P9: failed verifications are abuse signal (no OTP value logged).
+    emitSecurityEvent({
+      actor: null,
+      actorRole: req.body?.role || null,
+      action: "OTP_VERIFY_FAILURE",
+      reason: err.code || null,
+      metadata: { identifierHash: hashIdentifier(req.body?.identifier ?? req.body?.mobileNumber), ipHash: ipHashFromRequest(req) },
+    });
     return fail(
       res,
       err.statusCode || 500,
@@ -269,6 +288,8 @@ export const setPassword = async (req, res) => {
     validateSetPasswordInput(password);
 
     await setPasswordInternal({ userId, password });
+    // P9: password changes affect session validity — observable.
+    emitSecurityEvent({ actor: userId || null, actorRole: req.user?.role || null, action: "AUTH_PASSWORD_SET" });
     return ok(res, 200, "Password set successfully");
   } catch (err) {
     return fail(
@@ -299,6 +320,13 @@ export const login = async (req, res, opts = {}) => {
     });
 
     if (result.type === "PASSWORD_LOGIN") {
+      // P9: observable auth lifecycle.
+      emitSecurityEvent({
+        actor: result.userId || null,
+        actorRole: result.role || null,
+        action: "AUTH_LOGIN_SUCCESS",
+        metadata: { method: "password" },
+      });
       return ok(res, 200, "Login successful", {
         token: result.token,
         // P5 additive fields: existing `token` consumers keep working.
@@ -316,6 +344,14 @@ export const login = async (req, res, opts = {}) => {
       expiresInSeconds: result.expiresInSeconds,
     });
   } catch (err) {
+    // P9: failed logins are abuse signal (no password/OTP logged).
+    emitSecurityEvent({
+      actor: null,
+      actorRole: req.body?.role || null,
+      action: "AUTH_LOGIN_FAILURE",
+      reason: err.code || null,
+      metadata: { identifierHash: hashIdentifier(req.body?.identifier ?? req.body?.mobileNumber), ipHash: ipHashFromRequest(req) },
+    });
     return fail(
       res,
       err.statusCode || 500,
@@ -338,18 +374,6 @@ export const technicianLogin = async (req, res) => {
   req.body = req.body || {};
   req.body.role = "Technician";
   return login(req, res);
-};
-
-export const customerLogin = async (req, res) => {
-  req.body = req.body || {};
-  req.body.role = "Customer";
-  return login(req, res);
-};
-
-export const verifyCustomerOtp = async (req, res) => {
-  req.body = req.body || {};
-  req.body.role = "Customer";
-  return verifyOtp(req, res);
 };
 
 export const verifyTechnicianOtp = async (req, res) => {
@@ -416,6 +440,13 @@ export const logout = async (req, res) => {
     if (result.revoked && result.sessionId) {
       revokeSocketsForSession(getIo(), userId, String(result.sessionId));
     }
+    // P9: observable session lifecycle.
+    emitSecurityEvent({
+      actor: userId || null,
+      actorRole: req.user?.role || null,
+      action: "AUTH_LOGOUT",
+      metadata: { revoked: result.revoked === true },
+    });
     return ok(res, 200, "Logged out successfully", { revoked: result.revoked });
   } catch (err) {
     return fail(
@@ -435,6 +466,13 @@ export const logoutAll = async (req, res) => {
     }
     const result = await revokeAllUserSessions({ userId });
     revokeSocketsForUser(getIo(), userId);
+    // P9: global invalidation is a high-value security signal.
+    emitSecurityEvent({
+      actor: userId || null,
+      actorRole: req.user?.role || null,
+      action: "AUTH_LOGOUT_ALL",
+      metadata: { revokedCount: result.revokedCount ?? null },
+    });
     return ok(res, 200, "Logged out from all devices successfully", {
       revokedCount: result.revokedCount,
     });

@@ -1,5 +1,8 @@
 import crypto from "crypto";
-import { signToken } from "./token.js";
+import { signToken, resolveAccessTokenLifetimeMs, parseLifetimeToMs } from "./token.js";
+
+// Re-exported for compatibility (single implementation lives in token.js).
+export { parseLifetimeToMs };
 
 /**
  * P5 — refresh/access token primitives.
@@ -8,9 +11,12 @@ import { signToken } from "./token.js";
  *   Only SHA-256 hex (`tokenHash`) is persisted/looked up/compared —
  *   the raw value exists only in memory and in the one response that
  *   delivers it to the owning client. Never logged.
- * - Access tokens: unchanged HS256/JWT lifetime (P6 owns tightening);
- *   P5 only ADDS `sid` + `tokenVersion` claims. All pre-existing claims
+ * - Access tokens (P6): short-lived via the token.js resolver (default
+ *   1h). P5 ADDS `sid` + `tokenVersion` claims. All pre-existing claims
  *   (userId/role/technicianProfileId) are preserved.
+ * - Refresh/AuthSession lifetime is 30 days SLIDING per rotation (each
+ *   rotation issues expiresAt = now + 30d) and is NEVER derived from the
+ *   access-token value. P9: the old "absolute" wording was inaccurate.
  */
 
 export const REFRESH_TOKEN_BYTES = 48;
@@ -22,23 +28,9 @@ export const generateRefreshToken = () =>
 export const hashRefreshToken = (rawToken) =>
   crypto.createHash("sha256").update(String(rawToken), "utf8").digest("hex");
 
-const UNIT_MS = { s: 1000, m: 60 * 1000, h: 3600 * 1000, d: 24 * 3600 * 1000 };
-
-/** Parse the project's JWT lifetime strings ("7d", "12h", "30m") to ms. */
-export const parseLifetimeToMs = (value, fallbackMs) => {
-  const m = /^(\d+)\s*([smhd])$/i.exec(String(value || "").trim());
-  if (!m) return fallbackMs;
-  return Number(m[1]) * (UNIT_MS[m[2].toLowerCase()] || 0) || fallbackMs;
-};
-
 /** Access-token TTL in seconds, derived from the same source as signToken. */
 export const accessTokenExpiresInSeconds = () =>
-  Math.floor(
-    parseLifetimeToMs(
-      process.env.JWT_EXPIRES_IN || "7d",
-      7 * 24 * 3600 * 1000
-    ) / 1000
-  );
+  Math.floor(resolveAccessTokenLifetimeMs() / 1000);
 
 /**
  * Sign a session-aware access token. Pre-existing claims pass through

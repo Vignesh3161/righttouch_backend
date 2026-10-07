@@ -314,7 +314,7 @@ export const getTechnicianWallet = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    const currentAvailablePaise = tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0);
+    const currentAvailablePaise = tech?.availableBalancePaise ?? rupeesToPaise(tech?.walletBalance ?? 0);
     const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise;
     const availableToWithdrawPaise = Math.max(0, currentAvailablePaise - maintenanceFloorPaise);
     const config = getConfig();
@@ -605,7 +605,7 @@ export const requestWithdrawal = async (req, res) => {
     const autoConfig = await getAutoPayoutConfig();
     const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
     const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise || 10000;
-    const availableBalancePaise = tech.availableBalancePaise ?? toPaise(tech.walletBalance ?? 0);
+    const availableBalancePaise = tech.availableBalancePaise ?? rupeesToPaise(tech.walletBalance ?? 0);
     const maxPayoutPaise = Math.max(0, availableBalancePaise - maintenanceFloorPaise);
 
     if (amountPaiseNum > maxPayoutPaise) {
@@ -670,7 +670,7 @@ export const requestWithdrawal = async (req, res) => {
     await session.withTransaction(async () => {
       // Re-check balance inside transaction
       const fresh = await TechnicianProfile.findById(tech._id).session(session);
-      const freshAvailable = fresh.availableBalancePaise ?? toPaise(fresh.walletBalance ?? 0);
+      const freshAvailable = fresh.availableBalancePaise ?? rupeesToPaise(fresh.walletBalance ?? 0);
       const freshMaxPayout = Math.max(0, freshAvailable - maintenanceFloorPaise);
       if (amountPaiseNum > freshMaxPayout) {
         const err = new Error("Insufficient withdrawable balance (maintenance floor required)");
@@ -918,7 +918,14 @@ export const getWithdrawalReceipt = async (req, res) => {
     }
 
     const query = { _id: id };
-    if (isTech && req.technician) {
+    if (isTech) {
+      // P9: a Technician MUST be scoped via req.technician (set by
+      // isTechnician on the technician mount). Without it (e.g. the
+      // Admin-mounted twin) an unscoped query would read ANY payout
+      // receipt — deny instead of falling through.
+      if (!req.technician) {
+        return res.status(403).json({ success: false, message: "Unauthorized access" });
+      }
       query.technicianId = req.technician._id;
     }
 

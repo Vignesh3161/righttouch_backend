@@ -1,5 +1,5 @@
 import express from "express";
-import { Auth } from "../../../shared/middleware/Auth.js";
+import { Auth, authorizeRoles } from "../../../shared/middleware/Auth.js";
 import {
   getTechnicianDistricts,
   addTechnicianDistrictPermission,
@@ -151,8 +151,8 @@ const router = express.Router();
  *       403:
  *         description: Owner/Admin access only
  */
-router.get("/technicians/:technicianId/districts", Auth, getTechnicianDistricts);
-router.post("/technicians/:technicianId/districts", Auth, addTechnicianDistrictPermission);
+router.get("/technicians/:technicianId/districts", Auth, authorizeRoles("Admin", "Owner"), getTechnicianDistricts);
+router.post("/technicians/:technicianId/districts", Auth, authorizeRoles("Admin", "Owner"), addTechnicianDistrictPermission);
 
 /**
  * @openapi
@@ -238,8 +238,8 @@ router.post("/technicians/:technicianId/districts", Auth, addTechnicianDistrictP
  *       403:
  *         description: Owner/Admin access only
  */
-router.patch("/technicians/:technicianId/districts/:districtId", Auth, toggleTechnicianDistrictPermission);
-router.delete("/technicians/:technicianId/districts/:districtId", Auth, removeTechnicianDistrictPermission);
+router.patch("/technicians/:technicianId/districts/:districtId", Auth, authorizeRoles("Admin", "Owner"), toggleTechnicianDistrictPermission);
+router.delete("/technicians/:technicianId/districts/:districtId", Auth, authorizeRoles("Admin", "Owner"), removeTechnicianDistrictPermission);
 
 /* ================= ADMIN TECHNICIAN CITY ZONE PERMISSIONS ================= */
 
@@ -362,11 +362,11 @@ router.delete("/technicians/:technicianId/districts/:districtId", Auth, removeTe
  *       400:
  *         description: Missing technicianId or zoneIds
  */
-router.get("/technicians/:technicianId/city-zones", Auth, getTechnicianZonePermissions);
-router.get("/technicians/:technicianId/zones", Auth, getTechnicianZonePermissions);
+router.get("/technicians/:technicianId/city-zones", Auth, authorizeRoles("Admin", "Owner"), getTechnicianZonePermissions);
+router.get("/technicians/:technicianId/zones", Auth, authorizeRoles("Admin", "Owner"), getTechnicianZonePermissions);
 
-router.post("/technicians/:technicianId/city-zones", Auth, enableTechnicianZonePermission);
-router.post("/technicians/:technicianId/zones/:zoneId/enable", Auth, enableTechnicianZonePermission);
+router.post("/technicians/:technicianId/city-zones", Auth, authorizeRoles("Admin", "Owner"), enableTechnicianZonePermission);
+router.post("/technicians/:technicianId/zones/:zoneId/enable", Auth, authorizeRoles("Admin", "Owner"), enableTechnicianZonePermission);
 
 /**
  * @openapi
@@ -394,10 +394,10 @@ router.post("/technicians/:technicianId/zones/:zoneId/enable", Auth, enableTechn
  *       400:
  *         description: Missing technicianId or zoneId
  */
-router.delete("/technicians/:technicianId/city-zones/:zoneId", Auth, disableTechnicianZonePermission);
-router.delete("/technicians/:technicianId/city-zones", Auth, disableTechnicianZonePermission);
-router.post("/technicians/:technicianId/city-zones/remove", Auth, disableTechnicianZonePermission);
-router.post("/technicians/:technicianId/zones/:zoneId/disable", Auth, disableTechnicianZonePermission);
+router.delete("/technicians/:technicianId/city-zones/:zoneId", Auth, authorizeRoles("Admin", "Owner"), disableTechnicianZonePermission);
+router.delete("/technicians/:technicianId/city-zones", Auth, authorizeRoles("Admin", "Owner"), disableTechnicianZonePermission);
+router.post("/technicians/:technicianId/city-zones/remove", Auth, authorizeRoles("Admin", "Owner"), disableTechnicianZonePermission);
+router.post("/technicians/:technicianId/zones/:zoneId/disable", Auth, authorizeRoles("Admin", "Owner"), disableTechnicianZonePermission);
 
 export default router;
 

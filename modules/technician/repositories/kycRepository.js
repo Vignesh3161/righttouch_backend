@@ -25,6 +25,12 @@ export const newKycShell = (technicianId) => new TechnicianKyc({ technicianId })
 export const saveKycDocument = (kycDoc, options = {}) =>
   options?.session ? kycDoc.save({ session: options.session }) : kycDoc.save();
 
+/**
+ * P7 explicit compat: hash lookup (canonical) OR legacy plaintext lookup
+ * (pre-encryption documents). The plaintext arm fires only for unmigrated
+ * rows; run scripts/p7-canonical-backfill.mjs to shrink that set. Never
+ * remove the plaintext arm before backfill verification (Stage G).
+ */
 export const findDuplicateAccount = ({ accountNumberHash, accountNumber, excludeTechnicianId }, options = {}) =>
   withSession(
     options,

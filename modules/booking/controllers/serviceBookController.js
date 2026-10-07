@@ -2383,6 +2383,11 @@ export const deleteServiceBooking = async (req, res) => {
    ===================================================== */
 export const deleteBookingAsAdmin = async (req, res) => {
   try {
+    // P9: in-controller authorization (defense-in-depth; the route is also
+    // guarded, but a destructive handler must not depend on its mount).
+    if (!["Admin", "Owner"].includes(req.user?.role)) {
+      return res.status(403).json({ success: false, message: "Admin access only", result: {} });
+    }
     const { id } = req.params;
     if (!id) {
       return res.status(400).json({ success: false, message: "Booking id is required", result: {} });

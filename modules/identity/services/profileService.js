@@ -111,6 +111,16 @@ export const getMyProfileInternal = async ({ userId, role }) => {
       }
       result.bankUpdateRequired = kyc.bankUpdateRequired || false;
     }
+    // P7: response derives profileComplete from the canonical computation
+    // (populated owner names are already loaded — no extra query). A stale
+    // persisted mirror can no longer override the canonical value here.
+    const ownerUser =
+      result.userId && typeof result.userId === "object" ? result.userId : null;
+    result.profileComplete = computeProfileComplete({
+      role: "Technician",
+      user: ownerUser,
+      technicianProfile: result,
+    });
     return result;
   } else {
     const user = await userRepo.findByIdLean(userId, "-password");
@@ -120,6 +130,8 @@ export const getMyProfileInternal = async ({ userId, role }) => {
       err.code = "USER_NOT_FOUND";
       throw err;
     }
+    // P7: same canonical derivation for customers (already-loaded doc).
+    user.profileComplete = computeProfileComplete({ role, user });
     return user;
   }
 };

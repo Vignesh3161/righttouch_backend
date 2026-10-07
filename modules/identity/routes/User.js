@@ -1,13 +1,13 @@
 import express from "express";
 import { upload } from "../../../shared/utils/cloudinaryUpload.js";
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { authorizeRoles } from "../../../shared/middleware/Auth.js";
 import {
   signupAndSendOtp,
   resendOtp,
   verifyOtp,
   setPassword,
   login,
-  technicianLogin,
   ownerLogin,
   refreshSession,
   logout,
@@ -26,8 +26,6 @@ import {
 } from "../controllers/User.js";
 
 import { deleteMyAccount } from "../controllers/accountController.js";
-
-// ...existing code...
 
 
 
@@ -137,16 +135,13 @@ import { Auth } from "../../../shared/middleware/Auth.js";
 
 const router = express.Router();
 
-const getClientIp = (req) => {
-  const xff = req.headers?.["x-forwarded-for"];
-  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
-  if (req.ip) return req.ip;
-  return req.socket?.remoteAddress || "unknown";
-};
+// P9: trust-proxy-aware client key. Never prefer X-Forwarded-For
+// unconditionally — with trust proxy off any client could rotate the
+// header to mint fresh rate-limit buckets.
+const getClientIp = (req) => ipKeyGenerator(req);
 
 // 🔒 Strict Rate Limiters for Authentication
 const authLimiter = rateLimit({
-  //sk
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // 100 attempts per window (increased for testing)
   message: {
@@ -169,6 +164,17 @@ const otpLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+// P9: same throttle shape as the RazorpayX webhooks, for the legacy
+// Razorpay payment webhook (unauthenticated by design; HMAC verified
+// fail-closed inside the handler).
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { ip: false, trustProxy: false },
 });
 
 // ================= UNIFIED OTP LOGIN (ALL ROLES) =================
@@ -241,14 +247,12 @@ router.post("/owner/signup", authLimiter, async (req, res, next) => {
 // Owner: verify OTP
 // P2: server-trusted OTP scope — Owner SIGNUP OTPs only.
 router.post("/owner/verify-otp", authLimiter, async (req, res, next) => {
-  // req.body.role = "Owner";
   req.otpScope = { role: "Owner", purpose: "SIGNUP" };
   return verifyOtp(req, res, next);
 });
 
 // Owner: set password after OTP verified
 router.post("/owner/set-password", authLimiter, Auth, async (req, res, next) => {
-  // req.body.role = "Owner";
   return setPassword(req, res, next);
 });
 
@@ -256,7 +260,6 @@ router.post("/owner/set-password", authLimiter, Auth, async (req, res, next) => 
 router.post("/owner/login", authLimiter, ownerLogin);
 
 // 🔍 DEBUG: Check user by identifier (PROTECTED, OWNER/ADMIN ONLY)
-import { authorizeRoles } from "../../../shared/middleware/Auth.js";
 router.get("/debug/check-user/:identifier", Auth, authorizeRoles("Owner", "Admin"), checkUserByIdentifier);
 
 router.get("/me", Auth, getMyProfile);
@@ -414,7 +417,9 @@ router.put(
 /* ================= PAYMENT ================= */
 router.post("/payment/order", Auth, createPaymentOrder);
 router.post("/payment/verify", Auth, verifyPayment);
-router.post("/payment/webhook/razorpay", razorpayWebhook);
+// P9: throttle junk-HMAC floods like the RazorpayX webhooks (HMAC stays
+// fail-closed inside the handler; this only caps request rate).
+router.post("/payment/webhook/razorpay", webhookLimiter, razorpayWebhook);
 // RBAC: only Admin/Owner may mutate payment state by hand (audited)
 router.put("/payment/:id/status", Auth, authorizeRoles("Admin", "Owner"), updatePaymentStatus);
 router.get("/payment/:bookingId", Auth, getPaymentByBooking);

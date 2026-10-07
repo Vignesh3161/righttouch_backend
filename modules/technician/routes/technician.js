@@ -58,6 +58,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 const authLimiter = rateLimit({
   windowMs: 60 * 1000,
+  max: 10, // P9: explicit budget (was library default 5/min, undocumented)
   message: {
     success: false,
     message: "Too many attempts, please try again after 1 minute",
@@ -65,6 +66,7 @@ const authLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
 });
 
 // 📍 Location-ping limiter — mirrors the socket cap (1 per 5s = 12/min).

@@ -487,7 +487,13 @@ export const updateProduct = async (req, res) => {
       });
     }
 
+    // P9: never allow system/prototype keys through the spread into
+    // findByIdAndUpdate (mass-assignment + prototype pollution sink).
+    // Legit product fields pass through unchanged.
     const updateData = { ...req.body };
+    for (const k of ["__proto__", "constructor", "prototype", "_id", "__v", "ratingSummary", "createdAt", "updatedAt"]) {
+      delete updateData[k];
+    }
 
     if (updateData.categoryId) {
       if (!mongoose.Types.ObjectId.isValid(updateData.categoryId)) {

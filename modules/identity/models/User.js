@@ -66,6 +66,12 @@ const userSchema = new mongoose.Schema(
       default: "Active",
     },
 
+    // P7 compatibility mirror (DEPRECATED — do not read for decisions).
+    // Canonical source: computeProfileComplete() (identity/utils).
+    // All writers route through it; /me derives the response from it.
+    // Retained only so pre-P7 documents and external response shapes keep
+    // working. Removal condition (Stage G): every consumer proven to use
+    // the canonical computation + backfill verified. Never delete blindly.
     profileComplete: {
       type: Boolean,
       default: false,
@@ -84,8 +90,11 @@ const userSchema = new mongoose.Schema(
 
     lastLoginAt: Date,
 
-    // 📱 FCM push tokens (multi-device). Registered on app login/foreground;
-    // invalid tokens are pruned on FCM error responses (device-not-registered).
+    // 📱 P7 compatibility mirror (DEPRECATED — DeviceToken is canonical).
+    // Dual-written by deviceRepository/permissionService so legacy push
+    // keeps working during transition; canonical reads use the
+    // DeviceToken collection. Removal condition (Stage G): backfill
+    // verified + all readers proven DeviceToken-only. Never delete blindly.
     fcmTokens: {
       type: [String],
       default: [],

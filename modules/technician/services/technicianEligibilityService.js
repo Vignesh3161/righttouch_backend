@@ -240,8 +240,15 @@ export const evaluateTechnicianEligibility = async ({
   }
 
   // 3. TECHNICIAN WORK STATUS & VERIFICATION
+  // P7: strict read of the canonical-written persisted flag. All writers
+  // route through P4 computeProfileComplete(), so the stored value IS the
+  // canonical value; `=== true` (was `!== false`) additionally closes the
+  // hazard where a document missing the field counted as complete. Same
+  // business concept (activation gate), fail-closed direction. A full
+  // canonical recompute here would cost a User lookup per matching
+  // candidate; the persisted canonical value is the agreed source.
   const isApproved = tech.workStatus === "approved";
-  const profileComplete = tech.profileComplete !== false;
+  const profileComplete = tech.profileComplete === true;
   details.verified = isApproved && profileComplete;
 
   if (tech.workStatus === "suspended") {

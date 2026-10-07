@@ -140,8 +140,9 @@ const technicianProfileSchema = new mongoose.Schema(
       },
     },
 
-    // 📱 FCM push tokens (multi-device). Registered on app login/foreground;
-    // invalid tokens are pruned on FCM error responses (device-not-registered).
+    // 📱 P7 compatibility mirror (DEPRECATED — DeviceToken is canonical).
+    // See User.fcmTokens note. Removal condition (Stage G): backfill
+    // verified + all readers proven DeviceToken-only. Never delete blindly.
     fcmTokens: {
       type: [String],
       default: [],
@@ -153,6 +154,11 @@ const technicianProfileSchema = new mongoose.Schema(
       count: { type: Number, default: 0 },
     },
 
+    // P7 compatibility mirror (DEPRECATED — availableBalancePaise is
+    // canonical; WalletTransaction ledger is financial truth). Never
+    // written by settlement/debit engines; response reads must derive
+    // from paise state. Removal condition (Stage G): ledger backfill
+    // verified for docs missing paise fields. Never delete blindly.
     walletBalance: {
       type: Number,
       default: 0,
@@ -217,6 +223,10 @@ const technicianProfileSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // P7: response-shape compat only (DEPRECATED as storage — never
+    // persisted by current writers; KYC encrypted bankDetails is canonical
+    // and merged into reads at response time). Removal condition (Stage G):
+    // no reader references remain. Never delete blindly.
     // Bank / UPI details required for Razorpay X payout
     bankDetails: {
       accountNumber: { type: String, trim: true, default: null },
@@ -230,6 +240,10 @@ const technicianProfileSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // P7 compatibility mirror (DEPRECATED — computeProfileComplete() is
+    // canonical; all writers route through it; /me derives from it).
+    // Retained for pre-P7 documents and response shapes. Removal
+    // condition (Stage G): every consumer proven canonical. Never delete.
     profileComplete: {
       type: Boolean,
       default: false,

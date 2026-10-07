@@ -14,9 +14,15 @@
     "test:p0": "node test/contract/run.mjs && node --test test/contract/socket.auth.test.mjs",
     "test:p4": "node --test test/contract/p4-profile-computation.test.mjs test/contract/p4-bank-kyc-computation.test.mjs",
     "test:p5": "node --test test/contract/p5-session.test.mjs test/contract/p5-socket-session.test.mjs",
+    "test:p6": "node --test test/contract/p6-lifetime.test.mjs test/contract/p6-env-override.test.mjs",
+    "test:p7": "node --test test/contract/p7-canonical.test.mjs test/contract/p7-migration.test.mjs",
+    "test:p8": "node --test test/contract/p8-alias-cleanup.test.mjs",
+    "test:p9": "node --test test/contract/p9-security.test.mjs",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "generate-postman": "node postman/generate_zone_wise_complete.js && node postman/generate_technician_collection.js"
+    "generate-postman": "node postman/generate_zone_wise_complete.js && node postman/generate_technician_collection.js",
+    "seed:dummy": "node scripts/seed-dummy.mjs",
+    "seed:fresh": "node scripts/seed-dummy.mjs --fresh"
   },
   "repository": {
     "type": "git",
@@ -33,16 +39,12 @@
   },
   "homepage": "https://github.com/FlareMindsTech/righttouch_backend#readme",
   "dependencies": {
-    "@google-cloud/storage": "^7.19.0",
-    "@sendgrid/mail": "^8.1.6",
     "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
-    "body-parser": "^2.2.0",
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.2.1",
-    "express-mongo-sanitize": "^2.2.0",
     "express-rate-limit": "^8.2.1",
     "firebase-admin": "^14.2.0",
     "helmet": "^7.1.0",
@@ -52,18 +54,15 @@
     "multer-storage-cloudinary": "^4.0.0",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.5",
-    "nodemon": "^3.1.10",
     "razorpay": "^2.9.6",
     "redis": "^4.6.13",
-    "resend": "^6.6.0",
-    "sharp": "^0.34.5",
     "socket.io": "^4.8.3",
     "swagger-jsdoc": "^6.3.0",
     "swagger-ui-express": "^5.0.1",
-    "twilio": "^5.9.0",
-    "xss-clean": "^0.1.4"
+    "twilio": "^5.9.0"
   },
   "devDependencies": {
-    "mongodb-memory-server": "^11.3.0"
+    "mongodb-memory-server": "^11.3.0",
+    "nodemon": "^3.1.10"
   }
 }

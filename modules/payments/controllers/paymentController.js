@@ -13,7 +13,7 @@ import {
   verifyRazorpaySignature,
   verifyWebhookSignature,
 } from "../utils/razorpay.js";
-import { toPaise } from "../../../shared/utils/money.js";
+import { toPaise, paiseToRupees, rupeesToPaise } from "../../../shared/utils/money.js";
 import {
   markPaymentSucceeded,
   markPaymentFailed,
@@ -636,9 +636,13 @@ export const verifyPayment = async (req, res) => {
       if (booking?.technicianId) {
         const TechnicianProfile = (await import("../../technician/models/TechnicianProfile.js")).default;
         const techProfile = await TechnicianProfile.findById(booking.technicianId)
-          .select("walletBalance")
+          .select("availableBalancePaise walletBalance")
           .lean();
-        technicianWalletBalance = techProfile?.walletBalance || 0;
+        // P7: response field kept (contract); canonical paise source with
+        // explicit legacy-mirror fallback for pre-paise documents.
+        technicianWalletBalance = paiseToRupees(
+          techProfile?.availableBalancePaise ?? rupeesToPaise(techProfile?.walletBalance ?? 0)
+        );
       }
     }
 

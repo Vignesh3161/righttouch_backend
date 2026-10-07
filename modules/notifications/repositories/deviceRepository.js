@@ -39,7 +39,14 @@ export const deactivateByUserToken = (userId, fcmToken) =>
 export const deactivateByTokenGlobal = (fcmToken) =>
   DeviceToken.updateOne({ fcmToken, isActive: true }, { $set: { isActive: false } }).catch(() => {});
 
-/** Legacy mirrors (fire-and-forget, as today). Customer → User, else → TechnicianProfile. */
+/**
+ * P7 transition dual-write (DEPRECATED path — retained, not silent).
+ * Mirrors keep legacy User/TechnicianProfile.fcmTokens fresh while
+ * DeviceToken is canonical; every legacy-dependent read is counted via
+ * pushSourceMetrics. Removal condition (Stage G): sustained zero
+ * legacyFallbackSends after backfill + quiescence. Customer → User,
+ * else → TechnicianProfile.
+ */
 export const mirrorTokenToLegacyStore = (isCustomer, ownerId, fcmToken) =>
   (isCustomer ? addUserMirror(ownerId, fcmToken) : addProfileMirror(ownerId, fcmToken));
 

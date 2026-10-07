@@ -433,6 +433,11 @@ export const getPaymentsLedger = async (req, res) => {
 
 export const getTechnicianFinanceDetail = async (req, res) => {
   try {
+    // P9: in-controller authorization (defense-in-depth; route is guarded,
+    // but PII + earnings must not depend on the mount alone).
+    if (!["Admin", "Owner"].includes(req.user?.role)) {
+      return res.status(403).json({ success: false, message: "Admin access only" });
+    }
     const { technicianId } = req.params;
     if (!mongoose.Types.ObjectId.isValid(technicianId)) {
       return res.status(400).json({ success: false, message: "Invalid technicianId" });
@@ -493,7 +498,11 @@ export const getTechnicianFinanceDetail = async (req, res) => {
           technicianId: tech._id,
           name: tech.userId ? `${tech.userId.fname || ""} ${tech.userId.lname || ""}`.trim() : null,
           mobile: tech.userId?.mobileNumber || null,
-          walletBalance: tech.walletBalance || 0,
+          // P7: response field name kept (contract); value sourced from
+          // canonical paise state, legacy rupee mirror only as fallback.
+          walletBalance: paiseToRupees(
+            tech.availableBalancePaise ?? rupeesToPaise(tech.walletBalance ?? 0)
+          ),
           workStatus: tech.workStatus,
         },
         bookings: {
@@ -533,7 +542,9 @@ export const getMyEarnings = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const tech = await TechnicianProfile.findById(techId).select("walletBalance").lean();
+    // P7: canonical paise state selected alongside the legacy mirror
+    // (fallback only fires for pre-paise documents).
+    const tech = await TechnicianProfile.findById(techId).select("availableBalancePaise walletBalance").lean();
     if (!tech) return res.status(404).json({ success: false, message: "Technician profile not found" });
 
     const ledger = await WalletTransaction.aggregate([
@@ -561,7 +572,10 @@ export const getMyEarnings = async (req, res) => {
     res.json({
       success: true,
       result: {
-        balance: tech.walletBalance || 0,
+        // P7: response field name kept (contract); canonical paise source.
+        balance: paiseToRupees(
+          tech.availableBalancePaise ?? rupeesToPaise(tech.walletBalance ?? 0)
+        ),
         totalEarnings,
         totalJobEarnings: round2(l.job || 0),
         totalTips: round2(l.tips || 0),

@@ -84,6 +84,11 @@
       "key": "availabilityId",
       "value": "REPLACE_WITH_AVAILABILITY_ID",
       "type": "string"
+    },
+    {
+      "key": "refreshToken",
+      "value": "PASTE_REFRESH_TOKEN_FROM_LOGIN",
+      "type": "string"
     }
   ],
   "item": [
@@ -416,6 +421,106 @@
               "text": "{\n  \"status\": \"ok\",\n  \"data\": \"success\"\n}"
             }
           ]
+        },
+        {
+          "name": "POST /api/user/auth/refresh",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "refresh"
+              ]
+            },
+            "description": "P5: rotate refresh token. Returns { token, refresh_token, expires_in }. Old refresh token dies immediately; replay triggers theft protection (whole token family revoked). Save the new refresh_token over {{refreshToken}}. 400 missing/malformed, 401 invalid/expired/revoked/reused.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refreshToken}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/user/auth/logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/logout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "logout"
+              ]
+            },
+            "description": "P5: revoke the current session (derived from the Bearer token). Other devices stay logged in. Active socket for this session gets session:revoked. Legacy tokens return revoked:false with success."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/user/auth/logout-all",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/user/auth/logout-all",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "user",
+                "auth",
+                "logout-all"
+              ]
+            },
+            "description": "P5: revoke ALL sessions for the user + bump global token version (all access tokens die now). All user sockets disconnected. Use after password change on shared devices or suspected theft."
+          },
+          "response": []
         },
         {
           "name": "POST /api/user/set-password",

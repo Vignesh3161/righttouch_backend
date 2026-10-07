@@ -242,17 +242,20 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role, s
     throw err;
   }
 
-  if (record.attempts >= 5) {
+  // P9: atomic attempt claim (replaces read-then-write pre-check).
+  // Exactly 5 claims succeed per OTP row, even under concurrency; the
+  // 6th and later fail here with the same 429 as before.
+  const claimed = await otpRepo.claimOtpAttempt(record._id);
+  if (!claimed) {
     const err = new Error("Too many attempts. Request new OTP.");
     err.statusCode = 429;
     err.code = "OTP_TOO_MANY_ATTEMPTS";
     throw err;
   }
 
-  const isMatch = await bcrypt.compare(otp, record.otp);
+  const isMatch = await bcrypt.compare(otp, claimed.otp);
   if (!isMatch) {
-    await otpRepo.recordAttempt(record._id);
-    const remainingAttempts = Math.max(0, 5 - (record.attempts + 1));
+    const remainingAttempts = Math.max(0, 5 - claimed.attempts);
     const err = new Error(`Invalid OTP. ${remainingAttempts} attempts remaining`);
     err.statusCode = 400;
     err.code = "OTP_INVALID";

@@ -1,11 +1,10 @@
 import express from "express";
-import bodyParser from "body-parser";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
 import cors from "cors";
 import helmet from "helmet";
 import multer from "multer";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./shared/utils/socketConstants.js";
@@ -20,10 +19,25 @@ dotenv.config();
 let redisPubClient = null;
 let redisSubClient = null;
 let redisRevokeSubClient = null;
+const isRedisEnabled = () => {
+  const v = String(process.env.REDIS_ENABLED ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+};
 const initRedisAdapter = async (io) => {
+  if (!isRedisEnabled()) {
+    console.log("🔴 Redis disabled via REDIS_ENABLED (single-node mode, in-memory fallback)");
+    return;
+  }
   const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
   try {
-    redisPubClient = createClient({ url: redisUrl });
+    redisPubClient = createClient({
+      url: redisUrl,
+      socket: {
+        connectTimeout: 5000,
+        reconnectStrategy: (retries) => (retries >= 3 ? false : Math.min(retries * 200, 1000)),
+      },
+      disableOfflineQueue: true,
+    });
     redisSubClient = redisPubClient.duplicate();
     await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
     io.adapter(createAdapter(redisPubClient, redisSubClient));
@@ -132,7 +146,15 @@ const sanitizeNoSqlPayload = (value) => {
   }
 
   for (const key of Object.keys(value)) {
-    const shouldDropKey = key.startsWith("$") || key.includes(".");
+    // P9: also drop prototype-pollution keys — __proto__/constructor/
+    // prototype contain neither "$" nor "." so the old check let them
+    // through into {...req.body}/Object.assign sinks.
+    const shouldDropKey =
+      key.startsWith("$") ||
+      key.includes(".") ||
+      key === "__proto__" ||
+      key === "constructor" ||
+      key === "prototype";
     if (shouldDropKey) {
       delete value[key];
       continue;
@@ -448,16 +470,11 @@ App.use((req, res, next) => {
 });
 
 // 🔒 General API Rate Limiter (applies to all routes)
-const getClientIp = (req) => {
-  const xff = req.headers?.["x-forwarded-for"];
-  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
-  if (req.ip) return req.ip;
-  return req.socket?.remoteAddress || "unknown";
-};
-
+// P9: keyed by ipKeyGenerator (trust-proxy-aware). The previous custom
+// getClientIp() preferred X-Forwarded-For unconditionally, so any client
+// could mint fresh buckets by rotating the header when trust proxy is off.
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  //sk
   max: 1000, // 1000 requests per window (increased for development)
   message: {
     success: false,
@@ -468,7 +485,7 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
   // Don't crash the process if req.ip is temporarily unavailable (e.g. aborted connections)
   validate: { ip: false, trustProxy: false },
-  keyGenerator: (req) => getClientIp(req),
+  keyGenerator: (req) => ipKeyGenerator(req),
   // Socket.IO uses its own transport endpoints; don't rate-limit those via Express
   skip: (req) => typeof req.path === "string" && req.path.startsWith("/socket.io"),
 });
@@ -567,7 +584,10 @@ App.get("/health/metrics", async (req, res) => {
   res.status(200).json(notificationMetrics.getSummary());
 });
 
-App.get("/health/socket-rooms/:userId", async (req, res) => {
+// P9: authenticated-only. Previously public: anyone could probe arbitrary
+// userIds and learn techProfileId + live-socket presence (enumeration oracle).
+// Liveness probes must use /health/live and /health/ready (still public).
+App.get("/health/socket-rooms/:userId", Auth, async (req, res) => {
   const { userId } = req.params;
   if (!mongoose.Types.ObjectId.isValid(userId)) {
     return res.status(400).json({ success: false, message: "Invalid userId" });

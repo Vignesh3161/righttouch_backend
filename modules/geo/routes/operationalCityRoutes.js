@@ -1,5 +1,5 @@
 import express from "express";
-import { Auth } from "../../../shared/middleware/Auth.js";
+import { Auth, authorizeRoles } from "../../../shared/middleware/Auth.js";
 import {
   listOperationalCities,
   getOperationalCityById,
@@ -132,9 +132,9 @@ const router = express.Router();
  *       400:
  *         description: Validation failed
  */
-router.get("/districts", Auth, listOperationalCities);
-router.get("/operational-cities", Auth, listOperationalCities);
-router.get("/admin/districts", Auth, listOperationalCities);
+router.get("/districts", Auth, authorizeRoles("Admin", "Owner"), listOperationalCities);
+router.get("/operational-cities", Auth, authorizeRoles("Admin", "Owner"), listOperationalCities);
+router.get("/admin/districts", Auth, authorizeRoles("Admin", "Owner"), listOperationalCities);
 
 /**
  * @openapi
@@ -149,7 +149,7 @@ router.get("/admin/districts", Auth, listOperationalCities);
  *       200:
  *         description: Active city returned
  */
-router.get("/operational-cities/active", Auth, getActiveOperationalCity);
+router.get("/operational-cities/active", Auth, authorizeRoles("Admin", "Owner"), getActiveOperationalCity);
 
 /**
  * @openapi
@@ -164,7 +164,7 @@ router.get("/operational-cities/active", Auth, getActiveOperationalCity);
  *       200:
  *         description: Active polygons list returned
  */
-router.get("/operational-cities/polygons", Auth, getActivePolygons);
+router.get("/operational-cities/polygons", Auth, authorizeRoles("Admin", "Owner"), getActivePolygons);
 
 /**
  * @openapi
@@ -223,17 +223,17 @@ router.get("/operational-cities/polygons", Auth, getActivePolygons);
  *       200:
  *         description: District deleted successfully
  */
-router.get("/districts/:id", Auth, getOperationalCityById);
-router.get("/operational-cities/:id", Auth, getOperationalCityById);
-router.get("/admin/districts/:id", Auth, getOperationalCityById);
+router.get("/districts/:id", Auth, authorizeRoles("Admin", "Owner"), getOperationalCityById);
+router.get("/operational-cities/:id", Auth, authorizeRoles("Admin", "Owner"), getOperationalCityById);
+router.get("/admin/districts/:id", Auth, authorizeRoles("Admin", "Owner"), getOperationalCityById);
 
-router.post("/districts", Auth, createOperationalCity);
-router.post("/operational-cities", Auth, createOperationalCity);
-router.post("/admin/districts", Auth, createOperationalCity);
+router.post("/districts", Auth, authorizeRoles("Admin", "Owner"), createOperationalCity);
+router.post("/operational-cities", Auth, authorizeRoles("Admin", "Owner"), createOperationalCity);
+router.post("/admin/districts", Auth, authorizeRoles("Admin", "Owner"), createOperationalCity);
 
-router.put("/districts/:id", Auth, updateOperationalCity);
-router.put("/operational-cities/:id", Auth, updateOperationalCity);
-router.put("/admin/districts/:id", Auth, updateOperationalCity);
+router.put("/districts/:id", Auth, authorizeRoles("Admin", "Owner"), updateOperationalCity);
+router.put("/operational-cities/:id", Auth, authorizeRoles("Admin", "Owner"), updateOperationalCity);
+router.put("/admin/districts/:id", Auth, authorizeRoles("Admin", "Owner"), updateOperationalCity);
 
 /**
  * @openapi
@@ -332,14 +332,14 @@ router.put("/admin/districts/:id", Auth, updateOperationalCity);
  *       200:
  *         description: Technicians list returned
  */
-router.patch("/districts/:id/status", Auth, updateDistrictStatus);
-router.patch("/districts/:id/registration", Auth, updateDistrictRegistration);
-router.patch("/districts/:id/jobs", Auth, updateDistrictJobs);
-router.get("/districts/:id/technicians", Auth, getDistrictTechnicians);
-router.patch("/admin/districts/:id/status", Auth, updateDistrictStatus);
-router.patch("/admin/districts/:id/registration", Auth, updateDistrictRegistration);
-router.patch("/admin/districts/:id/jobs", Auth, updateDistrictJobs);
-router.get("/admin/districts/:id/technicians", Auth, getDistrictTechnicians);
+router.patch("/districts/:id/status", Auth, authorizeRoles("Admin", "Owner"), updateDistrictStatus);
+router.patch("/districts/:id/registration", Auth, authorizeRoles("Admin", "Owner"), updateDistrictRegistration);
+router.patch("/districts/:id/jobs", Auth, authorizeRoles("Admin", "Owner"), updateDistrictJobs);
+router.get("/districts/:id/technicians", Auth, authorizeRoles("Admin", "Owner"), getDistrictTechnicians);
+router.patch("/admin/districts/:id/status", Auth, authorizeRoles("Admin", "Owner"), updateDistrictStatus);
+router.patch("/admin/districts/:id/registration", Auth, authorizeRoles("Admin", "Owner"), updateDistrictRegistration);
+router.patch("/admin/districts/:id/jobs", Auth, authorizeRoles("Admin", "Owner"), updateDistrictJobs);
+router.get("/admin/districts/:id/technicians", Auth, authorizeRoles("Admin", "Owner"), getDistrictTechnicians);
 
 /**
  * @openapi
@@ -360,10 +360,10 @@ router.get("/admin/districts/:id/technicians", Auth, getDistrictTechnicians);
  *       200:
  *         description: City activated
  */
-router.post("/operational-cities/:id/activate", Auth, activateOperationalCity);
+router.post("/operational-cities/:id/activate", Auth, authorizeRoles("Admin", "Owner"), activateOperationalCity);
 
-router.delete("/districts/:id", Auth, deleteOperationalCity);
-router.delete("/operational-cities/:id", Auth, deleteOperationalCity);
-router.delete("/admin/districts/:id", Auth, deleteOperationalCity);
+router.delete("/districts/:id", Auth, authorizeRoles("Admin", "Owner"), deleteOperationalCity);
+router.delete("/operational-cities/:id", Auth, authorizeRoles("Admin", "Owner"), deleteOperationalCity);
+router.delete("/admin/districts/:id", Auth, authorizeRoles("Admin", "Owner"), deleteOperationalCity);
 
 export default router;

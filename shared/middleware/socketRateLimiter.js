@@ -30,10 +30,11 @@ export const createHandshakeLimiter = ({
 } = {}) => {
     return (socket, next) => {
         const now = Date.now();
-        // Consistent with HTTP getClientIp(): prefer X-Forwarded-For when behind
-        // a proxy (Render/Nginx), else the direct socket address.
-        // NOTE: still per-process — move to Redis for true multi-server limits.
-        const xff = socket.handshake.headers?.["x-forwarded-for"];
+        // P9: trust X-Forwarded-For ONLY when the deployment is behind a
+        // proxy (TRUST_PROXY=true/1); otherwise any client could rotate the
+        // header to mint fresh handshake buckets.
+        const trustProxy = process.env.TRUST_PROXY === "true" || process.env.TRUST_PROXY === "1";
+        const xff = trustProxy ? socket.handshake.headers?.["x-forwarded-for"] : null;
         const ip =
           (typeof xff === "string" && xff.split(",")[0].trim()) ||
           socket.handshake.address ||

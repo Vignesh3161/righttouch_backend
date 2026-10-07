@@ -184,6 +184,70 @@ const pruneInvalidTokens = async (recipientId, recipientType, tokens, errorCodes
   }
 };
 
+/**
+ * P7 — legacy-mirror fallback observability (explicit + temporary).
+ * DeviceToken is canonical; legacy User/TechnicianProfile.fcmTokens arrays
+ * are dual-written so they stay fresh, but any send that had to rely on
+ * them is counted here. Removal condition (Stage G): sustained zero
+ * `legacyFallbackSends` after backfill + quiescence window.
+ */
+export const pushSourceMetrics = {
+  canonicalDeviceTokenSends: 0,
+  legacyFallbackSends: 0,
+};
+
+/**
+ * P7: token gathering extracted verbatim (no behavior change) so the
+ * canonical-source precedence is unit-testable without FCM network.
+ * Order: DeviceToken (canonical) first, legacy mirrors as explicit
+ * measured fallback, then de-dupe + length validation.
+ */
+export const gatherPushTokens = async (recipientId, recipientType) => {
+  const type =
+    recipientType === "admin" ? "admin" : recipientType === "customer" ? "customer" : "technician";
+  const rawTokens = [];
+
+  // 1. Gather tokens from DeviceToken collection (active tokens)
+  const deviceDocs = await DeviceToken.find({
+    userId: recipientId,
+    isActive: true,
+  }).select("fcmToken").lean().catch(() => []);
+
+  deviceDocs.forEach((d) => {
+    if (d.fcmToken) rawTokens.push(d.fcmToken);
+  });
+
+  // 2. P7 explicit transition fallback: legacy User /
+  // TechnicianProfile arrays (dual-written, so fresh — but counted so the
+  // fallback is measurable, never silent; see pushSourceMetrics).
+  const canonicalHits = deviceDocs.length;
+  const beforeLegacy = rawTokens.length;
+  if (type === "customer" || type === "admin") {
+    const user = await User.findById(recipientId).select("fcmTokens").lean().catch(() => null);
+    if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
+  } else {
+    const tech = await TechnicianProfile.findById(recipientId).select("fcmTokens userId").lean().catch(() => null);
+    if (tech?.fcmTokens) rawTokens.push(...tech.fcmTokens);
+    if (tech?.userId) {
+      const user = await User.findById(tech.userId).select("fcmTokens").lean().catch(() => null);
+      if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
+      const userDeviceDocs = await DeviceToken.find({
+        userId: tech.userId,
+        isActive: true,
+      }).select("fcmToken").lean().catch(() => []);
+      userDeviceDocs.forEach((d) => {
+        if (d.fcmToken) rawTokens.push(d.fcmToken);
+      });
+    }
+  }
+  if (canonicalHits > 0) pushSourceMetrics.canonicalDeviceTokenSends += 1;
+  else if (rawTokens.length > beforeLegacy) pushSourceMetrics.legacyFallbackSends += 1;
+  // else: no tokens anywhere — counted by neither (skipped send).
+
+  // 3. De-duplicate and validate
+  return [...new Set(rawTokens)].filter((t) => typeof t === "string" && t.trim().length > 10);
+};
+
 export const sendPushNotification = async (recipientId, payload, options = {}) => {
   const recipientType = options.recipientType === "admin"
     ? "admin"
@@ -192,42 +256,7 @@ export const sendPushNotification = async (recipientId, payload, options = {}) =
     : "technician";
 
   try {
-    let rawTokens = [];
-
-    // 1. Gather tokens from DeviceToken collection (active tokens)
-    const deviceDocs = await DeviceToken.find({
-      userId: recipientId,
-      isActive: true,
-    }).select("fcmToken").lean().catch(() => []);
-
-    deviceDocs.forEach((d) => {
-      if (d.fcmToken) rawTokens.push(d.fcmToken);
-    });
-
-    // 2. Gather tokens from legacy User / TechnicianProfile arrays
-    if (recipientType === "customer" || recipientType === "admin") {
-      const user = await User.findById(recipientId).select("fcmTokens").lean().catch(() => null);
-      if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
-    } else {
-      const tech = await TechnicianProfile.findById(recipientId).select("fcmTokens userId").lean().catch(() => null);
-      if (tech?.fcmTokens) rawTokens.push(...tech.fcmTokens);
-      if (tech?.userId) {
-        const user = await User.findById(tech.userId).select("fcmTokens").lean().catch(() => null);
-        if (user?.fcmTokens) rawTokens.push(...user.fcmTokens);
-        const userDeviceDocs = await DeviceToken.find({
-          userId: tech.userId,
-          isActive: true,
-        }).select("fcmToken").lean().catch(() => []);
-        userDeviceDocs.forEach((d) => {
-          if (d.fcmToken) rawTokens.push(d.fcmToken);
-        });
-      }
-    }
-
-    // 3. De-duplicate and validate
-    const tokens = [...new Set(rawTokens)].filter(
-      (t) => typeof t === "string" && t.trim().length > 10
-    );
+    const tokens = await gatherPushTokens(recipientId, recipientType);
 
     if (!tokens.length) {
       return { success: true, skipped: true, reason: "no_fcm_token" };

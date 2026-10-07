@@ -50,7 +50,8 @@ export const findTechnicianWithUser = (userId, options = {}) =>
       .select("-password")
   );
 
-/** Legacy FCM mirror writes (dual-write compat; removal is P7). */
+/** P7 transition dual-write (DEPRECATED — DeviceToken is canonical;
+ * removal is Stage G, gated on sustained zero legacyFallbackSends). */
 export const addFcmMirror = (userId, fcmToken) =>
   TechnicianProfile.updateOne({ userId }, { $addToSet: { fcmTokens: fcmToken } }).catch(() => {});
 

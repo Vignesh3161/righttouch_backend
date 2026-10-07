@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import * as sessionRepo from "../repositories/sessionRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as profileRepo from "../repositories/profileRepository.js";
+import { emitSecurityEvent } from "../utils/securityEvents.js";
 import {
   generateRefreshToken,
   hashRefreshToken,
@@ -148,6 +149,12 @@ export const rotateRefreshToken = async ({ refreshToken, device = {} }, options 
     if (replacementExists) {
       await revokeSessionFamilyInternal(oldSession.familyId, "reuse_detected", options);
       await userRepo.bumpTokenVersion(oldSession.userId, options);
+      // P9: refresh reuse is a compromise signal — must be observable.
+      emitSecurityEvent({
+        actor: oldSession.userId || null,
+        actorRole: oldSession.role || null,
+        action: "AUTH_REFRESH_REUSE_DETECTED",
+      });
     }
     invalidRefresh();
   }
@@ -178,6 +185,12 @@ export const rotateRefreshToken = async ({ refreshToken, device = {} }, options 
       if (replacementExists) {
         await revokeSessionFamilyInternal(reread.familyId, "reuse_detected", options);
         await userRepo.bumpTokenVersion(reread.userId, options);
+        // P9: same compromise signal as the primary reuse path.
+        emitSecurityEvent({
+          actor: reread.userId || null,
+          actorRole: reread.role || null,
+          action: "AUTH_REFRESH_REUSE_DETECTED",
+        });
       }
     }
     invalidRefresh();
@@ -217,6 +230,9 @@ export const rotateRefreshToken = async ({ refreshToken, device = {} }, options 
     tokenVersion: user.tokenVersion ?? 0,
     sid: String(replacementId),
   });
+
+  // P9: rotation is the normal path — logged for anomaly baselining.
+  emitSecurityEvent({ actor: user._id || null, actorRole: user.role || null, action: "AUTH_REFRESH_ROTATED" });
 
   return {
     accessToken,

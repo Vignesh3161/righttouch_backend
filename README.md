@@ -268,6 +268,8 @@ REDIS_URL=redis://localhost:6379
 
 # Security Secrets
 JWT_SECRET=your_super_secret_jwt_key_min_32_characters
+# P6: short-lived access tokens (default 1h; JWT_EXPIRES_IN kept as legacy fallback)
+JWT_ACCESS_EXPIRES_IN=1h
 ENCRYPTION_KEY=32_byte_hex_string_for_kyc_field_crypto
 
 # Payment Gateway - Razorpay & RazorpayX

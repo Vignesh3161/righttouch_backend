@@ -142,7 +142,10 @@ export const getRatingById = async (req, res) => {
       return res.status(404).json({ success: false, message: "Rating not found", result: {} });
     }
 
-    if (role !== "admin" && role !== "owner" && rating.userId?.toString() !== userId) {
+    // P9: userId is populated ({_id, email}) above — compare the raw id,
+    // not the populated object (whose toString() never matches).
+    const ownerId = String(rating.userId?._id ?? rating.userId);
+    if (role !== "admin" && role !== "owner" && ownerId !== userId) {
       return res.status(403).json({ success: false, message: "Not authorized to view this rating", result: {} });
     }
 

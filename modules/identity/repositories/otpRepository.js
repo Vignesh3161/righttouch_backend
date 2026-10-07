@@ -54,9 +54,29 @@ export const recordAttempt = (otpId, options = {}) => {
 };
 
 /**
+ * P9: atomic attempt claim. Increments attempts ONLY when under the
+ * budget, in a single findOneAndUpdate — parallel wrong guesses can no
+ * longer all pass a read-then-write pre-check. Returns the post-claim
+ * document, or null when the budget is exhausted. Serial semantics are
+ * identical to recordAttempt-after-check (one increment per try).
+ */
+export const claimOtpAttempt = (otpId, maxAttempts = 5, options = {}) => {
+  let query = Otp.findOneAndUpdate(
+    { _id: otpId, attempts: { $lt: maxAttempts } },
+    { $inc: { attempts: 1 } },
+    { new: true }
+  );
+  if (options?.session) query = query.session(options.session);
+  return query;
+};
+
+/**
  * Atomic one-time consume. Succeeds for exactly one concurrent caller;
  * returns the consumed document, or null when already consumed/expired.
- * MUST NOT be replaced with read-then-write (P2 Task 3).
+ * Budget enforcement lives in claimOtpAttempt (P9): consume MUST NOT
+ * re-check attempts, because N parallel legitimate claims land before any
+ * consume runs and must still yield exactly one winner. MUST NOT be
+ * replaced with read-then-write (P2 Task 3).
  */
 export const consumeOtp = (otpId, options = {}) => {
   let query = Otp.findOneAndUpdate(

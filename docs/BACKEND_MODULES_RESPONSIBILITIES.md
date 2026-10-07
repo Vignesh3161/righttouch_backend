@@ -80,7 +80,7 @@ Rooms (`Utils/socketConstants.js`, `index.js` joins): `user:{userId}` (all roles
 | `Services/authService.js` | `signupAndSendOtpInternal / resendOtpInternal / verifyOtpInternal / loginInternal / setPasswordInternal / acceptTermsInternal` + `signToken`; Owner invite-code gate, terms enforcement, `TempUser` upsert, OTP bcrypt+SMS, txn `User.create (+TechnicianProfile)` on verify, `PASSWORD_LOGIN` vs `OTP_SENT` branching |
 | `Services/accountService.js` | Transactional self-delete + Owner-only `deleteUserById` (Owner quorum, technician snapshot preservation) |
 | `Services/profileService.js` | Customer (`User`-only) vs Technician (`User+Profile+KYC`, encrypted bank) get/complete/update + admin list/detail aggregations |
-| `Utils/token.js` | Central `signToken/verifyTokenOptions` (HS256, `JWT_SECRET`, `JWT_EXPIRES_IN` default 7d, optional iss/aud); payload `{userId, role, technicianProfileId?}` |
+| `Utils/token.js` | Central `signToken/verifyTokenOptions` (HS256, `JWT_SECRET`, P6 access lifetime `JWT_ACCESS_EXPIRES_IN` default 1h with `JWT_EXPIRES_IN` legacy fallback, optional iss/aud); payload `{userId, role, technicianProfileId?}` + P5 `tokenVersion/sid` |
 | `Utils/ensureCustomer.js` (+ `Middleware/ensureCustomer.js` duplicate) | Customer-only guard (helper-throw vs middleware-next variants) |
 | `Utils/ensureTechnician.js` | Technician-only helper variant |
 | `Utils/phoneValidation.js` | `normalizeIndianMobile()` |
