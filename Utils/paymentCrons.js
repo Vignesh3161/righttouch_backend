@@ -11,31 +11,32 @@ import PlatformLedgerEntry from "../Schemas/PlatformLedgerEntry.js";
 import ReconciliationException from "../Schemas/ReconciliationException.js";
 
 import { fetchOrderPayments } from "./razorpay.js";
-import { fetchPayout, PAYOUT_SUCCESS_STATUSES, PAYOUT_FINAL_FAILURE_STATUSES } from "./razorpayX.js";
 import { markPaymentSucceeded, markPaymentFailed } from "./paymentTransitions.js";
 import { settleEligibleBookingsBackstop } from "./settlement.js";
 import { writeAuditLog } from "./audit.js";
 import { toPaise, rupeesToPaise, paiseToRupees } from "./money.js";
 import { postPayoutLedgerEntry, postLedgerEntry } from "./ledger.js";
 import { raiseReconciliationException } from "./paymentTransitions.js";
-import { processAutoPayouts } from "./autoPayout.js";
-import { releaseFailedWithdrawalReserve } from "./withdrawalPayoutEngine.js";
 
 /**
  * ⏰ PAYMENT RECONCILIATION CRONS
  *
- * No money state may depend on a single HTTP round-trip succeeding:
+ * Technician payouts are manual-NEFT-only: an admin transfers via the bank
+ * portal and records the UTR with mark-paid. There is no payout-provider
+ * integration, so there is no automatic payout reconciliation. Legacy
+ * provider-linked records (if any) are resolved by a human via
+ * adminResolveManualReview() with verified bank/provider evidence — never
+ * automatically.
+ *
  *   - Phase 1 (payments): every 15 min — pending payments older than 30 min
  *     are checked against Razorpay; captured → success transition; still
  *     pending after 3 checks → failed + alert.
- *   - Phase 3 (payouts): every 10 min — initiated outbox entries older than
- *     5 min are reconciled against Razorpay X.
+ *   - Daily ledger (01:30 IST) + manual payout ledger checks (read-only
+ *     except ReconciliationException rows and the customer-payment backfill).
  */
 
 const MAX_PAYMENT_RECONCILIATION_ATTEMPTS = 3;
 const PAYMENT_RECONCILIATION_AGE_MS = 30 * 60 * 1000; // 30 min
-const PAYOUT_RECONCILIATION_AGE_MS = 5 * 60 * 1000;   // 5 min
-const MAX_PAYOUT_ATTEMPTS = 5;
 const CRON_CONCURRENCY = 5;
 
 /** 🔌 Skip cron work while Mongo is disconnected (avoids 10s buffer timeouts). */
@@ -174,10 +175,15 @@ export const reconcilePendingPayments = async () => {
 };
 
 /* =====================================================
-   PHASE 3 — PAYOUT RECONCILIATION (every 10 min)
+   LEGACY PAYOUT RESOLUTION (human-initiated only)
+   The automated payout integration was removed. These helpers exist solely
+   so an authorized admin can resolve legacy provider-linked records with
+   verified bank/provider evidence via adminResolveManualReview() below.
+   Nothing here calls a provider or runs on a schedule.
+   PayoutOutbox rows are historical evidence; no new rows are ever created.
 ===================================================== */
 
-const completePayout = async (outbox, payout) => {
+export const completePayout = async (outbox, payout) => {
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -201,7 +207,7 @@ const completePayout = async (outbox, payout) => {
         { session }
       );
 
-      // Align with settlePayoutSuccess: reserve moves by gross requested,
+      // Align with the manual mark-paid settlement: reserve moves by gross requested,
       // lifetime + ledger move by net (after deductions).
       const totalRequestedPaise = toPaise(
         withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount)
@@ -221,9 +227,9 @@ const completePayout = async (outbox, payout) => {
       withdrawal.status = "paid";
       withdrawal.paidAt = new Date();
       withdrawal.decidedAt = new Date();
-      withdrawal.payoutProvider = "razorpay_x";
+      withdrawal.payoutProvider = "legacy_provider";
       withdrawal.payoutReference = outbox.razorpayPayoutId || payout?.id || null;
-      withdrawal.adminNote = withdrawal.adminNote || `Paid via Razorpay X reconciliation`;
+      withdrawal.adminNote = withdrawal.adminNote || `Paid via legacy provider payout (human-resolved reconciliation)`;
       withdrawal.requestedAmountPaise = totalRequestedPaise;
       withdrawal.netPayoutAmountPaise = netPayoutAmountPaise;
       withdrawal.amountPaise = netPayoutAmountPaise;
@@ -231,11 +237,13 @@ const completePayout = async (outbox, payout) => {
       await withdrawal.save({ session });
 
       // Legacy/edge path: if the reserve debit was never recorded
-      // (pre-reserve-model requests), deduct + record it now.
+      // (pre-reserve-model requests), establish the hold now (available →
+      // reserved) so the release below nets to zero instead of driving
+      // reserved negative.
       if (!alreadyDebited) {
         await TechnicianProfile.updateOne(
           { _id: withdrawal.technicianId },
-          { $inc: { availableBalancePaise: -amountPaiseNum } },
+          { $inc: { availableBalancePaise: -amountPaiseNum, reservedBalancePaise: amountPaiseNum } },
           { session }
         );
         try {
@@ -249,7 +257,7 @@ const completePayout = async (outbox, payout) => {
                 source: "withdraw",
                 withdrawalId: withdrawal._id,
                 idempotencyKey: `withdrawal:${withdrawal._id}`,
-                note: `Razorpay X payout ${outbox.razorpayPayoutId} (reconciled) – withdrawal #${withdrawal._id}`,
+                note: `Legacy provider payout ${outbox.razorpayPayoutId} (human-resolved) – withdrawal #${withdrawal._id}`,
               },
             ],
             { session }
@@ -260,7 +268,7 @@ const completePayout = async (outbox, payout) => {
       }
 
       // Release the reserve (gross) + record lifetime withdrawn (net) —
-      // mirrors settlePayoutSuccess so both paths agree.
+      // mirrors the manual mark-paid settlement so both paths agree.
       await TechnicianProfile.updateOne(
         { _id: withdrawal.technicianId },
         {
@@ -300,165 +308,88 @@ const completePayout = async (outbox, payout) => {
   }
 };
 
-const revertPayout = async (outbox, payout, errorMsg) => {
-  const session = await mongoose.startSession();
+/**
+ * 🔓 Release a reserve after a legacy payout failure was human-verified, so the
+ * technician is never left with their balance frozen and the record reaches a
+ * terminal state. Moved here from the removed automated payout engine: it is
+ * now called only by adminResolveManualReview() below (human-initiated, with
+ * verified bank/provider evidence) — never by a schedule or webhook.
+ *
+ * Safety: the withdrawal + PayoutOutbox are both marked terminal (`failed`);
+ * the wallet reserve is moved back (reserved→available, clamped) with a
+ * single compensating refund row.
+ */
+export const releaseFailedWithdrawalReserve = async ({
+  withdrawalId,
+  amountPaise,
+  technicianId,
+  reason = null,
+}) => {
+  const amt = toPaise(amountPaise);
+  const s = await mongoose.startSession();
   try {
-    await session.withTransaction(async () => {
-      const withdrawal = await WithdrawalRequest.findById(outbox.withdrawalId).session(session);
-      if (!withdrawal) throw new Error("Withdrawal not found for outbox entry");
+    await s.withTransaction(async () => {
+      const w = await WithdrawalRequest.findById(withdrawalId).session(s);
+      if (!w) return;
+      w.status = "failed";
+      w.failedAt = new Date();
+      w.decisionNote = `Payout failed: ${reason || "unknown"}`;
+      w.failureReason = `Payout failed: ${reason || "unknown"}`;
 
-      if (withdrawal.status === "processing") {
-        withdrawal.status = "approved"; // retryable by admin
-        withdrawal.decisionNote = `Payout ${payout?.id || outbox.razorpayPayoutId} failed at Razorpay: ${errorMsg}`;
-        withdrawal.failedAt = new Date();
-        await withdrawal.save({ session });
-
-        // 🔓 Release the reserve back to available in the SAME txn —
-        // otherwise the technician's money stays frozen in reservedBalancePaise
-        // forever (mirrors releaseFailedWithdrawalReserve, kept inline so the
-        // status flip + reserve move stay atomic).
-        const amt = toPaise(withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount));
-        if (amt > 0) {
-          await TechnicianProfile.updateOne(
-            { _id: withdrawal.technicianId },
-            { $inc: { availableBalancePaise: amt, reservedBalancePaise: -amt } },
-            { session }
-          );
-          try {
-            await WalletTransaction.create(
-              [
-                {
-                  technicianId: withdrawal.technicianId,
-                  amountPaise: amt,
-                  amount: paiseToRupees(amt),
-                  type: "credit",
-                  source: "adjustment",
-                  withdrawalId: withdrawal._id,
-                  idempotencyKey: `withdrawal-refund:${withdrawal._id}`,
-                  note: `Refund for failed withdrawal #${withdrawal._id}: ${errorMsg}`,
-                },
-              ],
-              { session }
-            );
-          } catch (e) {
-            if (e?.code !== 11000) throw e; // replay-safe no-op
-          }
-        }
+      // Clamped to what is actually held: pre-reserve legacy records hold 0
+      // and must not go negative. Shortfalls are noted for human review.
+      const heldReserve = await TechnicianProfile.findById(technicianId)
+        .select("reservedBalancePaise")
+        .session(s)
+        .lean();
+      const releasePaise = Math.min(toPaise(heldReserve?.reservedBalancePaise) || 0, amt);
+      if (releasePaise < amt) {
+        w.decisionNote += ` Reserve shortfall: released ${releasePaise} of ${amt} paise held reserve. Requires human review.`;
       }
+      await w.save({ session: s });
 
-      outbox.status = "failed";
-      outbox.lastError = errorMsg;
-      outbox.razorpayPayoutId = outbox.razorpayPayoutId || payout?.id || null;
-      outbox.failedAt = new Date();
-      await outbox.save({ session });
+      await PayoutOutbox.updateOne(
+        { withdrawalId },
+        { $set: { status: "failed", failedAt: new Date(), lastError: reason || "Payout failed" } },
+        { session: s }
+      );
+
+      if (releasePaise > 0) {
+        await TechnicianProfile.updateOne(
+          { _id: technicianId },
+          { $inc: { availableBalancePaise: releasePaise, reservedBalancePaise: -releasePaise } },
+          { session: s }
+        );
+
+        await WalletTransaction.create(
+          [
+            {
+              technicianId,
+              amountPaise: releasePaise,
+              amount: paiseToRupees(releasePaise),
+              type: "credit",
+              source: "adjustment",
+              withdrawalId,
+              idempotencyKey: `withdrawal-refund:${withdrawalId}`,
+              note: `Refund for failed withdrawal #${withdrawalId}`,
+            },
+          ],
+          { session: s }
+        );
+      }
     });
-
-    await writeAuditLog({
-      action: "PAYOUT_RECONCILIATION_FAILED",
-      targetType: "WithdrawalRequest",
-      targetId: outbox.withdrawalId,
-      metadata: { payoutId: payout?.id || null, error: errorMsg },
-      reason: "Payout failed at Razorpay; withdrawal reverted to approved for retry",
-    });
-
-    console.error(
-      `[PayoutCron] ALERT: payout for withdrawal ${outbox.withdrawalId} failed at Razorpay: ${errorMsg}`
-    );
+  } catch (e) {
+    console.error("releaseFailedWithdrawalReserve error:", e.message);
   } finally {
-    session.endSession();
+    s.endSession();
   }
 };
 
-export const reconcileStuckPayouts = async () => {
-  const cutoff = new Date(Date.now() - PAYOUT_RECONCILIATION_AGE_MS);
-
-  const stuck = await PayoutOutbox.find({
-    status: "initiated",
-    updatedAt: { $lt: cutoff },
-    attempts: { $lt: MAX_PAYOUT_ATTEMPTS },
-  }).limit(50);
-
-  await runBatched(stuck, async (outbox) => {
-    try {
-      if (!outbox.razorpayPayoutId) {
-        // Payout API call itself may have failed before returning an id —
-        // treat as failed so admin can retry.
-        await revertPayout(outbox, null, "No razorpayPayoutId recorded");
-        return;
-      }
-
-      const payout = await fetchPayout(outbox.razorpayPayoutId);
-      const status = payout?.status;
-
-      if (PAYOUT_SUCCESS_STATUSES.includes(status)) {
-        await completePayout(outbox, payout);
-      } else if (PAYOUT_FINAL_FAILURE_STATUSES.includes(status)) {
-        await revertPayout(outbox, payout, `Razorpay status: ${status}`);
-      } else {
-        // created / processing / queued — leave for the next run
-        await PayoutOutbox.updateOne(
-          { _id: outbox._id },
-          { $inc: { attempts: 1 } }
-        );
-      }
-    } catch (err) {
-      await PayoutOutbox.updateOne(
-        { _id: outbox._id },
-        { $inc: { attempts: 1 }, $set: { lastError: err.message } }
-      );
-    }
-  });
-
-  // 🔍 Ambiguous payouts parked in `manual_review` (timeout/network at
-  // RazorpayX). If we recorded a Razorpay id, we CAN reconcile with the
-  // provider; otherwise they stay for an admin to resolve manually.
-  const reviewable = await PayoutOutbox.find({
-    status: "manual_review",
-    razorpayPayoutId: { $exists: true, $ne: null },
-    updatedAt: { $lt: cutoff },
-    attempts: { $lt: MAX_PAYOUT_ATTEMPTS },
-  }).limit(50);
-
-  await runBatched(reviewable, async (outbox) => {
-    try {
-      const payout = await fetchPayout(outbox.razorpayPayoutId);
-      const status = payout?.status;
-
-      if (PAYOUT_SUCCESS_STATUSES.includes(status)) {
-        // Money left the platform — complete (release reserve + ledger).
-        await completePayout(outbox, payout);
-      } else if (PAYOUT_FINAL_FAILURE_STATUSES.includes(status)) {
-        // Provider says it failed — refund the held reserve (no double pay).
-        const w = await WithdrawalRequest.findById(outbox.withdrawalId).lean();
-        if (w) {
-          await releaseFailedWithdrawalReserve({
-            withdrawalId: outbox.withdrawalId,
-            amountPaise: w.amountPaise,
-            technicianId: w.technicianId,
-            reason: `Razorpay status: ${status}`,
-          });
-        }
-      } else {
-        // Still processing at provider — leave for the next run.
-        await PayoutOutbox.updateOne(
-          { _id: outbox._id },
-          { $inc: { attempts: 1 } }
-        );
-      }
-    } catch (err) {
-      await PayoutOutbox.updateOne(
-        { _id: outbox._id },
-        { $inc: { attempts: 1 }, $set: { lastError: err.message } }
-      );
-    }
-  });
-};
-
 /**
- * 🛠️ Admin manual resolution of an ambiguous (`manual_review`) payout.
- * `decision` = "complete" (force mark paid — money confirmed sent) or
- * "revert" (refund the held reserve). The platform cannot auto-decide when
- * no Razorpay id was captured, so a human resolves it (spec §6F).
+ * 🛠️ Admin manual resolution of a legacy `manual_review` payout.
+ * `decision` = "complete" (force mark paid — money confirmed sent via bank
+ * records) or "revert" (refund the held reserve). A human resolves it with
+ * verified evidence; nothing here calls a provider or runs automatically.
  */
 export const adminResolveManualReview = async ({ withdrawalId, decision, admin }) => {
   const withdrawal = await WithdrawalRequest.findById(withdrawalId);
@@ -467,6 +398,9 @@ export const adminResolveManualReview = async ({ withdrawalId, decision, admin }
     throw new Error(`Only manual_review payouts can be resolved here (current: ${withdrawal.status})`);
   }
   const outbox = await PayoutOutbox.findOne({ withdrawalId });
+  if (!outbox) {
+    throw new Error("No linked payout outbox record — resolve via the manual mark-paid/reject flow instead");
+  }
 
   if (decision === "complete") {
     await completePayout(outbox, null);
@@ -507,6 +441,17 @@ export const adminResolveManualReview = async ({ withdrawalId, decision, admin }
    Runs every day at 01:30 IST. Every check is idempotent:
    problems surface as ReconciliationException rows (deduped by
    fingerprint) and are NEVER auto-fixed in a destructive way.
+
+   COMPLETE MUTATION INVENTORY (this job WRITES — contrast with the
+   read-only Utils/financialReconciliation.js audit, which writes nothing):
+   1-2,4,6-8: ReconciliationException inserts only (report-only findings).
+   3: customer_payment LEDGER BACKFILL via postLedgerEntry (idempotent key;
+      increments summary.fixed) — customer-collection path only.
+   5: PayoutOutbox initiated→manual_review flip for >24h stuck rows.
+   9: exception rows only (duplicate payout ledgers are never merged/deleted).
+   `reconcileManualPayoutLedger` (below): exception rows only.
+   NO technician-payout execution, NO reserve moves, NO withdrawal status
+   finalization, NO provider transfer calls anywhere in this job.
 ===================================================== */
 
 export const reconcileDailyLedger = async () => {
@@ -649,9 +594,10 @@ export const reconcileDailyLedger = async () => {
     summary.exceptions++;
   }
 
-  // ── 6. Approved withdrawals idle for > 72h (payout never initiated) ──
+  // ── 6. Approved/requested withdrawals idle for > 72h (manual bank run pending) ──
+  // Stage 1: `requested` added — both states now wait for the offline run.
   const idleWithdrawals = await WithdrawalRequest.find({
-    status: "approved",
+    status: { $in: ["approved", "requested"] },
     decidedAt: { $lt: new Date(now.getTime() - 72 * 60 * 60 * 1000) },
   })
     .select("_id technicianId amountPaise decidedAt")
@@ -710,9 +656,13 @@ export const reconcileDailyLedger = async () => {
   }
 
   // ── 9. Duplicate ledger entries for the same payout (double-spend detection) ──
+  // NOTE: PlatformLedgerEntry stores withdrawalId at the TOP LEVEL (see the
+  // schema and postLedgerEntry's refs→top-level mapping); there is no `refs`
+  // subdocument. Grouping by "$refs.withdrawalId" collapsed every payout
+  // entry into _id:null and false-fired once 2+ payouts existed.
   const dupPayoutLedger = await PlatformLedgerEntry.aggregate([
-    { $match: { type: "technician_payout" } },
-    { $group: { _id: "$refs.withdrawalId", count: { $sum: 1 } } },
+    { $match: { type: "technician_payout", withdrawalId: { $ne: null } } },
+    { $group: { _id: "$withdrawalId", count: { $sum: 1 } } },
     { $match: { count: { $gt: 1 } } },
     { $limit: 50 },
   ]);
@@ -727,6 +677,100 @@ export const reconcileDailyLedger = async () => {
   }
 
   console.log(`[DailyLedger] checked=${summary.checked} exceptions=${summary.exceptions} fixed=${summary.fixed}`);
+  return summary;
+};
+
+/**
+ * Stage 1 manual-flow reconciliation (no provider calls).
+ * Called from the daily cron below; every check is read-only except
+ * ReconciliationException rows (deduped by fingerprint, never destructive).
+ */
+export const reconcileManualPayoutLedger = async () => {
+  const summary = { checked: 0, exceptions: 0 };
+
+  // ── 10. Paid withdrawals missing their technician_payout ledger entry ──
+  const paidWithdrawals = await WithdrawalRequest.find({ status: "paid" })
+    .select("_id technicianId amountPaise netPayoutAmountPaise utr paidAt")
+    .limit(200)
+    .lean();
+  summary.checked += paidWithdrawals.length;
+  for (const w of paidWithdrawals) {
+    const exists = await PlatformLedgerEntry.exists({
+      idempotencyKey: `payout:${w._id}:technician-payout`,
+    });
+    if (!exists) {
+      await raiseReconciliationException({
+        code: "PAID_WITHOUT_PAYOUT_LEDGER",
+        severity: "critical",
+        details: { withdrawalId: w._id, technicianId: w.technicianId, utr: w.utr || null },
+      });
+      summary.exceptions++;
+    }
+  }
+
+  // ── 11. Duplicate UTRs across withdrawals ──
+  const dupUtr = await WithdrawalRequest.aggregate([
+    { $match: { utr: { $type: "string", $nin: ["", "N/A"] } } },
+    { $group: { _id: "$utr", count: { $sum: 1 }, withdrawals: { $push: "$_id" } } },
+    { $match: { count: { $gt: 1 } } },
+    { $limit: 50 },
+  ]);
+  summary.checked += dupUtr.length;
+  for (const d of dupUtr) {
+    await raiseReconciliationException({
+      code: "DUPLICATE_UTR",
+      severity: "critical",
+      details: { utr: d._id, count: d.count, withdrawalIds: d.withdrawals },
+    });
+    summary.exceptions++;
+  }
+
+  // ── 12. Reserved balance vs active-withdrawal gross (per technician) ──
+  // reservedBalancePaise must equal SUM(gross) of non-terminal withdrawals.
+  // Retention reserveBalancePaise is a separate field and is excluded.
+  const activeSums = await WithdrawalRequest.aggregate([
+    { $match: { status: { $in: ["pending", "requested", "approved", "processing", "manual_review"] } } },
+    {
+      $group: {
+        _id: "$technicianId",
+        grossPaise: {
+          $sum: {
+            $round: {
+              $multiply: [
+                { $ifNull: ["$requestedAmountPaise", { $ifNull: ["$amountPaise", { $multiply: [{ $ifNull: ["$amount", 0] }, 100] }] }] },
+                1,
+              ],
+            },
+          },
+        },
+        count: { $sum: 1 },
+      },
+    },
+    { $limit: 500 },
+  ]);
+  summary.checked += activeSums.length;
+  for (const a of activeSums) {
+    if (!a._id) continue;
+    const profile = await TechnicianProfile.findById(a._id)
+      .select("reservedBalancePaise")
+      .lean();
+    if (!profile) continue;
+    if (toPaise(profile.reservedBalancePaise) !== toPaise(a.grossPaise)) {
+      await raiseReconciliationException({
+        code: "RESERVE_MISMATCH",
+        severity: "critical",
+        details: {
+          technicianId: a._id,
+          reservedPaise: toPaise(profile.reservedBalancePaise),
+          activeGrossPaise: toPaise(a.grossPaise),
+          activeCount: a.count,
+        },
+      });
+      summary.exceptions++;
+    }
+  }
+
+  console.log(`[ManualPayoutLedger] checked=${summary.checked} exceptions=${summary.exceptions}`);
   return summary;
 };
 
@@ -757,27 +801,9 @@ export const initPaymentCrons = () => {
     }
   });
 
-  cron.schedule("*/10 * * * *", async () => {
-    if (!dbReady()) return;
-    try {
-      await reconcileStuckPayouts();
-    } catch (err) {
-      console.error("[PaymentCron] reconcileStuckPayouts error:", err.message);
-    }
-  });
-
-  // 💸 Auto-payout cron — every 6 hours (override via AUTO_PAYOUT_CRON_EXPRESSION).
-  // Scans high-balance technicians and pays out balance − maintenance floor
-  // automatically. Individual payout failures never abort the run, and the
-  // 10-min reconcileStuckPayouts above recovers any ambiguous payout.
-  cron.schedule(process.env.AUTO_PAYOUT_CRON_EXPRESSION || "0 */6 * * *", async () => {
-    if (!dbReady()) return;
-    try {
-      await processAutoPayouts();
-    } catch (err) {
-      console.error("[PaymentCron] processAutoPayouts error:", err.message);
-    }
-  });
+  // 💸 Automatic payouts were removed with the RazorpayX integration.
+  // Technician payouts are manual-NEFT-only (admin bank transfer + UTR
+  // mark-paid). No auto-payout schedule runs here.
 
   // 🌙 Daily ledger & wallet reconciliation (01:30 IST)
   cron.schedule("30 1 * * *", async () => {
@@ -786,6 +812,13 @@ export const initPaymentCrons = () => {
       await reconcileDailyLedger();
     } catch (err) {
       console.error("[PaymentCron] reconcileDailyLedger error:", err.message);
+    }
+    // Stage 1 manual-flow checks (paid-without-ledger, duplicate UTR,
+    // reserve-vs-active). Read-only; no provider calls.
+    try {
+      await reconcileManualPayoutLedger();
+    } catch (err) {
+      console.error("[PaymentCron] reconcileManualPayoutLedger error:", err.message);
     }
   });
 

@@ -641,11 +641,19 @@ export const deleteProduct = async (req, res) => {
     }
 
     const activeBooking = await ProductBooking.findOne({ productId: id, status: { $ne: "cancelled" } });
-    if (activeBooking) {
-      return res.status(409).json({
-        success: false,
-        message: "Cannot delete product referenced in active bookings. Mark status as ARCHIVED or INACTIVE instead.",
-        result: {},
+    if (activeBooking && req.query.force !== "true" && req.body?.force !== true) {
+      const archived = await Product.findByIdAndUpdate(id, { isActive: false }, { new: true });
+      if (!archived) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found",
+          result: {},
+        });
+      }
+      return res.status(200).json({
+        success: true,
+        message: "Product has bookings, archived (deactivated) instead of deleted.",
+        result: { ...archived.toObject(), archived: true },
       });
     }
 

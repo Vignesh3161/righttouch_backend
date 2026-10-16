@@ -10,6 +10,8 @@ import sendSms from "./sendSMS.js";
 import { notifyTechnicianWithFallback, emitJobsChanged, emitJobExpired } from "./sendNotification.js";
 import { toBookingCancelledDTO } from "./socketDTO.js";
 import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendReminder.js";
+import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
+import { expireRewards, recoverMissedRewards } from "../Services/rewardService.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
@@ -551,6 +553,70 @@ export const initBookingCrons = (io) => {
     });
 
     console.log("✅ Consolidated booking crons are active.");
+
+    /**
+     * ─── CRON 7: COMPLETED-UNPAID PAYMENT REMINDERS (Hourly) ───────────────
+     * Reminds customers of completed bookings still awaiting payment
+     * (24h + 72h) and escalates 7d+ overdue bookings to the admin
+     * dashboard. Notification-only: never touches settlement, ledger,
+     * wallet, or payout state. Stage claims are atomic — overlapping
+     * workers cannot double-send.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("0 * * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            const summary = await runPaymentReminderSweep({ io });
+            const total = ["first", "second", "escalated"].reduce(
+                (a, s) => a + (summary[s]?.sent || 0), 0
+            );
+            if (total > 0 || summary.first?.retry > 0) {
+                console.log("[Cron:PaymentReminder]", JSON.stringify(summary));
+            }
+        } catch (err) {
+            console.error("[Cron:PaymentReminder Error]", err);
+        }
+    });
+
+    /**
+     * ─── CRON 8: REWARD LOT EXPIRY (Hourly) ──────────────────────────────
+     * Expires eligible customer reward coin lots FIFO. Idempotent per lot
+     * ("reward-expire:<lotId>"); overlapping workers cannot double-expire.
+     * Notification-free; expiry is visible in reward history.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("30 * * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            const summary = await expireRewards({ now: new Date(), limit: 200 });
+            if (summary.expired > 0) {
+                console.log("[Cron:RewardExpiry]", JSON.stringify(summary));
+            }
+        } catch (err) {
+            console.error("[Cron:RewardExpiry Error]", err);
+        }
+    });
+
+    /**
+     * ─── CRON 9: REWARD MISSED-AWARD RECOVERY (Every 6 hours) ────────────
+     * Recovers settled bookings the post-settlement hook missed (hook
+     * failure, crash, standalone fallback). Bounded scan, idempotent
+     * awards; fully-refunded bookings reported, never awarded. Never
+     * blocks payment or settlement — read-compute-write on reward docs
+     * only, failures logged per booking.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("0 */6 * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            const summary = await recoverMissedRewards({ limit: 100 });
+            if (summary.awarded > 0 || summary.failed.length > 0) {
+                console.log("[Cron:RewardRecovery]", JSON.stringify(summary));
+            }
+        } catch (err) {
+            console.error("[Cron:RewardRecovery Error]", err);
+        }
+    });
 };
 
 // 🧹 CRON 6: ORPHANED JOBBROADCAST CLEANUP (Every 30 min)

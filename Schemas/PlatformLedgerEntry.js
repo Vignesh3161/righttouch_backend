@@ -15,8 +15,10 @@ import mongoose from "mongoose";
  *   platform_commission       credit — platform revenue (commission)
  *   customer_refund           debit  — money returned to customer
  *   gateway_fee / gateway_fee_tax — payment gateway costs
- *   technician_payout         debit  — actual RazorpayX payout executed
- *   payout_fee / payout_fee_tax   — RazorpayX payout costs
+ *   technician_payout         debit  — actual bank/UPI payout executed
+ *   technician_payout_reversal credit — reversal of a wrongly-recorded payout
+ *   (revert-paid; append-only, never edits the original payout entry)
+ *   payout_fee / payout_fee_tax   — payout gateway costs (legacy RazorpayX)
  *   cancellation_fee          credit — collected cancellation fee (if collected)
  *   chargeback                debit  — chargeback / reversal
  *   manual_adjustment         +/-    — explicit, audited corrections
@@ -38,6 +40,7 @@ const platformLedgerEntrySchema = new mongoose.Schema(
         "gateway_fee_tax",
         "technician_earning_liability",
         "technician_payout",
+        "technician_payout_reversal",
         "payout_fee",
         "payout_fee_tax",
         "platform_commission",

@@ -12,7 +12,9 @@ import { verifyTokenOptions } from "../Utils/token.js";
  * block the event loop synchronously (Socket Analysis B1.3).
  */
 export const socketAuth = (socket, next) => {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    // Tokens ONLY from handshake.auth — never from query string (URLs leak
+    // into proxy logs, browser history and referrer headers).
+    const token = socket.handshake.auth?.token;
 
     if (!token) {
         return next(new Error("Authentication error: Token required"));

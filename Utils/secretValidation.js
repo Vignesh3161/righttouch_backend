@@ -8,6 +8,11 @@ const REQUIRED = [
   "RAZORPAY_WEBHOOK_SECRET",
   "KYC_MASTER_KEY_B64",
   "MONGO_URI",
+  // Independent HMAC pepper for service-completion OTPs (Checkpoint B).
+  // Must NOT reuse JWT/Razorpay/KYC secrets: a 6-digit OTP has a small
+  // search space, so the pepper is the brute-force backstop.
+  // Generate: openssl rand -hex 32
+  "COMPLETION_OTP_PEPPER",
 ];
 
 const isPlaceholder = (v) =>
@@ -34,20 +39,10 @@ export const validateSecrets = () => {
     }
   }
 
-  // RazorpayX payout webhooks fail closed (see razorpayXWebhookController) —
-  // require at least one of the two supported variable names.
-  if (!process.env.RAZORPAYX_WEBHOOK_SECRET && !process.env.RAZORPAY_X_WEBHOOK_SECRET) {
-    errors.push(
-      "Missing required secret/env: RAZORPAYX_WEBHOOK_SECRET (or RAZORPAY_X_WEBHOOK_SECRET)"
-    );
-  } else {
-    const xSecret = process.env.RAZORPAYX_WEBHOOK_SECRET || process.env.RAZORPAY_X_WEBHOOK_SECRET;
-    if (isPlaceholder(xSecret)) {
-      errors.push(
-        "Insecure/placeholder secret rejected: RAZORPAYX_WEBHOOK_SECRET (must be >=16 chars and not a placeholder)"
-      );
-    }
-  }
+  // NOTE: RazorpayX automated payouts were removed; technician payouts are
+  // manual-NEFT-only (admin bank transfer + UTR mark-paid). No payout-provider
+  // webhook secret is required. Customer Razorpay collection still uses
+  // RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET above.
 
   // GCP service-account key should never be tracked in the repo.
   const gcpKey = process.env.GOOGLE_APPLICATION_CREDENTIALS;
@@ -65,6 +60,12 @@ export const validateSecrets = () => {
     console.error("🚨 CRITICAL SECRET VALIDATION WARNING / ERROR:");
     for (const err of errors) {
       console.error(`  - ${err}`);
+    }
+    // Fail closed in production: never serve traffic with missing/placeholder secrets.
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        `Refusing to boot with ${errors.length} missing/insecure secret(s). Configure them in environment variables.`
+      );
     }
     console.error(
       "⚠️ Server will bind HTTP port to satisfy container health checks, but missing/placeholder secrets MUST be configured in environment variables!"

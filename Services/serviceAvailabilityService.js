@@ -20,6 +20,10 @@ import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
  * Precedence inside a zone: ZONE/CITY DISABLED override > mapping gate >
  *   ZONE/CITY ENABLED override > DISTRICT default.
  *
+ * B-10: canonical ZONE rows (cityZoneId) govern; legacy CITY rows (cityId)
+ * apply only absent a canonical row. B-11: fail closed — missing district
+ * context, malformed identifiers, or an unknown district never authorize.
+ *
  * @param {Object} params
  * @param {string|ObjectId} params.serviceId
  * @param {string|ObjectId} params.districtId
@@ -44,6 +48,19 @@ export const resolveServiceAvailability = async ({
     };
   }
 
+  // B-17 follow-up: malformed service ids fail closed (findById would
+  // otherwise throw a CastError to the caller).
+  if (!mongoose.Types.ObjectId.isValid(serviceId)) {
+    return {
+      available: false,
+      scope: null,
+      districtId: districtId ? String(districtId) : null,
+      cityZoneId: null,
+      status: "DISABLED",
+      reason: "INVALID_SERVICE",
+    };
+  }
+
   const service = await Service.findById(serviceId).select("isActive zoneRestricted serviceName").lean();
   if (!service || !service.isActive) {
     return {
@@ -59,6 +76,20 @@ export const resolveServiceAvailability = async ({
   let resolvedDistrictId = districtId;
   const targetZoneId = cityZoneId || cityId;
 
+  // B-11: malformed zone identifiers fail closed before any DB lookup
+  // (findById would otherwise throw a CastError to the caller).
+  if (targetZoneId && !mongoose.Types.ObjectId.isValid(targetZoneId)) {
+    return {
+      available: false,
+      scope: "ZONE",
+      districtId: resolvedDistrictId ? String(resolvedDistrictId) : null,
+      cityZoneId: null,
+      cityId: null,
+      status: "DISABLED",
+      reason: "INVALID_ZONE",
+    };
+  }
+
   if (!resolvedDistrictId && targetZoneId) {
     const zDoc = await CityZone.findById(targetZoneId).select("operationalCityId").lean();
     if (zDoc?.operationalCityId) {
@@ -66,26 +97,67 @@ export const resolveServiceAvailability = async ({
     }
   }
 
+  // B-11 fail closed: without a district there is no basis to authorize.
   if (!resolvedDistrictId) {
     return {
-      available: true,
-      scope: "DEFAULT",
+      available: false,
+      scope: "DISTRICT",
       districtId: null,
       cityZoneId: targetZoneId ? String(targetZoneId) : null,
-      status: "ENABLED",
-      reason: "NO_DISTRICT_CONTEXT",
+      cityId: targetZoneId ? String(targetZoneId) : null,
+      status: "DISABLED",
+      reason: "DISTRICT_REQUIRED",
     };
   }
 
-  const districtObjId = new mongoose.Types.ObjectId(resolvedDistrictId);
-  const zoneObjId = targetZoneId ? new mongoose.Types.ObjectId(targetZoneId) : null;
+  let districtObjId;
+  let zoneObjId = null;
+  try {
+    districtObjId = new mongoose.Types.ObjectId(resolvedDistrictId);
+  } catch {
+    return {
+      available: false,
+      scope: "DISTRICT",
+      districtId: null,
+      cityZoneId: null,
+      cityId: null,
+      status: "DISABLED",
+      reason: "INVALID_DISTRICT",
+    };
+  }
+  if (targetZoneId) {
+    try {
+      zoneObjId = new mongoose.Types.ObjectId(targetZoneId);
+    } catch {
+      return {
+        available: false,
+        scope: "ZONE",
+        districtId: String(districtObjId),
+        cityZoneId: null,
+        cityId: null,
+        status: "DISABLED",
+        reason: "INVALID_ZONE",
+      };
+    }
+  }
   const cityObjId = zoneObjId;
 
-  // 0. DISTRICT OPERATIONAL STATUS CHECK (District must be active and jobs enabled)
+  // 0. DISTRICT OPERATIONAL STATUS CHECK (District must exist, be active and jobs enabled)
   const districtDoc = await OperationalCity.findById(districtObjId)
     .select("active isJobEnabled")
     .lean();
-  if (districtDoc && (districtDoc.active === false || districtDoc.isJobEnabled === false)) {
+  if (!districtDoc) {
+    return {
+      available: false,
+      scope: "DISTRICT",
+      districtId: String(districtObjId),
+      cityZoneId: zoneObjId ? String(zoneObjId) : null,
+      cityId: cityObjId ? String(cityObjId) : null,
+      status: "DISABLED",
+      reason: "DISTRICT_NOT_FOUND",
+    };
+  }
+  if (districtDoc.active === false || districtDoc.isJobEnabled === false) {
     return {
       available: false,
       scope: "DISTRICT",
@@ -170,13 +242,42 @@ export const resolveServiceAvailability = async ({
       }
     }
 
-    // 1B. Zone-Level ServiceAvailability Override (supports legacy cityId docs).
-    const zoneOverride = await ServiceAvailability.findOne({
+    // 1B. Zone-Level ServiceAvailability Override.
+    // B-10 deterministic precedence (no arbitrary findOne pick):
+    //   1. canonical ZONE row keyed by cityZoneId wins;
+    //   2. legacy CITY row keyed by cityId is honored only when no canonical
+    //      row exists (readers stay compatible until migration is approved).
+    // When both exist with conflicting status the canonical row governs; a
+    // warning is emitted so the pair can be cleaned up (see dry-run report).
+    const canonicalOverride = await ServiceAvailability.findOne({
       serviceId,
       districtId: districtObjId,
-      $or: [{ cityZoneId: zoneObjId }, { cityId: zoneObjId }],
-      scope: { $in: ["ZONE", "CITY"] },
+      cityZoneId: zoneObjId,
+      scope: "ZONE",
     }).lean();
+    let zoneOverride = canonicalOverride;
+    if (!zoneOverride) {
+      zoneOverride = await ServiceAvailability.findOne({
+        serviceId,
+        districtId: districtObjId,
+        cityId: zoneObjId,
+        scope: "CITY",
+      }).lean();
+    } else {
+      const legacyShadow = await ServiceAvailability.findOne({
+        serviceId,
+        districtId: districtObjId,
+        cityId: zoneObjId,
+        scope: "CITY",
+      })
+        .select("_id status")
+        .lean();
+      if (legacyShadow && String(legacyShadow.status) !== String(canonicalOverride.status)) {
+        console.warn(
+          `[availability] conflicting legacy CITY row ${legacyShadow._id} shadows canonical ZONE row ${canonicalOverride._id} (service ${serviceId}, zone ${zoneObjId}); canonical governs`
+        );
+      }
+    }
 
     if (zoneOverride) {
       const isCityScope = zoneOverride.scope === "CITY";

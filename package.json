@@ -8,7 +8,7 @@
     "test": "node --test \"test/*.test.js\"",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "generate-postman": "node postman/generate_zone_wise_complete.js && node postman/generate_technician_collection.js"
+    "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },
   "repository": {
     "type": "git",
@@ -54,5 +54,8 @@
     "swagger-ui-express": "^5.0.1",
     "twilio": "^5.9.0",
     "xss-clean": "^0.1.4"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.3.0"
   }
 }

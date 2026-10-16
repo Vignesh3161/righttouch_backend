@@ -84,8 +84,15 @@ export const getMyJobs = async (req, res) => {
 
 /* ================= RESPOND TO JOB ================= */
 export const respondToJob = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  // B-09 two-phase acceptance. Phase A performs all advisory reads outside
+  // any transaction (broadcast lookup, expiry, activation, mutex, candidate,
+  // version + eligibility pre-checks, feasibility). Phase B then opens a
+  // SHORT transaction that re-reads the authoritative rows on a fresh
+  // snapshot, re-validates version + eligibility, and performs the
+  // conditional claim. Anything revoked/re-broadcast before Phase B commits
+  // deterministically loses; only a revocation landing inside the short
+  // Phase-B window remains invisible (documented consistency boundary).
+  let session = null;
   let dispatchLockAt = null;
   try {
     ensureTechnician(req);
@@ -103,24 +110,22 @@ export const respondToJob = async (req, res) => {
     const isDecline = ["declined", "decline", "rejected", "reject", "no"].includes(finalStatus);
 
     if (!isAccept && !isDecline) {
-      await session.abortTransaction();
       return res.status(400).json({ success: false, message: "Invalid response status" });
     }
 
+    // Phase-A broadcast lookup (no session — advisory; Phase B re-reads).
     const broadcast = await JobBroadcast.findOne({
       bookingId: id,
       technicianId: technicianProfileId,
       status: { $in: ["sent"] },
-    }).session(session);
+    });
 
     if (!broadcast) {
-      await session.abortTransaction();
       return res.status(403).json({ success: false, message: "Job not assigned to you or already closed" });
     }
 
     // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
     if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
-      await session.abortTransaction();
       return res.status(410).json({
         success: false,
         message: "This job offer has expired. Pull to refresh your job list.",
@@ -130,39 +135,49 @@ export const respondToJob = async (req, res) => {
       });
     }
 
-    // 🛑 Handle DECLINE / REJECT
+    // 🛑 Handle DECLINE / REJECT in its own short transaction.
     if (isDecline) {
-      await JobBroadcast.updateOne(
-        { bookingId: id, technicianId: technicianProfileId },
-        { status: "rejected" },
-        { session }
-      );
-
-      const rejectedOffer = await TechnicianBookingOffer.findOneAndUpdate(
-        { bookingId: id, technicianId: technicianProfileId },
-        {
-          $set: {
-            decision: "rejected",
-            rejectReason: req.body?.reason || "declined_by_technician",
-            respondedAt: new Date(),
-          },
-        },
-        { new: true, session }
-      );
-
-      if (rejectedOffer) {
-        await TechnicianBookingOffer.updateOne(
-          { _id: rejectedOffer._id },
-          {
-            $set: {
-              responseLatencyMs: Date.now() - new Date(rejectedOffer.offeredAt).getTime(),
-            },
-          },
+      session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        await JobBroadcast.updateOne(
+          { bookingId: id, technicianId: technicianProfileId },
+          { status: "rejected" },
           { session }
         );
-      }
 
-      await session.commitTransaction();
+        const rejectedOffer = await TechnicianBookingOffer.findOneAndUpdate(
+          { bookingId: id, technicianId: technicianProfileId },
+          {
+            $set: {
+              decision: "rejected",
+              rejectReason: req.body?.reason || "declined_by_technician",
+              respondedAt: new Date(),
+            },
+          },
+          { new: true, session }
+        );
+
+        if (rejectedOffer) {
+          await TechnicianBookingOffer.updateOne(
+            { _id: rejectedOffer._id },
+            {
+              $set: {
+                responseLatencyMs: Date.now() - new Date(rejectedOffer.offeredAt).getTime(),
+              },
+            },
+            { session }
+          );
+        }
+
+        await session.commitTransaction();
+      } catch (declineErr) {
+        if (session.inTransaction()) await session.abortTransaction();
+        throw declineErr;
+      } finally {
+        session.endSession();
+        session = null;
+      }
 
       return res.status(200).json({
         success: true,
@@ -174,15 +189,15 @@ export const respondToJob = async (req, res) => {
     // must not accept jobs, even with a lingering "sent" broadcast record.
     const activation = await checkTechnicianActivation(technicianProfileId);
     if (!activation.isActive) {
-      await session.abortTransaction();
       return res.status(403).json({
         success: false,
         message: activation.message,
       });
     }
 
-    // 🔒 Per-technician dispatch mutex (self-expiring) — serializes
-    // concurrent accept requests for the SAME technician
+    // 🔒 Per-technician dispatch mutex (self-expiring, cross-process via the
+    // profile document) — serializes concurrent accept requests for the SAME
+    // technician. Deliberately outside any transaction (self-expiry).
     dispatchLockAt = new Date(Date.now() + DISPATCH_LOCK_MS);
     const locked = await TechnicianProfile.findOneAndUpdate(
       {
@@ -197,7 +212,6 @@ export const respondToJob = async (req, res) => {
     ).lean();
 
     if (!locked) {
-      await session.abortTransaction();
       return res.status(409).json({
         success: false,
         message: "Another request is being processed, please try again.",
@@ -210,12 +224,9 @@ export const respondToJob = async (req, res) => {
         { status: { $in: ["on_the_way", "reached", "in_progress"] } },
         { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
       ],
-    })
-      .session(session)
-      .select("_id status bookingType");
+    }).select("_id status bookingType");
 
     if (activeJob) {
-      await session.abortTransaction();
       const statusMsg =
         activeJob.status === "ACCEPTED" || activeJob.status === "accepted"
           ? "start travel for your current job"
@@ -234,19 +245,16 @@ export const respondToJob = async (req, res) => {
         ? req.body.version
         : broadcast.version || 1;
 
-    // ⏱ Candidate booking snapshot (pre-claim, same transaction)
+    // ⏱ Candidate booking snapshot (Phase-A advisory read).
     const candidate = await ServiceBooking.findById(id)
-      .session(session)
       .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
     if (!candidate) {
-      await session.abortTransaction();
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
 
-    // 🎯 VERSION VALIDATION — reject stale broadcast versions
-    // Validate against JobBroadcast.version (single source of truth)
+    // 🎯 VERSION VALIDATION (advisory) — reject stale broadcast versions.
+    // The authoritative version gate runs inside the Phase-B transaction.
     if (broadcast.version && requestedVersion !== broadcast.version) {
-      await session.abortTransaction();
       return res.status(409).json({
         success: false,
         message: "This job offer has been updated. Please refresh and try again.",
@@ -256,14 +264,14 @@ export const respondToJob = async (req, res) => {
       });
     }
 
-    // 🎯 RE-VALIDATE ELIGIBILITY (District Permission, Service Availability, 10km Radius) AT ACCEPT TIME
+    // 🎯 ELIGIBILITY PRE-CHECK (advisory) — the authoritative re-check runs
+    // inside the Phase-B transaction on a fresh snapshot.
     const eligibility = await checkTechnicianEligibility({
       technician: technicianProfileId,
       booking: candidate,
     });
 
     if (!eligibility.eligible) {
-      await session.abortTransaction();
       return res.status(403).json({
         success: false,
         message: "You are no longer eligible to accept this job.",
@@ -272,13 +280,9 @@ export const respondToJob = async (req, res) => {
       });
     }
 
-    const bookingAttemptCount = Array.isArray(candidate.assignmentAttempts)
-      ? candidate.assignmentAttempts.length
-      : 0;
-
-    // ⏱ The claim must reference an active unassigned booking.
+    // ⏱ The claim must reference an active unassigned booking (advisory —
+    // re-verified on live state inside Phase B).
     if (candidate.technicianId || !["pending", "broadcasted"].includes(candidate.status)) {
-      await session.abortTransaction();
       return res.status(409).json({
         success: false,
         message: "Too late! Booking already taken or closed.",
@@ -291,9 +295,7 @@ export const respondToJob = async (req, res) => {
     //   schedule candidate                        → window overlap check
     const [techQueueMap, techProfileForCheck] = await Promise.all([
       loadCommittedQueues([technicianProfileId]),
-      TechnicianProfile.findById(technicianProfileId)
-        .session(session)
-        .select("location"),
+      TechnicianProfile.findById(technicianProfileId).select("location"),
     ]);
     const techQueue = techQueueMap.get(String(technicianProfileId));
 
@@ -355,7 +357,6 @@ export const respondToJob = async (req, res) => {
           // Must arrive before the slot (with grace)
           const deadline = computeLatestArrival(stop.scheduledAt);
           if (deadline && cursor > deadline.getTime()) {
-            await session.abortTransaction();
             return res.status(409).json({
               success: false,
               message: "This time slot conflicts with an appointment you already accepted.",
@@ -376,7 +377,6 @@ export const respondToJob = async (req, res) => {
 
             const deadline = computeLatestArrival(stop.scheduledAt);
             if (deadline && cursor > deadline.getTime()) {
-              await session.abortTransaction();
               return res.status(409).json({
                 success: false,
                 message: "Accepting this job would make you late for a later appointment.",
@@ -400,7 +400,6 @@ export const respondToJob = async (req, res) => {
             queue: { activeJob: null, schedules: [instantJob] },
           });
           if (!feasibility.feasible) {
-            await session.abortTransaction();
             return res.status(409).json({
               success: false,
               message: "This job would make you late for another instant job you accepted.",
@@ -419,7 +418,6 @@ export const respondToJob = async (req, res) => {
         queue: techQueue,
       });
       if (!feasibility.feasible) {
-        await session.abortTransaction();
         return res.status(409).json({
           success: false,
           message: "This job would make you late for your scheduled appointment.",
@@ -431,35 +429,114 @@ export const respondToJob = async (req, res) => {
       }
     }
 
-    // Fetch technician profile and user data for snapshot
-    const technicianProfile = await TechnicianProfile.findById(technicianProfileId)
-      .session(session)
-      .select("userId location");
+    // B-09 deterministic test hook (inert in production): runs after the
+    // advisory checks and BEFORE the claim transaction opens, so tests can
+    // commit a revocation/re-broadcast mid-flight on a fresh snapshot.
+    await globalThis.__b09OnEligible?.();
 
-    if (!technicianProfile) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: "Technician profile not found" });
-    }
+    // ================= PHASE B — CLAIM TRANSACTION (fresh snapshot) ======
+    // Re-reads the authoritative rows, re-validates version + eligibility,
+    // then performs the conditional claim. A concurrent winner, re-broadcast,
+    // or revocation committed before this point deterministically loses.
+    session = await mongoose.startSession();
+    session.startTransaction();
+    let booking = null;
+    let otherTechIds = [];
+    try {
+      const fresh = await JobBroadcast.findOne({
+        bookingId: id,
+        technicianId: technicianProfileId,
+        status: "sent",
+      }).session(session);
 
-    const technicianUser = await User.findById(technicianProfile.userId)
-      .session(session)
-      .select("fname lname mobileNumber");
+      if (!fresh || (broadcast.version && fresh.version !== requestedVersion)) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This job offer has been updated. Please refresh and try again.",
+          reason: "version_mismatch",
+          requestedVersion,
+          currentVersion: fresh?.version ?? broadcast.version,
+        });
+      }
 
-    if (!technicianUser) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: "Technician user not found" });
-    }
+      const live = await ServiceBooking.findById(id)
+        .session(session)
+        .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
+      if (!live) {
+        await session.abortTransaction();
+        return res.status(404).json({ success: false, message: "Booking not found" });
+      }
+      if (live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "Too late! Booking already taken or closed.",
+        });
+      }
 
-    const technicianSnapshot = {
-      name: `${technicianUser.fname || ""} ${technicianUser.lname || ""}`.trim() || "Unknown",
-      mobile: technicianUser.mobileNumber || "",
-      deleted: false,
-    };
+      const recheck = await checkTechnicianEligibility({
+        technician: technicianProfileId,
+        booking: live,
+      });
+      if (!recheck.eligible) {
+        await session.abortTransaction();
+        return res.status(403).json({
+          success: false,
+          message: "You are no longer eligible to accept this job.",
+          reasons: recheck.reasons,
+          details: recheck.details,
+        });
+      }
 
-    // 🎯 ATOMIC CLAIM — status in [pending, broadcasted], technicianId null,
-    // and the exact broadcast version the technician was offered. If the claim
-    // fails, the booking was taken or re-broadcast concurrently: conflict, no
-    // partial state changes.
+      // Fetch technician profile and user data for snapshot
+      const technicianProfile = await TechnicianProfile.findById(technicianProfileId)
+        .session(session)
+        .select("userId location");
+
+      if (!technicianProfile) {
+        await session.abortTransaction();
+        return res.status(404).json({ success: false, message: "Technician profile not found" });
+      }
+
+      const technicianUser = await User.findById(technicianProfile.userId)
+        .session(session)
+        .select("fname lname mobileNumber");
+
+      if (!technicianUser) {
+        await session.abortTransaction();
+        return res.status(404).json({ success: false, message: "Technician user not found" });
+      }
+
+      const technicianSnapshot = {
+        name: `${technicianUser.fname || ""} ${technicianUser.lname || ""}`.trim() || "Unknown",
+        mobile: technicianUser.mobileNumber || "",
+        deleted: false,
+      };
+
+      // Version-guarded broadcast flip FIRST: a re-broadcast that committed
+      // after the Phase-A read misses this filter and loses deterministically.
+      const flip = await JobBroadcast.updateOne(
+        { bookingId: id, technicianId: technicianProfileId, status: "sent", version: fresh.version },
+        { $set: { status: "accepted", respondedAt: new Date() } },
+        { session }
+      );
+      if (flip.matchedCount === 0) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This job offer has been updated. Please refresh and try again.",
+          reason: "version_mismatch",
+          requestedVersion,
+          currentVersion: fresh.version,
+        });
+      }
+
+      const liveAttemptCount = Array.isArray(live.assignmentAttempts) ? live.assignmentAttempts.length : 0;
+
+    // 🎯 ATOMIC CLAIM — the broadcast flip above already pinned the offered
+    // version; this claim pins the unassigned booking. A miss means a
+    // concurrent winner: conflict, no partial state changes (all in-txn).
     const acceptUpdate = {
       technicianId: technicianProfileId,
       status: "accepted",
@@ -469,7 +546,7 @@ export const respondToJob = async (req, res) => {
       $push: {
         assignmentAttempts: {
           technicianId: technicianProfileId,
-          attemptNumber: (bookingAttemptCount || 0) + 1,
+          attemptNumber: (liveAttemptCount || 0) + 1,
           status: "assigned",
           acceptedAt: new Date(),
           feasibilitySnapshot: null,
@@ -478,13 +555,13 @@ export const respondToJob = async (req, res) => {
       $inc: { version: 1 },
     };
 
-    if (candidate.bookingType === "instant") {
+    if (live.bookingType === "instant") {
       // Instant: technician must click On The Way within 30 minutes.
       acceptUpdate.autoCancelAt = new Date(Date.now() + 30 * 60 * 1000);
     }
     // Schedule: keep the slot-driven lifecycle (reminders, escalation).
 
-    const booking = await ServiceBooking.findOneAndUpdate(
+    booking = await ServiceBooking.findOneAndUpdate(
       {
         _id: id,
         status: { $in: ["pending", "broadcasted"] },
@@ -502,14 +579,12 @@ export const respondToJob = async (req, res) => {
       return res.status(409).json({ success: false, message: "Too late! Booking already taken" });
     }
 
-    await JobBroadcast.updateOne({ bookingId: id, technicianId: technicianProfileId }, { status: "accepted" }, { session });
-
     const otherBroadcasts = await JobBroadcast.find({
       bookingId: id,
       technicianId: { $ne: technicianProfileId },
       status: "sent"
     }).session(session).select("technicianId");
-    const otherTechIds = otherBroadcasts.map(b => b.technicianId.toString());
+    otherTechIds = otherBroadcasts.map(b => b.technicianId.toString());
 
     await JobBroadcast.updateMany({ bookingId: id, technicianId: { $ne: technicianProfileId } }, { status: "expired" }, { session });
 
@@ -537,6 +612,30 @@ export const respondToJob = async (req, res) => {
     );
 
     await session.commitTransaction();
+    } catch (claimErr) {
+      // B-09: a write/commit conflict here means a concurrent winner,
+      // re-broadcast, or revocation-touching commit landed first. All writes
+      // were in-transaction, so the abort leaves no partial state; surface a
+      // retryable 409 (client retries the whole accept) instead of a 500.
+      try {
+        if (session.inTransaction()) await session.abortTransaction();
+      } catch {
+        /* already aborted */
+      }
+      const labels = claimErr?.errorLabels || [];
+      const msg = String(claimErr?.message || "");
+      const retryable =
+        labels.includes("TransientTransactionError") ||
+        labels.includes("UnknownTransactionCommitResult") ||
+        claimErr?.code === 112 ||
+        /WriteConflict|WriteConcern|wtimeout|transaction/i.test(msg);
+      console.error("respondToJob claim error:", msg);
+      return res.status(retryable ? 409 : 500).json({
+        success: false,
+        message: retryable ? "Too late! Booking already taken or updated. Please retry." : "Failed to accept job",
+        ...(retryable ? { reason: "claim_conflict" } : {}),
+      });
+    }
 
     if (req.io) {
       if (booking.customerId) {
@@ -569,7 +668,11 @@ export const respondToJob = async (req, res) => {
 
     return res.status(200).json({ success: true, message: "Job accepted successfully", result: bookingWithoutBaseAmount });
   } catch (err) {
-    if (session.inTransaction()) await session.abortTransaction();
+    try {
+      if (session && session.inTransaction()) await session.abortTransaction();
+    } catch {
+      /* already aborted */
+    }
     console.error("respondToJob Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   } finally {
@@ -581,6 +684,10 @@ export const respondToJob = async (req, res) => {
         { $set: { dispatchLockUntil: new Date() } }
       ).catch(() => {});
     }
-    session.endSession();
+    try {
+      session?.endSession();
+    } catch {
+      /* already ended */
+    }
   }
 };

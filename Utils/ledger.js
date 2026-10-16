@@ -122,7 +122,8 @@ export const postPaymentLedgerEntries = async ({
 };
 
 /**
- * Post a technician-payout ledger entry once the RazorpayX payout is confirmed.
+ * Post a technician-payout ledger entry once money has left the platform
+ * (automated provider payout historically; manual bank transfer in Stage 1).
  * Idempotent: "payout:<withdrawalId>:technician-payout".
  */
 export const postPayoutLedgerEntry = async ({
@@ -138,7 +139,7 @@ export const postPayoutLedgerEntry = async ({
     idempotencyKey: key,
     refs: { withdrawalId: withdrawal._id, technicianId: withdrawal.technicianId },
     providerReference,
-    description: "RazorpayX payout to technician bank/UPI",
+    description: "Technician payout (bank/UPI transfer) — money left the platform",
     session,
   });
 };

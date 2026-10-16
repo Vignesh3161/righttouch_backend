@@ -461,22 +461,6 @@ const options = {
           responses: { 200: { description: "Rejected" } },
         },
       },
-      "/admin/wallet/withdrawal/{id}/pay": {
-        put: {
-          tags: ["Admin - Wallet & Withdrawals"],
-          summary: "Trigger Razorpay X bank/UPI payout to technician",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
-          responses: { 200: { description: "Payout triggered" } },
-        },
-      },
-      "/admin/wallet/withdrawal/{id}/retry": {
-        post: {
-          tags: ["Admin - Wallet & Withdrawals"],
-          summary: "Retry failed withdrawal payout",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
-          responses: { 200: { description: "Retried" } },
-        },
-      },
       "/admin/wallet/technician/{technicianId}/freeze": {
         put: {
           tags: ["Admin - Wallet & Withdrawals"],

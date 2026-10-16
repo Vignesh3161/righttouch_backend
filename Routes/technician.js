@@ -40,7 +40,7 @@ import {
   deleteOrphanedKyc,
   deleteAllOrphanedKyc,
 } from "../Controllers/technicianKycController.js";
-import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob } from "../Controllers/serviceBookController.js";
+import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob, requestCompletionOtp, resendCompletionOtp, verifyCompletionOtp, getCompletionStatus } from "../Controllers/serviceBookController.js";
 import { createWalletTransaction, getWalletTransactions, requestWithdrawal, getMyWithdrawalRequests, cancelMyWithdrawal } from "../Controllers/technicianWalletController.js";
 import { getMyZone, getServicesInMyZone } from "../Controllers/zoneAvailabilityController.js";
 import { technicianListMyComplaints, technicianGetComplaintDetail, technicianRespondToComplaint } from "../Controllers/complaintController.js";
@@ -223,6 +223,25 @@ router.put("/booking/reaccept/:id", Auth, isTechnician, acceptCancelledJob); // 
 // Technician updates job status
 
 router.put("/status/:id", Auth, isTechnician, updateBookingStatus);
+
+/* ============ SERVICE COMPLETION OTP (customer-confirmed) ============
+   Direct `completed` via PUT /status/:id is closed (409) — completion
+   flows only through verify-completion-otp. */
+const completionOtpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    message: "Too many verification attempts, please try again after 1 minute",
+    result: {},
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+router.post("/booking/:id/completion-otp", Auth, isTechnician, completionOtpLimiter, requestCompletionOtp);
+router.post("/booking/:id/completion-otp/resend", Auth, isTechnician, completionOtpLimiter, resendCompletionOtp);
+router.post("/booking/:id/verify-completion-otp", Auth, isTechnician, completionOtpLimiter, verifyCompletionOtp);
+router.get("/booking/:id/completion-status", Auth, isTechnician, getCompletionStatus);
 router.post(
   "/jobs/:id/work-images",
   Auth,

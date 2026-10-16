@@ -272,13 +272,8 @@ export const submitTechnicianBankDetails = async (req, res) => {
     kyc.set(updateData);
     await kyc.save();
 
-    // 🔒 Razorpay X fund_account is bound to the bank/UPI details. The cached
-    // id becomes invalid when the account changes — clear it so the next
-    // payout creates a fresh fund account for the NEW bank details.
-    await TechnicianProfile.updateOne(
-      { _id: technicianProfileId },
-      { $unset: { razorpayFundAccountId: 1 } }
-    );
+    // NOTE: bank verification resets to pending on change; the manual
+    // mark-paid flow re-verifies (verified flag + fingerprint) at payout time.
 
     const kycObj = kyc.toObject();
     // Self data — return plaintext, not ciphertext.
@@ -1258,8 +1253,8 @@ export const adminUpdateTechnicianKycDetails = async (req, res) => {
 
 /* ================= ADMIN UPDATE TECHNICIAN BANK DETAILS ================= */
 // Admin/Owner can correct a technician's bank/UPI details. Re-encrypts,
-// recomputes the verification fingerprint, resets bank verification to pending,
-// and clears the cached RazorpayX fund account (bound to old details).
+// recomputes the verification fingerprint, and resets bank verification to
+// pending (re-verified at manual mark-paid time).
 export const adminUpdateTechnicianBankDetails = async (req, res) => {
   try {
     const { technicianId } = req.params;
@@ -1343,11 +1338,8 @@ export const adminUpdateTechnicianBankDetails = async (req, res) => {
     });
     await kyc.save();
 
-    // Cached RazorpayX fund account is bound to the old bank/UPI — invalidate it.
-    await TechnicianProfile.updateOne(
-      { _id: technicianId },
-      { $unset: { razorpayFundAccountId: 1 } }
-    );
+    // NOTE: bank verification resets to pending on change; the manual
+    // mark-paid flow re-verifies (verified flag + fingerprint) at payout time.
 
     await writeAuditLog({
       actor: req.user.userId,

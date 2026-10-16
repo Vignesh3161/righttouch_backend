@@ -547,6 +547,20 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
+    // 💳 COMPLETED-UNPAID PAYMENT REMINDERS (deduplicated cron reminders)
+    // Timestamps are claimed atomically (findOneAndUpdate with a null guard)
+    // so overlapping workers can never double-send for the same stage.
+    // `attempts` counts every sweep attempt (including failed sends) for
+    // operational monitoring. This subdocument is notification state ONLY —
+    // it never drives settlement, ledger, or payout decisions.
+    paymentReminders: {
+      firstAt: { type: Date, default: null },
+      secondAt: { type: Date, default: null },
+      escalatedAt: { type: Date, default: null },
+      attempts: { type: Number, default: 0, min: 0 },
+      lastAttemptAt: { type: Date, default: null },
+    },
+
     // 🕒 SEARCH & TIMEOUT TRACKING
     broadcastStartedAt: {
       type: Date,
@@ -597,6 +611,9 @@ serviceBookingSchema.index({ status: 1, technicianId: 1, autoCancelAt: 1 });
 
 // Worker lease / expiry hot path
 serviceBookingSchema.index({ leaseUntil: 1, status: 1 });
+
+// Completed-unpaid payment-reminder sweep hot path
+serviceBookingSchema.index({ status: 1, paymentStatus: 1, completedAt: 1 });
 
 // ── NORMALIZATION HOOK ────────────────────────────────────────────────────
 // Legacy statuses (ACCEPTED / SEARCHING / requested) are normalized to the

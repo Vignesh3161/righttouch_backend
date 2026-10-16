@@ -11,10 +11,13 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import User from "../Schemas/User.js";
 import DistrictPermissionHistory from "../Schemas/DistrictPermissionHistory.js";
 import PolygonVersion from "../Schemas/PolygonVersion.js";
-import { validateAndSanitizePolygon, isPointInPolygonRing, validateZoneInsideDistrict, checkZoneOverlap } from "../Utils/geoValidation.js";
+import { validateAndSanitizePolygon } from "../Utils/geoValidation.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
+import { isValidObjectId, exactRegex, containsRegex, clampLimit, clampPage, internalError } from "../Utils/safeQuery.js";
+import { seedZoneDisabledServices, recordPolygonVersion, withZoneWriteTransaction, invalidateDistrictPolygonCache } from "../Services/zoneWriteService.js";
+import { writeAuditLog } from "../Utils/audit.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -38,30 +41,42 @@ export const createDistrict = async (req, res) => {
       });
     }
 
-    const district = await OperationalCity.create({
-      name,
-      state,
-      country,
-      code: code ? String(code).toUpperCase() : null,
-      polygon: validation.sanitizedPolygon,
-      active: true,
-      status: "ACTIVE",
-      isRegistrationEnabled,
-      isJobEnabled,
-      createdBy: req.user._id,
-      updatedBy: req.user._id,
-      version: 1,
+    // B-05: district + v1 history commit atomically; polygon cache cleared.
+    const { result: district } = await withZoneWriteTransaction(async (session) => {
+      const opts = session ? { session } : {};
+      const docs = await OperationalCity.create(
+        [
+          {
+            name,
+            state,
+            country,
+            code: code ? String(code).toUpperCase() : null,
+            polygon: validation.sanitizedPolygon,
+            active: true,
+            status: "ACTIVE",
+            isRegistrationEnabled,
+            isJobEnabled,
+            createdBy: req.user._id,
+            updatedBy: req.user._id,
+            version: 1,
+          },
+        ],
+        opts
+      );
+      const created = Array.isArray(docs) ? docs[0] : docs;
+      await recordPolygonVersion(
+        {
+          entityType: "DISTRICT",
+          entityId: created._id,
+          polygon: validation.sanitizedPolygon,
+          changedBy: req.user._id,
+          changeReason: "Initial District Creation",
+        },
+        session
+      );
+      return created;
     });
-
-    // P — Save Polygon Version 1
-    await PolygonVersion.create({
-      entityType: "DISTRICT",
-      entityId: district._id,
-      version: 1,
-      polygon: validation.sanitizedPolygon,
-      changedBy: req.user._id,
-      changeReason: "Initial District Creation",
-    });
+    invalidateDistrictPolygonCache();
 
     return res.status(201).json({
       success: true,
@@ -69,7 +84,7 @@ export const createDistrict = async (req, res) => {
       result: district,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -78,6 +93,9 @@ export const updateDistrict = async (req, res) => {
     const { id } = req.params;
     const { name, state, code, polygon, status, statusReason, reason } = req.body;
 
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid district id", code: "INVALID_ID" });
+    }
     const district = await OperationalCity.findById(id);
     if (!district) return res.status(404).json({ success: false, message: "District not found" });
 
@@ -107,22 +125,42 @@ export const updateDistrict = async (req, res) => {
     if (statusReason) district.statusReason = statusReason;
     district.updatedBy = req.user._id;
 
-    if (versionIncremented) {
-      district.version = (district.version || 1) + 1;
-      district.polygon = updatedPolygon;
+    // B-05: version bump + history row commit atomically with the district
+    // save; polygon cache is invalidated so matching sees new geometry.
+    await withZoneWriteTransaction(async (session) => {
+      if (versionIncremented) {
+        district.version = (district.version || 1) + 1;
+        district.polygon = updatedPolygon;
+      }
+      await district.save(session ? { session } : {});
+      if (versionIncremented) {
+        await recordPolygonVersion(
+          {
+            entityType: "DISTRICT",
+            entityId: district._id,
+            polygon: updatedPolygon,
+            changedBy: req.user._id,
+            changeReason: reason || "District Boundary Update",
+          },
+          session
+        );
+      }
+    });
+    if (versionIncremented) invalidateDistrictPolygonCache(String(district._id));
 
-      // P — Save Polygon Version
-      await PolygonVersion.create({
-        entityType: "DISTRICT",
-        entityId: district._id,
-        version: district.version,
-        polygon: updatedPolygon,
-        changedBy: req.user._id,
-        changeReason: reason || "District Boundary Update",
-      });
+    // B-12: a status flip through the geofence path changes dispatch
+    // eligibility the same way the standard status toggle does.
+    if (status) {
+      if (district.active) {
+        const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+        await backfillBroadcastsForScope({ districtId: district._id, io: req.io })
+          .catch((e) => console.warn("geofence status backfill warning:", e.message));
+      } else {
+        const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+        await revalidateTechniciansForService(null, district._id, null, req.io)
+          .catch((e) => console.warn("geofence status revalidation warning:", e.message));
+      }
     }
-
-    await district.save();
 
     return res.status(200).json({
       success: true,
@@ -130,7 +168,7 @@ export const updateDistrict = async (req, res) => {
       result: district,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -140,28 +178,31 @@ export const listDistricts = async (req, res) => {
     const query = {};
 
     if (search) {
+      const rx = containsRegex(search);
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { code: { $regex: search, $options: "i" } },
-        { state: { $regex: search, $options: "i" } },
+        { name: { $regex: rx } },
+        { code: { $regex: rx } },
+        { state: { $regex: rx } },
       ];
     }
 
     if (status) query.status = status;
 
-    const skip = (Number(page) - 1) * Number(limit);
+    const safePage = clampPage(page);
+    const safeLimit = clampLimit(limit);
+    const skip = (safePage - 1) * safeLimit;
     const [districts, total] = await Promise.all([
-      OperationalCity.find(query).sort({ name: 1 }).skip(skip).limit(Number(limit)).lean(),
+      OperationalCity.find(query).sort({ name: 1 }).skip(skip).limit(safeLimit).lean(),
       OperationalCity.countDocuments(query),
     ]);
 
     return res.status(200).json({
       success: true,
       result: districts,
-      pagination: { total, page: Number(page), limit: Number(limit), pages: Math.ceil(total / Number(limit)) },
+      pagination: { total, page: safePage, limit: safeLimit, pages: Math.ceil(total / safeLimit) },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -197,40 +238,60 @@ export const createCityZone = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors });
     }
 
-    // Validate Parent-Child Containment (Zone must be inside Parent Operational District)
-    if (parentDistrict.polygon) {
-      const containment = validateZoneInsideDistrict(validation.sanitizedPolygon, parentDistrict.polygon);
-      if (!containment.valid) {
-        return res.status(400).json({
-          success: false,
-          code: "ZONE_OUTSIDE_PARENT_DISTRICT",
-          message: containment.reason,
-        });
-      }
-    }
-
-    // Overlap Detection: Verify zone polygon does not overlap existing active zones in district
-    const existingZones = await CityZone.find({ operationalCityId: parentId, active: true }).lean();
-    for (const ez of existingZones) {
-      if (ez.polygon && checkZoneOverlap(validation.sanitizedPolygon, ez.polygon)) {
-        return res.status(409).json({
-          success: false,
-          code: "ZONE_OVERLAP_DETECTED",
-          message: `Zone polygon overlaps geographically with existing active zone "${ez.name || "Zone"}" in the same district.`,
-        });
-      }
-    }
-
-    let zone;
-    try {
-      zone = await CityZone.create({
-        operationalCityId: parentId,
-        name: String(zoneName).trim(),
-        zoneCode: String(zoneCode).trim().toUpperCase(),
-        polygon: validation.sanitizedPolygon,
-        active: true,
-        description: description || null,
+    // B-05/B-07 canonical placement: same containment + overlap rules as the
+    // standard CRUD path (assertZonePlacement), so the two writers agree.
+    const { assertZonePlacement } = await import("../Services/zoneWriteService.js");
+    const placement = await assertZonePlacement({
+      sanitizedPolygon: validation.sanitizedPolygon,
+      districtId: parentId,
+    });
+    if (!placement.ok) {
+      return res.status(placement.status).json({
+        success: false,
+        code: placement.code,
+        message: placement.message,
       });
+    }
+
+    // B-05: same invariants as the standard CRUD path — caller-supplied
+    // `active` is honored (was hardcoded true), every active service is
+    // seeded DISABLED, and zone + seed + version commit atomically.
+    const activeFlag = active === undefined ? true : active === true || String(active).toLowerCase() === "true";
+    const actorId = req.user?._id || req.user?.userId || null;
+    let zone;
+    let seededCount = 0;
+    try {
+      const out = await withZoneWriteTransaction(async (session) => {
+        const createOpts = session ? { session } : {};
+        const docs = await CityZone.create(
+          [
+            {
+              operationalCityId: parentId,
+              name: String(zoneName).trim(),
+              zoneCode: String(zoneCode).trim().toUpperCase(),
+              polygon: validation.sanitizedPolygon,
+              active: activeFlag,
+              description: description || null,
+            },
+          ],
+          createOpts
+        );
+        const created = Array.isArray(docs) ? docs[0] : docs;
+        const seeded = await seedZoneDisabledServices({ zone: created, actorId, session });
+        await recordPolygonVersion(
+          {
+            entityType: "CITY_ZONE",
+            entityId: created._id,
+            polygon: validation.sanitizedPolygon,
+            changedBy: actorId,
+            changeReason: "Initial CityZone Creation",
+          },
+          session
+        );
+        return { created, seeded };
+      });
+      zone = out.result.created;
+      seededCount = out.result.seeded;
     } catch (e) {
       if (e.code === 11000) {
         return res.status(409).json({ success: false, code: "ZONE_CODE_EXISTS", message: "Zone code already exists. Use a unique zoneCode." });
@@ -238,18 +299,9 @@ export const createCityZone = async (req, res) => {
       throw e;
     }
 
-    await PolygonVersion.create({
-      entityType: "CITY_ZONE",
-      entityId: zone._id,
-      version: 1,
-      polygon: validation.sanitizedPolygon,
-      changedBy: req.user._id,
-      changeReason: "Initial CityZone Creation",
-    });
-
-    return res.status(201).json({ success: true, message: "CityZone created successfully", result: zone });
+    return res.status(201).json({ success: true, message: "CityZone created successfully", result: { ...zone.toObject(), seededDisabledServices: seededCount } });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -264,12 +316,12 @@ export const listCityZones = async (req, res) => {
       }
       query.operationalCityId = parentFilter;
     }
-    if (search) query.name = { $regex: search, $options: "i" };
+    if (search) query.name = { $regex: containsRegex(search) };
 
     const zones = await CityZone.find(query).populate("operationalCityId", "name code state").sort({ name: 1 }).lean();
     return res.status(200).json({ success: true, result: zones });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -278,46 +330,53 @@ export const listCityZones = async (req, res) => {
    ========================================================================= */
 
 export const grantDistrictPermission = async (req, res) => {
+  // B-13: thin delegate to the canonical district-permission service (single
+  // writer for rows + derived arrays + history). Response contract preserved.
   try {
     const { technicianId, districtId, reason } = req.body;
 
     if (!technicianId || !districtId || !reason) {
       return res.status(400).json({ success: false, message: "technicianId, districtId, and reason are required." });
     }
-
-    const [tech, district] = await Promise.all([
-      TechnicianProfile.findById(technicianId),
-      OperationalCity.findById(districtId),
-    ]);
-
-    if (!tech) return res.status(404).json({ success: false, message: "Technician not found" });
-    if (!district) return res.status(404).json({ success: false, message: "District not found" });
-
-    // Set primary district if none present
-    if (!tech.primaryDistrictId) {
-      tech.primaryDistrictId = districtId;
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
     }
 
-    // Add to enabled districts
-    const enabledStr = (tech.enabledDistrictIds || []).map((id) => id.toString());
-    if (!enabledStr.includes(String(districtId))) {
-      tech.enabledDistrictIds.push(districtId);
+    const { addDistrictPermission } = await import("../Services/technicianDistrictService.js");
+    try {
+      await addDistrictPermission({
+        technicianId,
+        districtId,
+        adminUserId: req.user._id || req.user?.userId,
+        adminRole: req.user?.role,
+        reason,
+      });
+    } catch (svcErr) {
+      // Preserve the original 404 contract for unknown technician/district.
+      if (svcErr.code === "TECHNICIAN_INACTIVE" || svcErr.code === "DISTRICT_INACTIVE") {
+        const isTech = svcErr.code === "TECHNICIAN_INACTIVE";
+        return res.status(404).json({
+          success: false,
+          message: isTech ? "Technician not found" : "District not found",
+          code: svcErr.code,
+        });
+      }
+      return res
+        .status(svcErr.statusCode || 400)
+        .json({ success: false, message: svcErr.message, code: svcErr.code });
     }
 
-    await tech.save();
-
-    // Log Permission Audit
-    await DistrictPermissionHistory.create({
-      technicianId,
-      districtId,
-      action: "GRANT",
-      adminId: req.user._id,
-      reason,
-    });
+    const tech = await TechnicianProfile.findById(technicianId)
+      .select("primaryDistrictId enabledDistrictIds location")
+      .lean();
+    const district = await OperationalCity.findById(districtId).select("name").lean();
 
     // 🔄 Revalidate active broadcasts for this technician (district permission changed)
     const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
-    if (tech.location?.coordinates) {
+    if (tech?.location?.coordinates) {
       const [lng, lat] = tech.location.coordinates;
       await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
         .catch(err => console.error("District permission grant revalidation error:", err));
@@ -325,14 +384,14 @@ export const grantDistrictPermission = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `District permission granted for ${district.name}`,
+      message: `District permission granted for ${district?.name || "district"}`,
       result: {
-        primaryDistrictId: tech.primaryDistrictId,
-        enabledDistrictIds: tech.enabledDistrictIds,
+        primaryDistrictId: tech?.primaryDistrictId || null,
+        enabledDistrictIds: tech?.enabledDistrictIds || [],
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -343,33 +402,40 @@ export const revokeDistrictPermission = async (req, res) => {
     if (!technicianId || !districtId || !reason) {
       return res.status(400).json({ success: false, message: "technicianId, districtId, and reason are required." });
     }
-
-    const tech = await TechnicianProfile.findById(technicianId);
-    if (!tech) return res.status(404).json({ success: false, message: "Technician not found" });
-
-    // Remove from enabled districts
-    tech.enabledDistrictIds = (tech.enabledDistrictIds || []).filter(
-      (id) => id.toString() !== String(districtId)
-    );
-
-    // If primary district revoked, re-assign primary to first remaining enabled district or null
-    if (String(tech.primaryDistrictId) === String(districtId)) {
-      tech.primaryDistrictId = tech.enabledDistrictIds[0] || null;
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
     }
 
-    await tech.save();
+    // B-13: delegate to the canonical service. Primary-district revocation
+    // is now PROTECTED (400) instead of silently re-pointing primary.
+    const { removeDistrictPermission } = await import("../Services/technicianDistrictService.js");
+    try {
+      await removeDistrictPermission({
+        technicianId,
+        districtId,
+        adminUserId: req.user._id || req.user?.userId,
+        adminRole: req.user?.role,
+        reason,
+      });
+    } catch (svcErr) {
+      if (svcErr.code === "TECHNICIAN_NOT_FOUND") {
+        return res.status(404).json({ success: false, message: "Technician not found", code: svcErr.code });
+      }
+      return res
+        .status(svcErr.statusCode || 400)
+        .json({ success: false, message: svcErr.message, code: svcErr.code });
+    }
 
-    await DistrictPermissionHistory.create({
-      technicianId,
-      districtId,
-      action: "REVOKE",
-      adminId: req.user._id,
-      reason,
-    });
+    const tech = await TechnicianProfile.findById(technicianId)
+      .select("primaryDistrictId enabledDistrictIds location")
+      .lean();
 
     // 🔄 Revalidate active broadcasts for this technician (district permission revoked)
     const { revalidateActiveBroadcasts } = await import("../Utils/technicianLocation.js");
-    if (tech.location?.coordinates) {
+    if (tech?.location?.coordinates) {
       const [lng, lat] = tech.location.coordinates;
       await revalidateActiveBroadcasts(technicianId, lat, lng, req.io)
         .catch(err => console.error("District permission revoke revalidation error:", err));
@@ -384,7 +450,7 @@ export const revokeDistrictPermission = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -396,6 +462,12 @@ export const getImpactAnalysis = async (req, res) => {
   try {
     const { type, id } = req.query;
     if (!type || !id) return res.status(400).json({ success: false, message: "type and id are required" });
+    if (!["district", "service"].includes(type)) {
+      return res.status(400).json({ success: false, message: "Invalid type", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid id", code: "INVALID_ID" });
+    }
 
     let affectedTechnicians = 0;
     let affectedServices = 0;
@@ -446,7 +518,7 @@ export const getImpactAnalysis = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -481,13 +553,16 @@ export const getSpatialHierarchy = async (req, res) => {
 
     return res.status(200).json({ success: true, result: tree });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
 export const getDistrictDashboardDetails = async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid district id", code: "INVALID_ID" });
+    }
     const district = await OperationalCity.findById(id).lean();
     if (!district) return res.status(404).json({ success: false, message: "District not found" });
 
@@ -516,7 +591,7 @@ export const getDistrictDashboardDetails = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -527,6 +602,9 @@ export const getDistrictDashboardDetails = async (req, res) => {
 export const inspectJobLocation = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    if (!isValidObjectId(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid bookingId", code: "INVALID_ID" });
+    }
     const booking = await ServiceBooking.findById(bookingId)
       .populate("serviceId", "serviceName serviceCost")
       .populate("customerId", "fname lname mobileNumber")
@@ -595,7 +673,7 @@ export const inspectJobLocation = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -605,8 +683,17 @@ export const inspectJobLocation = async (req, res) => {
 
 export const rollbackPolygonVersion = async (req, res) => {
   try {
-    const { entityType, entityId, targetVersion } = req.body;
+    // B-16: baseVersion is an optional optimistic-concurrency guard — when
+    // supplied, the live version must match it or the rollback is rejected,
+    // so a concurrent polygon edit cannot be silently clobbered.
+    const { entityType, entityId, targetVersion, baseVersion, reason } = req.body;
 
+    if (!["DISTRICT", "CITY_ZONE"].includes(entityType)) {
+      return res.status(400).json({ success: false, message: "Invalid entityType", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(entityId)) {
+      return res.status(400).json({ success: false, message: "Invalid entityId", code: "INVALID_ID" });
+    }
     const versionDoc = await PolygonVersion.findOne({
       entityType,
       entityId,
@@ -617,16 +704,119 @@ export const rollbackPolygonVersion = async (req, res) => {
       return res.status(404).json({ success: false, message: `Polygon version ${targetVersion} not found.` });
     }
 
+    // B-05: restored geometry is re-validated (explicit 400 if a historic
+    // version no longer satisfies current rules) and the rollback itself is
+    // recorded as a NEW history row so the audit trail stays append-only.
+    const restored = validateAndSanitizePolygon(versionDoc.polygon);
+    if (!restored.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "ROLLBACK_GEOMETRY_INVALID",
+        message: `Stored version ${targetVersion} no longer satisfies polygon validation and cannot be restored.`,
+        errors: restored.errors,
+      });
+    }
+
+    // B-16: placement recheck against CURRENT neighbors. A zone rollback
+    // must not overlap sibling zones or escape its district; a district
+    // rollback must not strand its active zones outside the restored shape.
+    const { assertZonePlacement } = await import("../Services/zoneWriteService.js");
+    const { validateZoneInsideDistrict } = await import("../Utils/geoValidation.js");
+    let rollbackDistrictId = entityType === "DISTRICT" ? entityId : null;
+    if (entityType === "CITY_ZONE") {
+      const zoneDoc = await CityZone.findById(entityId).select("operationalCityId").lean();
+      if (!zoneDoc) return res.status(404).json({ success: false, message: "City zone not found." });
+      rollbackDistrictId = zoneDoc.operationalCityId;
+      const placement = await assertZonePlacement({
+        sanitizedPolygon: restored.sanitizedPolygon,
+        districtId: zoneDoc.operationalCityId,
+        excludeZoneId: entityId,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status).json({
+          success: false, code: placement.code,
+          message: `Rollback to version ${targetVersion} rejected: ${placement.message}`,
+        });
+      }
+    } else {
+      const districtDoc = await OperationalCity.findById(entityId).select("version").lean();
+      if (!districtDoc) return res.status(404).json({ success: false, message: "District not found." });
+      // Optimistic concurrency: live version must match the caller's base.
+      if (baseVersion !== undefined && baseVersion !== null && Number(baseVersion) !== Number(districtDoc.version)) {
+        return res.status(409).json({
+          success: false, code: "ROLLBACK_VERSION_CONFLICT",
+          message: `District geometry changed since version ${baseVersion} was read (live: v${districtDoc.version}). Re-check and retry.`,
+        });
+      }
+      const childZones = await CityZone.find({ operationalCityId: entityId, active: true }).select("name polygon").lean();
+      for (const z of childZones) {
+        if (!z.polygon) continue;
+        const containment = validateZoneInsideDistrict(z.polygon, restored.sanitizedPolygon);
+        if (!containment.valid) {
+          return res.status(409).json({
+            success: false, code: "ROLLBACK_STRANDS_ZONES",
+            message: `Rollback to version ${targetVersion} rejected: active zone "${z.name}" would fall outside the restored district boundary.`,
+          });
+        }
+      }
+    }
+
+    await withZoneWriteTransaction(async (session) => {
+      const opts = session ? { session } : {};
+      const created = await recordPolygonVersion(
+        {
+          entityType,
+          entityId,
+          polygon: versionDoc.polygon,
+          changedBy: req.user._id,
+          changeReason: reason || `Rollback to version ${targetVersion}`,
+        },
+        session
+      );
+      if (entityType === "DISTRICT") {
+        // Conditional write: abort if geometry moved since the pre-check.
+        const applied = await OperationalCity.updateOne(
+          baseVersion !== undefined && baseVersion !== null
+            ? { _id: entityId, version: Number(baseVersion) }
+            : { _id: entityId },
+          { $set: { polygon: versionDoc.polygon, version: created.version, updatedBy: req.user._id } },
+          opts
+        );
+        if (applied.matchedCount === 0) {
+          throw Object.assign(new Error("District geometry changed concurrently; rollback aborted."), {
+            code: "ROLLBACK_VERSION_CONFLICT",
+            statusCode: 409,
+          });
+        }
+      } else if (entityType === "CITY_ZONE") {
+        await CityZone.updateOne(
+          { _id: entityId },
+          { $set: { polygon: versionDoc.polygon, updatedBy: req.user._id } },
+          opts
+        );
+      }
+    });
+    if (entityType === "DISTRICT") invalidateDistrictPolygonCache(String(entityId));
+
+    // B-16: audit trail (actor, target, source version, reason) + broadcast
+    // revalidation against the restored shape. Post-commit hooks: failures
+    // are logged, never fail the committed rollback.
+    await writeAuditLog({
+      actor: req.user._id,
+      actorRole: req.user?.role || "Admin",
+      action: "POLYGON_ROLLBACK",
+      targetType: entityType === "DISTRICT" ? "OperationalCity" : "CityZone",
+      targetId: entityId,
+      after: { restoredVersion: targetVersion, reason: reason || `Rollback to version ${targetVersion}` },
+    }).catch((e) => console.warn("Rollback audit warning:", e.message));
+
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
     if (entityType === "DISTRICT") {
-      await OperationalCity.updateOne(
-        { _id: entityId },
-        { $set: { polygon: versionDoc.polygon, version: targetVersion, updatedBy: req.user._id } }
-      );
-    } else if (entityType === "CITY_ZONE") {
-      await CityZone.updateOne(
-        { _id: entityId },
-        { $set: { polygon: versionDoc.polygon, updatedBy: req.user._id } }
-      );
+      await revalidateTechniciansForService(null, entityId, null, req.io)
+        .catch((e) => console.warn("Rollback revalidation warning:", e.message));
+    } else {
+      await revalidateTechniciansForService(null, rollbackDistrictId, entityId, req.io)
+        .catch((e) => console.warn("Rollback revalidation warning:", e.message));
     }
 
     return res.status(200).json({
@@ -634,7 +824,77 @@ export const rollbackPolygonVersion = async (req, res) => {
       message: `Successfully rolled back ${entityType} polygon to version ${targetVersion}`,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message, code: error.code });
+    }
+    return internalError(res, error);
+  }
+};
+
+/**
+ * POST /api/admin/zone-geofence/validate-polygon
+ * Read-only pre-write validation for admin-drawn polygons (GeoJSON tool).
+ * Body: { polygon, districtId?, excludeZoneId? }
+ * - Always runs the canonical geometry validator.
+ * - With districtId: also checks district containment + overlap against
+ *   sibling zones (excluding excludeZoneId), using the same rules as create.
+ * Never writes. Admin/Owner only (router guard).
+ */
+export const validatePolygonPreview = async (req, res) => {
+  try {
+    const { polygon, districtId, excludeZoneId } = req.body || {};
+    const validation = validateAndSanitizePolygon(polygon);
+    const vertexCount = Array.isArray(polygon?.coordinates?.[0]) ? polygon.coordinates[0].length : 0;
+
+    const result = {
+      isValid: validation.valid,
+      errors: validation.errors,
+      sanitizedPolygon: validation.sanitizedPolygon,
+      vertexCount,
+      codeOrder: "Counter-Clockwise (Standard)",
+      containment: null,
+      overlap: null,
+    };
+
+    if (validation.valid && districtId) {
+      if (!isValidObjectId(districtId)) {
+        return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
+      }
+      if (excludeZoneId && !isValidObjectId(excludeZoneId)) {
+        return res.status(400).json({ success: false, message: "Invalid excludeZoneId", code: "INVALID_ID" });
+      }
+      const { assertZonePlacement } = await import("../Services/zoneWriteService.js");
+      const placement = await assertZonePlacement({
+        sanitizedPolygon: validation.sanitizedPolygon,
+        districtId,
+        excludeZoneId: excludeZoneId || null,
+      });
+      if (placement.status === 404) {
+        return res.status(404).json({ success: false, message: placement.message, code: placement.code });
+      }
+      const outside = placement.code === "ZONE_OUTSIDE_PARENT_DISTRICT";
+      result.containment = {
+        checked: true,
+        // Render-compatible keys (both spellings).
+        isFullyContained: placement.ok || !outside,
+        isContained: placement.ok || !outside,
+        message: placement.ok ? "Polygon completely contained within district limits." : placement.message,
+        reason: placement.ok ? null : placement.message,
+      };
+      const overlap = !placement.ok && placement.code === "ZONE_OVERLAP_DETECTED";
+      result.overlap = {
+        checked: true,
+        hasOverlap: overlap,
+        overlappingZone: overlap ? placement.message : null,
+        message: overlap ? placement.message : "No overlap with sibling zones detected.",
+      };
+      result.isValid = placement.ok;
+      if (!placement.ok) result.errors = [...validation.errors, placement.message];
+    }
+
+    return res.status(200).json({ success: true, result });
+  } catch (error) {
+    return internalError(res, error);
   }
 };
 
@@ -680,7 +940,7 @@ export const getZoneHealthDashboard = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -711,6 +971,9 @@ export const listAdminTechnicians = async (req, res) => {
     let targetBooking = null;
 
     if (bookingId) {
+      if (!isValidObjectId(bookingId)) {
+        return res.status(400).json({ success: false, message: "Invalid bookingId", code: "INVALID_ID" });
+      }
       targetBooking = await ServiceBooking.findById(bookingId).lean();
       if (targetBooking?.location?.coordinates) {
         targetJobLng = targetBooking.location.coordinates[0];
@@ -734,13 +997,15 @@ export const listAdminTechnicians = async (req, res) => {
         );
       }
 
-      // Also match by district name if passed as text or code
+      // Also match by district name if passed as text or code (literal-escaped).
+      const exact = exactRegex(dStr);
+      const contains = containsRegex(dStr);
       const matchingDistricts = await OperationalCity.find({
         $or: [
-          { name: new RegExp(`^${dStr}$`, "i") },
-          { city: new RegExp(`^${dStr}$`, "i") },
-          { code: new RegExp(`^${dStr}$`, "i") },
-          { name: { $regex: dStr, $options: "i" } }
+          { name: exact },
+          { city: exact },
+          { code: exact },
+          { name: { $regex: contains } }
         ]
       }).select("_id").lean().catch(() => []);
 
@@ -755,7 +1020,7 @@ export const listAdminTechnicians = async (req, res) => {
       }
 
       // Match legacy text string in city
-      districtConditions.push({ city: new RegExp(`^${dStr}$`, "i") });
+      districtConditions.push({ city: exact });
 
       if (districtConditions.length > 0) {
         techQuery.$or = districtConditions;
@@ -777,18 +1042,90 @@ export const listAdminTechnicians = async (req, res) => {
     }
 
     if (serviceId) {
+      // B-17: malformed service ids fail closed instead of CastError 500.
+      if (!isValidObjectId(serviceId)) {
+        return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+      }
       techQuery["skills.serviceId"] = serviceId;
     }
 
-    const technicians = await TechnicianProfile.find(techQuery)
-      .populate("userId", "fname lname email mobileNumber status")
-      .populate("primaryDistrictId", "name code city")
-      .populate("primaryCityId", "name code city")
-      .populate("enabledDistrictIds", "name code city")
-      .populate("allowedCityIds", "name code city")
-      .lean();
-
+    // B-08: GPS buckets as DB predicates (identical bucket semantics to the
+    // old in-memory filters: missing timestamps count as stale; missing
+    // coordinates count as missing).
     const now = Date.now();
+    const freshCutoff = new Date(now - 90 * 1000);
+    const fresh30Cutoff = new Date(now - 30 * 1000);
+    const andClauses = [];
+    if (gpsStatus && gpsStatus !== "All") {
+      if (gpsStatus === "GPS Fresh") andClauses.push({ locationUpdatedAt: { $gte: freshCutoff } });
+      else if (gpsStatus === "GPS Stale") {
+        andClauses.push({
+          $or: [{ locationUpdatedAt: { $lt: freshCutoff } }, { locationUpdatedAt: null }],
+        });
+      } else if (gpsStatus === "GPS Missing") {
+        andClauses.push({ $or: [{ location: null }, { "location.coordinates": null }] });
+      }
+    }
+    if (gpsFreshness === "< 30 sec") andClauses.push({ locationUpdatedAt: { $gte: fresh30Cutoff } });
+    else if (gpsFreshness === "> 90 sec") {
+      andClauses.push({
+        $or: [{ locationUpdatedAt: { $lt: freshCutoff } }, { locationUpdatedAt: null }],
+      });
+    }
+
+    // B-08: search at the DB layer via the Users collection (one query) plus
+    // profile text fields, instead of loading every technician. The exact
+    // name/id/phone/email predicate is still applied to page items below.
+    let searchTruncated = false;
+    if (search && String(search).trim() !== "") {
+      const rx = containsRegex(search);
+      const matchingUsers = await User.find({
+        $or: [{ fname: rx }, { lname: rx }, { mobileNumber: rx }, { email: rx }],
+      })
+        .select("_id")
+        .limit(500)
+        .lean()
+        .catch(() => []);
+      if (matchingUsers.length >= 500) searchTruncated = true;
+      andClauses.push({
+        $or: [
+          { userId: { $in: matchingUsers.map((u) => u._id) } },
+          { city: rx },
+          { locality: rx },
+        ],
+      });
+    }
+
+    // Merge district $or with search/gps $and clauses (all filters AND).
+    let finalQuery = techQuery;
+    if (andClauses.length) {
+      const base = techQuery.$or ? [{ $or: techQuery.$or }] : [];
+      const rest = { ...techQuery };
+      delete rest.$or;
+      finalQuery = { $and: [...base, rest, ...andClauses] };
+    }
+
+    // B-08: bounded at the database layer — count + stable-sorted page fetch
+    // BEFORE any per-technician work. Eligibility below is annotation-only
+    // (it never filtered totals), so page-scoped evaluation preserves
+    // semantics exactly while bounding N+1 by page size.
+    const boundedPage = clampPage(page);
+    const boundedLimit = clampLimit(limit);
+    const boundedSkip = (boundedPage - 1) * boundedLimit;
+    const [total, technicians] = await Promise.all([
+      TechnicianProfile.countDocuments(finalQuery),
+      TechnicianProfile.find(finalQuery)
+        .sort({ _id: 1 })
+        .skip(boundedSkip)
+        .limit(boundedLimit)
+        .populate("userId", "fname lname email mobileNumber")
+        .populate("primaryDistrictId", "name code city")
+        .populate("primaryCityId", "name code city")
+        .populate("enabledDistrictIds", "name code city")
+        .populate("allowedCityIds", "name code city")
+        .lean(),
+    ]);
+
     const formattedList = [];
 
     for (const tech of technicians) {
@@ -797,9 +1134,9 @@ export const listAdminTechnicians = async (req, res) => {
       const mobile = tech.userId?.mobileNumber || "";
       const email = tech.userId?.email || "";
 
-      // 🔍 Search text matching across name, ID, phone, email
-      if (search) {
-        const q = search.toLowerCase();
+      // 🔍 Exact search predicate on page items (name, derived ID, phone, email).
+      if (search && String(search).trim() !== "") {
+        const q = String(search).toLowerCase();
         const matchesName = name.toLowerCase().includes(q);
         const matchesId = techIdStr.toLowerCase().includes(q);
         const matchesMobile = mobile.includes(q);
@@ -819,20 +1156,9 @@ export const listAdminTechnicians = async (req, res) => {
       else if (ageSeconds <= 60) freshnessBadge = "30-60s";
       else if (ageSeconds <= 90) freshnessBadge = "60-90s";
 
-      const isGpsFresh = ageSeconds <= 90;
-
-      // Filter by GPS Status if specified
-      if (gpsStatus && gpsStatus !== "All") {
-        if (gpsStatus === "GPS Fresh" && !isGpsFresh) continue;
-        if (gpsStatus === "GPS Stale" && isGpsFresh) continue;
-        if (gpsStatus === "GPS Missing" && tech.location?.coordinates) continue;
-      }
-
-      // Filter by GPS Freshness range if specified
-      if (gpsFreshness) {
-        if (gpsFreshness === "< 30 sec" && ageSeconds >= 30) continue;
-        if (gpsFreshness === "> 90 sec" && ageSeconds <= 90) continue;
-      }
+      // NOTE (B-08): GPS-status/freshness filtering now happens in the DB
+      // query above with identical bucket semantics; badges below are
+      // display-only.
 
       // 📏 Distance calculation if job location present
       let distanceKm = null;
@@ -900,27 +1226,31 @@ export const listAdminTechnicians = async (req, res) => {
       });
     }
 
-    const skip = (Number(page) - 1) * Number(limit);
-    const paginatedResult = formattedList.slice(skip, skip + Number(limit));
-
+    // B-08: DB-bounded pagination. `total` is the database-filtered count
+    // (eligibility is annotation-only and never affected totals, so page
+    // scoping preserves semantics). Stable _id ordering across pages.
     return res.status(200).json({
       success: true,
-      result: paginatedResult,
+      result: formattedList,
       pagination: {
-        total: formattedList.length,
-        page: Number(page),
-        limit: Number(limit),
-        pages: Math.ceil(formattedList.length / Number(limit)),
+        total,
+        page: boundedPage,
+        limit: boundedLimit,
+        pages: Math.ceil(total / boundedLimit) || 1,
+        searchTruncated,
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
 export const getAdminTechnicianDetails = async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid technician id", code: "INVALID_ID" });
+    }
 
     const [tech, permHistory] = await Promise.all([
       TechnicianProfile.findById(id)
@@ -983,7 +1313,7 @@ export const getAdminTechnicianDetails = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -992,6 +1322,9 @@ export const updateTechnicianVerification = async (req, res) => {
     const { id } = req.params;
     const { action, reason } = req.body; // action: "APPROVE", "REJECT", "SUSPEND", "REACTIVATE"
 
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid technician id", code: "INVALID_ID" });
+    }
     const tech = await TechnicianProfile.findById(id);
     if (!tech) return res.status(404).json({ success: false, message: "Technician profile not found" });
 
@@ -1047,13 +1380,16 @@ export const updateTechnicianVerification = async (req, res) => {
       result: { workStatus: tech.workStatus, reason },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
 export const getJobBroadcastAudit = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    if (!isValidObjectId(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid bookingId", code: "INVALID_ID" });
+    }
     const booking = await ServiceBooking.findById(bookingId).lean();
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
 
@@ -1070,7 +1406,7 @@ export const getJobBroadcastAudit = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 

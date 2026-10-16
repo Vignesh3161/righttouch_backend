@@ -1,4 +1,5 @@
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import User from "../Schemas/User.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ProductBooking from "../Schemas/ProductBooking.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
@@ -32,7 +33,52 @@ import {
   broadcastCreatedBooking,
 } from "../Utils/bookingService.js";
 import { getBookingSchedulePayload } from "../Utils/slots.js";
+import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { containsRegex } from "../Utils/safeQuery.js";
 import { getReacceptPenaltyPercent } from "./adminSettingsController.js";
+import {
+  requestCompletionOtp as requestCompletionOtpService,
+  resendCompletionOtp as resendCompletionOtpService,
+  verifyCompletionOtp as verifyCompletionOtpService,
+  getCompletionStatus as getCompletionStatusService,
+} from "../Services/completionVerificationService.js";
+
+/**
+ * Post-commit completion side effects — the EXISTING completion behavior,
+ * byte-for-byte in outcome: idempotent settlement attempt, customer push +
+ * socket, rebroadcast of pending jobs to this technician. Called ONLY from
+ * the OTP-verified completion path (verifyCompletionOtp below). Kept as a
+ * single function so completion can never notify/settle twice.
+ */
+export const fireBookingCompletedSideEffects = async (booking, technicianProfileId, io) => {
+  // If payment is already verified, credit technician wallet (idempotent)
+  await settleBookingEarningsIfEligible(booking._id);
+
+  // Notify customer — service is complete, payment is now due
+  if (booking.customerId) {
+    try {
+      const { sendPushNotification } = await import("../Utils/sendNotification.js");
+      await sendPushNotification(booking.customerId.toString(), {
+        title: "Service Completed",
+        body: "Your service is complete. Please complete the payment for your booking.",
+        data: { bookingId: booking._id.toString(), type: "BOOKING_COMPLETED" },
+      }, { recipientType: "customer" });
+    } catch (notifyErr) {
+      console.error("notifyCustomerCompleted error:", notifyErr.message);
+    }
+    if (io) {
+      io.to(`customer_${booking.customerId}`).emit("booking_completed", {
+        bookingId: booking._id,
+        message: "Service completed — payment is now due",
+        type: "PAYMENT_DUE",
+      });
+    }
+  }
+
+  // Re-broadcast pending jobs to this technician only
+  const busyStartTime = booking.assignedAt || booking.createdAt || null;
+  await broadcastPendingJobsToTechnician(technicianProfileId, io, busyStartTime);
+};
 
 const toNumber = value => {
   const num = Number(value);
@@ -678,10 +724,11 @@ export const getCustomerBookings = async (req, res) => {
       }
     }
 
-    // 4️⃣ Search Query (Searches address, fault notes, payment order ID, or booking ID)
+    // 4️⃣ Search Query (Searches address, fault notes, payment order ID, or booking ID).
+    // B-17 follow-up: literal-escaped (user text is not a regex pattern).
     if (search && typeof search === "string" && search.trim().length >= 2) {
       const searchTerm = search.trim();
-      const searchRegex = new RegExp(searchTerm, "i");
+      const searchRegex = containsRegex(searchTerm);
       const searchClauses = [
         { address: searchRegex },
         { faultProblem: searchRegex },
@@ -1232,6 +1279,16 @@ export const updateBookingStatus = async (req, res) => {
     if (status === "completed" && booking.status === "completed") {
       return res.status(200).json({ success: true, message: "Booking already completed", result: booking });
     }
+    // 🔒 Completion requires customer OTP verification. The direct
+    // completed transition is closed BEFORE any state write — use POST
+    // /api/technician/booking/:id/verify-completion-otp instead.
+    if (status === "completed") {
+      return res.status(409).json({
+        success: false,
+        message: "Service completion requires customer OTP verification. Request an OTP, then verify it.",
+        result: {},
+      });
+    }
     // Check technician approval status
     const technician = await TechnicianProfile.findById(technicianProfileId);
     if (!technician) {
@@ -1296,35 +1353,10 @@ export const updateBookingStatus = async (req, res) => {
         result: {},
       });
     }
-    if (status === "completed") {
-      // If payment is already verified, credit technician wallet (idempotent)
-      await settleBookingEarningsIfEligible(booking._id);
-
-      // Notify customer — service is complete, payment is now due
-      if (booking.customerId) {
-        try {
-          const { sendPushNotification } = await import("../Utils/sendNotification.js");
-          await sendPushNotification(booking.customerId.toString(), {
-            title: "Service Completed",
-            body: "Your service is complete. Please complete the payment for your booking.",
-            data: { bookingId: booking._id.toString(), type: "BOOKING_COMPLETED" },
-          }, { recipientType: "customer" });
-        } catch (notifyErr) {
-          console.error("notifyCustomerCompleted error:", notifyErr.message);
-        }
-        if (req.io) {
-          req.io.to(`customer_${booking.customerId}`).emit("booking_completed", {
-            bookingId: booking._id,
-            message: "Service completed — payment is now due",
-            type: "PAYMENT_DUE",
-          });
-        }
-      }
-
-      // Re-broadcast pending jobs to this technician only
-      const busyStartTime = booking.assignedAt || booking.createdAt || null;
-      await broadcastPendingJobsToTechnician(technicianProfileId, req.io, busyStartTime);
-    }
+    // NOTE: the `completed` transition is closed above (409 → verify-completion-otp).
+    // Post-commit side effects for verified completion live in
+    // fireBookingCompletedSideEffects and are invoked only from
+    // verifyCompletionOtp below — never from this generic path.
 
     // Re-fetch booking with service details to include technicianAmount
     const updatedBooking = await ServiceBooking.findById(booking._id)
@@ -1347,6 +1379,72 @@ export const updateBookingStatus = async (req, res) => {
       message: error.message,
       result: { error: error.message },
     });
+  }
+};
+
+/* =====================================================
+   SERVICE COMPLETION OTP (TECHNICIAN + CUSTOMER)
+   Customer-confirmed completion — Checkpoint C.
+   Responses never contain OTP, hash, pepper, phone, or provider payload.
+===================================================== */
+export const requestCompletionOtp = async (req, res) => {
+  try {
+    const result = await requestCompletionOtpService({
+      bookingId: req.params.id,
+      technicianProfileId: req.user?.technicianProfileId,
+    });
+    return res.status(200).json({ success: true, message: "Completion verification requested.", result });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+export const resendCompletionOtp = async (req, res) => {
+  try {
+    const result = await resendCompletionOtpService({
+      bookingId: req.params.id,
+      technicianProfileId: req.user?.technicianProfileId,
+    });
+    return res.status(200).json({ success: true, message: "Completion OTP resent.", result });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+export const verifyCompletionOtp = async (req, res) => {
+  try {
+    const { booking, generation } = await verifyCompletionOtpService({
+      bookingId: req.params.id,
+      technicianProfileId: req.user?.technicianProfileId,
+      otp: req.body?.otp,
+    });
+    // Existing post-commit side effects (settlement attempt + notifications),
+    // exactly once — the transaction above already flipped the booking.
+    await fireBookingCompletedSideEffects(booking, req.user?.technicianProfileId, req.io);
+    const updatedBooking = await ServiceBooking.findById(booking._id)
+      .populate("serviceId", "serviceName serviceType technicianAmount");
+    return res.status(200).json({
+      success: true,
+      message: "Service completion verified.",
+      result: { bookingId: String(booking._id), verificationStatus: "verified", generation, booking: updatedBooking },
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+export const getCompletionStatus = async (req, res) => {
+  try {
+    const role = req.user?.role;
+    const result = await getCompletionStatusService({
+      bookingId: req.params.id,
+      technicianProfileId: role === "Technician" ? req.user?.technicianProfileId : null,
+      customerId: role === "Customer" ? req.user?.userId : null,
+      isAdmin: role === "Admin" || role === "Owner",
+    });
+    return res.status(200).json({ success: true, message: "Completion status.", result });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
   }
 };
 
@@ -1781,15 +1879,19 @@ export const technicianCancelBooking = async (req, res) => {
      GET/PUT /api/admin/settings/reaccept-penalty.
 ===================================================== */
 export const acceptCancelledJob = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  // B-09 two-phase re-acceptance (mirrors respondToJob): Phase A performs
+  // advisory reads + eligibility outside any transaction; Phase B opens a
+  // SHORT transaction that re-reads live state, re-validates eligibility,
+  // then debits penalty + revives atomically. Revocations landing before
+  // Phase B deterministically lose; only changes inside the short window
+  // remain invisible (documented consistency boundary).
+  let session = null;
   try {
     const { id } = req.params;
     const { withPenalty = false } = req.body || {};
     const techId = req.user.technicianProfileId;
 
     if (!techId) {
-      await session.abortTransaction();
       return res.status(401).json({ success: false, message: "Unauthorized. Technician profile not found." });
     }
 
@@ -1797,26 +1899,21 @@ export const acceptCancelledJob = async (req, res) => {
     // must not re-accept jobs.
     const activation = await checkTechnicianActivation(techId);
     if (!activation.isActive) {
-      await session.abortTransaction();
       return res.status(403).json({ success: false, message: activation.message });
     }
 
     const booking = await ServiceBooking.findById(id)
-      .session(session)
       .populate("customerId", "fname lname mobileNumber email")
       .populate({ path: "serviceId", populate: { path: "categoryId" } });
     if (!booking) {
-      await session.abortTransaction();
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
 
     // ✅ Only a CANCELLED job that was assigned to this technician can be re-accepted.
     if (booking.status !== "cancelled") {
-      await session.abortTransaction();
       return res.status(400).json({ success: false, message: "Only cancelled jobs can be re-accepted" });
     }
     if (booking.technicianId?.toString() !== techId?.toString()) {
-      await session.abortTransaction();
       return res.status(403).json({ success: false, message: "This job was not assigned to you" });
     }
 
@@ -1827,17 +1924,81 @@ export const acceptCancelledJob = async (req, res) => {
         { status: { $in: ["on_the_way", "reached", "in_progress"] } },
         { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
       ],
-    })
-      .session(session)
-      .select("_id status bookingType");
+    }).select("_id status bookingType");
     if (activeJob) {
-      await session.abortTransaction();
       return res.status(409).json({
         success: false,
         message:
           activeJob.status === "accepted" || activeJob.status === "ACCEPTED"
             ? "Please start travel for your current job before re-accepting."
             : "You are already on a job. Complete it before re-accepting another.",
+      });
+    }
+
+    // B-04: cancelled-job re-acceptance must enforce the SAME canonical
+    // ACCEPT-mode eligibility as ordinary acceptance (respondToJob).
+    // Advisory here; authoritative re-check runs inside Phase B.
+    const eligibility = await checkTechnicianEligibility({
+      technician: techId,
+      booking,
+    });
+    if (!eligibility.eligible) {
+      return res.status(403).json({
+        success: false,
+        message: "You are no longer eligible to accept this job.",
+        code: "TECHNICIAN_INELIGIBLE",
+        reasons: eligibility.reasons,
+        details: eligibility.details,
+      });
+    }
+
+    // B-09 deterministic test hook (inert in production): runs after the
+    // advisory checks and BEFORE the claim transaction opens.
+    await globalThis.__b09OnEligible?.();
+
+    // ================= PHASE B — CLAIM TRANSACTION (fresh snapshot) ======
+    session = await mongoose.startSession();
+    session.startTransaction();
+    session.__b09ClaimTxn = true;
+
+    const live = await ServiceBooking.findById(id).session(session);
+    if (!live) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (live.status !== "cancelled") {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: "Only cancelled jobs can be re-accepted" });
+    }
+    if (live.technicianId?.toString() !== techId?.toString()) {
+      await session.abortTransaction();
+      return res.status(403).json({ success: false, message: "This job was not assigned to you" });
+    }
+    const liveActiveJob = await ServiceBooking.findOne({
+      technicianId: techId,
+      $or: [
+        { status: { $in: ["on_the_way", "reached", "in_progress"] } },
+        { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+      ],
+    })
+      .session(session)
+      .select("_id status bookingType");
+    if (liveActiveJob) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        success: false,
+        message: "You are already on a job. Complete it before re-accepting another.",
+      });
+    }
+    const recheck = await checkTechnicianEligibility({ technician: techId, booking: live });
+    if (!recheck.eligible) {
+      await session.abortTransaction();
+      return res.status(403).json({
+        success: false,
+        message: "You are no longer eligible to accept this job.",
+        code: "TECHNICIAN_INELIGIBLE",
+        reasons: recheck.reasons,
+        details: recheck.details,
       });
     }
 
@@ -1851,7 +2012,7 @@ export const acceptCancelledJob = async (req, res) => {
 
     if (withPenalty) {
       const percent = await getReacceptPenaltyPercent();
-      const totalAmountPaise = booking.financialSnapshot?.totalAmountPaise || 0;
+      const totalAmountPaise = live.financialSnapshot?.totalAmountPaise || 0;
       penaltyPaise = percentageOf(totalAmountPaise, percent);
       if (penaltyPaise > 0) {
         const eventId = crypto.randomUUID();
@@ -1922,7 +2083,7 @@ export const acceptCancelledJob = async (req, res) => {
           cancellationStatus: "active",
           cancelledBy: null,
           cancelReason: null,
-          autoCancelAt: booking.bookingType === "instant" ? new Date(now.getTime() + 30 * 60 * 1000) : null,
+          autoCancelAt: live.bookingType === "instant" ? new Date(now.getTime() + 30 * 60 * 1000) : null,
           ...(penaltyPaise > 0
             ? {
                 technicianPenaltyPaise: penaltyPaise,
@@ -1934,7 +2095,7 @@ export const acceptCancelledJob = async (req, res) => {
         $push: {
           assignmentAttempts: {
             technicianId: techId,
-            attemptNumber: (booking.assignmentAttempts?.length || 0) + 1,
+            attemptNumber: (live.assignmentAttempts?.length || 0) + 1,
             status: "assigned",
             acceptedAt: now,
             releaseReason: null,
@@ -1992,11 +2153,36 @@ export const acceptCancelledJob = async (req, res) => {
       },
     });
   } catch (error) {
-    if (session.inTransaction()) await session.abortTransaction();
-    console.error("acceptCancelledJob Error:", error);
+    // B-09: commit/write conflicts mean a concurrent state change won —
+    // retryable 409, never partial (all mutations were in-transaction).
+    try {
+      if (session && session.inTransaction()) await session.abortTransaction();
+    } catch {
+      /* already aborted */
+    }
+    const labels = error?.errorLabels || [];
+    const msg = String(error?.message || "");
+    const retryable =
+      session?.__b09ClaimTxn === true &&
+      (labels.includes("TransientTransactionError") ||
+        labels.includes("UnknownTransactionCommitResult") ||
+        error?.code === 112 ||
+        /WriteConflict|WriteConcern|wtimeout/i.test(msg));
+    console.error("acceptCancelledJob Error:", msg);
+    if (retryable && !res.headersSent) {
+      return res.status(409).json({
+        success: false,
+        message: "Booking changed concurrently. Please retry.",
+        reason: "claim_conflict",
+      });
+    }
     return res.status(500).json({ success: false, message: error.message });
   } finally {
-    session.endSession();
+    try {
+      session?.endSession();
+    } catch {
+      /* already ended */
+    }
   }
 };
 

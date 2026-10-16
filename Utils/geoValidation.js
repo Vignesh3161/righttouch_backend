@@ -6,8 +6,12 @@
  * 2. Bounds: Longitude ∈ [-180, 180], Latitude ∈ [-90, 90]
  * 3. Linear ring closure: First vertex MUST equal last vertex
  * 4. Minimum vertices: At least 4 vertices per linear ring
- * 5. Rewind / Winding Order: Ensures exterior ring is counter-clockwise (Right-Hand Rule)
- * 6. Self-intersection & Zero-Area detection
+ * 5. Rewind / Winding Order: exterior rings are normalized to
+ *    counter-clockwise and holes to clockwise (RFC 7946 section 3.1.6,
+ *    right-hand rule). Signed shoelace area > 0 means counter-clockwise in
+ *    the lng(x)/lat(y) plane.
+ * 6. Zero-Area detection (exterior and holes). Self-intersection rejection
+ *    lives in `hasSelfIntersection` below and is enforced per ring.
  */
 
 export function validateAndSanitizePolygon(geometry) {
@@ -67,7 +71,9 @@ function validateAndSanitizeRings(rings, errors) {
 
     const sanitizedRing = [];
 
-    // Validate coordinate bounds and order
+    // Validate coordinate bounds and order. Only finite numbers (or
+    // finite numeric strings) are accepted — null/boolean/empty values must
+    // not silently coerce to 0 via Number(). Altitude elements are dropped.
     for (let i = 0; i < ring.length; i++) {
       const pt = ring[i];
       if (!Array.isArray(pt) || pt.length < 2) {
@@ -75,18 +81,31 @@ function validateAndSanitizeRings(rings, errors) {
         continue;
       }
 
-      const lng = Number(pt[0]);
-      const lat = Number(pt[1]);
+      const rawLng = pt[0];
+      const rawLat = pt[1];
+      const lngOk =
+        (typeof rawLng === "number" || (typeof rawLng === "string" && rawLng.trim() !== "")) &&
+        Number.isFinite(Number(rawLng));
+      const latOk =
+        (typeof rawLat === "number" || (typeof rawLat === "string" && rawLat.trim() !== "")) &&
+        Number.isFinite(Number(rawLat));
+      if (!lngOk || !latOk) {
+        errors.push(`Ring ${ringIdx} vertex ${i} is not a finite numeric [lng, lat] pair.`);
+        continue;
+      }
+      const lng = Number(rawLng);
+      const lat = Number(rawLat);
 
-      if (isNaN(lng) || lng < -180 || lng > 180) {
+      if (lng < -180 || lng > 180) {
         errors.push(`Ring ${ringIdx} vertex ${i} longitude out of bounds [-180, 180]: ${pt[0]}`);
       }
 
-      if (isNaN(lat) || lat < -90 || lat > 90) {
+      if (lat < -90 || lat > 90) {
         errors.push(`Ring ${ringIdx} vertex ${i} latitude out of bounds [-90, 90]: ${pt[1]}`);
       }
 
-      // Check common Lat/Lng swap error where Lat is first and exceeds bounds or fits India bounds inversely
+      // Heuristic for a common [lat, lng] swap inside the India operating
+      // band. This REJECTS (never silently swaps) ambiguous input.
       if (Math.abs(lng) <= 37 && Math.abs(lat) >= 68 && Math.abs(lat) <= 97) {
         errors.push(
           `Ring ${ringIdx} vertex ${i} appears to have reversed coordinates [lat, lng] instead of GeoJSON standard [lng, lat].`
@@ -107,15 +126,32 @@ function validateAndSanitizeRings(rings, errors) {
       }
     }
 
-    // Rewind Check (exterior ring counter-clockwise)
-    if (ringIdx === 0 && sanitizedRing.length >= 4) {
+    // Winding normalization (RFC 7946 section 3.1.6): exterior rings MUST be
+    // counter-clockwise (signed area > 0), holes MUST be clockwise
+    // (signed area < 0). The previous implementation reversed area > 0,
+    // forcing exteriors to clockwise — the opposite of the standard.
+    if (sanitizedRing.length >= 4) {
       const area = calculateSignedArea(sanitizedRing);
       if (area === 0) {
-        errors.push("Polygon exterior ring has zero area (degenerate polygon).");
-      } else if (area > 0) {
-        // Clockwise in GeoJSON standard — reverse to counter-clockwise
-        sanitizedRing.reverse();
+        errors.push(
+          ringIdx === 0
+            ? "Polygon exterior ring has zero area (degenerate polygon)."
+            : `Polygon hole ring ${ringIdx} has zero area (degenerate hole).`
+        );
+      } else if (ringIdx === 0 && area < 0) {
+        sanitizedRing.reverse(); // exterior -> counter-clockwise
+      } else if (ringIdx !== 0 && area > 0) {
+        sanitizedRing.reverse(); // hole -> clockwise
       }
+    }
+
+    // Self-intersection rejection (bowtie / figure-8 rings).
+    if (sanitizedRing.length >= 5 && hasSelfIntersection(sanitizedRing)) {
+      errors.push(
+        ringIdx === 0
+          ? "Polygon exterior ring is self-intersecting."
+          : `Polygon hole ring ${ringIdx} is self-intersecting.`
+      );
     }
 
     return sanitizedRing;
@@ -130,6 +166,61 @@ function calculateSignedArea(ring) {
     area += p1[0] * p2[1] - p2[0] * p1[1];
   }
   return area / 2;
+}
+
+// Segment intersection primitives shared by self-intersection rejection
+// (within one ring: touching counts) and zone-overlap detection (between
+// rings: only proper interior crossings count, so zones sharing a border
+// vertex or edge are NOT reported as overlapping).
+const orientation = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+
+const onSegment = (a, b, c) =>
+  Math.min(a[0], c[0]) <= b[0] && b[0] <= Math.max(a[0], c[0]) &&
+  Math.min(a[1], c[1]) <= b[1] && b[1] <= Math.max(a[1], c[1]);
+
+const segmentsIntersectInclusive = (p1, p2, p3, p4) => {
+  const o1 = orientation(p1, p2, p3);
+  const o2 = orientation(p1, p2, p4);
+  const o3 = orientation(p3, p4, p1);
+  const o4 = orientation(p3, p4, p2);
+  if (o1 === 0 && onSegment(p1, p3, p2)) return true;
+  if (o2 === 0 && onSegment(p1, p4, p2)) return true;
+  if (o3 === 0 && onSegment(p3, p1, p4)) return true;
+  if (o4 === 0 && onSegment(p3, p2, p4)) return true;
+  return o1 * o2 < 0 && o3 * o4 < 0;
+};
+
+const segmentsProperlyIntersect = (p1, p2, p3, p4) => {
+  const o1 = orientation(p1, p2, p3);
+  const o2 = orientation(p1, p2, p4);
+  const o3 = orientation(p3, p4, p1);
+  const o4 = orientation(p3, p4, p2);
+  return o1 * o2 < 0 && o3 * o4 < 0;
+};
+
+const eachEdgePair = (ringA, ringB, fn) => {
+  const n = ringA.length - 1;
+  const m = ringB.length - 1;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < m; j++) {
+      if (ringA === ringB) {
+        // Edges sharing a vertex (adjacent, or first/last pair of the
+        // closed ring) legitimately touch — only non-adjacent pairs count.
+        if (i === j) continue;
+        if (Math.abs(i - j) === 1) continue;
+        if (i === 0 && j === n - 1) continue;
+        if (j === 0 && i === n - 1) continue;
+      }
+      if (fn(ringA[i], ringA[i + 1], ringB[j], ringB[j + 1])) return true;
+    }
+  }
+  return false;
+};
+
+/** True when a closed ring crosses or pinches itself (figure-8, bowtie). */
+export function hasSelfIntersection(ring) {
+  if (!Array.isArray(ring) || ring.length < 5) return false;
+  return eachEdgePair(ring, ring, segmentsIntersectInclusive);
 }
 
 /**
@@ -150,54 +241,147 @@ export function isPointInPolygonRing(point, ring) {
   return inside;
 }
 
+const EPS = 1e-9;
+
+const pointOnSegment = (pt, a, b) => {
+  if (orientation(a, b, pt) !== 0) {
+    // Allow tiny floating-point tolerance around exact collinearity.
+    const cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]);
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    if (Math.abs(cross) / len > EPS) return false;
+  }
+  return onSegment(a, pt, b);
+};
+
+const pointOnRingBoundary = (pt, ring) => {
+  for (let i = 0; i < ring.length - 1; i++) {
+    if (pointOnSegment(pt, ring[i], ring[i + 1])) return true;
+  }
+  return false;
+};
+
 /**
- * Verifies that a sub-zone polygon is geographically contained inside its parent district polygon.
+ * Boundary policy (explicit, consistent everywhere):
+ * - A point ON a ring boundary counts as inside for containment purposes,
+ *   so zones tiling a district may share border vertices with it.
+ * - A point strictly inside another zone, or proper edge crossings between
+ *   two zones, count as overlap. Mere shared borders/vertices do NOT.
+ */
+export const pointInRingInclusive = (pt, ring) =>
+  isPointInPolygonRing(pt, ring) || pointOnRingBoundary(pt, ring);
+
+const outerRingsOf = (polygon) => {
+  if (!polygon || !Array.isArray(polygon.coordinates)) return [];
+  if (polygon.type === "Polygon") return [polygon.coordinates[0]].filter(Boolean);
+  if (polygon.type === "MultiPolygon") return polygon.coordinates.map((p) => p[0]).filter(Boolean);
+  return [];
+};
+
+const allRingsOf = (polygon) => {
+  if (!polygon || !Array.isArray(polygon.coordinates)) return [];
+  if (polygon.type === "Polygon") return polygon.coordinates.filter(Array.isArray);
+  if (polygon.type === "MultiPolygon") return polygon.coordinates.flatMap((p) => (Array.isArray(p) ? p : []));
+  return [];
+};
+
+const ringsProperlyCross = (ringA, ringB) => eachEdgePair(ringA, ringB, segmentsProperlyIntersect);
+
+/**
+ * Verifies that EVERY ring (outer + holes, all MultiPolygon components) of
+ * the sub-zone lies inside the parent district's outer ring, with no edge
+ * properly crossing the district boundary and without swallowing the
+ * district. Replaces the old 50%-of-vertices shortcut, which accepted zones
+ * straddling the boundary or bulging outside it.
  */
 export function validateZoneInsideDistrict(zonePolygon, districtPolygon) {
   if (!zonePolygon || !districtPolygon) return { valid: false, reason: "Missing polygon geometry" };
-  
-  const zoneRings = zonePolygon.coordinates ? (zonePolygon.type === "Polygon" ? [zonePolygon.coordinates[0]] : zonePolygon.coordinates.map(p => p[0])) : [];
-  const districtRings = districtPolygon.coordinates ? (districtPolygon.type === "Polygon" ? [districtPolygon.coordinates[0]] : districtPolygon.coordinates.map(p => p[0])) : [];
 
-  if (!zoneRings.length || !districtRings.length) return { valid: false, reason: "Empty polygon coordinate rings" };
+  const zoneRings = allRingsOf(zonePolygon);
+  const districtOuters = outerRingsOf(districtPolygon);
 
-  const districtOuterRing = districtRings[0];
-  const zoneOuterRing = zoneRings[0];
+  if (!zoneRings.length || !districtOuters.length) return { valid: false, reason: "Empty polygon coordinate rings" };
+  const districtOuterRing = districtOuters[0];
 
-  let insideCount = 0;
-  for (const pt of zoneOuterRing) {
-    if (isPointInPolygonRing(pt, districtOuterRing)) {
-      insideCount++;
+  for (let r = 0; r < zoneRings.length; r++) {
+    const ring = zoneRings[r];
+    for (let i = 0; i < ring.length; i++) {
+      if (!pointInRingInclusive(ring[i], districtOuterRing)) {
+        return {
+          valid: false,
+          reason: `Sub-zone polygon extends outside the parent Operational District boundary (ring ${r} vertex ${i} is outside).`,
+        };
+      }
+    }
+    if (ringsProperlyCross(ring, districtOuterRing)) {
+      return {
+        valid: false,
+        reason: `Sub-zone polygon edge crosses the parent Operational District boundary (ring ${r}).`,
+      };
     }
   }
 
-  const ratio = insideCount / zoneOuterRing.length;
-  if (ratio < 0.5) {
-    return {
-      valid: false,
-      reason: `Sub-zone polygon is geographically outside the parent Operational District boundary (only ${Math.round(ratio * 100)}% of vertices fall inside district polygon).`
-    };
+  // The zone must not swallow the district: a district vertex strictly
+  // inside the zone outer means the zone contains (not sits inside) it.
+  const zoneOuter = outerRingsOf(zonePolygon)[0] || [];
+  for (const pt of districtOuterRing) {
+    if (isPointInPolygonRing(pt, zoneOuter) && !pointOnRingBoundary(pt, zoneOuter)) {
+      return {
+        valid: false,
+        reason: "Sub-zone polygon contains the parent district boundary instead of sitting inside it.",
+      };
+    }
   }
 
   return { valid: true };
 }
 
 /**
- * Checks whether two zone outer rings overlap geographically.
+ * True when two zone geometries genuinely overlap: a vertex of one lies
+ * strictly inside the other, or any edge pair properly crosses. Shared
+ * borders/vertices (tiling) and holes are handled: holes are part of the
+ * geometry and crossing a hole boundary still counts.
  */
 export function checkZoneOverlap(zonePolygon1, zonePolygon2) {
-  if (!zonePolygon1 || !zonePolygon2) return false;
-  const getRing = (p) => p.coordinates ? (p.type === "Polygon" ? p.coordinates[0] : p.coordinates[0][0]) : p;
-  const ring1 = getRing(zonePolygon1);
-  const ring2 = getRing(zonePolygon2);
+  const outers1 = outerRingsOf(zonePolygon1);
+  const outers2 = outerRingsOf(zonePolygon2);
+  if (!outers1.length || !outers2.length) return false;
 
-  if (!Array.isArray(ring1) || !Array.isArray(ring2)) return false;
-
-  for (const pt of ring1) {
-    if (isPointInPolygonRing(pt, ring2)) return true;
-  }
-  for (const pt of ring2) {
-    if (isPointInPolygonRing(pt, ring1)) return true;
+  const midpoint = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  // Ring centroid (average of distinct vertices). For identical or fully
+  // coincident geometries every edge lies exactly on the peer boundary, so
+  // vertex/midpoint/crossing tests all abstain — but the shared interior
+  // point is strictly inside both rings, which still proves duplication.
+  const centroid = (ring) => {
+    const pts = ring.slice(0, -1);
+    if (!pts.length) return null;
+    return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+  };
+  for (const r1 of outers1) {
+    for (const r2 of outers2) {
+      const c1 = centroid(r1);
+      const c2 = centroid(r2);
+      if (c1 && isPointInPolygonRing(c1, r2) && !pointOnRingBoundary(c1, r2)) return true;
+      if (c2 && isPointInPolygonRing(c2, r1) && !pointOnRingBoundary(c2, r1)) return true;
+      for (const pt of r1) {
+        if (isPointInPolygonRing(pt, r2) && !pointOnRingBoundary(pt, r2)) return true;
+      }
+      for (const pt of r2) {
+        if (isPointInPolygonRing(pt, r1) && !pointOnRingBoundary(pt, r1)) return true;
+      }
+      if (ringsProperlyCross(r1, r2)) return true;
+      // Edge-midpoint sampling: catches edges that pass through the other
+      // ring with both endpoints on/outside its boundary (e.g. a vertex
+      // landing exactly on the peer edge). Midpoints of genuinely shared
+      // tiling borders lie ON the boundary, never strictly inside.
+      for (let i = 0; i < r1.length - 1; i++) {
+        const mid = midpoint(r1[i], r1[i + 1]);
+        if (isPointInPolygonRing(mid, r2) && !pointOnRingBoundary(mid, r2)) return true;
+      }
+      for (let j = 0; j < r2.length - 1; j++) {
+        const mid = midpoint(r2[j], r2[j + 1]);
+        if (isPointInPolygonRing(mid, r1) && !pointOnRingBoundary(mid, r1)) return true;
+      }
+    }
   }
   return false;
 }

@@ -3,7 +3,13 @@ import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { validateGeoJsonPolygon } from "../Utils/servicePolygon.js";
+import {
+  sanitizePolygon,
+  assertZonePlacement,
+  seedZoneDisabledServices,
+  recordPolygonVersion,
+  withZoneWriteTransaction,
+} from "../Services/zoneWriteService.js";
 
 const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
 const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
@@ -104,83 +110,65 @@ export const createCityZone = async (req, res) => {
       return res.status(400).json({ success: false, message: "zoneCode is required", result: {} });
     }
 
-    const polygonError = validateGeoJsonPolygon(polygon);
-    if (polygonError) {
-      return res.status(400).json({ success: false, message: polygonError, result: {} });
+    // B-05 canonical geometry validation (same sanitizer as the geofence path).
+    const validation = sanitizePolygon(polygon);
+    if (!validation.valid) {
+      return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
     }
 
-    // Ensure the operational city exists
-    const opCity = await OperationalCity.findById(operationalCityId).lean();
-    if (!opCity) {
-      return res.status(404).json({ success: false, message: "Operational city not found", result: {} });
-    }
-
-    const zone = await CityZone.create({
-      operationalCityId,
-      name: name.trim(),
-      zoneCode: zoneCode.trim().toUpperCase(),
-      polygon,
-      active: parseBoolean(active),
-      description: description || null,
+    // B-05 canonical placement: district containment + overlap vs active zones.
+    const placement = await assertZonePlacement({
+      sanitizedPolygon: validation.sanitizedPolygon,
+      districtId: operationalCityId,
     });
+    if (!placement.ok) {
+      return res.status(placement.status === 404 ? 404 : placement.status).json({
+        success: false,
+        code: placement.code,
+        message: placement.message,
+        result: {},
+      });
+    }
 
-    // Required architecture: new zones default every service to DISABLED.
-    // Pre-create inactive ZoneServiceMapping rows (and matching ZONE DISABLED
-    // ServiceAvailability overrides) for all active services so "no mapping"
-    // can never be misread as available and the admin screen lists every
-    // service as DISABLED until explicitly enabled.
+    const actorId = req.user?.userId || req.user?._id || null;
+    let zone;
     let seededCount = 0;
     try {
-      const Service = mongoose.model("Service");
-      const activeServices = await Service.find({ isActive: true }).select("_id").lean();
-      if (activeServices.length) {
-        const mapOps = activeServices.map((s) => ({
-          updateOne: {
-            filter: { zoneId: zone._id, serviceId: s._id },
-            update: {
-              $setOnInsert: {
-                zoneId: zone._id,
-                serviceId: s._id,
-                approvedBy: req.user?.userId || null,
-                approvedAt: new Date(),
-              },
-              $set: { active: false },
+      const out = await withZoneWriteTransaction(async (session) => {
+        const docs = await CityZone.create(
+          [
+            {
+              operationalCityId,
+              name: name.trim(),
+              zoneCode: zoneCode.trim().toUpperCase(),
+              polygon: validation.sanitizedPolygon,
+              active: parseBoolean(active),
+              description: description || null,
             },
-            upsert: true,
+          ],
+          session ? { session } : {}
+        );
+        const created = Array.isArray(docs) ? docs[0] : docs;
+        const seeded = await seedZoneDisabledServices({ zone: created, actorId, session });
+        await recordPolygonVersion(
+          {
+            entityType: "CITY_ZONE",
+            entityId: created._id,
+            polygon: validation.sanitizedPolygon,
+            changedBy: actorId,
+            changeReason: "Initial CityZone Creation",
           },
-        }));
-        const mapRes = await ZoneServiceMapping.bulkWrite(mapOps, { ordered: false });
-        seededCount = mapRes.upsertedCount ?? activeServices.length;
-        try {
-          const ServiceAvailability = mongoose.model("ServiceAvailability");
-          const availOps = activeServices.map((s) => ({
-            updateOne: {
-              filter: {
-                serviceId: s._id,
-                districtId: zone.operationalCityId,
-                cityZoneId: zone._id,
-                scope: "ZONE",
-              },
-              update: {
-                $set: {
-                  serviceId: s._id,
-                  districtId: zone.operationalCityId,
-                  cityZoneId: zone._id,
-                  scope: "ZONE",
-                  status: "DISABLED",
-                  updatedBy: req.user?.userId || null,
-                },
-              },
-              upsert: true,
-            },
-          }));
-          await ServiceAvailability.bulkWrite(availOps, { ordered: false });
-        } catch (e) {
-          console.warn("zone-create availability seed warning:", e.message);
-        }
-      }
+          session
+        );
+        return { created, seeded };
+      });
+      zone = out.result.created;
+      seededCount = out.result.seeded;
     } catch (e) {
-      console.warn("zone-create mapping seed warning:", e.message);
+      if (e.code === 11000) {
+        return res.status(409).json({ success: false, message: "Zone code already exists", result: {} });
+      }
+      throw e;
     }
 
     await writeAuditLog({
@@ -238,21 +226,52 @@ export const updateCityZone = async (req, res) => {
     }
     if (req.body.active !== undefined) update.active = parseBoolean(req.body.active);
     if (req.body.description !== undefined) update.description = req.body.description || null;
+    let sanitizedPolygon = null;
     if (req.body.polygon !== undefined) {
-      const polygonError = validateGeoJsonPolygon(req.body.polygon);
-      if (polygonError) {
-        return res.status(400).json({ success: false, message: polygonError, result: {} });
+      // B-05 canonical geometry validation (same sanitizer as the geofence path).
+      const validation = sanitizePolygon(req.body.polygon);
+      if (!validation.valid) {
+        return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
       }
-      update.polygon = req.body.polygon;
+      sanitizedPolygon = validation.sanitizedPolygon;
+      // B-05 canonical placement recheck (excluding self) on geometry change.
+      const placement = await assertZonePlacement({
+        sanitizedPolygon,
+        districtId: existing.operationalCityId,
+        excludeZoneId: id,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status === 404 ? 404 : placement.status).json({
+          success: false,
+          code: placement.code,
+          message: placement.message,
+          result: {},
+        });
+      }
+      update.polygon = sanitizedPolygon;
     }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ success: false, message: "Nothing to update", result: {} });
     }
 
-    const zone = await CityZone.findByIdAndUpdate(id, update, {
-      new: true,
-      runValidators: true,
+    const actorId = req.user?.userId || req.user?._id || null;
+    const { result: zone } = await withZoneWriteTransaction(async (session) => {
+      const opts = { new: true, runValidators: true, ...(session ? { session } : {}) };
+      const updated = await CityZone.findByIdAndUpdate(id, update, opts);
+      if (sanitizedPolygon) {
+        await recordPolygonVersion(
+          {
+            entityType: "CITY_ZONE",
+            entityId: id,
+            polygon: sanitizedPolygon,
+            changedBy: actorId,
+            changeReason: "CityZone Boundary Update",
+          },
+          session
+        );
+      }
+      return updated;
     });
 
     await writeAuditLog({
@@ -287,32 +306,40 @@ export const deleteCityZone = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid zone ID", result: {} });
     }
 
-    const zone = await CityZone.findByIdAndDelete(id);
+    // B-05: delete + full cascade inside one transaction (standalone dev
+    // falls back to sequential writes inside withZoneWriteTransaction).
+    const zoneObjId = new mongoose.Types.ObjectId(id);
+    const { result: zone } = await withZoneWriteTransaction(async (session) => {
+      const opts = session ? { session } : {};
+      const deleted = await CityZone.findByIdAndDelete(id, opts);
+      if (!deleted) return null;
+      // Clean up all zone references — mappings, per-zone availability
+      // overrides, technician permissions/registrations pointing at the zone.
+      await ZoneServiceMapping.deleteMany({ zoneId: zoneObjId }, opts);
+      await mongoose.model("ServiceAvailability").deleteMany(
+        { $or: [{ cityZoneId: zoneObjId }, { cityId: zoneObjId }] },
+        opts
+      );
+      await mongoose.model("TechnicianProfile").updateMany(
+        { enabledCityZoneIds: zoneObjId },
+        { $pull: { enabledCityZoneIds: zoneObjId } },
+        opts
+      );
+      await mongoose.model("TechnicianProfile").updateMany(
+        { cityZoneId: zoneObjId },
+        { $set: { cityZoneId: null } },
+        opts
+      );
+      await mongoose.model("TechnicianProfile").updateMany(
+        { currentCityZoneId: zoneObjId },
+        { $set: { currentCityZoneId: null } },
+        opts
+      );
+      return deleted;
+    });
     if (!zone) {
       return res.status(404).json({ success: false, message: "City zone not found", result: {} });
     }
-
-    // Clean up all zone references — mappings, per-zone availability overrides,
-    // technician permissions/registrations pointing at the deleted zone.
-    const zoneObjId = new mongoose.Types.ObjectId(id);
-    await Promise.all([
-      ZoneServiceMapping.deleteMany({ zoneId: zoneObjId }),
-      mongoose.model("ServiceAvailability").deleteMany({
-        $or: [{ cityZoneId: zoneObjId }, { cityId: zoneObjId }],
-      }).catch(() => null),
-      mongoose.model("TechnicianProfile").updateMany(
-        { enabledCityZoneIds: zoneObjId },
-        { $pull: { enabledCityZoneIds: zoneObjId } }
-      ).catch(() => null),
-      mongoose.model("TechnicianProfile").updateMany(
-        { cityZoneId: zoneObjId },
-        { $set: { cityZoneId: null } }
-      ).catch(() => null),
-      mongoose.model("TechnicianProfile").updateMany(
-        { currentCityZoneId: zoneObjId },
-        { $set: { currentCityZoneId: null } }
-      ).catch(() => null),
-    ]);
 
     await writeAuditLog({
       actor: req.user.userId,
@@ -454,6 +481,11 @@ export const createZoneServiceMappings = async (req, res) => {
       after: { zoneCode: zone.zoneCode, serviceCount: validServiceIds.length },
     });
 
+    // B-12: newly mapped services may newly authorize offers — backfill.
+    const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+    await backfillBroadcastsForScope({ districtId: zone.operationalCityId, cityZoneId: zone._id, io: req.io })
+      .catch((e) => console.warn("mapping create backfill warning:", e.message));
+
     return res.status(201).json({
       success: true,
       message: "Zone-service mappings created",
@@ -516,6 +548,12 @@ export const deleteZoneServiceMapping = async (req, res) => {
     } catch (e) {
       console.warn("zone-mapping delete sync warning:", e.message);
     }
+
+    // B-12: deleting the mandatory mapping invalidates live offers — expire.
+    const zone = await CityZone.findById(zoneId).select("operationalCityId").lean();
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+    await revalidateTechniciansForService(serviceId, zone?.operationalCityId || null, zoneId, req.io)
+      .catch((e) => console.warn("mapping delete revalidation warning:", e.message));
 
     return res.status(200).json({ success: true, message: "Zone-service mapping deleted", result: {} });
   } catch (err) {
@@ -590,6 +628,17 @@ export const toggleZoneServices = async (req, res) => {
       }
     } catch (e) {
       console.warn("toggleZoneServices sync warning:", e.message);
+    }
+
+    // B-12: bulk mapping flips revalidate (disable) or backfill (enable).
+    if (targetActive) {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ districtId: zone.operationalCityId, cityZoneId: zone._id, io: req.io })
+        .catch((e) => console.warn("mapping bulk-enable backfill warning:", e.message));
+    } else {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      await revalidateTechniciansForService(null, zone.operationalCityId, zone._id, req.io)
+        .catch((e) => console.warn("mapping bulk-disable revalidation warning:", e.message));
     }
 
     return res.status(200).json({

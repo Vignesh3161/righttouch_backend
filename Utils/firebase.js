@@ -62,13 +62,31 @@ const loadServiceAccount = () => {
     if ((privateKey.startsWith('"') && privateKey.endsWith('"')) || (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
       privateKey = privateKey.slice(1, -1);
     }
-    privateKey = privateKey.replace(/\\n/g, "\n");
+    privateKey = privateKey.replace(/\\n/g, "\n").trim();
+    // Accept bare base64 bodies (no PEM armor) — wrap them so cert() works.
+    // Correct .env form is the full PEM quoted with \n; this keeps the old
+    // armor-less form working instead of silently disabling push.
+    if (!privateKey.includes("BEGIN PRIVATE KEY")) {
+      const body = privateKey.replace(/\s+/g, "");
+      privateKey = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\n`;
+    }
 
     const sa = {
       project_id: (process.env.FIREBASE_PROJECT_ID || REQUIRED_PROJECT_ID).trim(),
       client_email: process.env.FIREBASE_CLIENT_EMAIL.trim(),
       private_key: privateKey,
     };
+    // Warn when the service account itself belongs to another GCP project —
+    // validateProjectMatch only sees project_id (env-forced), so this is the
+    // real sender-mismatch signal (FCM would fail with sender-id-mismatch).
+    const emailProject = sa.client_email.split("@")[1]?.split(".iam.gserviceaccount.com")[0];
+    if (emailProject && emailProject !== sa.project_id) {
+      console.error(
+        `❌ [FCM CONFIG ERROR] Service account project mismatch: client_email belongs to ` +
+        `"${emailProject}" but FIREBASE_PROJECT_ID is "${sa.project_id}". ` +
+        `Generate the key in the Firebase console of "${sa.project_id}" (Project settings → Service accounts).`
+      );
+    }
     if (isValidServiceAccount(sa)) return sa;
   }
 

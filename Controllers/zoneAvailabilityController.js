@@ -3,6 +3,7 @@ import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
 import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import { internalError } from "../Utils/safeQuery.js";
 
 /* =====================================================
    RESOLVE ZONE FROM CUSTOMER LOCATION
@@ -73,7 +74,7 @@ export const resolveCustomerZone = async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
+    return internalError(res, err);
   }
 };
 
@@ -155,7 +156,7 @@ export const checkServiceAvailability = async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
+    return internalError(res, err);
   }
 };
 
@@ -204,7 +205,7 @@ export const getMyZone = async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
+    return internalError(res, err);
   }
 };
 
@@ -261,6 +262,6 @@ export const getServicesInMyZone = async (req, res) => {
       meta: { count: services.length },
     });
   } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
+    return internalError(res, err);
   }
 };

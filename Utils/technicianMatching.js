@@ -15,8 +15,8 @@ import { emitJobsChanged } from "./sendNotification.js";
 import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibility.js";
 import { geoSearch } from "./technicianGeo.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
-import { 
-  evaluateTechnicianEligibility, 
+import {
+  evaluateTechnicianEligibility,
   getAllowedDistrictIds,
   getAllowedZoneIds,
   hasDistrictPermission,
@@ -25,12 +25,14 @@ import {
   checkCurrentZoneMatch,
   calculateDistanceMeters,
   getEffectiveRadiusMeters,
+  MAX_PREFILTER_RADIUS_M,
 } from "../Services/technicianEligibilityService.js";
 import { checkGpsValid, checkGpsFreshness } from "./locationConfig.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 import { STALENESS_SECONDS, stalenessCutoff } from "./locationConfig.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
+import { enqueueJobNewNotifications } from "./dispatchQueue.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -220,9 +222,12 @@ export const filterByBookingZone = async (techIds, bookingId) => {
 
   const finalTechIds = [];
   for (const tech of eligibleTechs) {
-    // Use unified zone permission check
+    // Use unified zone permission check.
+    // NOTE (B-01c): normalize to strings — callers key profile/user maps by
+    // String(_id); returning raw ObjectIds silently misses every map lookup
+    // and rejects all zoned-booking candidates with MISSING_LOCATION.
     if (hasZonePermission(tech, booking.cityZoneId)) {
-      finalTechIds.push(tech._id);
+      finalTechIds.push(String(tech._id));
     }
   }
 
@@ -422,6 +427,9 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       .lean();
     const allowedZoneIds = allowedZones.map((z) => z._id);
 
+    // B-19: technician-centric scan uses THIS technician's effective radius
+    // (exact, not the 10km default), so wide-radius techs are not starved.
+    const techEffectiveRadiusM = getEffectiveRadiusMeters(tech);
     const bookingQuery = {
       serviceId: { $in: technicianServiceIds },
       technicianId: null,
@@ -429,7 +437,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       location: {
         $nearSphere: {
           $geometry: { type: "Point", coordinates: [lng, lat] },
-          $maxDistance: 10000, // 10km limit
+          $maxDistance: techEffectiveRadiusM,
         },
       },
     };
@@ -515,8 +523,10 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           }
         );
 
-        if (distanceMeters == null || distanceMeters > 10000) {
-          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — distance > 10km (${Math.round(distanceMeters || 0)}m)`);
+        // B-19: coarse reject against the same effective radius the final
+        // gate enforces (not a hardcoded 10km).
+        if (distanceMeters == null || distanceMeters > techEffectiveRadiusM) {
+          console.log(`🚫 Skipped job ${booking._id} for tech ${tech._id} — distance beyond effective radius (${Math.round(distanceMeters || 0)}m > ${techEffectiveRadiusM}m)`);
           continue;
         }
 
@@ -656,7 +666,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
 export const findEligibleTechniciansForService = async ({
   serviceId,
   address,
-  radiusMeters = 10000,
+  // B-19: booking-centric prefilter ceiling covers the platform-maximum
+  // effective radius, so no technician passing the per-tech final gate is
+  // ever discarded here. Callers must not pass a smaller radius unless the
+  // candidate set is already radius-bounded.
+  radiusMeters = MAX_PREFILTER_RADIUS_M,
   enableGeo = true,
   limit = 50,
   session,
@@ -956,14 +970,15 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       return { success: false, count: 0, message: `Service unavailable at customer location (${avail.reason || avail.code})` };
     }
 
-    // 1. Find Technicians
+    // 1. Find Technicians (prefilter at platform-max ceiling; the
+    // per-technician effective radius gates authoritatively below).
     const eligibleTechnicians = await findEligibleTechniciansForService({
       serviceId: booking.serviceId,
       address: booking.addressSnapshot || {
         latitude: booking.location?.coordinates[1],
         longitude: booking.location?.coordinates[0]
       },
-      radiusMeters: 10000,
+      radiusMeters: MAX_PREFILTER_RADIUS_M,
       enableGeo: true,
       limit: 100
     });
@@ -1092,7 +1107,21 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     });
 
     // 3. Create JobBroadcast Records + Update Booking Status + Create DispatchOutbox
-    // All in a single transaction for atomicity
+    // All in a single transaction for atomicity.
+    // NOTE: jobDataPayload is constructed BEFORE the transaction so the
+    // DispatchOutbox rows inside the transaction can reference it (B-01 TDZ fix).
+    const jobDataPayload = {
+      bookingId: booking._id,
+      serviceId: service._id,
+      serviceName: service.serviceName,
+      serviceType: service.serviceType,
+      description: service.description,
+      duration: service.duration,
+      customerName: booking.addressSnapshot?.name || "Customer",
+      baseAmount: booking.baseAmount,
+      address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
+      scheduledAt: booking.scheduledAt,
+    };
     const session = await mongoose.startSession();
     let broadcastMap = new Map();
     
@@ -1133,20 +1162,40 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           broadcastRows.map(b => [b.technicianId ? b.technicianId.toString() : "", b])
         );
 
-        const dispatchOutboxRows = technicianIds.map(techId => {
+        // Idempotent outbox enqueue: $setOnInsert upsert scoped to the live
+        // (pending/inflight) window of the partial unique index. A retried
+        // broadcast must NEVER throw inside the transaction — even a caught
+        // duplicate-key aborts the txn server-side, and committing an aborted
+        // txn makes withTransaction retry forever (P1 root cause).
+        const outboxOps = technicianIds.map((techId) => {
           const b = broadcastMap.get(String(techId));
           return {
-            bookingId: booking._id,
-            technicianId: techId,
-            kind: "job_new",
-            broadcastId: b?._id || null,
-            version: b?.version || 1,
-            payload: { ...jobDataPayload, traceId: trc },
-            status: "pending",
-            nextAttemptAt: new Date(),
+            updateOne: {
+              filter: {
+                bookingId: booking._id,
+                technicianId: techId,
+                kind: "job_new",
+                status: { $in: ["pending", "inflight"] },
+              },
+              update: {
+                $setOnInsert: {
+                  bookingId: booking._id,
+                  technicianId: techId,
+                  kind: "job_new",
+                  broadcastId: b?._id || null,
+                  version: b?.version || 1,
+                  payload: { ...jobDataPayload, traceId: trc },
+                  status: "pending",
+                  nextAttemptAt: new Date(),
+                },
+              },
+              upsert: true,
+            },
           };
         });
-        await DispatchOutbox.insertMany(dispatchOutboxRows, { session, ordered: false }).catch(() => {});
+        if (outboxOps.length) {
+          await DispatchOutbox.bulkWrite(outboxOps, { session, ordered: false });
+        }
       });
     } finally {
       await session.endSession();
@@ -1156,18 +1205,6 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     recordHistogram(METRIC_KEYS.MATCHING_LATENCY_MS, Date.now() - matchStartTime);
 
     // 4. Send Notifications (AFTER transaction commit for durability)
-    const jobDataPayload = {
-      bookingId: booking._id,
-      serviceId: service._id,
-      serviceName: service.serviceName,
-      serviceType: service.serviceType,
-      description: service.description,
-      duration: service.duration,
-      customerName: booking.addressSnapshot?.name || "Customer",
-      baseAmount: booking.baseAmount,
-      address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
-      scheduledAt: booking.scheduledAt,
-    };
 
     // ⚡ INSTANT DIRECT SOCKET DISPATCH (after commit)
     if (io) {
@@ -1175,6 +1212,8 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         const b = broadcastMap.get(String(techId));
         const techOffer = offerRows.find(o => String(o.technicianId) === String(techId));
         const distM = techOffer?.distanceAtOffer != null ? Math.round(techOffer.distanceAtOffer) : null;
+        // B-19: report the per-technician effective radius actually enforced.
+        const techEffectiveM = getEffectiveRadiusMeters(profileById.get(String(techId)));
         const jobDTO = toJobNewDTO({
           ...jobDataPayload,
           latitude,
@@ -1182,9 +1221,9 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           distanceMeters: distM,
           distanceKm: distM != null ? Number((distM / 1000).toFixed(2)) : null,
           distanceStr: distM != null ? `${(distM / 1000).toFixed(1)} km` : null,
-          jobRadiusKm: 10,
-          maxRadiusKm: 10,
-          maxAllowedMeters: 10000,
+          jobRadiusKm: techEffectiveM / 1000,
+          maxRadiusKm: techEffectiveM / 1000,
+          maxAllowedMeters: techEffectiveM,
         }, b);
         // PRIMARY: Technician operational room (always correct)
         io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);

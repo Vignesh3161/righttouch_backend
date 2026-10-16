@@ -4,7 +4,11 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianDistrictPermission from "../Schemas/TechnicianDistrictPermission.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { invalidateOperationalPolygonCache } from "../Utils/technicianMatching.js";
-import { validateGeoJsonPolygon } from "../Utils/servicePolygon.js";
+import {
+  sanitizePolygon,
+  recordPolygonVersion,
+  withZoneWriteTransaction,
+} from "../Services/zoneWriteService.js";
 
 const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
 const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
@@ -135,26 +139,50 @@ export const createOperationalCity = async (req, res) => {
       return res.status(400).json({ success: false, message: `District record with name "${trimmedName}" already exists`, result: {} });
     }
 
-    const polygonError = validateGeoJsonPolygon(polygon);
-    if (polygonError) {
-      return res.status(400).json({ success: false, message: polygonError, result: {} });
+    // B-05 canonical geometry validation (same sanitizer as the geofence path).
+    const validation = sanitizePolygon(polygon);
+    if (!validation.valid) {
+      return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
     }
 
     const finalActive = isActive !== undefined ? Boolean(isActive) : Boolean(active);
 
-    const cityDoc = await OperationalCity.create({
-      name: trimmedName,
-      city: city ? String(city).trim() : null,
-      state: state ? String(state).trim() : null,
-      country: country ? String(country).trim() : "India",
-      code: code ? String(code).trim().toUpperCase() : null,
-      cityId: cityId || null,
-      polygon,
-      active: finalActive,
-      isRegistrationEnabled: Boolean(isRegistrationEnabled),
-      isJobEnabled: Boolean(isJobEnabled),
-      createdBy: req.user?.userId || null,
-      updatedBy: req.user?.userId || null,
+    // B-05: district + v1 history commit atomically.
+    const actorId = req.user?.userId || null;
+    const { result: cityDoc } = await withZoneWriteTransaction(async (session) => {
+      const opts = session ? { session } : {};
+      const docs = await OperationalCity.create(
+        [
+          {
+            name: trimmedName,
+            city: city ? String(city).trim() : null,
+            state: state ? String(state).trim() : null,
+            country: country ? String(country).trim() : "India",
+            code: code ? String(code).trim().toUpperCase() : null,
+            cityId: cityId || null,
+            polygon: validation.sanitizedPolygon,
+            active: finalActive,
+            isRegistrationEnabled: Boolean(isRegistrationEnabled),
+            isJobEnabled: Boolean(isJobEnabled),
+            createdBy: actorId,
+            updatedBy: actorId,
+            version: 1,
+          },
+        ],
+        opts
+      );
+      const created = Array.isArray(docs) ? docs[0] : docs;
+      await recordPolygonVersion(
+        {
+          entityType: "DISTRICT",
+          entityId: created._id,
+          polygon: validation.sanitizedPolygon,
+          changedBy: actorId,
+          changeReason: "Initial District Creation",
+        },
+        session
+      );
+      return created;
     });
 
     await writeAuditLog({
@@ -210,17 +238,39 @@ export const updateOperationalCity = async (req, res) => {
     if (req.body.isRegistrationEnabled !== undefined) update.isRegistrationEnabled = Boolean(req.body.isRegistrationEnabled);
     if (req.body.isJobEnabled !== undefined) update.isJobEnabled = Boolean(req.body.isJobEnabled);
 
+    let sanitizedPolygon = null;
     if (req.body.polygon !== undefined) {
-      const polygonError = validateGeoJsonPolygon(req.body.polygon);
-      if (polygonError) {
-        return res.status(400).json({ success: false, message: polygonError, result: {} });
+      // B-05 canonical geometry validation (same sanitizer as the geofence path).
+      const validation = sanitizePolygon(req.body.polygon);
+      if (!validation.valid) {
+        return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
       }
-      update.polygon = req.body.polygon;
+      sanitizedPolygon = validation.sanitizedPolygon;
+      update.polygon = sanitizedPolygon;
     }
 
-    const cityDoc = await OperationalCity.findByIdAndUpdate(id, update, {
-      new: true,
-      runValidators: true,
+    // B-05: district save + history row commit atomically on geometry change.
+    const actorId = req.user?.userId || null;
+    const { result: cityDoc } = await withZoneWriteTransaction(async (session) => {
+      const opts = { new: true, runValidators: true, ...(session ? { session } : {}) };
+      const updated = await OperationalCity.findByIdAndUpdate(id, update, opts);
+      if (sanitizedPolygon && updated) {
+        const bumped = (updated.version || 1) + 1;
+        const saveOpts = session ? { session } : {};
+        await OperationalCity.updateOne({ _id: id }, { $set: { version: bumped } }, saveOpts);
+        updated.version = bumped;
+        await recordPolygonVersion(
+          {
+            entityType: "DISTRICT",
+            entityId: id,
+            polygon: sanitizedPolygon,
+            changedBy: actorId,
+            changeReason: "District Boundary Update",
+          },
+          session
+        );
+      }
+      return updated;
     });
 
     await writeAuditLog({
@@ -278,6 +328,17 @@ export const updateDistrictStatus = async (req, res) => {
     });
 
     invalidateOperationalPolygonCache();
+    // B-12: district activation gates dispatch — deactivate expires stale
+    // broadcasts district-wide, re-activate backfills (bounded, idempotent).
+    if (targetActive) {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ districtId: cityDoc._id, io: req.io })
+        .catch((e) => console.warn("district activate backfill warning:", e.message));
+    } else {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      await revalidateTechniciansForService(null, cityDoc._id, null, req.io)
+        .catch((e) => console.warn("district deactivate revalidation warning:", e.message));
+    }
     return res.status(200).json({ success: true, message: `District ${targetActive ? "activated" : "deactivated"} successfully`, result: cityDoc });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message, result: {} });
@@ -364,6 +425,16 @@ export const updateDistrictJobs = async (req, res) => {
       after: { isJobEnabled: cityDoc.isJobEnabled },
     });
 
+    // B-12: jobs gate feeds the resolver directly — keep broadcasts in sync.
+    if (cityDoc.isJobEnabled) {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ districtId: cityDoc._id, io: req.io })
+        .catch((e) => console.warn("district jobs-enable backfill warning:", e.message));
+    } else {
+      const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+      await revalidateTechniciansForService(null, cityDoc._id, null, req.io)
+        .catch((e) => console.warn("district jobs-disable revalidation warning:", e.message));
+    }
     return res.status(200).json({ success: true, message: `District job assignment ${cityDoc.isJobEnabled ? "enabled" : "disabled"} successfully`, result: cityDoc });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message, result: {} });

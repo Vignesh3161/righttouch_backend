@@ -18,6 +18,7 @@ import {
   getAdminTechnicianDetails,
   updateTechnicianVerification,
   getJobBroadcastAudit,
+  validatePolygonPreview,
 } from "../Controllers/adminZoneGeofenceController.js";
 
 const router = express.Router();
@@ -51,5 +52,6 @@ router.get("/zone-health-dashboard", getZoneHealthDashboard);
 router.get("/health-dashboard", getZoneHealthDashboard);
 router.get("/live-monitor", listDistricts);
 router.post("/polygons/rollback", rollbackPolygonVersion);
+router.post("/validate-polygon", validatePolygonPreview);
 
 export default router;

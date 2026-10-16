@@ -11,8 +11,10 @@ import {
   resolveTechPayoutSettings,
   computeAutoPayoutForTech,
 } from "../Utils/autoPayout.js";
-import { executeWithdrawalPayout, releaseFailedWithdrawalReserve } from "../Utils/withdrawalPayoutEngine.js";
 import { hasActivePayoutBlock } from "../Utils/complaintFreeze.js";
+import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
+import { fingerprintBankDetails } from "../Utils/kycPrivacy.js";
+import { SOCKET_ROOMS } from "../Utils/socketConstants.js";
 import { atomicWalletDebit } from "../Utils/walletDebit.js";
 import { getIo } from "../Utils/ioAccess.js";
 
@@ -565,7 +567,9 @@ export const requestWithdrawal = async (req, res) => {
     }
 
     // 🏦 Bank Verification Withdrawal Guard — prevent withdrawal if bank account is unverified or under review
-    const kycDoc = await TechnicianKyc.findOne({ technicianId: tech._id }).select("bankVerified bankVerificationStatus").lean();
+    const kycDoc = await TechnicianKyc.findOne({ technicianId: tech._id })
+      .select("bankVerified bankVerificationStatus bankDetails bankDetailsFingerprint encryptedDek")
+      .lean();
     const isBankApproved = Boolean(
       kycDoc &&
       (kycDoc.bankVerified === true ||
@@ -580,6 +584,36 @@ export const requestWithdrawal = async (req, res) => {
           bankVerified: kycDoc?.bankVerified || false,
           bankVerificationStatus: kycDoc?.bankVerificationStatus || "pending"
         }
+      });
+    }
+
+    // 🔒 Fingerprint guard at request time (Stage 1 manual flow): the
+    // verified bank details must still match exactly what the admin approved.
+    // Unlike the old automated engine, this check NEVER mutates KYC here —
+    // it only rejects so an admin re-verification can resolve the drift.
+    try {
+      const reqDek = await getDekForKycDoc(kycDoc);
+      const reqBank = decryptBankDetails(kycDoc?.bankDetails, reqDek) || {};
+      const reqHasBank = Boolean(reqBank.accountNumber && reqBank.ifscCode);
+      const reqHasUpi = Boolean(reqBank.upiId);
+      if (!reqHasBank && !reqHasUpi) {
+        return res.status(422).json({
+          success: false,
+          message: "Withdrawal blocked: no bank/UPI details on file. Please update your bank details and wait for verification.",
+        });
+      }
+      const reqCurrent = fingerprintBankDetails(reqBank);
+      const reqStored = kycDoc?.bankDetailsFingerprint;
+      if (!reqStored || !reqCurrent || reqStored !== reqCurrent) {
+        return res.status(422).json({
+          success: false,
+          message: "Withdrawal blocked: your bank details changed since verification. Please ask Admin to re-verify them before requesting payouts.",
+        });
+      }
+    } catch (fpErr) {
+      return res.status(422).json({
+        success: false,
+        message: "Withdrawal blocked: bank details could not be verified right now. Please try again later.",
       });
     }
 
@@ -667,64 +701,127 @@ export const requestWithdrawal = async (req, res) => {
     }
 
     let withdrawal;
-    await session.withTransaction(async () => {
-      // Re-check balance inside transaction
-      const fresh = await TechnicianProfile.findById(tech._id).session(session);
-      const freshAvailable = fresh.availableBalancePaise ?? toPaise(fresh.walletBalance ?? 0);
-      const freshMaxPayout = Math.max(0, freshAvailable - maintenanceFloorPaise);
-      if (amountPaiseNum > freshMaxPayout) {
-        const err = new Error("Insufficient withdrawable balance (maintenance floor required)");
-        err.statusCode = 400;
-        throw err;
+    try {
+      await session.withTransaction(async () => {
+        // Re-check withdrawable balance inside the transaction (the
+        // pre-transaction read of req.technician may be stale).
+        const fresh = await TechnicianProfile.findById(tech._id).session(session);
+        if (!fresh) {
+          const err = new Error("Technician profile not found");
+          err.statusCode = 404;
+          throw err;
+        }
+        const freshAvailable = fresh.availableBalancePaise ?? toPaise(fresh.walletBalance ?? 0);
+        const freshMaxPayout = Math.max(0, freshAvailable - maintenanceFloorPaise);
+        if (amountPaiseNum > freshMaxPayout) {
+          const err = new Error("Insufficient withdrawable balance (maintenance floor required)");
+          err.statusCode = 400;
+          throw err;
+        }
+
+        // Atomically move available → reserved. The
+        // availableBalancePaise >= N filter makes the debit conditional so
+        // concurrent requests can never overspend; walletVersion bumps for
+        // optimistic-concurrency consumers. A null return means the balance
+        // moved under us — abort instead of creating an unfunded request.
+        const moved = await TechnicianProfile.findOneAndUpdate(
+          { _id: tech._id, availableBalancePaise: { $gte: amountPaiseNum } },
+          [
+            {
+              $set: {
+                availableBalancePaise: { $subtract: ["$availableBalancePaise", amountPaiseNum] },
+                reservedBalancePaise: { $add: ["$reservedBalancePaise", amountPaiseNum] },
+                walletVersion: { $add: [{ $ifNull: ["$walletVersion", 0] }, 1] },
+              },
+            },
+          ],
+          { session, new: true }
+        );
+        if (!moved) {
+          const err = new Error("Insufficient withdrawable balance (maintenance floor required)");
+          err.statusCode = 400;
+          throw err;
+        }
+
+        // Stage 1 manual flow: requests park in "requested" for admin
+        // approval + offline bank transfer. Nothing is sent to any provider
+        // here (the old automated engine call is intentionally gone).
+        withdrawal = await WithdrawalRequest.create(
+          [
+            {
+              technicianId: tech._id,
+              amount: amountRupees,
+              amountPaise: amountPaiseNum,
+              requestedAmountPaise: amountPaiseNum,
+              netPayoutAmountPaise: amountPaiseNum,
+              status: "requested",
+              origin: "technician_request",
+              requiresApproval: false,
+              initiatedBy: { actorType: "technician", actorId: tech._id },
+              // Omitted (undefined) when the client sent no key: with the
+              // unique sparse index, an absent field is not indexed, while an
+              // explicit null WOULD collide across keyless requests (E11000).
+              clientIdempotencyKey: clientIdempotencyKey || undefined,
+            },
+          ],
+          { session }
+        );
+
+        await WalletTransaction.create(
+          [
+            {
+              technicianId: tech._id,
+              amountPaise: amountPaiseNum,
+              amount: amountRupees,
+              type: "debit",
+              source: "withdraw",
+              withdrawalId: withdrawal[0]._id,
+              idempotencyKey: `withdrawal:${withdrawal[0]._id}`,
+              note: `Amount reserved for withdrawal request #${withdrawal[0]._id}`,
+            },
+          ],
+          { session }
+        );
+      });
+    } catch (txnErr) {
+      // Concurrent double-submit: the uniq_active_payout_per_technician
+      // partial index (or the clientIdempotencyKey unique index) rejected the
+      // second insert. Report the live active request instead of a raw 11000.
+      if (txnErr?.code === 11000) {
+        const live = await WithdrawalRequest.findOne({
+          technicianId: tech._id,
+          status: { $in: ["pending", "requested", "approved", "processing", "manual_review"] },
+        })
+          .select("_id status amount amountPaise")
+          .lean();
+        if (live) {
+          if (clientIdempotencyKey) {
+            const sameKey = await WithdrawalRequest.findOne({
+              clientIdempotencyKey,
+              technicianId: tech._id,
+            }).lean();
+            if (sameKey && String(sameKey._id) === String(live._id)) {
+              return res.status(200).json({
+                success: true,
+                message: "Withdrawal request already submitted (idempotent)",
+                result: {
+                  withdrawalId: sameKey._id,
+                  status: sameKey.status,
+                  amount: sameKey.amount,
+                  amountPaise: sameKey.amountPaise,
+                },
+              });
+            }
+          }
+          return res.status(409).json({
+            success: false,
+            message: "You already have a payout in progress or under review. Please wait for it to complete.",
+            result: { withdrawalId: live._id, status: live.status },
+          });
+        }
       }
-
-      // Atomically move available → reserved
-      await TechnicianProfile.updateOne(
-        { _id: tech._id },
-        {
-          $inc: {
-            availableBalancePaise: -amountPaiseNum,
-            reservedBalancePaise: amountPaiseNum,
-          },
-        },
-        { session }
-      );
-
-      // Create WithdrawalRequest in "processing" status
-      withdrawal = await WithdrawalRequest.create(
-        [
-          {
-            technicianId: tech._id,
-            amount: amountRupees,
-            amountPaise: amountPaiseNum,
-            requestedAmountPaise: amountPaiseNum,
-            netPayoutAmountPaise: amountPaiseNum,
-            status: "processing",
-            origin: "technician_request",
-            requiresApproval: false,
-            initiatedBy: { actorType: "technician", actorId: tech._id },
-            clientIdempotencyKey: clientIdempotencyKey || null,
-          },
-        ],
-        { session }
-      );
-
-      await WalletTransaction.create(
-        [
-          {
-            technicianId: tech._id,
-            amountPaise: amountPaiseNum,
-            amount: amountRupees,
-            type: "debit",
-            source: "withdraw",
-            withdrawalId: withdrawal[0]._id,
-            idempotencyKey: `withdrawal:${withdrawal[0]._id}`,
-            note: `Amount reserved for withdrawal request #${withdrawal[0]._id}`,
-          },
-        ],
-        { session }
-      );
-    });
+      throw txnErr;
+    }
 
     await writeAuditLog({
       actor: req.user.userId,
@@ -732,53 +829,35 @@ export const requestWithdrawal = async (req, res) => {
       action: "WITHDRAWAL_REQUESTED",
       targetType: "WithdrawalRequest",
       targetId: withdrawal[0]._id,
-      after: { amountPaise: amountPaiseNum, status: "processing", origin: "technician_request", reserved: true },
+      after: { amountPaise: amountPaiseNum, status: "requested", origin: "technician_request", reserved: true },
     });
 
-    // ── AUTOMATIC payout processing: single shared engine, no Admin approval ──
-    const io = getIo();
+    // Notify admins of the new request (best-effort: must never break the
+    // committed money flow).
     try {
-      const payout = await executeWithdrawalPayout({
-        withdrawalId: withdrawal[0]._id,
-        actor: { userId: req.user.userId, role: req.user.role },
-        narration: "RightTouch Technician Withdrawal",
-        io,
-      });
-
-      return res.status(201).json({
-        success: true,
-        message: payout.message || "Withdrawal initiated successfully",
-        result: {
-          withdrawalId: withdrawal[0]._id,
-          status: payout.withdrawalStatus || "processing",
-          amount: payout.amount,
-          amountPaise: payout.amountPaise,
-          payoutId: payout.payoutId,
-          mode: payout.mode,
-          payoutDestination: payout.payoutDestination,
-        },
-      });
-    } catch (payErr) {
-      const w = await WithdrawalRequest.findById(withdrawal[0]._id).lean();
-      if (w && w.status === "manual_review") {
-        return res.status(202).json({
-          success: false,
-          message: "Payout outcome is being verified with your bank. We'll notify you shortly.",
-          result: { withdrawalId: withdrawal[0]._id, status: "manual_review" },
-        });
-      }
-      await releaseFailedWithdrawalReserve({
-        withdrawalId: withdrawal[0]._id,
+      const io = getIo();
+      io?.to(SOCKET_ROOMS.ADMIN_DASHBOARD).emit("withdrawal:requested", {
+        withdrawalId: String(withdrawal[0]._id),
+        technicianId: String(tech._id),
+        amount: amountRupees,
         amountPaise: amountPaiseNum,
-        technicianId: tech._id,
-        reason: payErr?.message,
+        status: "requested",
+        timestamp: new Date().toISOString(),
       });
-      return res.status(400).json({
-        success: false,
-        message: payErr?.message || "Payout failed. Your balance has been restored.",
-        result: { withdrawalId: withdrawal[0]._id, status: "failed" },
-      });
+    } catch (notifyErr) {
+      console.warn("[requestWithdrawal] admin notify failed:", notifyErr.message);
     }
+
+    return res.status(201).json({
+      success: true,
+      message: "Withdrawal request submitted. Admin will review and transfer the amount to your verified bank account.",
+      result: {
+        withdrawalId: withdrawal[0]._id,
+        status: "requested",
+        amount: amountRupees,
+        amountPaise: amountPaiseNum,
+      },
+    });
   } catch (error) {
     res.status(error.statusCode || 500).json({ success: false, message: error.message });
   } finally {
@@ -812,72 +891,83 @@ export const cancelMyWithdrawal = async (req, res) => {
 
     const { id } = req.params;
 
-    const withdrawal = await WithdrawalRequest.findOne({
-      _id: id,
-      technicianId: req.technician._id,
-    });
-
-    if (!withdrawal) {
-      return res.status(404).json({
-        success: false,
-        message: "Withdrawal request not found"
-      });
-    }
-
-    if (!["pending", "requested"].includes(withdrawal.status)) {
-      return res.status(400).json({
-        success: false,
-        message: withdrawal.status === "processing"
-          ? "Withdrawal is currently processing with RazorpayX and cannot be cancelled."
-          : `Withdrawal request cannot be cancelled in status "${withdrawal.status}"`
-      });
-    }
-
     let refundedToWalletPaise = 0;
-    const amountPaiseNum = toPaise(withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount));
+    let cancelledId = null;
 
     await session.withTransaction(async () => {
-      withdrawal.status = "cancelled";
-      withdrawal.rejectedAt = new Date();
-      withdrawal.decidedAt = new Date();
-      withdrawal.adminNote = "Cancelled by technician";
-      await withdrawal.save({ session });
+      // Compare-and-set: only pending/requested can be cancelled. The status
+      // filter makes concurrent double-clicks safe — exactly one wins.
+      const updated = await WithdrawalRequest.findOneAndUpdate(
+        {
+          _id: id,
+          technicianId: req.technician._id,
+          status: { $in: ["pending", "requested"] },
+        },
+        {
+          $set: {
+            status: "cancelled",
+            rejectedAt: new Date(),
+            decidedAt: new Date(),
+            adminNote: "Cancelled by technician",
+          },
+        },
+        { session, new: true }
+      );
 
-      // Refund the reserved amount (only if it was actually reserved)
+      if (!updated) {
+        const err = new Error("CANCEL_CAS_MISS");
+        err.statusCode = 409;
+        throw err;
+      }
+      cancelledId = updated._id;
+
+      const amountPaiseNum = toPaise(updated.amountPaise ?? rupeesToPaise(updated.amount));
+
+      // Refund the reserved amount (only if it was actually reserved —
+      // legacy pre-reserve docs have no debit and must not double-credit).
       const reserveDebit = await WalletTransaction.findOne(
-        { withdrawalId: withdrawal._id, type: "debit", source: "withdraw" },
+        { withdrawalId: updated._id, type: "debit", source: "withdraw" },
         null,
         { session }
       );
 
-      if (reserveDebit) {
-        // Move reserved → available
-        await TechnicianProfile.updateOne(
-          { _id: withdrawal.technicianId },
-          {
-            $inc: {
-              availableBalancePaise: amountPaiseNum,
-              reservedBalancePaise: -amountPaiseNum,
-            },
-          },
-          { session }
-        );
-
-        await WalletTransaction.create(
+      if (reserveDebit && amountPaiseNum > 0) {
+        // Move reserved → available, guarded so reserved never goes negative,
+        // and bump walletVersion for optimistic-concurrency consumers.
+        await TechnicianProfile.findOneAndUpdate(
+          { _id: updated.technicianId, reservedBalancePaise: { $gte: amountPaiseNum } },
           [
             {
-              technicianId: withdrawal.technicianId,
-              amountPaise: amountPaiseNum,
-              amount: paiseToRupees(amountPaiseNum),
-              type: "credit",
-              source: "adjustment",
-              withdrawalId: withdrawal._id,
-              idempotencyKey: `withdrawal-refund:${withdrawal._id}`,
-              note: `Refund for cancelled withdrawal #${withdrawal._id}`,
+              $set: {
+                availableBalancePaise: { $add: ["$availableBalancePaise", amountPaiseNum] },
+                reservedBalancePaise: { $subtract: ["$reservedBalancePaise", amountPaiseNum] },
+                walletVersion: { $add: [{ $ifNull: ["$walletVersion", 0] }, 1] },
+              },
             },
           ],
           { session }
         );
+
+        try {
+          await WalletTransaction.create(
+            [
+              {
+                technicianId: updated.technicianId,
+                amountPaise: amountPaiseNum,
+                amount: paiseToRupees(amountPaiseNum),
+                type: "credit",
+                source: "adjustment",
+                withdrawalId: updated._id,
+                idempotencyKey: `withdrawal-refund:${updated._id}`,
+                note: `Refund for cancelled withdrawal #${updated._id}`,
+              },
+            ],
+            { session }
+          );
+        } catch (creditErr) {
+          // Replay-safe: a retried cancel reuses the same idempotency key.
+          if (creditErr?.code !== 11000) throw creditErr;
+        }
         refundedToWalletPaise = amountPaiseNum;
       }
     });
@@ -887,7 +977,7 @@ export const cancelMyWithdrawal = async (req, res) => {
       actorRole: req.user.role,
       action: "WITHDRAWAL_CANCELLED_BY_TECHNICIAN",
       targetType: "WithdrawalRequest",
-      targetId: withdrawal._id,
+      targetId: cancelledId,
       after: { status: "cancelled", refundedToWalletPaise },
     });
 
@@ -897,6 +987,27 @@ export const cancelMyWithdrawal = async (req, res) => {
       result: { refundedToWallet: paiseToRupees(refundedToWalletPaise), refundedToWalletPaise },
     });
   } catch (error) {
+    if (error?.message === "CANCEL_CAS_MISS") {
+      const current = await WithdrawalRequest.findOne({
+        _id: req.params.id,
+        technicianId: req.technician._id,
+      })
+        .select("status")
+        .lean();
+      if (!current) {
+        return res.status(404).json({
+          success: false,
+          message: "Withdrawal request not found",
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message:
+          current.status === "processing" || current.status === "manual_review"
+            ? "Withdrawal is currently being processed/verified and cannot be cancelled."
+            : `Withdrawal request cannot be cancelled in status "${current.status}"`,
+      });
+    }
     res.status(500).json({
       success: false,
       message: error.message

@@ -74,10 +74,10 @@ import productQuoteRoutes from "./Routes/productQuoteRoutes.js";
 
 // Shared / System Route Imports
 import { adminFinanceRoutes, technicianFinanceRoutes } from "./Routes/financeRoutes.js";
+import { customerRewardRoutes, adminRewardRoutes } from "./Routes/rewardRoutes.js";
 import { makePermissionRouter } from "./Routes/permissionRoutes.js";
 import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
 import notificationRoutes from "./Routes/notificationRoutes.js";
-import razorpayXWebhookRoutes from "./Routes/razorpayXWebhookRoutes.js";
 import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
 
 // Swagger API Documentation
@@ -417,6 +417,7 @@ import {
 import { releaseExpiredHolds } from "./Utils/complaintFreeze.js";
 import { getRefundPolicy } from "./Utils/refundPolicy.js";
 import { validateSecrets } from "./Utils/secretValidation.js";
+import { enforceTransactionSupport } from "./Utils/mongoTransactions.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -654,13 +655,14 @@ App.use("/api/user", productQuoteRoutes);
 App.use("/api/user/notifications", Auth, notificationRoutes);
 App.use("/api/user/permissions", Auth, makePermissionRouter("Customer"));
 App.use("/api/user/device-token", Auth, makeDeviceRouter("Customer"));
+App.use("/api/user/rewards", Auth, customerRewardRoutes);
+App.use("/api/admin/rewards", Auth, authorizeRoles("Admin", "Owner"), adminRewardRoutes);
 App.use("/api/addresses", AddressRoutes);
 App.use("/api", userZoneRoutes);
 
 /* --------------------------------------------------------------------------
-   4. SHARED, SYSTEM & WEBHOOK ROUTES
+   4. SHARED & SYSTEM ROUTES
    -------------------------------------------------------------------------- */
-App.use("/api", razorpayXWebhookRoutes);
 App.use("/api/admin/dispatch", adminDispatchRoutes);
 
 // 📖 Swagger API Documentation
@@ -715,7 +717,9 @@ const startServer = async () => {
   try {
     validateSecrets();
   } catch (err) {
-    console.error("❌ Secret validation warning:", err.message);
+    // validateSecrets() throws in production — fail closed, do not bind.
+    console.error("❌ Secret validation failed:", err.message);
+    if (process.env.NODE_ENV === "production") process.exit(1);
   }
 
   // 1. Start HTTP & WebSocket Server immediately so Cloud Run / container health checks pass
@@ -743,6 +747,10 @@ const startServer = async () => {
       socketTimeoutMS: 45000,
     });
     console.log("✅ Connected to MongoDB Atlas...");
+
+    // 3a. Financial mutations require multi-document transactions — fail
+    // closed in production on standalone topologies (warn in dev/test).
+    await enforceTransactionSupport();
 
     // 3b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
     await initRedisAdapter(io);

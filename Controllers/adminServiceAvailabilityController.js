@@ -9,6 +9,7 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import AuditLog from "../Schemas/AuditLog.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
+import { isValidObjectId, containsRegex, internalError } from "../Utils/safeQuery.js";
 
 /**
  * 🛠 ADMIN: CREATE SERVICE AVAILABILITY CONFIGURATION
@@ -24,6 +25,15 @@ export const createServiceAvailability = async (req, res) => {
         message: "serviceId and districtId are required",
       });
     }
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
+    }
+    if (cityId && !isValidObjectId(cityId)) {
+      return res.status(400).json({ success: false, message: "Invalid cityId", code: "INVALID_ID" });
+    }
 
     const service = await Service.findById(serviceId).lean();
     if (!service) {
@@ -37,13 +47,18 @@ export const createServiceAvailability = async (req, res) => {
 
     const finalScope = scope === "CITY" ? "CITY" : "DISTRICT";
     const finalCityId = finalScope === "CITY" && cityId ? cityId : null;
+    // B-10: dual-write the canonical cityZoneId mirror so legacy CITY rows
+    // remain readable after a future cityId retirement (scope stays CITY to
+    // preserve CITY_* response reasons; the resolver prefers canonical ZONE
+    // rows deterministically on conflict).
 
-    // Check for conflicting configuration
+    // Check for conflicting configuration. Legacy rows may carry only one
+    // of the two mirrored identifiers, so match on either.
     const existing = await ServiceAvailability.findOne({
       serviceId,
       districtId,
-      cityId: finalCityId,
       scope: finalScope,
+      $or: [{ cityId: finalCityId }, { cityZoneId: finalCityId }],
     });
 
     if (existing) {
@@ -58,6 +73,7 @@ export const createServiceAvailability = async (req, res) => {
       serviceId,
       districtId,
       cityId: finalCityId,
+      cityZoneId: finalCityId,
       cityName: cityName || null,
       scope: finalScope,
       status: status === "DISABLED" ? "DISABLED" : "ENABLED",
@@ -87,7 +103,7 @@ export const createServiceAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("createServiceAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -100,6 +116,12 @@ export const updateServiceAvailability = async (req, res) => {
     const { status, scope, cityId, cityName } = req.body;
     const adminId = req.user?.userId;
 
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid configuration id", code: "INVALID_ID" });
+    }
+    if (cityId !== undefined && cityId !== null && !isValidObjectId(cityId)) {
+      return res.status(400).json({ success: false, message: "Invalid cityId", code: "INVALID_ID" });
+    }
     const existing = await ServiceAvailability.findById(id);
     if (!existing) {
       return res.status(404).json({ success: false, message: "Configuration not found" });
@@ -112,10 +134,16 @@ export const updateServiceAvailability = async (req, res) => {
     }
     if (scope && ["DISTRICT", "CITY"].includes(scope)) {
       existing.scope = scope;
-      if (scope === "DISTRICT") existing.cityId = null;
+      if (scope === "DISTRICT") {
+        existing.cityId = null;
+        existing.cityZoneId = null;
+      }
     }
     if (cityId !== undefined) {
-      existing.cityId = existing.scope === "CITY" ? cityId : null;
+      // B-10: keep the canonical cityZoneId mirror in sync with legacy cityId.
+      const mirrored = existing.scope === "CITY" ? cityId : null;
+      existing.cityId = mirrored;
+      existing.cityZoneId = mirrored;
     }
     if (cityName !== undefined) {
       existing.cityName = cityName;
@@ -148,7 +176,7 @@ export const updateServiceAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("updateServiceAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -164,16 +192,20 @@ export const getServiceAvailability = async (req, res) => {
     const { serviceId, districtId, cityId, scope, status, search } = req.query;
 
     const filter = {};
-    if (serviceId) filter.serviceId = serviceId;
-    if (districtId) filter.districtId = districtId;
-    if (cityId) filter.cityId = cityId;
+    for (const [key, val] of [["serviceId", serviceId], ["districtId", districtId], ["cityId", cityId]]) {
+      if (val) {
+        if (!isValidObjectId(val)) {
+          return res.status(400).json({ success: false, message: `Invalid ${key}`, code: "INVALID_ID" });
+        }
+        filter[key] = val;
+      }
+    }
     if (scope && scope !== "ALL") filter.scope = scope;
     if (status && status !== "ALL") filter.status = status;
 
     if (search) {
-      const searchRegex = new RegExp(search.trim(), "i");
       filter.$or = [
-        { cityName: searchRegex },
+        { cityName: containsRegex(search) },
       ];
     }
 
@@ -204,7 +236,7 @@ export const getServiceAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("getServiceAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -216,6 +248,9 @@ export const deleteServiceAvailability = async (req, res) => {
     const { id } = req.params;
     const adminId = req.user?.userId;
 
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid configuration id", code: "INVALID_ID" });
+    }
     const existing = await ServiceAvailability.findByIdAndDelete(id);
     if (!existing) {
       return res.status(404).json({ success: false, message: "Configuration not found" });
@@ -241,7 +276,7 @@ export const deleteServiceAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("deleteServiceAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -255,6 +290,14 @@ export const dispatchDiagnostics = async (req, res) => {
 
     if (!technicianId) {
       return res.status(400).json({ success: false, message: "technicianId is required for diagnostics" });
+    }
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
+    }
+    for (const [key, val] of [["bookingId", bookingId], ["serviceId", serviceId], ["districtId", districtId], ["cityId", cityId]]) {
+      if (val && !isValidObjectId(val)) {
+        return res.status(400).json({ success: false, message: `Invalid ${key}`, code: "INVALID_ID" });
+      }
     }
 
     let booking = null;
@@ -313,7 +356,7 @@ export const dispatchDiagnostics = async (req, res) => {
     });
   } catch (error) {
     console.error("dispatchDiagnostics error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -331,7 +374,7 @@ export const getServiceZoneMatrix = async (req, res) => {
     if (serviceStatus === "INACTIVE") serviceFilter.isActive = false;
 
     if (search) {
-      serviceFilter.serviceName = new RegExp(search.trim(), "i");
+      serviceFilter.serviceName = containsRegex(search);
     }
 
     const services = await Service.find(serviceFilter)
@@ -431,7 +474,7 @@ export const getServiceZoneMatrix = async (req, res) => {
     });
   } catch (error) {
     console.error("getServiceZoneMatrix error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -442,6 +485,9 @@ export const getServiceZoneMatrix = async (req, res) => {
 export const getServiceZoneDetail = async (req, res) => {
   try {
     const { serviceId } = req.params;
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+    }
 
     const service = await Service.findById(serviceId)
       .populate("categoryId", "category name categoryName")
@@ -543,7 +589,7 @@ export const getServiceZoneDetail = async (req, res) => {
     });
   } catch (error) {
     console.error("getServiceZoneDetail error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -558,9 +604,18 @@ export const toggleZoneAvailability = async (req, res) => {
     if (!serviceId || !districtId) {
       return res.status(400).json({ success: false, message: "serviceId and districtId are required" });
     }
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
+    }
+    if (cityZoneId && cityZoneId !== "DISTRICT" && !isValidObjectId(cityZoneId)) {
+      return res.status(400).json({ success: false, message: "Invalid cityZoneId", code: "INVALID_ID" });
+    }
 
     const finalStatus = status === "DISABLED" ? "DISABLED" : "ENABLED";
-    const isDistrictScope = !cityZoneId || cityZoneId === "DISTRICT" || !mongoose.Types.ObjectId.isValid(cityZoneId);
+    const isDistrictScope = !cityZoneId || cityZoneId === "DISTRICT";
 
     const targetScope = isDistrictScope ? "DISTRICT" : "ZONE";
     const targetZoneId = isDistrictScope ? null : cityZoneId;
@@ -608,11 +663,17 @@ export const toggleZoneAvailability = async (req, res) => {
       reason: `Admin set ${targetScope} availability (zone: ${cityZoneId || "DISTRICT"}) for service ${serviceId} to ${finalStatus}`,
     }).catch((e) => console.warn("AuditLog error:", e.message));
 
-    // 🔄 Revalidate technicians affected by this zone availability change
+    // B-12: DISABLED expires stale broadcasts; ENABLED backfills offers to
+    // newly eligible technicians (bounded, idempotent — never duplicates).
+    // Post-commit hooks: revalidation failure never fails the admin mutation.
     if (finalStatus === "DISABLED") {
       const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
       await revalidateTechniciansForService(serviceId, districtId, targetZoneId, req.io)
         .catch(err => console.error("Zone disable revalidation error:", err));
+    } else {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ serviceId, districtId, cityZoneId: targetZoneId, io: req.io })
+        .catch(err => console.error("Zone enable backfill error:", err));
     }
 
     return res.status(200).json({
@@ -622,7 +683,7 @@ export const toggleZoneAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("toggleZoneAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -637,11 +698,21 @@ export const bulkToggleZoneAvailability = async (req, res) => {
     if (!serviceId || !districtId || !Array.isArray(cityZoneIds)) {
       return res.status(400).json({ success: false, message: "serviceId, districtId, and cityZoneIds array are required" });
     }
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
+    }
+    const malformedBulk = cityZoneIds.filter((z) => z && z !== "DISTRICT" && !isValidObjectId(z));
+    if (malformedBulk.length) {
+      return res.status(400).json({ success: false, message: "One or more zone IDs are invalid", code: "INVALID_ID" });
+    }
 
     const finalStatus = status === "DISABLED" ? "DISABLED" : "ENABLED";
 
     const operations = cityZoneIds.map((zoneId) => {
-      const isDistrictScope = !zoneId || zoneId === "DISTRICT" || !mongoose.Types.ObjectId.isValid(zoneId);
+      const isDistrictScope = !zoneId || zoneId === "DISTRICT";
       const targetScope = isDistrictScope ? "DISTRICT" : "ZONE";
       const targetZoneId = isDistrictScope ? null : zoneId;
 
@@ -697,13 +768,17 @@ export const bulkToggleZoneAvailability = async (req, res) => {
       reason: `Admin bulk updated ${cityZoneIds.length} zones for service ${serviceId} to ${finalStatus}`,
     }).catch((e) => console.warn("AuditLog error:", e.message));
 
-    // 🔄 Revalidate technicians affected by this bulk zone availability change
+    // B-12: DISABLED expires stale broadcasts per zone; ENABLED backfills.
     if (finalStatus === "DISABLED") {
       const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
       for (const zoneId of cityZoneIds) {
         await revalidateTechniciansForService(serviceId, districtId, zoneId, req.io)
           .catch(err => console.error("Bulk zone disable revalidation error:", err));
       }
+    } else {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ serviceId, districtId, io: req.io })
+        .catch(err => console.error("Bulk zone enable backfill error:", err));
     }
 
     return res.status(200).json({
@@ -712,7 +787,7 @@ export const bulkToggleZoneAvailability = async (req, res) => {
     });
   } catch (error) {
     console.error("bulkToggleZoneAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -726,6 +801,12 @@ export const clearDistrictZoneAvailability = async (req, res) => {
 
     if (!serviceId || !districtId) {
       return res.status(400).json({ success: false, message: "serviceId and districtId are required" });
+    }
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
+    }
+    if (!isValidObjectId(districtId)) {
+      return res.status(400).json({ success: false, message: "Invalid districtId", code: "INVALID_ID" });
     }
 
     await ServiceAvailability.updateMany(
@@ -747,13 +828,18 @@ export const clearDistrictZoneAvailability = async (req, res) => {
       reason: `Admin cleared all zone availability for service ${serviceId} in district ${districtId}`,
     }).catch((e) => console.warn("AuditLog error:", e.message));
 
+    // B-12: clearing is a district-wide disable — expire stale broadcasts.
+    const { revalidateTechniciansForService: revalidateAfterClear } = await import("../Utils/technicianLocation.js");
+    await revalidateAfterClear(serviceId, districtId, null, req.io)
+      .catch((e) => console.error("Clear revalidation error:", e.message));
+
     return res.status(200).json({
       success: true,
       message: `Cleared all zones in district for service`,
     });
   } catch (error) {
     console.error("clearDistrictZoneAvailability error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -767,6 +853,9 @@ export const toggleServiceStatus = async (req, res) => {
 
     if (!serviceId || typeof isActive !== "boolean") {
       return res.status(400).json({ success: false, message: "serviceId and boolean isActive are required" });
+    }
+    if (!isValidObjectId(serviceId)) {
+      return res.status(400).json({ success: false, message: "Invalid serviceId", code: "INVALID_ID" });
     }
 
     const service = await Service.findByIdAndUpdate(
@@ -787,6 +876,18 @@ export const toggleServiceStatus = async (req, res) => {
       reason: `Admin toggled service ${service.serviceName} status to ${isActive ? "ACTIVE" : "INACTIVE"}`,
     }).catch(() => {});
 
+    // B-12: global kill-switch changes revalidate without GPS movement.
+    // DISABLED expires stale broadcasts service-wide; ENABLED backfills.
+    if (isActive) {
+      const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
+      await backfillBroadcastsForScope({ serviceId, io: req.io })
+        .catch((e) => console.error("Service activate backfill error:", e.message));
+    } else {
+      const { revalidateTechniciansForService: revalidateAfterToggle } = await import("../Utils/technicianLocation.js");
+      await revalidateAfterToggle(serviceId, null, null, req.io)
+        .catch((e) => console.error("Service deactivate revalidation error:", e.message));
+    }
+
     return res.status(200).json({
       success: true,
       message: `Service status updated to ${isActive ? "ACTIVE" : "INACTIVE"}`,
@@ -794,6 +895,6 @@ export const toggleServiceStatus = async (req, res) => {
     });
   } catch (error) {
     console.error("toggleServiceStatus error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };

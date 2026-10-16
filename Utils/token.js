@@ -14,17 +14,21 @@ const ALGORITHM = "HS256";
 const issuer = process.env.JWT_ISSUER || undefined;
 const audience = process.env.JWT_AUDIENCE || undefined;
 
+// Session lifetime: env-overridable, defaults to 7 days for mobile apps.
+// MUST stay in sync with client re-login handling.
+const expiresIn = process.env.JWT_EXPIRES_IN || "7d";
+
 export const signToken = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, {
     algorithm: ALGORITHM,
-    // expiresIn removed — tokens do not expire
+    expiresIn,
     ...(issuer ? { issuer } : {}),
     ...(audience ? { audience } : {}),
   });
 
 export const verifyTokenOptions = () => ({
   algorithms: [ALGORITHM],
-  ignoreExpiration: true, // ignore expiration on any legacy tokens
+  ignoreExpiration: false, // sessions MUST expire; legacy tokens without exp still verify until rotated
   ...(issuer ? { issuer } : {}),
   ...(audience ? { audience } : {}),
 });

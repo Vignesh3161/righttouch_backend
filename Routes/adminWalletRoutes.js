@@ -5,11 +5,12 @@ import {
   getAdminWalletSummary,
   getAllWithdrawalRequests,
   exportWithdrawalRequests,
+  exportApprovedBulkPayments,
   getWithdrawalDetails,
   approveWithdrawal,
   rejectWithdrawal,
-  payWithdrawal,
-  retryFailedWithdrawal,
+  markWithdrawalPaid,
+  revertPaidWithdrawal,
   toggleTechnicianPayoutFreeze,
   getAutoPayoutSummary,
   getAutoPayoutSettings,
@@ -17,6 +18,7 @@ import {
   adminManualPayoutToTechnician,
   approveAdminManualPayout,
   resolveManualReviewPayout,
+  getTechnicianWalletOverview,
 } from "../Controllers/adminWalletController.js";
 import { getWithdrawalReceipt } from "../Controllers/technicianWalletController.js";
 
@@ -44,6 +46,7 @@ router.get("/wallet", Auth, getAdminWalletSummary);
 router.get("/wallet/withdrawalhistory", Auth, getAllWithdrawalRequests);
 router.get("/wallet/withdrawals", Auth, getAllWithdrawalRequests);
 router.get("/wallet/export", Auth, exportWithdrawalRequests);
+router.get("/wallet/bulk-payment-export", Auth, exportApprovedBulkPayments);
 router.get("/wallet/withdrawal/:id/receipt", Auth, getWithdrawalReceipt);
 router.get("/wallet/withdrawal/:id/details", Auth, getWithdrawalDetails);
 
@@ -58,16 +61,21 @@ router.put("/settings/auto-payout", Auth, updateAutoPayoutSettings);
 router.put("/wallet/withdrawal/:id/approve", Auth, approveWithdrawal);
 router.put("/wallet/withdrawal/:id/reject", Auth, rejectWithdrawal);
 
-// ✅ Razorpay X – trigger actual bank/UPI payout to technician (outbox pattern)
-router.put("/wallet/withdrawal/:id/pay", Auth, payWithdrawal);
-router.post("/wallet/withdrawal/:id/retry", Auth, retryFailedWithdrawal);
+// 💰 Manual bank-transfer flow: record an offline transfer (approved->paid)
+// and revert a wrongly-recorded payment (paid->failed). No provider calls.
+router.post("/wallet/withdrawal/:id/mark-paid", Auth, markWithdrawalPaid);
+router.post("/wallet/withdrawal/:id/revert-paid", Auth, revertPaidWithdrawal);
+
+// 🔍 Admin technician wallet overview — inspect balances, blocks, KYC
+// summary and payout history before selecting a technician for payout.
+router.get("/wallet/technician/:technicianId", Auth, getTechnicianWalletOverview);
 
 // 🔒 Admin Freeze/Unfreeze technician payouts
 router.put("/wallet/technician/:technicianId/freeze", Auth, toggleTechnicianPayoutFreeze);
 
-// 💸 Admin manual "Send Money" to a technician — single shared payout engine.
+// 💸 Admin manual "Send Money" to a technician — reserve-at-request model.
 // origin = admin_direct; below the configurable dual-approval threshold it
-// pays immediately, at/above it parks in `requested` for a second admin.
+// parks in `approved`, at/above it parks in `requested` for a second admin.
 router.post("/wallet/technician/:technicianId/send-money", Auth, adminManualPayoutToTechnician);
 
 // ✅ Second-admin approval for a high-value (dual-approval) admin_direct payout.

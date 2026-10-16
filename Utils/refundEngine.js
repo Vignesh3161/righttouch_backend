@@ -450,6 +450,23 @@ export const executeRefund = async (refundId) => {
     await CreditNote.updateOne({ refundId: refund._id }, { $set: { declared: true } });
     await RefundOutbox.updateOne({ refundId: refund._id }, { $set: { status: "done" } });
 
+    // 🪙 Reverse rewards earned on this booking (best-effort, post-commit).
+    // Full refund → full reversal; partial refunds reverse proportionally
+    // (proposed default — requires finance sign-off). Never throws.
+    if (refund.bookingId) {
+      try {
+        const { reverseEarnedReward } = await import("../Services/rewardService.js");
+        const paid = await Payment.findById(refund.paymentId).select("totalAmountPaise").lean().catch(() => null);
+        const ratioBps =
+          paid && paid.totalAmountPaise > 0
+            ? Math.min(10000, Math.floor((refund.netRefundPaise * 10000) / paid.totalAmountPaise))
+            : 10000;
+        await reverseEarnedReward({ bookingId: refund.bookingId, refundId: refund._id, ratioBps });
+      } catch (err) {
+        console.error(`[Refund] reward reversal failed for refund ${refund._id}:`, err.message);
+      }
+    }
+
     emit(SOCKET_ROOMS.CUSTOMER(refund.customerId), SOCKET_EVENTS.REFUND_PROCESSED, {
       refundId: String(refund._id),
       amountPaise: refund.netRefundPaise,

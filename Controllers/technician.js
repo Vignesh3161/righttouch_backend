@@ -18,6 +18,7 @@ import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 
 import OperationalCity from "../Schemas/OperationalCity.js";
+import { containsRegex } from "../Utils/safeQuery.js";
 import TechnicianDistrictPermission from "../Schemas/TechnicianDistrictPermission.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
@@ -507,8 +508,10 @@ export const validateRegistrationLocation = async (req, res) => {
       });
     }
 
+    // B-14: inactive-aware resolution — GPS inside a deactivated zone is
+    // reported explicitly instead of collapsing to a generic mismatch.
     const { district: resolvedDistrict, zone: resolvedZone } =
-      await resolveDistrictAndZoneFromCoordinates(lat, lng);
+      await resolveDistrictAndZoneFromCoordinates(lat, lng, { includeInactiveZone: true });
 
     if (!resolvedDistrict) {
       return res.status(400).json({
@@ -517,6 +520,18 @@ export const validateRegistrationLocation = async (req, res) => {
         message: "Your current GPS location is outside our operational service areas.",
         result: {
           providedCoordinates: { latitude: lat, longitude: lng },
+        },
+      });
+    }
+
+    if (resolvedZone && resolvedZone.active === false) {
+      return res.status(400).json({
+        success: false,
+        code: "LOCATION_ZONE_INACTIVE",
+        message: `Your GPS location falls in ${resolvedZone.name || "a zone"} (${resolvedDistrict.name}), which is currently inactive. Registration requires an active micro-zone.`,
+        result: {
+          resolvedZone: { id: resolvedZone._id, name: resolvedZone.name },
+          resolvedDistrict: { id: resolvedDistrict._id, name: resolvedDistrict.name },
         },
       });
     }
@@ -996,8 +1011,10 @@ export const createTechnician = async (req, res) => {
         });
       }
 
+      // B-14: inactive-aware resolution so GPS inside a deactivated zone
+      // yields an explicit LOCATION_ZONE_INACTIVE (not a generic mismatch).
       const { district: resolvedDistrict, zone: resolvedZone } =
-        await resolveDistrictAndZoneFromCoordinates(lat, lng);
+        await resolveDistrictAndZoneFromCoordinates(lat, lng, { includeInactiveZone: true });
 
       if (!resolvedDistrict) {
         return res.status(400).json({
@@ -1005,6 +1022,18 @@ export const createTechnician = async (req, res) => {
           code: "LOCATION_OUTSIDE_SERVICE_AREA",
           message: "Your address GPS coordinates fall outside our operational service areas.",
           result: { latitude: lat, longitude: lng },
+        });
+      }
+
+      if (resolvedZone && resolvedZone.active === false) {
+        return res.status(400).json({
+          success: false,
+          code: "LOCATION_ZONE_INACTIVE",
+          message: `The service area covering your address (${resolvedZone.name || "zone"}) is currently inactive. Please choose an address in an active zone.`,
+          result: {
+            resolvedZone: { id: resolvedZone._id, name: resolvedZone.name },
+            resolvedDistrict: { id: resolvedDistrict._id, name: resolvedDistrict.name },
+          },
         });
       }
 
@@ -1037,7 +1066,11 @@ export const createTechnician = async (req, res) => {
         }
       }
 
-      // Assign verified geo location & districts
+      // Assign verified geo location & districts (location context ONLY —
+      // B-03: GPS must never create an authorized district grant. Operational
+      // access requires the Admin/Owner grant workflow (addDistrictPermission),
+      // which records enabledBy/enabledAt provenance. Registration leaves
+      // primaryDistrictId/cityZoneId as unprivileged location metadata.
       profileUpdate.location = {
         type: "Point",
         coordinates: [lng, lat],
@@ -1045,17 +1078,6 @@ export const createTechnician = async (req, res) => {
       profileUpdate.primaryDistrictId = resolvedDistrict._id;
       profileUpdate.primaryCityId = resolvedDistrict._id;
       profileUpdate.cityZoneId = resolvedZone ? resolvedZone._id : (targetZoneId || null);
-
-      // Auto-grant TechnicianDistrictPermission for primary district
-      try {
-        await TechnicianDistrictPermission.findOneAndUpdate(
-          { technicianId: technicianProfileId, districtId: resolvedDistrict._id },
-          { $set: { isEnabled: true } },
-          { upsert: true, new: true }
-        );
-      } catch (permErr) {
-        console.warn("Auto-grant district permission failed:", permErr.message);
-      }
     } else {
       if (targetDistrictId && isValidObjectId(targetDistrictId)) {
         profileUpdate.primaryDistrictId = targetDistrictId;
@@ -1254,7 +1276,7 @@ export const getAllTechnicians = async (req, res) => {
         ],
       });
     } else if (targetDistrictName && targetDistrictName.trim().length >= 2) {
-      const districtRegex = new RegExp(targetDistrictName.trim(), "i");
+      const districtRegex = containsRegex(targetDistrictName);
 
       const matchedCities = await OperationalCity.find({
         $or: [{ name: districtRegex }, { city: districtRegex }],
@@ -1292,7 +1314,7 @@ export const getAllTechnicians = async (req, res) => {
 
     // 4. Two-step search query (mobile/name lives on User, not TechnicianProfile)
     if (search && search.trim().length >= 2) {
-      const searchRegex = { $regex: search.trim(), $options: "i" };
+      const searchRegex = containsRegex(search);
 
       const matchingUsers = await mongoose.model("User").find({
         $or: [
@@ -1604,25 +1626,35 @@ export const updateTechnician = async (req, res) => {
 
       if (freshProfile?.location?.coordinates) {
         const [lng, lat] = freshProfile.location.coordinates;
-        const { zone } = await resolveZoneFromCoordinates(lat, lng);
-        const newZoneId = zone ? zone._id : null;
+        // B-14: inactive-aware resolution. Registration assignment is owned
+        // by admin flows — it is only auto-adopted when live GPS sits in an
+        // ACTIVE zone that differs. Inactive-zone or outside-coverage GPS
+        // never nulls or rewrites the stored registration (deactivation must
+        // not silently destroy it; dispatch eligibility live-resolves anyway).
+        const { zone } = await resolveZoneFromCoordinates(lat, lng, { includeInactive: true });
         const currentZoneId = freshProfile.cityZoneId
           ? String(freshProfile.cityZoneId)
           : null;
-        const newZoneIdStr = newZoneId ? String(newZoneId) : null;
 
-        if (currentZoneId !== newZoneIdStr) {
-          await TechnicianProfile.updateOne(
-            { _id: technicianProfileId },
-            {
-              $set: {
-                cityZoneId: newZoneId,
-                zoneMismatch: false,
-                zoneMismatchSince: null,
-              },
-            }
-          );
-          console.log(`🏘 Tech ${technicianProfileId} assigned to zone ${newZoneId || "none"}`);
+        if (zone && zone.active !== false) {
+          const newZoneIdStr = String(zone._id);
+          if (currentZoneId !== newZoneIdStr) {
+            await TechnicianProfile.updateOne(
+              { _id: technicianProfileId },
+              {
+                $set: {
+                  cityZoneId: zone._id,
+                  zoneMismatch: false,
+                  zoneMismatchSince: null,
+                },
+              }
+            );
+            console.log(`🏘 Tech ${technicianProfileId} assigned to zone ${zone._id}`);
+          }
+        } else if (!zone) {
+          console.log(`🏘 Tech ${technicianProfileId} GPS outside all zones — registration kept (${currentZoneId || "none"})`);
+        } else {
+          console.log(`🏘 Tech ${technicianProfileId} GPS inside inactive zone ${zone._id} — registration kept (${currentZoneId || "none"})`);
         }
       }
     } catch (zoneErr) {

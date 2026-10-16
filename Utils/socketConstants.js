@@ -49,6 +49,7 @@ export const SOCKET_EVENTS = {
     PAYMENT_SUCCESS: "payment_success",
     PAYMENT_RECEIVED: "payment_received",
     AUTO_PAYOUT_PAID: "auto_payout_paid",
+    WITHDRAWAL_REQUESTED: "withdrawal:requested",
     WITHDRAWAL_FAILED: "withdrawal_failed",
     PAYMENT_STATUS: "payment:status",
 

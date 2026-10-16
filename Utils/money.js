@@ -2,7 +2,7 @@
  * 💰 MONEY UTILITIES — integer-paise financial math.
  *
  * ALL persisted financial amounts are integer PAISE (1 ₹ = 100 paise).
- * Floating-point arithmetic is NEVER persisted. Razorpay/RazorpayX use
+ * Floating-point arithmetic is NEVER persisted. Razorpay uses
  * integer paise natively, so no precision is lost across the wire.
  */
 

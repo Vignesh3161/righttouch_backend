@@ -174,18 +174,9 @@ const technicianProfileSchema = new mongoose.Schema(
     // Optimistic-concurrency guard for all wallet debits.
     walletVersion: { type: Number, default: 0, min: 0 },
 
-    // Razorpay X (Payout) identifiers – cached to avoid re-creating on every payout
-    razorpayContactId: {
-      type: String,
-      default: null,
-      trim: true,
-    },
-
-    razorpayFundAccountId: {
-      type: String,
-      default: null,
-      trim: true,
-    },
+    // NOTE: RazorpayX contact/fund-account caching was removed with the
+    // automated payout integration. Manual payouts use KYC bank details
+    // directly (verified + fingerprinted at mark-paid time).
 
     /* ──────────────────────────────────────────────────────────────
        💸 AUTO-PAYOUT SETTINGS (per-technician overrides)

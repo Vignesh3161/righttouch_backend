@@ -44,10 +44,10 @@ The **RightTouch Backend** manages end-to-end operational workflows for home app
 - **Immutability & State Safeguards**: Enforces state machine integrity (`quote_requested` → `quotation_prepared` → `ACCEPTED` / `REJECTED`), preventing illegal modifications on finalized contracts.
 - **Quotation-to-Booking Conversion**: Automated workflow converting accepted quotations into formal `ProductBooking` entries.
 
-### 3. 💳 Financial Ledger, Wallets & Automated Payouts
+### 3. 💳 Financial Ledger, Wallets & Manual Payouts
 - **Double-Entry Platform Ledger**: Complete auditability via `PlatformLedgerEntry` tracking gross revenue, platform commissions, reserve holds, and tax deductions.
-- **Razorpay & RazorpayX Integration**: Live customer payment collection alongside automated technician bank payouts via RazorpayX.
-- **Wallet & Clawback System**: Real-time balance calculations, automated withdrawal approvals, reserve holds, and complaint freeze mechanisms.
+- **Razorpay Integration**: Live customer payment collection via Razorpay; technician payouts are manual-NEFT (admin bank transfer + UTR mark-paid).
+- **Wallet & Clawback System**: Real-time balance calculations, manual withdrawal approvals, reserve holds, and complaint freeze mechanisms.
 
 ### 4. ⚡ Real-Time Socket.IO Infrastructure
 - **Single Active Session**: Ensures one user identity per live socket connection; automatically terminates duplicate device connections.
@@ -72,7 +72,7 @@ The **RightTouch Backend** manages end-to-end operational workflows for home app
 | **Database & ODM** | MongoDB Atlas / Mongoose v8.17.1 | Schematized NoSQL document store |
 | **Real-Time Layer** | Socket.IO v4.8.3 | WebSockets with Redis Adapter support |
 | **Caching & Pub/Sub** | Redis v4.6.13 | High-speed data store for location & session scaling |
-| **Payment Gateways** | Razorpay v2.9.6 | Customer payment processing & RazorpayX Payouts |
+| **Payment Gateways** | Razorpay v2.9.6 | Customer payment processing (manual-NEFT technician payouts) |
 | **Cloud Storage** | Cloudinary & GCP Cloud Storage | Media, service assets & KYC document uploads |
 | **Push & Messaging** | Firebase Admin, SendGrid, Resend, Twilio | Multi-channel communication suite |
 | **Image Processing** | Sharp v0.34.5 | High-performance image optimization |
@@ -270,23 +270,28 @@ REDIS_URL=redis://localhost:6379
 JWT_SECRET=your_super_secret_jwt_key_min_32_characters
 ENCRYPTION_KEY=32_byte_hex_string_for_kyc_field_crypto
 
-# Payment Gateway - Razorpay & RazorpayX
+# Payment Gateway - Razorpay (customer collection; technician payouts are manual-NEFT)
 RAZORPAY_KEY_ID=rzp_test_xxxxxxxxx
 RAZORPAY_KEY_SECRET=xxxxxxx_secret
 RAZORPAY_WEBHOOK_SECRET=xxxxxxx_webhook_secret
-RAZORPAYX_ACCOUNT_NUMBER=23344556677
 
 # Cloud Storage
 CLOUDINARY_CLOUD_NAME=your_cloud_name
 CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 
-# Firebase Push Notifications
-# Use service account JSON file (recommended):
+# Firebase Push Notifications (project: righttouchmessaging-401e9)
+# Mint the key in Firebase console → righttouchmessaging-401e9 → Project settings → Service accounts.
+# Use service account JSON file (recommended, git-ignored):
 FCM_SERVICE_ACCOUNT_PATH=./config/firebase-credentials.json
 # OR inline JSON env var:
 # FIREBASE_SERVICE_ACCOUNT='{"project_id":"righttouchmessaging-401e9","private_key":"...","client_email":"..."}'
-# OR individual env vars (must match righttouchmessaging-401e9):
+# OR individual env vars. ALL THREE RULES ARE MANDATORY:
+#  1. FIREBASE_CLIENT_EMAIL must end @righttouchmessaging-401e9.iam.gserviceaccount.com
+#     (a key from any other GCP project fails with sender-id-mismatch).
+#  2. FIREBASE_PRIVATE_KEY must be ONE quoted line with literal \n sequences
+#     including the BEGIN/END armor (bare base64 is auto-wrapped, but prefer full PEM).
+#  3. Verify with: GET /health/fcm → 200 (not 503).
 # FIREBASE_PROJECT_ID=righttouchmessaging-401e9
 # FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@righttouchmessaging-401e9.iam.gserviceaccount.com
 # FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"

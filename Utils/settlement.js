@@ -6,7 +6,7 @@ import WalletTransaction from "../Schemas/WalletTransaction.js";
 import Payment from "../Schemas/Payment.js";
 import { writeAuditLog } from "./audit.js";
 import { postLedgerEntry, postPaymentLedgerEntries } from "./ledger.js";
-import { toPaise } from "./money.js";
+import { toPaise, paiseToRupees } from "./money.js";
 
 /**
  * O2 — Credit technician earnings but FIRST recover any outstanding dues.
@@ -65,7 +65,7 @@ const creditEarningsRecoverDues = async ({ technicianId, credit, session = null,
  * the platform financial position into the technician WALLET LIABILITY.
  *
  * It is NOT an external bank transfer. Real money leaves the platform only at
- * payout (Phase 5, RazorpayX).
+ * payout (manual-NEFT: admin bank transfer + UTR mark-paid).
  *
  * Conditions (ALL required):
  *   - Booking.paymentStatus === "paid"
@@ -178,8 +178,15 @@ const performSettlement = async ({ booking, payment, session = null }) => {
 
   // 🔁 Standalone-Mongo fallback (no replica set). Wallet is credited ONLY for
   // ledger rows this run actually created (11000 = someone else already did).
+  // ⚠️ NOT ATOMIC: without transactions each write commits independently, so
+  // a crash between steps can leave partial records (e.g. job credit without
+  // the liability ledger row or booking flag). Production MUST run a replica
+  // set so the transactional path above is used; this fallback exists only
+  // for standalone/dev databases and must never be treated as safe.
   if (!session) {
-    let createdJob = false;
+    console.warn(
+      `[Settlement] non-transactional fallback for booking ${booking._id} — replica set required for atomic settlement in production`
+    );    let createdJob = false;
     let createdTip = false;
     for (const row of entries) {
       try {
@@ -369,6 +376,18 @@ export const settleBookingEarningsIfEligible = async (bookingId) => {
       },
       metadata: { source: "settlement" },
     });
+    // 🪙 Customer rewards (earn-first): best-effort, post-commit only.
+    // Fresh settlements only — replays must not re-award (idempotency keys
+    // would dedupe anyway). Never throws: reward failure must not undo or
+    // block a successful settlement.
+    if (result.settled && result.reason !== "already_settled") {
+      try {
+        const { awardServiceReward } = await import("../Services/rewardService.js");
+        await awardServiceReward(booking._id);
+      } catch (err) {
+        console.error(`[Settlement] reward award failed for booking ${booking._id}:`, err.message);
+      }
+    }
     return result;
   } catch (e) {
     if (isTransactionUnsupported(e)) {

@@ -85,6 +85,7 @@ import {
   getOwnerBookingById,
   getCompletedServices,
   rebookService,
+  getCompletionStatus,
 } from "../Controllers/serviceBookController.js";
 
 
@@ -263,7 +264,7 @@ router.delete("/deletecategory/:id", Auth, authorizeRoles("Admin", "Owner"), del
 router.post("/report", Auth, userReport);
 router.get("/getAllReports", Auth, authorizeRoles("Admin", "Owner"), getAllReports);
 router.get("/get-my-reports", Auth, getMyReports);
-router.get("/getReportById/:id", Auth, getReportById);
+router.get("/getReportById/:id", Auth, authorizeRoles("Admin", "Owner"), getReportById);
 router.put("/report/resolve/:id", Auth, authorizeRoles("Admin", "Owner"), resolveReport);
 
 /* ================= SERVICE ================= */
@@ -302,6 +303,8 @@ router.post("/booking/schedule", Auth, storeBookingSchedule);
 router.put("/booking/cancel/:id", Auth, cancelBooking);
 router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
+// Safe completion-verification status only (no OTP/hash/phone ever).
+router.get("/booking/:id/completion-status", Auth, getCompletionStatus);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
 router.delete("/booking/:id", Auth, deleteServiceBooking);
 router.delete("/booking/admin/:id", Auth, authorizeRoles("Admin", "Owner"), deleteBookingAsAdmin);
@@ -317,8 +320,8 @@ router.get("/booking/getBookingById/:id", Auth, authorizeRoles("Admin", "Owner")
 
 /* ================= RATING ================= */
 router.post("/rating", Auth, userRating);
-// 🔒 Authenticated browsing only — no anonymous scraping of user ratings
-router.get("/getAllRatings", Auth, getAllRatings);
+// 🔒 Full rating table contains PII — Admin/Owner only. Customers use /ratings and /get-my-ratings.
+router.get("/getAllRatings", Auth, authorizeRoles("Admin", "Owner"), getAllRatings);
 
 // Customer rating history + read (architecture §45)
 router.get("/ratings", Auth, getMyRatings);

@@ -11,6 +11,11 @@ import { STALENESS_SECONDS, ACCEPT_GRACE_SECONDS, checkGpsFreshness, checkGpsVal
 
 const MAX_JOB_DISTANCE_KM = 10;
 const MAX_JOB_DISTANCE_METERS = 10000;
+// Platform ceiling for per-technician service radius (mirrors the
+// TechnicianProfile.serviceRadiusKm schema max). Prefilters must cover up
+// to this ceiling so they never discard a technician the final gate passes.
+export const MAX_SERVICE_RADIUS_KM = 100;
+export const MAX_PREFILTER_RADIUS_M = MAX_SERVICE_RADIUS_KM * 1000;
 
 /**
  * Get allowed district IDs for a technician (primary + enabled + allowed)
@@ -135,8 +140,9 @@ export const calculateDistanceMeters = (techLocation, jobLocation) => {
  * Get effective radius for technician (per-tech config or global default)
  */
 export const getEffectiveRadiusMeters = (tech) => {
-  const radiusKm = Number(tech?.serviceRadiusKm) > 0 ? Number(tech.serviceRadiusKm) : MAX_JOB_DISTANCE_KM;
-  return radiusKm * 1000;
+  const configured = Number(tech?.serviceRadiusKm);
+  const radiusKm = Number.isFinite(configured) && configured > 0 ? Math.min(configured, MAX_SERVICE_RADIUS_KM) : MAX_JOB_DISTANCE_KM;
+  return Math.round(radiusKm * 1000);
 };
 
 /**

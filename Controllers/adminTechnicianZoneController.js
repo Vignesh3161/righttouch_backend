@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { isValidObjectId, internalError } from "../Utils/safeQuery.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import CityZone from "../Schemas/CityZone.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
@@ -19,6 +20,9 @@ export const getTechnicianZonePermissions = async (req, res) => {
     const { technicianId } = req.params;
     if (!technicianId) {
       return res.status(400).json({ success: false, message: "Technician ID is required" });
+    }
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
     }
 
     const tech = await TechnicianProfile.findById(technicianId)
@@ -128,7 +132,7 @@ export const getTechnicianZonePermissions = async (req, res) => {
     });
   } catch (error) {
     console.error("❌ getTechnicianZonePermissions error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -148,6 +152,13 @@ export const enableTechnicianZonePermission = async (req, res) => {
 
     if (!technicianId || targetZoneIds.length === 0) {
       return res.status(400).json({ success: false, message: "technicianId and cityZoneId(s) are required" });
+    }
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
+    }
+    const malformedZones = targetZoneIds.filter((id) => !isValidObjectId(id));
+    if (malformedZones.length) {
+      return res.status(400).json({ success: false, message: "One or more zone IDs are invalid", code: "INVALID_ID" });
     }
 
     // 1. Fetch Technician to check authorized parent districts
@@ -230,7 +241,7 @@ export const enableTechnicianZonePermission = async (req, res) => {
     return getTechnicianZonePermissions(req, res);
   } catch (error) {
     console.error("❌ enableTechnicianZonePermission error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
@@ -249,6 +260,13 @@ export const disableTechnicianZonePermission = async (req, res) => {
 
     if (!technicianId || targetZoneIds.length === 0) {
       return res.status(400).json({ success: false, message: "technicianId and zoneId(s) are required" });
+    }
+    if (!isValidObjectId(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technicianId", code: "INVALID_ID" });
+    }
+    const malformed = targetZoneIds.filter((id) => !isValidObjectId(id));
+    if (malformed.length) {
+      return res.status(400).json({ success: false, message: "One or more zone IDs are invalid", code: "INVALID_ID" });
     }
 
     // Convert to ObjectIds so $pull matches the stored ObjectId array entries
@@ -289,7 +307,7 @@ export const disableTechnicianZonePermission = async (req, res) => {
     return getTechnicianZonePermissions(req, res);
   } catch (error) {
     console.error("❌ disableTechnicianZonePermission error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return internalError(res, error);
   }
 };
 
