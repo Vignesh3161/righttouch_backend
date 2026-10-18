@@ -404,6 +404,34 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // 🔒 MATCHING LEASE — mutual exclusion for the dispatch matching engine
+    // (matchAndBroadcastBooking + broadcastPendingJobsToTechnician).
+    // H15: these fields were written via updateOne for months but MISSING
+    // from the schema, so Mongoose strict mode silently stripped every
+    // write — the "lease" never persisted and every worker believed it held
+    // the lease. Declared here (no new indexes: per-_id access is already
+    // indexed; legacy docs without the fields remain claimable via the
+    // null-match in the claim filter, which also backfills them).
+    matchingLeaseUntil: {
+      type: Date,
+      default: null,
+    },
+    matchingLeaseOwner: {
+      type: String,
+      default: null,
+    },
+
+    // 📡 REBROADCAST DIRTY-TRACKING — same H15 class: written via updateOne
+    // but previously undeclared (writes stripped). No indexes added.
+    lastRebroadcastAt: {
+      type: Date,
+      default: null,
+    },
+    jobChangedAt: {
+      type: Date,
+      default: null,
+    },
+
     // 🔢 OPTIMISTIC VERSION — bumped on every write; used by idempotent
     // commands and admin overrides.
     version: {

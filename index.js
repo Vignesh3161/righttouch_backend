@@ -80,10 +80,6 @@ import { makeDeviceRouter } from "./Routes/deviceRoutes.js";
 import notificationRoutes from "./Routes/notificationRoutes.js";
 import adminDispatchRoutes from "./Routes/adminDispatchRoutes.js";
 
-// Swagger API Documentation
-import swaggerUi from "swagger-ui-express";
-import swaggerSpec from "./swagger.js";
-
 // 🛡 SINGLE ACTIVE SESSION registry (module scope — Socket Analysis Fix #9)
 const activeSocketByUser = new Map(); // userId -> socket.id
 // NOTE: single-session + the limiters below are per-process. The Redis adapter
@@ -448,9 +444,15 @@ App.use((req, res, next) => {
 });
 
 // 🔒 General API Rate Limiter (applies to all routes)
+//
+// H3: the limiter key MUST be Express's `req.ip` — never a hand-parsed
+// X-Forwarded-For. `req.ip` already resolves the client address through the
+// configured `trust proxy` hop count, so a client cannot evade limits by
+// spoofing forwarded headers when the app is directly exposed, and legitimate
+// proxy chains keep working once TRUST_PROXY matches the real hop count.
+// Operator requirement: set TRUST_PROXY to the exact number of trusted
+// reverse proxies in front of this process (see the trust-proxy setup above).
 const getClientIp = (req) => {
-  const xff = req.headers?.["x-forwarded-for"];
-  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
   if (req.ip) return req.ip;
   return req.socket?.remoteAddress || "unknown";
 };
@@ -664,13 +666,6 @@ App.use("/api", userZoneRoutes);
    4. SHARED & SYSTEM ROUTES
    -------------------------------------------------------------------------- */
 App.use("/api/admin/dispatch", adminDispatchRoutes);
-
-// 📖 Swagger API Documentation
-App.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-App.get("/api-docs.json", (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.send(swaggerSpec);
-});
 
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
 App.use((err, req, res, next) => {

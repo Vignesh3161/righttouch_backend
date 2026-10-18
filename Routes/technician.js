@@ -1,5 +1,5 @@
 import express from "express";
-import { Auth } from "../Middleware/Auth.js";
+import { Auth, authorizeRoles } from "../Middleware/Auth.js";
 import isTechnician from "../Middleware/isTechnician.js";
 import { upload, kycUpload } from "../Utils/cloudinaryUpload.js";
 import {
@@ -91,8 +91,21 @@ router.post("/signup/technician", authLimiter, async (req, res, next) => {
   return signupAndSendOtp(req, res, next);
 });
 
+// H1/H2: verification guesses bounded per-IP on top of the atomic OTP budget.
+const otpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    message: "Too many OTP requests, please try again after 1 minute",
+    result: {},
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Technician: verify OTP after signup
-router.post("/signup/technician/verify-otp", authLimiter, verifyOtp);
+router.post("/signup/technician/verify-otp", otpLimiter, verifyOtp);
 
 /* ================= TECHNICIAN REGISTRATION FLOW & ZONE-SERVICE ================= */
 // Step 1: Get active districts where registration is enabled
@@ -115,12 +128,16 @@ router.post("/skill-requests", Auth, isTechnician, submitTechnicianSkillRequest)
 router.get("/skill-requests", Auth, isTechnician, getMyTechnicianSkillRequests);
 
 /* ================= TECHNICIAN AUTH ================= */
-router.post("/login/technician", technicianLogin);
-router.post("/login/technician/verify-otp", verifyTechnicianOtp);
+// H2: login OTP issuance + verification must be rate-limited like every other
+// OTP endpoint (these previously had no limiter at all).
+router.post("/login/technician", authLimiter, technicianLogin);
+router.post("/login/technician/verify-otp", otpLimiter, verifyTechnicianOtp);
 router.put("/location", Auth, isTechnician, locationLimiter, updateTechnicianLocation);
 router.put("/fcm-token", Auth, isTechnician, registerTechnicianFcmToken);
 router.post("/technicianData", Auth, createTechnician);
-router.get("/technicianAll", Auth, getAllTechnicians);
+// C3: privileged technician PII listing — Admin/Owner only. Detail endpoint
+// keeps Auth and enforces self-or-privileged inside the controller.
+router.get("/technicianAll", Auth, authorizeRoles("Admin", "Owner"), getAllTechnicians);
 router.get("/technicianById/:id", Auth, getTechnicianById);
 router.get("/technician/me", Auth, getMyTechnician);
 router.put("/updateTechnician", Auth, updateTechnician);

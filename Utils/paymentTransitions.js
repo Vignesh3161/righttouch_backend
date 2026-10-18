@@ -331,8 +331,144 @@ export const markPaymentSucceeded = async (
 };
 
 /**
- * Transition a payment to failed (idempotent, transactional).
+ * H8 — resolve a `manual_review` payment through the ONLY supported path.
+ *
+ * Permitted outcomes (never an arbitrary client-selected status):
+ *   - decision "confirm-failed" → failed (audited, always allowed).
+ *   - decision "confirm-success" → success ONLY with provider evidence
+ *     (providerPaymentId + captured amount matching the booking total).
+ *     Ambiguous captures stay in manual_review — never settled to clear state.
+ *
+ * The status claim is atomic (manual_review → target in one conditional
+ * update), so concurrent resolutions cannot double-settle or double-refund.
  */
+export const resolveManualReview = async (
+  paymentId,
+  { decision, providerPaymentId = null, providerAmountPaise = null, actor = null, reason = null }
+) => {
+  if (!["confirm-success", "confirm-failed"].includes(decision)) {
+    throw Object.assign(new Error("decision must be 'confirm-success' or 'confirm-failed'"), { statusCode: 400 });
+  }
+  if (!reason || !String(reason).trim()) {
+    throw Object.assign(new Error("An audit reason is required to resolve manual review"), { statusCode: 400 });
+  }
+
+  const session = await mongoose.startSession();
+  try {
+    let outcome = null;
+    await session.withTransaction(async () => {
+      // Atomic claim: exactly one resolver wins (conditional on manual_review,
+      // staying inside the Payment status enum). Concurrent attempts see a
+      // non-manual_review row and get a 409 below. Any later throw aborts the
+      // whole transaction, leaving the payment safely in manual_review.
+      const payment = await Payment.findOneAndUpdate(
+        { _id: paymentId, status: "manual_review" },
+        { $set: { status: decision === "confirm-success" ? "pending" : "failed" } },
+        { new: true, session }
+      );
+      if (!payment) {
+        const current = await Payment.findById(paymentId).session(session).lean();
+        if (!current) throw Object.assign(new Error("Payment not found"), { statusCode: 404 });
+        throw Object.assign(
+          new Error(`Payment is ${current.status}, not manual_review — use the standard transition path`),
+          { statusCode: 409, code: "REVIEW_RESOLVE_CONFLICT" }
+        );
+      }
+
+      if (decision === "confirm-failed") {
+        payment.failureReason = `Manual review resolved as failed: ${String(reason).slice(0, 500)}`;
+        await payment.save({ session });
+        await writeAuditLog({
+          actor: actor?.userId || null,
+          actorRole: actor?.role || null,
+          action: "PAYMENT_REVIEW_RESOLVED_FAILED",
+          targetType: "Payment",
+          targetId: payment._id,
+          before: { status: "manual_review" },
+          after: { status: "failed" },
+          reason,
+          metadata: { source: "manual_review_resolution" },
+          session,
+        });
+        outcome = { payment, alreadyProcessed: false };
+        return;
+      }
+
+      // confirm-success: provider evidence is mandatory and must match.
+      if (!providerPaymentId || providerAmountPaise == null) {
+        throw Object.assign(
+          new Error("confirm-success requires providerPaymentId and providerAmountPaise evidence"),
+          { statusCode: 422, code: "REVIEW_EVIDENCE_REQUIRED" }
+        );
+      }
+      const { mismatch, capturedAmountPaise } = verifyCapturedAmount(payment, providerAmountPaise);
+      if (mismatch) {
+        throw Object.assign(
+          new Error(
+            `Provider captured ${capturedAmountPaise} paise but expected ${toPaise(payment.totalAmountPaise)} paise — remains in manual review`
+          ),
+          { statusCode: 422, code: "REVIEW_AMOUNT_MISMATCH" }
+        );
+      }
+      // Evidence verified: complete as a normal success (ledger + settlement).
+      payment.failureReason = null;
+      await payment.save({ session });
+      await writeAuditLog({
+        actor: actor?.userId || null,
+        actorRole: actor?.role || null,
+        action: "PAYMENT_REVIEW_RESOLVED_SUCCESS",
+        targetType: "Payment",
+        targetId: payment._id,
+        before: { status: "manual_review" },
+        after: { status: "success", providerPaymentId },
+        reason,
+        metadata: { source: "manual_review_resolution", capturedAmountPaise },
+        session,
+      });
+      payment.capturedAmountPaise = capturedAmountPaise ?? toPaise(payment.totalAmountPaise);
+      await applySuccess({ payment, providerPaymentId, source: "manual_review_resolution", actor, reason, session });
+      outcome = { payment, alreadyProcessed: false };
+    });
+
+    if (outcome?.payment?.status === "success") {
+      await settleAfterCommit({
+        bookingId: outcome.payment.bookingId,
+        itemType: outcome.payment.itemType || "service",
+        source: "manual_review_resolution",
+      });
+    }
+    return outcome;
+  } catch (txErr) {
+    if (isTransactionUnsupported(txErr)) {
+      throw Object.assign(
+        new Error("Manual-review resolution requires a replica set; refusing to resolve non-transactionally"),
+        { statusCode: 503, code: "REVIEW_TXN_REQUIRED" }
+      );
+    }
+    throw txErr;
+  } finally {
+    session.endSession();
+  }
+};
+
+/**
+ * Transition a payment to failed (idempotent, transactional).
+ *
+ * H8: payments in `manual_review` carry unresolved provider ambiguity and
+ * must NEVER be cleared through this generic path. They resolve only via
+ * `resolveManualReview` (confirm-failed with audit reason). All three
+ * execution paths below refuse `manual_review` with 409 so webhook/verify
+ * failures cannot bypass the audited resolution flow.
+ */
+const manualReviewGuard = (payment) => {
+  if (payment?.status === "manual_review") {
+    throw Object.assign(
+      new Error("Payment is in manual review — resolve via the manual-review resolution endpoint"),
+      { statusCode: 409, code: "MANUAL_REVIEW_RESOLUTION_REQUIRED" }
+    );
+  }
+};
+
 export const markPaymentFailed = async (
   paymentId,
   { failureReason = null, source, actor = null, reason = null, session: outerSession = null }
@@ -340,6 +476,7 @@ export const markPaymentFailed = async (
   const doNonTransactional = async () => {
     const payment = await Payment.findById(paymentId);
     if (!payment) throw Object.assign(new Error("Payment not found"), { statusCode: 404 });
+    manualReviewGuard(payment);
     if (payment.status === "success") {
       return { alreadyProcessed: true, payment };
     }
@@ -371,6 +508,7 @@ export const markPaymentFailed = async (
   if (outerSession) {
     const payment = await Payment.findById(paymentId).session(outerSession);
     if (!payment) throw Object.assign(new Error("Payment not found"), { statusCode: 404 });
+    manualReviewGuard(payment);
     if (payment.status === "success") return { alreadyProcessed: true, payment };
 
     const before = payment.toObject();
@@ -401,6 +539,7 @@ export const markPaymentFailed = async (
       await session.withTransaction(async () => {
         const payment = await Payment.findById(paymentId).session(session);
         if (!payment) throw Object.assign(new Error("Payment not found"), { statusCode: 404 });
+        manualReviewGuard(payment);
         if (payment.status === "success") {
           result = { alreadyProcessed: true, payment };
           return;

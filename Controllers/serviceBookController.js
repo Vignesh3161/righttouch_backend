@@ -1581,11 +1581,14 @@ export const cancelBooking = async (req, res) => {
 
     // 🎯 ATOMIC CANCEL CLAIM — only one cancellation can win. Status must be
     // cancellable per the canonical transition table and not already cancelled.
-    const cancellableStatuses = ["pending", "broadcasted", "accepted", "on_the_way", "reached"];
+    // H17: the claim additionally pins the status (and technician assignment)
+    // observed at fee-computation time, so a concurrent accept/arrive between
+    // the read and the claim cannot silently misprice the fee — the customer
+    // retries and the fee is recomputed from fresh state.
     const cancelled = await ServiceBooking.findOneAndUpdate(
       {
         _id: id,
-        status: { $in: cancellableStatuses },
+        status: booking.status,
         cancellationStatus: "active",
         technicianId: booking.technicianId,
       },
@@ -1726,6 +1729,16 @@ export const technicianCancelBooking = async (req, res) => {
           await session.abortTransaction();
           return res.status(409).json({ success: false, message: "Wallet changed concurrently, please retry" });
         }
+      }
+      // H11: uncollectable shortfall becomes outstanding dues (recovered
+      // from future settlements) instead of silently vanishing.
+      const duesShortfall = penaltyPaise - debitedPaise;
+      if (duesShortfall > 0) {
+        await TechnicianProfile.updateOne(
+          { _id: techId },
+          { $inc: { outstandingDuesPaise: duesShortfall, walletVersion: 1 } },
+          { session }
+        );
       }
 
       // 2. Penalty transaction — idempotency key makes double-processing
@@ -1873,11 +1886,18 @@ export const technicianCancelBooking = async (req, res) => {
 /* =====================================================
    TECHNICIAN RE-ACCEPT CANCELLED JOB
    (OPTIONAL PENALTY — % OF BOOKING TOTAL, ADMIN-CONFIGURED)
-   Body: { withPenalty: true|false }
    Penalty percent is a global admin setting:
      "technician.reacceptPenaltyPercent" (0–100), managed via
      GET/PUT /api/admin/settings/reaccept-penalty.
-===================================================== */
+   H18: penalty applicability is SERVER-AUTHORITATIVE. The penalty applies
+   if and only if the technician is re-accepting a job THEY cancelled
+   (cancelledBy technician) and the admin percent yields a positive amount.
+   Any client-supplied `withPenalty` flag is IGNORED (accepted for backward
+   compatibility but never trusted) — a manipulated payload can neither
+   dodge a due penalty nor impose one where policy says none.
+   Per the admin setting: "debited when a technician re-accepts a job
+   they cancelled."
+   ===================================================== */
 export const acceptCancelledJob = async (req, res) => {
   // B-09 two-phase re-acceptance (mirrors respondToJob): Phase A performs
   // advisory reads + eligibility outside any transaction; Phase B opens a
@@ -1888,7 +1908,7 @@ export const acceptCancelledJob = async (req, res) => {
   let session = null;
   try {
     const { id } = req.params;
-    const { withPenalty = false } = req.body || {};
+    // H18: client-supplied penalty flags are never trusted (see header).
     const techId = req.user.technicianProfileId;
 
     if (!techId) {
@@ -2005,12 +2025,15 @@ export const acceptCancelledJob = async (req, res) => {
     const now = new Date();
 
     // 💰 OPTIONAL PENALTY — admin-configured % of the booking total (paise).
+    // H18: applicability decided from the authoritative booking record
+    // (technician-cancelled only), never from the request payload.
     let penaltyPaise = 0;
     let debitedPaise = 0;
     let penaltyTxnId = null;
     let technician = null;
+    const applyPenalty = live.cancelledBy === "technician";
 
-    if (withPenalty) {
+    if (applyPenalty) {
       const percent = await getReacceptPenaltyPercent();
       const totalAmountPaise = live.financialSnapshot?.totalAmountPaise || 0;
       penaltyPaise = percentageOf(totalAmountPaise, percent);
@@ -2032,6 +2055,15 @@ export const acceptCancelledJob = async (req, res) => {
             await session.abortTransaction();
             return res.status(409).json({ success: false, message: "Wallet changed concurrently, please retry" });
           }
+        }
+        // H11: uncollectable re-accept shortfall becomes outstanding dues.
+        const reacceptShortfall = penaltyPaise - debitedPaise;
+        if (applyPenalty && penaltyPaise > 0 && reacceptShortfall > 0) {
+          await TechnicianProfile.updateOne(
+            { _id: techId },
+            { $inc: { outstandingDuesPaise: reacceptShortfall, walletVersion: 1 } },
+            { session }
+          );
         }
 
         const [penaltyTxn] = await WalletTransaction.create(
@@ -2148,6 +2180,8 @@ export const acceptCancelledJob = async (req, res) => {
           penaltyPaise,
           penaltyDebitedPaise: debitedPaise,
           penaltyOutstandingPaise: penaltyPaise - debitedPaise,
+          // H18 auditability: server-decided basis (pre-reaccept cancelledBy).
+          penaltyBasis: live.cancelledBy || null,
           walletBalance: (technician?.availableBalancePaise || 0) / 100,
         },
       },

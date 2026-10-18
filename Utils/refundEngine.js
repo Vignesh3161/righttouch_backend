@@ -34,13 +34,32 @@ const RefundError = (code, statusCode, message) => {
   return e;
 };
 
-const runTxn = async (fn) => {
+const runTxn = async (fn, meta = {}) => {
   let session;
   try {
     session = await mongoose.startSession();
     return await session.withTransaction(() => fn(session));
   } catch (e) {
     if (/replica set|Transaction|mongos/.test(String(e?.message || ""))) {
+      // 3A-3: previously SILENT non-transactional fallback. Standalone/dev
+      // continuity is preserved (atomic reserve + idempotent keys still hold
+      // per-operation), but the downgrade is now LOUD and actionable via the
+      // existing reconciliation-exception contract — consistent with the
+      // settlement standalone fallback (warn + verify + reconcile). Production
+      // MUST run a replica set; every fallback instance is surfaced.
+      console.error(
+        `[Refund] NON-TRANSACTIONAL fallback for ${meta.op || "refund-op"} — replica set required for atomicity`
+      );
+      try {
+        const { raiseReconciliationException } = await import("./paymentTransitions.js");
+        await raiseReconciliationException({
+          code: "REFUND_NON_TRANSACTIONAL_FALLBACK",
+          severity: "critical",
+          details: { op: meta.op || "refund-op", ...(meta.details || {}) },
+        });
+      } catch (raiseErr) {
+        console.error("[Refund] fallback exception surfacing failed:", raiseErr?.message || raiseErr);
+      }
       return await fn(null);
     }
     throw e;
@@ -74,6 +93,24 @@ const push = async (recipientId, title, body, data, opts) => {
   try {
     await sendPushNotification(recipientId, { title, body, data }, opts);
   } catch {}
+};
+
+/**
+ * H9/H10: conditional, idempotent reservation release.
+ * Decrements Payment.amountRefundedPaise ONLY when at least `netPaise` is
+ * currently reserved ($gte guard), so racing failure paths (executeRefund,
+ * worker catch, reconcile, webhook) cannot double-release below zero or
+ * hand the same reserved amount to two retries.
+ * @returns {boolean} true if the release was applied.
+ */
+export const releaseRefundReservation = async (paymentId, netPaise) => {
+  const net = toPaise(netPaise || 0);
+  if (!paymentId || !(net > 0)) return false;
+  const res = await Payment.updateOne(
+    { _id: paymentId, amountRefundedPaise: { $gte: net } },
+    { $inc: { amountRefundedPaise: -net } }
+  );
+  return (res.modifiedCount || 0) > 0;
 };
 
 export const computeRefundAllocation = async ({
@@ -179,7 +216,15 @@ export const createRefund = async ({
   initiatedBy = null,
   approvedBy = null,
   note = null,
+  idempotencyKey = null,
 }) => {
+  // H9: request-level dedupe — retried admin calls carrying the same
+  // Idempotency-Key return the original refund instead of creating a
+  // duplicate logical refund (atomic reserve ceiling is the backstop).
+  if (idempotencyKey) {
+    const existing = await Refund.findOne({ idempotencyKey }).lean();
+    if (existing) return existing;
+  }
   const policy = await getRefundPolicy();
   const alloc = await computeRefundAllocation({
     paymentId,
@@ -224,7 +269,7 @@ export const createRefund = async ({
     if (!reserved) throw RefundError("REFUND_EXCEEDS_CAPTURED", 422);
 
     const parties = await getBookingParties(payment.bookingId, payment.itemType);
-    const idem = `refund:${paymentId}:${randomUUID()}`;
+    const idem = idempotencyKey || `refund:${paymentId}:${randomUUID()}`;
 
     const [ref] = await Refund.create(
       [
@@ -341,8 +386,11 @@ export const createRefund = async ({
     }
 
     if (reportId && !needsApproval) {
+      // H14: never overwrite a terminal complaint resolution — only an
+      // open/under-review report may transition to resolved_refunded here.
+      // Terminal updates belong to the canonical complaintService flow.
       await Report.updateOne(
-        { _id: reportId },
+        { _id: reportId, status: { $in: ["open", "under_review"] } },
         { $set: { status: "resolved_refunded", reviewedAt: new Date(), refundId: ref._id } },
         opts
       );
@@ -372,7 +420,7 @@ export const createRefund = async ({
     });
 
     return ref;
-  });
+  }, { op: "createRefund", details: { paymentId: String(paymentId) } });
 
   if (!refund.awaitingApproval) {
     emit(SOCKET_ROOMS.CUSTOMER(refund.customerId), SOCKET_EVENTS.REFUND_INITIATED, {
@@ -402,8 +450,9 @@ export const approveRefund = async (refundId, approvedBy) => {
   await RefundOutbox.create([{ refundId: refund._id, status: "new" }]);
 
   if (refund.reportId) {
+    // H14: same terminal-state guard as createRefund.
     await Report.updateOne(
-      { _id: refund.reportId },
+      { _id: refund.reportId, status: { $in: ["open", "under_review"] } },
       { $set: { status: "resolved_refunded", reviewedAt: new Date(), refundId: refund._id } }
     );
   }
@@ -426,13 +475,47 @@ export const approveRefund = async (refundId, approvedBy) => {
   return refund;
 };
 
-export const executeRefund = async (refundId) => {
-  const refund = await Refund.findById(refundId);
-  if (!refund) throw RefundError("REFUND_NOT_FOUND", 404);
-  if (!["pending_execution", "retrying"].includes(refund.status)) return refund;
+export const executeRefund = async (refundId, deps = {}) => {
+  const createProvider = deps.createProvider || createRazorpayRefund;
+  // H9: two-level atomic ownership for one execution attempt.
+  //  (1) Outbox mutex (SAME row/state machine as the Phase-1 worker claim —
+  //      no conflicting mechanism): the caller must hold `processing`. The
+  //      worker holds it already (pass ownedClaim:true); direct callers claim
+  //      new→processing here, and concurrent claimants lose atomically.
+  //  (2) Refund attempt fence: status filter + attempts increment in ONE
+  //      findOneAndUpdate, so attempt accounting is exact under concurrency.
+  //  Plus the stable provider idempotency key (set once at creation, never
+  //  regenerated) for provider-side dedupe of any residual overlap.
+  if (!deps.ownedClaim) {
+    await RefundOutbox.updateOne(
+      { refundId },
+      { $setOnInsert: { status: "new", attempts: 0 } },
+      { upsert: true }
+    );
+    const owned = await RefundOutbox.findOneAndUpdate(
+      { refundId, status: "new" },
+      { $set: { status: "processing" } },
+      { new: true }
+    ).lean();
+    if (!owned) {
+      const current = await Refund.findById(refundId).lean();
+      if (!current) throw RefundError("REFUND_NOT_FOUND", 404);
+      return current;
+    }
+  }
+  const refund = await Refund.findOneAndUpdate(
+    { _id: refundId, status: { $in: ["pending_execution", "retrying"] } },
+    { $inc: { attempts: 1 } },
+    { new: true }
+  );
+  if (!refund) {
+    const current = await Refund.findById(refundId).lean();
+    if (!current) throw RefundError("REFUND_NOT_FOUND", 404);
+    return current;
+  }
 
   try {
-    const rzp = await createRazorpayRefund({
+    const rzp = await createProvider({
       paymentId: String(refund.paymentId),
       amountInPaisa: refund.netRefundPaise,
       speed: refund.speed,
@@ -481,17 +564,16 @@ export const executeRefund = async (refundId) => {
   } catch (e) {
     const statusCode = e?.statusCode || 500;
     const msg = String(e?.message || "");
-    refund.attempts = (refund.attempts || 0) + 1;
+    // H9: attempts were already consumed atomically by the execution claim
+    // above — do NOT increment again here (that would double-count and could
+    // prematurely terminal-fail a retryable refund).
     refund.lastError = msg;
 
     if (statusCode >= 400 && statusCode < 500) {
       refund.status = "failed";
       await refund.save();
-      // Revert the reservation made at createRefund (terminal provider failure).
-      await Payment.updateOne(
-        { _id: refund.paymentId },
-        { $inc: { amountRefundedPaise: -refund.netRefundPaise } }
-      );
+      // H9/H10: conditional release — racing paths cannot double-release.
+      await releaseRefundReservation(refund.paymentId, refund.netRefundPaise);
       if (refund.clawbackRequiredPaise > 0 && refund.technicianId) {
         await reverseClawback({ technicianId: refund.technicianId, refundId: refund._id });
       }
@@ -506,10 +588,12 @@ export const executeRefund = async (refundId) => {
     } else if (/source|invalid_refund/.test(msg)) {
       refund.status = "unrefundable_source";
       await refund.save();
-      await Payment.updateOne(
-        { _id: refund.paymentId },
-        { $inc: { amountRefundedPaise: -refund.netRefundPaise } }
-      );
+      // H9: unrefundable source is terminal — release reservation (guarded)
+      // and reverse any clawback, mirroring the failed path.
+      await releaseRefundReservation(refund.paymentId, refund.netRefundPaise);
+      if (refund.clawbackRequiredPaise > 0 && refund.technicianId) {
+        await reverseClawback({ technicianId: refund.technicianId, refundId: refund._id });
+      }
       await RefundOutbox.updateOne({ refundId: refund._id }, { $set: { status: "failed" } });
     } else {
       refund.status = "manual_review";
@@ -519,67 +603,327 @@ export const executeRefund = async (refundId) => {
   }
 };
 
-export const refundWorker = async (limit = 25) => {
+/**
+ * C5 — REFUND STATUS MAP (authoritative, verified against this file).
+ *
+ * Persisted Refund.status values and their producers:
+ *   pending_execution   ← createRefund (queued; RefundOutbox "new" unless dual-approval hold)
+ *   processed           ← executeRefund success | reconcileRefunds (provider confirmed) | webhook
+ *   failed              ← executeRefund 4xx-terminal | refundWorker attempts>=3 | reconcile (provider failed)
+ *   retrying            ← retryRefund (admin re-queue; outbox upserted to "new")
+ *   manual_review       ← executeRefund unexpected/provider error (admin must retryRefund)
+ *   unrefundable_source ← executeRefund (cash/offline source — no provider reversal possible)
+ * "initiated" is a LEGACY enum member: nothing in the current workflow ever
+ * writes it. Reconcilers must NOT query for it.
+ *
+ * RefundOutbox.status: new → processing (atomic worker claim) → done | failed.
+ * Provider calls carry Refund.idempotencyKey, and every ledger write uses a
+ * per-refund idempotency key — repeats are safe by construction.
+ */
+const ACTIONABLE_REFUND_STATUSES = ["pending_execution", "retrying"];
+const TERMINAL_REFUND_STATUSES = ["processed", "failed", "unrefundable_source"];
+const RECONCILE_STALE_MS = 10 * 60 * 1000;
+const OUTBOX_CLAIM_STALE_MS = 5 * 60 * 1000;
+
+// Harmonize a "processing" outbox claim after executeRefund settled (or
+// early-returned for an already-terminal refund) so no claim dangles forever.
+const harmonizeOutboxClaim = async (refundId) => {
+  const refund = await Refund.findById(refundId).select("status attempts").lean();
+  if (!refund) {
+    await RefundOutbox.updateOne(
+      { refundId, status: "processing" },
+      { $set: { status: "failed", lastError: "refund record not found" } }
+    );
+    return;
+  }
+  if (refund.status === "processed") {
+    await RefundOutbox.updateOne({ refundId, status: "processing" }, { $set: { status: "done" } });
+  } else if (["failed", "unrefundable_source", "manual_review"].includes(refund.status)) {
+    await RefundOutbox.updateOne({ refundId, status: "processing" }, { $set: { status: "failed" } });
+  }
+};
+
+export const refundWorker = async (limit = 25, deps = {}) => {
   const batch = await RefundOutbox.find({ status: "new" }).limit(limit).lean();
+  let processed = 0;
   for (const item of batch) {
+    // Atomic claim: exactly one worker (same process or another replica) can
+    // own this item. Losers skip via the null return — no double execution.
+    const claimed = await RefundOutbox.findOneAndUpdate(
+      { _id: item._id, status: "new" },
+      { $set: { status: "processing" } },
+      { new: true }
+    ).lean();
+    if (!claimed) continue;
+    processed += 1;
     try {
-      await executeRefund(item.refundId);
+      // H9: the worker holds this item's `processing` claim — hand it to
+      // executeRefund so no second mutex is taken for the same attempt.
+      await executeRefund(item.refundId, { ...deps, ownedClaim: true });
+      await harmonizeOutboxClaim(item.refundId);
+      const refund = await Refund.findById(item.refundId).lean();
+      if (refund && ACTIONABLE_REFUND_STATUSES.includes(refund.status) && refund.attempts >= 3) {
+        // H10: attempts exhausted while still actionable (e.g. repeated
+        // ambiguity). Park as manual_review — reservation stays intact for an
+        // admin retry — and close the outbox (retryRefund requeues it).
+        await Refund.updateOne(
+          { _id: refund._id, status: { $in: ACTIONABLE_REFUND_STATUSES } },
+          { $set: { status: "manual_review", lastError: "max execution attempts reached" } }
+        );
+        await RefundOutbox.updateOne({ refundId: item.refundId }, { $set: { status: "failed" } });
+      } else if (refund && ACTIONABLE_REFUND_STATUSES.includes(refund.status)) {
+        // Still actionable (e.g. a transient throw before any state change):
+        // release the claim so a later tick retries. Provider idempotency key
+        // makes the retried provider call safe.
+        await RefundOutbox.updateOne(
+          { refundId: item.refundId, status: "processing" },
+          { $set: { status: "new" } }
+        );
+      }
     } catch (e) {
+      console.error(`[RefundWorker] refund ${item.refundId}: ${e?.message || e}`);
       const refund = await Refund.findById(item.refundId).lean();
       if (refund && refund.attempts >= 3) {
         await RefundOutbox.updateOne({ refundId: item.refundId }, { $set: { status: "failed" } });
-        // Terminal failure: release the createRefund reservation so the
-        // customer can be refunded again through a fresh request.
-        await Payment.updateOne(
-          { _id: refund.paymentId },
-          { $inc: { amountRefundedPaise: -refund.netRefundPaise } }
+        // H10 invariant: the createRefund reservation is released ONLY when
+        // the refund reached a terminal-failure status (failed /
+        // unrefundable_source — both release on their own paths).
+        // manual_review KEEPS its reservation so an admin retry needs no
+        // re-reserve; releasing here would corrupt the retry accounting.
+        // H9: guarded release — safe even if executeRefund already released.
+        // 3A-1: reversal included — closes the crash window between
+        // executeRefund's status save and its own reversal. reverseClawback
+        // is marker-guarded and idempotent, so a repeat here is a no-op
+        // when executeRefund already reversed.
+        if (["failed", "unrefundable_source"].includes(refund.status)) {
+          await releaseRefundReservation(refund.paymentId, refund.netRefundPaise);
+          if (refund.clawbackRequiredPaise > 0 && refund.technicianId) {
+            await reverseClawback({ technicianId: refund.technicianId, refundId: refund._id }).catch((e) =>
+              console.error(`[RefundWorker] catch-path clawback reversal ${refund._id}: ${e?.message || e}`)
+            );
+          }
+        }
+      } else if (refund && ACTIONABLE_REFUND_STATUSES.includes(refund.status)) {
+        await RefundOutbox.updateOne(
+          { refundId: item.refundId, status: "processing" },
+          { $set: { status: "new" } }
         );
+      } else {
+        await harmonizeOutboxClaim(item.refundId);
       }
     }
   }
-  return { processed: batch.length };
+  return { processed };
 };
 
-export const reconcileRefunds = async () => {
+export const reconcileRefunds = async (deps = {}) => {
+  const fetchProvider = deps.fetchProvider || fetchRazorpayRefund;
+  const summary = { checked: 0, recovered: 0, requeued: 0 };
+  const staleBefore = new Date(Date.now() - RECONCILE_STALE_MS);
+
+  // 1. Provider-truth for refunds that reached the provider but whose DB row
+  //    is still uncertain (interrupted between provider call and save).
+  //    Only actionable states with a real provider id are eligible — terminal
+  //    states (processed/failed/unrefundable_source/manual_review) are never
+  //    re-processed here.
   const stale = await Refund.find({
-    status: "initiated",
-    executedAt: { $lte: new Date(Date.now() - 10 * 60 * 1000) },
-  }).lean();
+    status: { $in: ACTIONABLE_REFUND_STATUSES },
+    providerRefundId: { $ne: null },
+    updatedAt: { $lte: staleBefore },
+  })
+    .select("_id providerRefundId status attempts")
+    .limit(50)
+    .lean();
   for (const r of stale) {
-    if (!r.providerRefundId) continue;
+    summary.checked += 1;
+    let rzp;
     try {
-      const rzp = await fetchRazorpayRefund(r.providerRefundId);
-      if (rzp.status === "processed" || rzp.status === "captured") {
-        r.status = "processed";
-        r.processedAt = new Date();
-        await r.save();
-        await CreditNote.updateOne({ refundId: r._id }, { $set: { declared: true } });
-      } else if (rzp.status === "failed") {
-        r.status = "failed";
-        await r.save();
-      }
+      rzp = await fetchProvider(r.providerRefundId);
     } catch (e) {
-      console.error(`[RefundReconcile] refund ${r._id}: ${e.message}`);
+      // Provider unreachable — surfaced, NOT marked. Safe retry next tick.
+      console.error(`[RefundReconcile] refund ${r._id}: ${e?.message || e}`);
+      continue;
+    }
+    if (rzp.status === "processed" || rzp.status === "captured") {
+      await Refund.updateOne(
+        { _id: r._id, status: { $in: ACTIONABLE_REFUND_STATUSES } },
+        { $set: { status: "processed", processedAt: new Date(), providerStatus: rzp.status } }
+      );
+      await CreditNote.updateOne({ refundId: r._id }, { $set: { declared: true } });
+      await RefundOutbox.updateOne({ refundId: r._id }, { $set: { status: "done" } });
+      summary.recovered += 1;
+    } else if (rzp.status === "failed") {
+      // Mirror the executeRefund terminal-failure path (reservation release +
+      // clawback reversal) so the customer can retry through a fresh request.
+      const ref = await Refund.findById(r._id);
+      if (ref && ACTIONABLE_REFUND_STATUSES.includes(ref.status)) {
+        ref.status = "failed";
+        ref.attempts = (ref.attempts || 0) + 1;
+        ref.lastError = "provider reported failed (reconciliation)";
+        await ref.save();
+        // H9: conditional release — safe under reconcile/worker races.
+        await releaseRefundReservation(ref.paymentId, ref.netRefundPaise);
+        if (ref.clawbackRequiredPaise > 0 && ref.technicianId) {
+          await reverseClawback({ technicianId: ref.technicianId, refundId: ref._id }).catch((e) =>
+            console.error(`[RefundReconcile] clawback reversal ${ref._id}: ${e?.message || e}`)
+          );
+        }
+        await RefundOutbox.updateOne({ refundId: ref._id }, { $set: { status: "failed" } });
+        summary.recovered += 1;
+      }
     }
   }
-  return { checked: stale.length };
+
+  // 2. Orphaned actionable refunds: still pending/retrying but with no live
+  //    outbox row (lost write) or a stale worker claim (crashed mid-execution).
+  //    Requeue as "new" — the provider idempotency key keeps the retried call
+  //    safe. Terminal outbox rows ("failed" after 3 attempts) are NEVER
+  //    resurrected here; that path belongs to admin retryRefund.
+  const actionable = await Refund.find({ status: { $in: ACTIONABLE_REFUND_STATUSES } })
+    .select("_id updatedAt")
+    .limit(100)
+    .lean();
+  const claimStaleBefore = new Date(Date.now() - OUTBOX_CLAIM_STALE_MS);
+  for (const r of actionable) {
+    const ob = await RefundOutbox.findOne({ refundId: r._id }).lean();
+    if (!ob) {
+      await RefundOutbox.create([{ refundId: r._id, status: "new" }]).catch((e) => {
+        if (e?.code !== 11000) throw e; // another reconciler won the race
+      });
+      summary.requeued += 1;
+    } else if (
+      ob.status === "processing" &&
+      ob.updatedAt &&
+      ob.updatedAt <= claimStaleBefore
+    ) {
+      const released = await RefundOutbox.updateOne(
+        { _id: ob._id, status: "processing" },
+        { $set: { status: "new" } }
+      );
+      if (released.modifiedCount > 0) summary.requeued += 1;
+    } else if (ob.status === "done") {
+      // Interrupted between provider success and refund save: the refund is
+      // still actionable but the outbox claims completion. Requeue so the
+      // worker re-enters executeRefund idempotently via the provider key.
+      const fresh = await Refund.findById(r._id).select("status updatedAt").lean();
+      if (
+        fresh &&
+        ACTIONABLE_REFUND_STATUSES.includes(fresh.status) &&
+        fresh.updatedAt &&
+        fresh.updatedAt <= staleBefore
+      ) {
+        const requeued = await RefundOutbox.updateOne(
+          { _id: ob._id, status: "done" },
+          { $set: { status: "new" } }
+        );
+        if (requeued.modifiedCount > 0) summary.requeued += 1;
+      }
+    }
+  }
+
+  // 3. 3A-1 crash-window recovery for terminal-failure refunds: a crash
+  //    between `refund.save(status=failed)` and the guarded release /
+  //    marker-guarded reversal inside executeRefund (or the webhook path)
+  //    leaves reservation held + clawback applied with NO throw for the
+  //    worker to catch and NO actionable state for steps 1–2. Detect via
+  //    the reversal markers: a terminal refund whose clawback steps lack
+  //    markers never reversed. Both recovery ops are idempotent (guarded
+  //    release + marker-guarded reversal), stale-gated (10m) so live
+  //    executions are never touched, and audited. Skips when markers show
+  //    reversal already ran.
+  const crashCandidates = await Refund.find({
+    status: { $in: ["failed", "unrefundable_source"] },
+    clawbackRequiredPaise: { $gt: 0 },
+    technicianId: { $ne: null },
+    updatedAt: { $lte: staleBefore },
+  })
+    .select("_id paymentId technicianId netRefundPaise clawbackRequiredPaise")
+    .limit(50)
+    .lean();
+  for (const r of crashCandidates) {
+    const base = `rfd:${r._id}:clawback`;
+    const markers = await WalletTransaction.countDocuments({
+      technicianId: r.technicianId,
+      idempotencyKey: { $regex: `^${base}:reversal` },
+    });
+    if (markers > 0) continue;
+    await releaseRefundReservation(r.paymentId, r.netRefundPaise);
+    await reverseClawback({ technicianId: r.technicianId, refundId: r._id }).catch((e) =>
+      console.error(`[RefundReconcile] crash-window reversal ${r._id}: ${e?.message || e}`)
+    );
+    await writeAuditLog({
+      action: "REFUND_CRASH_WINDOW_RECOVERED",
+      targetType: "Refund",
+      targetId: r._id,
+      after: { netRefundPaise: r.netRefundPaise, clawbackRequiredPaise: r.clawbackRequiredPaise },
+      reason: "Terminal-failure refund found without clawback reversal markers — recovered idempotently",
+    });
+    summary.recovered += 1;
+  }
+
+  return summary;
 };
 
 export const retryRefund = async (refundId, adminId) => {
-  const refund = await Refund.findById(refundId);
-  if (!refund) throw RefundError("REFUND_NOT_FOUND", 404);
-  if (refund.attempts >= 3) throw RefundError("MAX_ATTEMPTS_EXCEEDED", 409);
-  if (!["failed", "manual_review"].includes(refund.status)) {
+  // H10: atomic retry claim + reservation re-establishment.
+  //
+  // Reservation invariant (enforced by every failure path): the
+  // createRefund reservation (Payment.amountRefundedPaise += net) is released
+  // if and only if the refund reached failed/unrefundable_source, and kept
+  // while in manual_review. Therefore:
+  //   - retry from failed ⇒ re-reserve atomically, guarded by the captured
+  //     ceiling ($expr) so concurrent/duplicate retries can never over-refund;
+  //   - retry from manual_review ⇒ reservation intact, no re-reserve.
+  // The status claim itself is conditional (failed/manual_review → retrying),
+  // so concurrent admin retries collapse to a single winner (409 for losers).
+  const pre = await Refund.findOneAndUpdate(
+    { _id: refundId, status: { $in: ["failed", "manual_review"] }, attempts: { $lt: 3 } },
+    { $set: { status: "retrying", lastError: null } },
+    { new: false }
+  );
+  if (!pre) {
+    const current = await Refund.findById(refundId).lean();
+    if (!current) throw RefundError("REFUND_NOT_FOUND", 404);
+    if ((current.attempts || 0) >= 3) throw RefundError("MAX_ATTEMPTS_EXCEEDED", 409);
     throw RefundError("REFUND_IN_FLIGHT", 409);
   }
-  refund.status = "retrying";
-  await refund.save();
+
+  if (pre.status === "failed") {
+    const payment = await Payment.findById(pre.paymentId).lean();
+    if (!payment) {
+      await Refund.updateOne({ _id: refundId, status: "retrying" }, { $set: { status: "failed" } });
+      throw RefundError("PAYMENT_NOT_FOUND", 404);
+    }
+    const captured = toPaise(payment.capturedAmountPaise ?? payment.totalAmountPaise);
+    const reReserved = await Payment.findOneAndUpdate(
+      {
+        _id: pre.paymentId,
+        $expr: { $lte: [{ $add: ["$amountRefundedPaise", pre.netRefundPaise] }, captured] },
+      },
+      { $inc: { amountRefundedPaise: pre.netRefundPaise } },
+      { new: true }
+    );
+    if (!reReserved) {
+      // Not enough eligible amount left — roll the claim back, keep auditable.
+      await Refund.updateOne({ _id: refundId, status: "retrying" }, { $set: { status: "failed" } });
+      throw RefundError("REFUND_EXCEEDS_CAPTURED", 422);
+    }
+  }
+
   await RefundOutbox.updateOne(
     { refundId },
     { $set: { status: "new", nextAttemptAt: new Date() } },
     { upsert: true }
   );
-  return refund;
+  await writeAuditLog({
+    action: "REFUND_RETRY_QUEUED",
+    targetType: "Refund",
+    targetId: refundId,
+    actor: adminId,
+    actorRole: "Admin",
+    after: { priorStatus: pre.status, reReserved: pre.status === "failed" },
+  });
+  return Refund.findById(refundId);
 };
 
 export const handleRefundWebhook = async (event, payload) => {
@@ -594,11 +938,16 @@ export const handleRefundWebhook = async (event, payload) => {
     await refund.save();
     await CreditNote.updateOne({ refundId: refund._id }, { $set: { declared: true } });
   } else if (event === "refund.failed" && refund.status !== "failed") {
+    // H10: provider-reported failure is terminal for this attempt — mirror the
+    // executeRefund failure path exactly (guarded reservation release +
+    // clawback reversal) so the failed ⇒ released invariant holds.
     refund.status = "failed";
     await refund.save();
+    await releaseRefundReservation(refund.paymentId, refund.netRefundPaise);
     if (refund.clawbackRequiredPaise > 0 && refund.technicianId) {
       await reverseClawback({ technicianId: refund.technicianId, refundId: refund._id });
     }
+    await RefundOutbox.updateOne({ refundId: refund._id }, { $set: { status: "failed" } });
   }
 };
 

@@ -14,6 +14,7 @@
 
 import DispatchOutbox from "../Schemas/DispatchOutbox.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { notifyTechnicianOfNewJob } from "./sendNotification.js";
 import mongoose from "mongoose";
 
@@ -35,7 +36,7 @@ const backoffFor = (attempts) =>
   Math.min(BACKOFF_BASE_MS * 2 ** attempts, MAX_BACKOFF_MS);
 
 /** Claim one row atomically: pending → inflight. Returns doc or null. */
-const claimOne = async () => {
+export const claimOne = async () => {
   const now = new Date();
   const row = await DispatchOutbox.findOneAndUpdate(
     {
@@ -57,7 +58,8 @@ const claimOne = async () => {
   );
 };
 
-const processRow = async (row) => {
+/** Exported for regression tests (H25). Production entry remains the poller. */
+export const processRow = async (row) => {
   const { bookingId, technicianId, kind, broadcastId, version, payload } = row;
   const traceId = payload?.traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   try {
@@ -78,6 +80,28 @@ const processRow = async (row) => {
     const broadcast = broadcastId
       ? { _id: broadcastId, version: version ?? 1 }
       : null;
+    // H25: the offer itself must still be live (sent + version-current).
+    // A broadcast expired, superseded, or accepted after enqueue must not
+    // produce a valid-looking notification for an unavailable job — the
+    // accept path would only 409. Stale rows complete as stale (no retry).
+    if (broadcastId) {
+      const live = await JobBroadcast.findById(broadcastId)
+        .select("status version expiresAt")
+        .lean();
+      const stale =
+        !live ||
+        live.status !== "sent" ||
+        (version != null && live.version !== version) ||
+        (live.expiresAt && new Date(live.expiresAt).getTime() <= Date.now());
+      if (stale) {
+        await DispatchOutbox.updateOne(
+          { _id: row._id },
+          { $set: { status: "done", completedAt: new Date(), lastError: "stale_broadcast" } }
+        );
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=stale_broadcast`);
+        return;
+      }
+    }
     const result = await notifyTechnicianOfNewJob(ioRef, technicianId.toString(), payload, broadcast);
 
     if (result?.skipped) {
@@ -149,23 +173,36 @@ const poll = async () => {
 export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, jobData, broadcastMap, traceId }) => {
   if (!technicianIds?.length) return { count: 0 };
   const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  const rows = technicianIds.map((techId) => {
+  // H25: idempotent enqueue via updateOne+upsert+$setOnInsert (the same
+  // pattern as the matching transaction's outbox write). A duplicate enqueue
+  // matches the live row instead of inserting — deterministic even before
+  // the partial unique index finishes building (insertMany would
+  // double-insert in that window). The partial index remains as backstop.
+  const ops = technicianIds.map((techId) => {
     const idStr = String(techId);
     const broadcast = broadcastMap?.get(idStr);
     return {
-      bookingId,
-      technicianId: idStr,
-      kind: "job_new",
-      broadcastId: broadcast?._id || null,
-      version: broadcast?.version || 1,
-      payload: { ...jobData, traceId: trc },
-      status: "pending",
-      nextAttemptAt: new Date(),
+      updateOne: {
+        filter: { bookingId, technicianId: idStr, kind: "job_new", status: { $in: ["pending", "inflight"] } },
+        update: {
+          $setOnInsert: {
+            bookingId,
+            technicianId: idStr,
+            kind: "job_new",
+            broadcastId: broadcast?._id || null,
+            version: broadcast?.version || 1,
+            payload: { ...jobData, traceId: trc },
+            status: "pending",
+            nextAttemptAt: new Date(),
+          },
+        },
+        upsert: true,
+      },
     };
   });
 
   try {
-    await DispatchOutbox.insertMany(rows, { ordered: false, lean: true });
+    await DispatchOutbox.bulkWrite(ops, { ordered: false });
   } catch (err) {
     // E11000 collisions (re-broadcast already queued) are fine — skip.
     if (err?.code !== 11000) {
@@ -182,7 +219,7 @@ export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, job
       poll().catch(() => {});
     });
   }
-  return { count: rows.length };
+  return { count: technicianIds.length };
 };
 
 export const startDispatchWorker = (io) => {

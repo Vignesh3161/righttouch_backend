@@ -38,12 +38,29 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
     err.statusCode = 400;
     throw err;
   }
+  if (!customerId || !mongoose.Types.ObjectId.isValid(customerId)) {
+    const err = new Error("Authenticated customer identity is required");
+    err.statusCode = 401;
+    err.code = "QUOTATION_AUTH_REQUIRED";
+    throw err;
+  }
+  const ownerId = String(customerId);
 
-  // Idempotent & validation check: Ensure quotation exists and is in an acceptable state
+  const forbidden = () => {
+    const err = new Error("You do not own this quotation");
+    err.statusCode = 403;
+    err.code = "QUOTATION_FORBIDDEN";
+    throw err;
+  };
+
+  // C2: ownership-enforcing pre-check. Never trust a client-supplied customer
+  // id as proof of ownership — the caller's authenticated identity must match
+  // the quotation's owning customer before any state is revealed or mutated.
   const existingQuote = await Quotation.findById(quotationId);
   if (!existingQuote) {
     throw new ConflictError("Quotation not found");
   }
+  if (String(existingQuote.customerId) !== ownerId) forbidden();
   if (existingQuote.status === "superseded") {
     const err = new ConflictError("This quotation is no longer active. Please review the latest quotation.");
     err.code = "QUOTATION_SUPERSEDED";
@@ -71,24 +88,44 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
   try {
     await session.withTransaction(async () => {
       const now = new Date();
-      const quote = await Quotation.findOne({
-        _id: quotationId,
-        status: { $in: ["sent", "viewed", "accepted"] },
-      }).session(session);
-      if (!quote) throw new ConflictError("Quotation is unavailable or expired");
-
-      if (quote.status !== "accepted") {
-        if (quote.validUntil && new Date(quote.validUntil) < now) {
-          quote.status = "expired";
-          await quote.save({ session });
+      // C2: atomic conditional claim — ownership + eligible status + not
+      // expired in ONE findOneAndUpdate. Exactly one concurrent request can
+      // win the sent/viewed → accepted transition; losers fall through to
+      // the idempotent existing-bookings path below instead of double-booking.
+      const quote = await Quotation.findOneAndUpdate(
+        {
+          _id: quotationId,
+          customerId: ownerId,
+          status: { $in: ["sent", "viewed"] },
+          $or: [{ validUntil: { $gte: now } }, { validUntil: null }],
+        },
+        { $set: { status: "accepted", acceptedAt: now }, $inc: { version: 1 } },
+        { new: true, session }
+      );
+      if (!quote) {
+        const current = await Quotation.findOne({ _id: quotationId }).session(session);
+        if (!current) throw new ConflictError("Quotation not found");
+        if (String(current.customerId) !== ownerId) forbidden();
+        if (current.status === "accepted" || current.status === "converted") {
+          const already = await ProductBooking.find({ quotationId }).session(session);
+          if (already.length > 0) {
+            bookings = already;
+            return;
+          }
+        }
+        if (current.status === "expired" || (current.validUntil && new Date(current.validUntil) < now)) {
+          if (current.status !== "expired") {
+            await Quotation.updateOne(
+              { _id: quotationId },
+              { $set: { status: "expired" }, $inc: { version: 1 } },
+              { session }
+            );
+          }
           const err = new ConflictError("Quotation has expired");
           err.code = "QUOTATION_EXPIRED";
           throw err;
         }
-        quote.status = "accepted";
-        quote.acceptedAt = now;
-        quote.version = (quote.version || 0) + 1;
-        await quote.save({ session });
+        throw new ConflictError("Quotation is unavailable or expired");
       }
 
       // Multi-product: decide which items are accepted.

@@ -4,6 +4,7 @@ import { deleteBookingAsAdmin } from "../Controllers/serviceBookController.js";
 import {
   recordAdminOfflinePayment,
   updatePaymentStatus,
+  resolveManualReviewPayment,
   getPaymentByBooking,
   adminGetProductPaymentsListController,
   adminGetProductPaymentsSummaryController,
@@ -26,7 +27,13 @@ router.post("/record-offline", Auth, adminOnly, recordAdminOfflinePayment);
 router.post("/record-offline/:bookingId", Auth, adminOnly, recordAdminOfflinePayment);
 
 // PUT /api/admin/payments/:id/status (manual status override with audited reason)
+// H8: refuses manual_review sources — those resolve only via :id/resolve-review.
 router.put("/:id/status", Auth, adminOnly, updatePaymentStatus);
+
+// H8: PUT /api/admin/payments/:id/resolve-review (manual-review resolution)
+// body: { decision: confirm-success|confirm-failed, providerPaymentId?,
+//         providerAmountPaise?, reason }
+router.put("/:id/resolve-review", Auth, adminOnly, resolveManualReviewPayment);
 
 // GET /api/admin/payments/booking/:bookingId
 router.get("/booking/:bookingId", Auth, adminOnly, getPaymentByBooking);

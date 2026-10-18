@@ -21,20 +21,34 @@ const sweep = (now, windowMs) => {
 
 setInterval(() => sweep(Date.now(), 60000), 60000).unref?.();
 
+// H3: resolve the limiter key WITHOUT trusting client-controlled headers by
+// default. `handshake.address` is the direct TCP peer and cannot be spoofed.
+// X-Forwarded-For is honored ONLY when the operator explicitly configures
+// TRUST_PROXY to the real proxy hop count — mirroring Express's `trust
+// proxy` semantics (take the entry `hops` deep from the right, never the
+// leftmost). Operator requirement: TRUST_PROXY must equal the exact number
+// of trusted reverse proxies, otherwise per-client limiting is either
+// evadable (too high) or unfairly shared (too low / unset behind a proxy).
+export const getSocketIp = (socket) => {
+    const direct = socket.handshake.address || "unknown";
+    const raw = process.env.TRUST_PROXY;
+    const hops = raw === "true" ? 1 : Number.parseInt(raw, 10);
+    if (!Number.isFinite(hops) || hops <= 0) return direct;
+    const xff = socket.handshake.headers?.["x-forwarded-for"];
+    if (typeof xff !== "string" || !xff.trim()) return direct;
+    const chain = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    if (chain.length < hops) return direct;
+    return chain[chain.length - hops] || direct;
+};
+
 export const createHandshakeLimiter = ({
     max = 20,
     windowMs = 60000,
 } = {}) => {
     return (socket, next) => {
         const now = Date.now();
-        // Consistent with HTTP getClientIp(): prefer X-Forwarded-For when behind
-        // a proxy (Render/Nginx), else the direct socket address.
         // NOTE: still per-process — move to Redis for true multi-server limits.
-        const xff = socket.handshake.headers?.["x-forwarded-for"];
-        const ip =
-          (typeof xff === "string" && xff.split(",")[0].trim()) ||
-          socket.handshake.address ||
-          "unknown";
+        const ip = getSocketIp(socket);
 
         const timestamps = (attemptBuckets.get(ip) || []).filter(
             (t) => now - t < windowMs

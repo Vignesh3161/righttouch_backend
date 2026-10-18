@@ -419,8 +419,37 @@ export const getAdminWalletSummary = async (req, res) => {
 const buildWithdrawalFilterQuery = (queryObj) => {
   const query = {};
 
-  if (queryObj.status && String(queryObj.status).trim()) {
-    query.status = String(queryObj.status).trim();
+  if (queryObj.status) {
+    if (Array.isArray(queryObj.status)) {
+      const list = queryObj.status.map((s) => String(s).trim()).filter(Boolean);
+      if (list.length === 1) query.status = list[0];
+      else if (list.length > 1) query.status = { $in: list };
+    } else {
+      const raw = String(queryObj.status).trim();
+      if (raw.includes(",")) {
+        const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        if (list.length === 1) query.status = list[0];
+        else if (list.length > 1) query.status = { $in: list };
+      } else if (raw) {
+        query.status = raw;
+      }
+    }
+  }
+
+  const searchTerm = String(queryObj.search || queryObj.q || "").trim();
+  if (searchTerm) {
+    const isOid = mongoose.isValidObjectId(searchTerm);
+    const searchConditions = [
+      { utr: { $regex: searchTerm, $options: "i" } },
+      { payoutReference: { $regex: searchTerm, $options: "i" } },
+      { payoutDestination: { $regex: searchTerm, $options: "i" } },
+      { adminNote: { $regex: searchTerm, $options: "i" } },
+    ];
+    if (isOid) {
+      searchConditions.push({ _id: searchTerm });
+      searchConditions.push({ technicianId: searchTerm });
+    }
+    query.$or = searchConditions;
   }
 
   const payoutType = queryObj.payoutType || queryObj.type || queryObj.origin;
@@ -545,6 +574,16 @@ export const exportWithdrawalRequests = async (req, res) => {
       .limit(5000)
       .lean();
 
+    const sanitizeCsvCell = (val) => {
+      if (val == null) return "N/A";
+      let str = String(val).trim();
+      if (!str) return "N/A";
+      if (/^[=+@\-\t\r|]/.test(str)) {
+        str = '\x27' + str;
+      }
+      return '"' + str.replace(/"/g, '""') + '"';
+    };
+
     const headers = [
       "Withdrawal ID",
       "Technician Name",
@@ -559,8 +598,8 @@ export const exportWithdrawalRequests = async (req, res) => {
       "Origin",
       "Payout Mode",
       "Payout Destination",
-      "UTR",
-      "UTR",
+      "Payout Reference",
+      "Bank UTR",
       "Requested Date",
       "Paid Date",
     ];
@@ -571,21 +610,21 @@ export const exportWithdrawalRequests = async (req, res) => {
       const netPaise = w.netPayoutAmountPaise ?? requestedPaise;
 
       return [
-        String(w._id),
-        `"${(`${user.fname || ""} ${user.lname || ""}`).trim() || "N/A"}"`,
-        `"${user.mobileNumber || "N/A"}"`,
-        `"${user.email || "N/A"}"`,
+        sanitizeCsvCell(w._id),
+        sanitizeCsvCell((`${user.fname || ""} ${user.lname || ""}`).trim()),
+        sanitizeCsvCell(user.mobileNumber),
+        sanitizeCsvCell(user.email),
         paiseToRupees(requestedPaise).toFixed(2),
         paiseToRupees(netPaise).toFixed(2),
         paiseToRupees(w.commissionDeductionPaise || 0).toFixed(2),
         paiseToRupees(w.penaltyDeductionPaise || 0).toFixed(2),
-        `"${w.penaltyReason || "N/A"}"`,
-        w.status,
-        w.origin,
-        w.payoutMode || "N/A",
-        `"${w.payoutDestination || "N/A"}"`,
-        w.payoutReference || "N/A",
-        w.utr || "N/A",
+        sanitizeCsvCell(w.penaltyReason),
+        sanitizeCsvCell(w.status),
+        sanitizeCsvCell(w.origin),
+        sanitizeCsvCell(w.payoutMode),
+        sanitizeCsvCell(w.payoutDestination),
+        sanitizeCsvCell(w.payoutReference),
+        sanitizeCsvCell(w.utr),
         w.createdAt ? new Date(w.createdAt).toISOString() : "N/A",
         w.paidAt ? new Date(w.paidAt).toISOString() : "N/A",
       ].join(",");
@@ -717,21 +756,40 @@ export const approveWithdrawal = async (req, res) => {
     } = req.body || {};
 
     const existing = await WithdrawalRequest.findById(req.params.id)
-      .select("requestedAmountPaise amountPaise amount status origin requiresApproval")
+      .select("requestedAmountPaise amountPaise amount status origin requiresApproval initiatedBy")
       .lean();
     if (!existing) {
       return res.status(404).json({ success: false, message: "Withdrawal request not found" });
+    }
+
+    // Maker-checker separation: The admin who initiated an admin_direct payout
+    // cannot approve it.
+    if (
+      existing.origin === "admin_direct" &&
+      existing.initiatedBy?.actorId &&
+      String(existing.initiatedBy.actorId) === String(req.user.userId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Maker-checker violation: The admin who initiated this payout cannot also approve it.",
+      });
     }
 
     // Dual-control guard: high-value admin_direct payouts parked with
     // requiresApproval must go through the second-admin endpoint
     // (approve-manual-payout, initiator != approver). The generic approve
     // endpoint must not bypass that check.
-    if (existing.origin === "admin_direct" && existing.requiresApproval) {
-      return res.status(400).json({
-        success: false,
-        message: "This payout requires second-admin approval via approve-manual-payout.",
-      });
+    if (existing.origin === "admin_direct") {
+      const dualThreshold = await getAdminManualDualApprovalPaise();
+      const grossPaise = toPaise(
+        existing.requestedAmountPaise ?? existing.amountPaise ?? rupeesToPaise(existing.amount)
+      );
+      if (existing.requiresApproval || (grossPaise != null && grossPaise >= dualThreshold)) {
+        return res.status(400).json({
+          success: false,
+          message: "This payout requires second-admin approval via approve-manual-payout.",
+        });
+      }
     }
 
     if (!["pending", "requested"].includes(existing.status)) {
@@ -905,7 +963,9 @@ export const rejectWithdrawal = async (req, res) => {
       if (reserveDebit && amountPaiseNum > 0) {
         // Move reserved → available (the reserve was deducted at request time),
         // guarded so reserved never goes negative; bump walletVersion.
-        await TechnicianProfile.findOneAndUpdate(
+        // H11: honor the guard — on a miss no funds moved, so skip the
+        // credit row and surface the shortfall for human review.
+        const moved = await TechnicianProfile.findOneAndUpdate(
           { _id: updated.technicianId, reservedBalancePaise: { $gte: amountPaiseNum } },
           [
             {
@@ -916,30 +976,44 @@ export const rejectWithdrawal = async (req, res) => {
               },
             },
           ],
-          { session }
+          { session, new: true }
         );
 
-        try {
-          await WalletTransaction.create(
-            [
-              {
-                technicianId: updated.technicianId,
-                amountPaise: amountPaiseNum,
-                amount: paiseToRupees(amountPaiseNum),
-                type: "credit",
-                source: "adjustment",
-                withdrawalId: updated._id,
-                idempotencyKey: `withdrawal-refund:${updated._id}`,
-                note: `Refund for rejected withdrawal #${updated._id}`,
-              },
-            ],
-            { session }
-          );
-        } catch (creditErr) {
-          // Replay-safe: double-click reuses the same idempotency key.
-          if (creditErr?.code !== 11000) throw creditErr;
+        if (moved) {
+          try {
+            await WalletTransaction.create(
+              [
+                {
+                  technicianId: updated.technicianId,
+                  amountPaise: amountPaiseNum,
+                  amount: paiseToRupees(amountPaiseNum),
+                  type: "credit",
+                  source: "adjustment",
+                  withdrawalId: updated._id,
+                  idempotencyKey: `withdrawal-refund:${updated._id}`,
+                  note: `Refund for rejected withdrawal #${updated._id}`,
+                },
+              ],
+              { session }
+            );
+          } catch (creditErr) {
+            // Replay-safe: double-click reuses the same idempotency key.
+            if (creditErr?.code !== 11000) throw creditErr;
+          }
+          refundedToWalletPaise = amountPaiseNum;
+        } else {
+          refundedToWalletPaise = 0;
+          await writeAuditLog({
+            actor: req.user.userId,
+            actorRole: req.user.role,
+            action: "WITHDRAWAL_REJECT_RESERVE_SHORTFALL",
+            targetType: "WithdrawalRequest",
+            targetId: updated._id,
+            after: { requestedPaise: amountPaiseNum, refundedToWalletPaise: 0 },
+            reason: "Reserved balance insufficient at reject time — requires human review",
+            session,
+          });
         }
-        refundedToWalletPaise = amountPaiseNum;
       }
     });
 

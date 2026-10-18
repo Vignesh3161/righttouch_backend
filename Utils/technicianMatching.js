@@ -911,7 +911,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     if (!["pending", "broadcasted"].includes(normalizeBookingStatus(booking.status))) {
       // Already processed or cancelled
-      return { success: false, message: `Booking status is ${booking.status}` };
+      return { success: false, count: 0, message: `Booking status is ${booking.status}` };
     }
 
     const service = await Service.findById(booking.serviceId);
@@ -1127,6 +1127,31 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     
     try {
       await session.withTransaction(async () => {
+        // 3b FIRST. Update Booking Status
+        // H25: guarded claim — the booking must still be unassigned and
+        // dispatchable. Without the filter, a booking accepted/cancelled/
+        // expired between the eligibility scan and this transaction would be
+        // flipped back to broadcasted AND technicians notified for a dead
+        // job. On a miss NOTHING else is written (no broadcast flips, no
+        // outbox rows) and section 4 is skipped: no notify without claim.
+        const bookingClaim = await ServiceBooking.updateOne(
+          {
+            _id: booking._id,
+            status: { $in: ["pending", "broadcasted"] },
+            technicianId: null,
+          },
+          {
+            $set: { status: "broadcasted", broadcastedAt: new Date(), assignmentStatus: "broadcasted" },
+            $inc: { activeBroadcastVersion: 1, version: 1 },
+          },
+          { session }
+        );
+        // Set on the final committed attempt (withTransaction re-runs this
+        // whole callback on transient errors, overwriting the flag each
+        // time, so it always reflects the attempt that actually committed).
+        session.__broadcastClaimLost = (bookingClaim.matchedCount || 0) === 0;
+        if (session.__broadcastClaimLost) return;
+
         // 3a. Create/update JobBroadcast records
         const bulkOps = technicianIds.map(technicianId => ({
           updateOne: {
@@ -1140,16 +1165,6 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           }
         }));
         await JobBroadcast.bulkWrite(bulkOps, { session });
-
-        // 3b. Update Booking Status
-        await ServiceBooking.updateOne(
-          { _id: booking._id },
-          {
-            $set: { status: "broadcasted", broadcastedAt: new Date(), assignmentStatus: "broadcasted" },
-            $inc: { activeBroadcastVersion: 1, version: 1 },
-          },
-          { session }
-        );
 
         // 3c. Create DispatchOutbox entries for FCM retry (inside transaction)
         // Use version from JobBroadcast after bulkWrite
@@ -1199,6 +1214,16 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       });
     } finally {
       await session.endSession();
+    }
+
+    // H25: no durable claim → no notifications. The booking was assigned,
+    // cancelled, or expired between the eligibility scan and the commit;
+    // emitting job:new now would hand technicians a valid-looking offer
+    // for a dead job (their accept would only 409). The outbox worker
+    // independently skips non-dispatchable bookings as a second layer.
+    if (session.__broadcastClaimLost) {
+      console.log(`📭 [TRACE] ${trc} BROADCAST_CLAIM_LOST bookingId=${bookingId} — skipping notify`);
+      return { success: true, count: 0, message: "Booking no longer dispatchable" };
     }
 
     recordMetric(METRIC_KEYS.BROADCAST_CREATED, technicianIds.length);

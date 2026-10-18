@@ -30,6 +30,30 @@ const normalizeRole = (role) => {
   return null;
 };
 
+// C1: public self-registration allowlist. Admin/Owner accounts must be
+// provisioned through a trusted authorized flow — never public signup/OTP.
+export const PUBLIC_SIGNUP_ROLES = ["Customer", "Technician"];
+
+const assertPublicSignupRole = (normRole, rawRole) => {
+  if (!normRole) {
+    const err = new Error("Invalid role. Allowed roles: Customer, Technician");
+    err.statusCode = 400;
+    err.code = "INVALID_ROLE";
+    err.details = { received: rawRole ?? null, allowed: PUBLIC_SIGNUP_ROLES };
+    throw err;
+  }
+  if (!PUBLIC_SIGNUP_ROLES.includes(normRole)) {
+    const err = new Error(
+      `${normRole} registration is not allowed via public signup. Contact an authorized administrator.`
+    );
+    err.statusCode = 403;
+    err.code = "PUBLIC_SIGNUP_ROLE_FORBIDDEN";
+    err.details = { received: normRole, allowed: PUBLIC_SIGNUP_ROLES };
+    throw err;
+  }
+  return normRole;
+};
+
 /**
  * Handles user signup and OTP dispatch.
  */
@@ -59,17 +83,11 @@ export const signupAndSendOtpInternal = async ({ identifier, role, termsAndServi
     throw err;
   }
 
-  // Owner signup invite code enforcement
-  if (normRole === "Owner") {
-    const expected = process.env.OWNER_SIGNUP_INVITE_CODE;
-    const providedCode = String(inviteCode || "").trim();
-    if (!expected || !providedCode || providedCode !== expected) {
-      const err = new Error("Owner signup requires a valid invite code");
-      err.statusCode = 403;
-      err.code = "OWNER_INVITE_REQUIRED";
-      throw err;
-    }
-  }
+  // C1: close Admin/Owner self-registration on the public signup path.
+  // The persisted role below comes from this validated allowlist, never
+  // directly from the request body. inviteCode is intentionally no longer
+  // accepted as a bypass — privileged provisioning lives outside signup.
+  assertPublicSignupRole(normRole, role);
 
   // Customer & Technician terms/privacy validation
   if (normRole === "Customer" || normRole === "Technician") {
@@ -143,25 +161,59 @@ export const signupAndSendOtpInternal = async ({ identifier, role, termsAndServi
     throw err;
   }
 
-  // Clean old SIGNUP OTPs
-  await Otp.deleteMany({
-    identifier: normalizedIdentifier,
-    role: normRole,
-    purpose: "SIGNUP",
-  });
+  // H1/H2: repeat signup requests share one cooldown + one attempt budget.
+  // The check-and-reissue runs transactionally (replica set) so concurrent
+  // /signup calls collapse to a single OTP/SMS instead of resetting the
+  // attacker's budget or spamming SMS.
+  const issuedOtp = await withOtpTxn(async (session) => {
+    const opts = session ? { session } : {};
+    const latest = await Otp.findOne({
+      identifier: normalizedIdentifier,
+      role: normRole,
+      purpose: "SIGNUP",
+    })
+      .sort({ createdAt: -1 })
+      .session(session || undefined);
+    if (latest && Date.now() - new Date(latest.createdAt).getTime() < OTP_RESEND_COOLDOWN_MS) {
+      const err = new Error("An OTP was sent recently. Please wait before requesting another.");
+      err.statusCode = 429;
+      err.code = "OTP_COOLDOWN";
+      throw err;
+    }
+    // Carry the verification budget forward — never reset it on reissue.
+    const carriedAttempts = Math.min(Number(latest?.attempts) || 0, OTP_MAX_ATTEMPTS);
 
-  // Generate CSPRNG OTP
-  const otp = generateSecureOtp();
-  const hashedOtp = await bcrypt.hash(otp, 10);
+    // Clean old SIGNUP OTPs
+    await Otp.deleteMany(
+      {
+        identifier: normalizedIdentifier,
+        role: normRole,
+        purpose: "SIGNUP",
+      },
+      opts
+    );
 
-  // Store OTP
-  await Otp.create({
-    identifier: normalizedIdentifier,
-    role: normRole,
-    purpose: "SIGNUP",
-    otp: hashedOtp,
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+    // Generate CSPRNG OTP
+    const otp = generateSecureOtp();
+    const hashedOtp = await bcrypt.hash(otp, 10);
+
+    // Store OTP
+    await Otp.create(
+      [
+        {
+          identifier: normalizedIdentifier,
+          role: normRole,
+          purpose: "SIGNUP",
+          otp: hashedOtp,
+          attempts: carriedAttempts,
+          expiresAt: Date.now() + OTP_TTL_MS, // 5 minutes
+        },
+      ],
+      opts
+    );
+    return otp;
   });
+  const otp = issuedOtp;
 
   // Send SMS
   try {
@@ -181,8 +233,40 @@ export const signupAndSendOtpInternal = async ({ identifier, role, termsAndServi
   };
 };
 
+export const OTP_MAX_ATTEMPTS = 5;
+export const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+export const OTP_TTL_MS = 5 * 60 * 1000;
+
+// H1/H2: run the check-and-reissue sequence inside a transaction when the
+// topology supports it (replica set in production). The cooldown read and the
+// delete+create then serialize, so concurrent resends on any replica collapse
+// to a single SMS. Standalone/dev falls back to sequential ops (documented,
+// not distributed-safe).
+const withOtpTxn = async (fn) => {
+  let session = null;
+  try {
+    session = await mongoose.startSession();
+    let result;
+    await session.withTransaction(() => fn(session).then((r) => { result = r; }));
+    return result;
+  } catch (e) {
+    if (/replica set|Transaction|mongos/.test(String(e?.message || ""))) {
+      return await fn(null);
+    }
+    throw e;
+  } finally {
+    if (session) await session.endSession().catch(() => {});
+  }
+};
+
 /**
  * Resends OTP with 60-second cooldown check.
+ *
+ * H1: the reissued OTP inherits the previous attempt count (capped) — a
+ * resend never resets an attacker's verification budget.
+ * H2: cooldown is checked inside the reissue transaction against the shared
+ * Otp collection, so it holds across replicas for sequential requests and
+ * serializes concurrent ones on a replica set.
  */
 export const resendOtpInternal = async ({ identifier, mobileNumber }) => {
   const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
@@ -193,45 +277,60 @@ export const resendOtpInternal = async ({ identifier, mobileNumber }) => {
     throw err;
   }
 
-  const lastOtp = await Otp.findOne({ identifier: finalIdentifier }).sort({ createdAt: -1 });
-  if (!lastOtp) {
-    const err = new Error("No recent OTP found. Please login or signup again.");
-    err.statusCode = 404;
-    err.code = "OTP_NOT_FOUND";
-    throw err;
-  }
+  const issued = await withOtpTxn(async (session) => {
+    const opts = session ? { session } : {};
+    const lastOtp = await Otp.findOne({ identifier: finalIdentifier })
+      .sort({ createdAt: -1 })
+      .session(session || undefined);
+    if (!lastOtp) {
+      const err = new Error("No recent OTP found. Please login or signup again.");
+      err.statusCode = 404;
+      err.code = "OTP_NOT_FOUND";
+      throw err;
+    }
 
-  // 60s cooldown check
-  if (Date.now() - new Date(lastOtp.createdAt).getTime() < 60 * 1000) {
-    const err = new Error("Please wait before retrying");
-    err.statusCode = 429;
-    err.code = "OTP_COOLDOWN";
-    throw err;
-  }
+    // 60s cooldown check — inside the txn so concurrent resends serialize.
+    if (Date.now() - new Date(lastOtp.createdAt).getTime() < OTP_RESEND_COOLDOWN_MS) {
+      const err = new Error("Please wait before retrying");
+      err.statusCode = 429;
+      err.code = "OTP_COOLDOWN";
+      throw err;
+    }
 
-  const { role, purpose } = lastOtp;
-  if (role === "Owner" && purpose !== "SIGNUP") {
-    const err = new Error("Owner can only resend OTP for signup");
-    err.statusCode = 403;
-    err.code = "FORBIDDEN";
-    throw err;
-  }
+    const { role, purpose } = lastOtp;
+    if (role === "Owner" && purpose !== "SIGNUP") {
+      const err = new Error("Owner can only resend OTP for signup");
+      err.statusCode = 403;
+      err.code = "FORBIDDEN";
+      throw err;
+    }
 
-  await Otp.deleteMany({ identifier: finalIdentifier, role, purpose });
+    // H1: carry the verification budget forward — never reset it on resend.
+    const carriedAttempts = Math.min(Number(lastOtp.attempts) || 0, OTP_MAX_ATTEMPTS);
 
-  const otp = generateSecureOtp();
-  const hashedOtp = await bcrypt.hash(otp, 10);
+    await Otp.deleteMany({ identifier: finalIdentifier, role, purpose }, opts);
 
-  await Otp.create({
-    identifier: finalIdentifier,
-    role,
-    purpose,
-    otp: hashedOtp,
-    expiresAt: Date.now() + 5 * 60 * 1000,
+    const otp = generateSecureOtp();
+    const hashedOtp = await bcrypt.hash(otp, 10);
+
+    const [created] = await Otp.create(
+      [
+        {
+          identifier: finalIdentifier,
+          role,
+          purpose,
+          otp: hashedOtp,
+          attempts: carriedAttempts,
+          expiresAt: Date.now() + OTP_TTL_MS,
+        },
+      ],
+      opts
+    );
+    return { created, otp, role, purpose };
   });
 
   try {
-    await sendSms(finalIdentifier, otp);
+    await sendSms(finalIdentifier, issued.otp);
   } catch (smsErr) {
     const err = new Error("Failed to send OTP. Please try again.");
     err.statusCode = 500;
@@ -241,8 +340,8 @@ export const resendOtpInternal = async ({ identifier, mobileNumber }) => {
 
   return {
     identifier: finalIdentifier,
-    role,
-    purpose,
+    role: issued.role,
+    purpose: issued.purpose,
     expiresInSeconds: 300,
     cooldownSeconds: 60,
   };
@@ -261,32 +360,48 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
     throw err;
   }
 
-  const query = {
-    identifier: finalIdentifier,
-    verified: false,
-    otp: { $exists: true },
-    expiresAt: { $gte: Date.now() },
-  };
-
-  const record = await Otp.findOne(query).sort({ createdAt: -1 });
+  // H1: atomically consume exactly one verification attempt BEFORE comparing.
+  // The $inc + attempts<$lt filter run as a single atomic update, so N
+  // concurrent wrong guesses consume N distinct attempts and the
+  // (MAX+1)-th concurrent guess always fails closed — no read-then-increment
+  // race. A correct guess also consumes its attempt; the record is deleted
+  // on success below, so the budget never wrongly blocks a valid OTP.
+  const record = await Otp.findOneAndUpdate(
+    {
+      identifier: finalIdentifier,
+      verified: false,
+      otp: { $exists: true },
+      expiresAt: { $gte: Date.now() },
+      attempts: { $lt: OTP_MAX_ATTEMPTS },
+    },
+    { $inc: { attempts: 1 } },
+    { new: true, sort: { createdAt: -1 } }
+  );
   if (!record) {
+    const exhausted = await Otp.findOne({
+      identifier: finalIdentifier,
+      verified: false,
+      otp: { $exists: true },
+      expiresAt: { $gte: Date.now() },
+      attempts: { $gte: OTP_MAX_ATTEMPTS },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (exhausted) {
+      const err = new Error("Too many attempts. Request new OTP.");
+      err.statusCode = 429;
+      err.code = "OTP_TOO_MANY_ATTEMPTS";
+      throw err;
+    }
     const err = new Error("OTP expired, invalid, or already used");
     err.statusCode = 400;
     err.code = "OTP_INVALID_OR_EXPIRED";
     throw err;
   }
 
-  if (record.attempts >= 5) {
-    const err = new Error("Too many attempts. Request new OTP.");
-    err.statusCode = 429;
-    err.code = "OTP_TOO_MANY_ATTEMPTS";
-    throw err;
-  }
-
   const isMatch = await bcrypt.compare(otp, record.otp);
   if (!isMatch) {
-    await Otp.updateOne({ _id: record._id }, { $inc: { attempts: 1 } });
-    const remainingAttempts = Math.max(0, 5 - (record.attempts + 1));
+    const remainingAttempts = Math.max(0, OTP_MAX_ATTEMPTS - record.attempts);
     const err = new Error(`Invalid OTP. ${remainingAttempts} attempts remaining`);
     err.statusCode = 400;
     err.code = "OTP_INVALID";
@@ -297,6 +412,9 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
   await Otp.updateOne({ _id: record._id }, { $set: { verified: true } });
 
   if (record.purpose === "SIGNUP") {
+    // C1: OTP completion cannot bypass the public-signup allowlist, even if a
+    // stale/forged OTP record carries a privileged role.
+    assertPublicSignupRole(record.role, record.role);
     const tempUser = await TempUser.findOne({ identifier: finalIdentifier, role: record.role });
     if (!tempUser) {
       const err = new Error("No signup request found. Please signup first.");
@@ -352,6 +470,8 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
       const tokenPayload = {
         userId: user._id,
         role: record.role,
+        // H4: bind the token to the current revocation generation.
+        tokenVersion: user.tokenVersion ?? 0,
       };
       if (technicianProfile && technicianProfile[0]) {
         tokenPayload.technicianProfileId = technicianProfile[0]._id;
@@ -429,6 +549,8 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
       userId: user._id,
       role: user.role,
       technicianProfileId,
+      // H4: bind the token to the current revocation generation.
+      tokenVersion: user.tokenVersion ?? 0,
     });
 
     return {
@@ -477,6 +599,17 @@ export const setPasswordInternal = async ({ userId, password }) => {
     throw err;
   }
 
+  // H7: upper bound keeps the approved minimum intact while preventing
+  // oversized-input abuse against the password hasher (bcrypt silently
+  // truncates past 72 bytes, which would otherwise give a false sense of
+  // added strength and burn CPU).
+  if (password.length > 128) {
+    const err = new Error("Password must not exceed 128 characters");
+    err.statusCode = 400;
+    err.code = "VALIDATION_ERROR";
+    throw err;
+  }
+
   const user = await User.findById(userId);
   if (!user) {
     const err = new Error("User not found");
@@ -487,9 +620,37 @@ export const setPasswordInternal = async ({ userId, password }) => {
 
   const hashedPassword = await bcrypt.hash(password, 10);
   user.password = hashedPassword;
+  // H4+H7: a password change revokes every previously issued token (including
+  // the one used for this call) — the user re-authenticates for a new session.
+  user.tokenVersion = (Number(user.tokenVersion) || 0) + 1;
   await user.save();
 
   return true;
+};
+
+/**
+ * H4: explicitly revoke all sessions for a user (role change, suspension
+ * lift, admin security action). No current code path mutates User.role —
+ * verified by audit — so this is the designated hook for any future
+ * privileged-account lifecycle change: bump, then re-issue.
+ */
+export const bumpTokenVersion = async (userId) => {
+  if (!userId) {
+    const err = new Error("userId required");
+    err.statusCode = 400;
+    throw err;
+  }
+  const updated = await User.findByIdAndUpdate(
+    userId,
+    { $inc: { tokenVersion: 1 } },
+    { new: true }
+  ).select("tokenVersion");
+  if (!updated) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+  return updated.tokenVersion ?? 0;
 };
 
 /**
@@ -574,7 +735,8 @@ export const loginInternal = async ({ identifier, mobileNumber, role, password, 
     }
 
     await User.updateOne({ _id: user._id }, { $set: { lastLoginAt: new Date() } });
-    const token = signToken({ userId: user._id, role: user.role });
+    // H4: bind the token to the current revocation generation.
+    const token = signToken({ userId: user._id, role: user.role, tokenVersion: user.tokenVersion ?? 0 });
 
     return {
       type: "PASSWORD_LOGIN",

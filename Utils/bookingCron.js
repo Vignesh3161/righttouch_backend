@@ -24,8 +24,20 @@ const dbReady = () => mongoose.connection.readyState === 1;
  * 🔒 ATOMIC WORKER LEASE — multi-instance safe claim.
  * Only one cron instance may process a booking at a time; crashed workers
  * have their lease expire and get reclaimed.
+ *
+ * H15: lease-field contract (ServiceBooking.leaseUntil/leaseOwner):
+ *  - owner is required (non-empty string) — anonymous claims are rejected;
+ *  - legacy documents missing the fields are claimable: MongoDB matches
+ *    `{ leaseUntil: null }` against missing fields, so first claim also
+ *    backfills both fields;
+ *  - a document carrying leaseOwner with a missing/expired leaseUntil is
+ *    reclaimable (stale recovery);
+ *  - renewal is owner-gated (renewLease) — see H16.
  */
-const claimLease = async (bookingId, owner, ttlMs = LEASE_TTL_MS) => {
+export const claimLease = async (bookingId, owner, ttlMs = LEASE_TTL_MS) => {
+  if (!owner || typeof owner !== "string" || !owner.trim()) {
+    throw Object.assign(new Error("claimLease requires a non-empty owner"), { statusCode: 400 });
+  }
   const now = new Date();
   const result = await ServiceBooking.findOneAndUpdate(
     {
@@ -38,11 +50,42 @@ const claimLease = async (bookingId, owner, ttlMs = LEASE_TTL_MS) => {
   return result;
 };
 
-const releaseLease = async (bookingId) => {
-  await ServiceBooking.updateOne(
-    { _id: bookingId },
+/**
+ * H15/H16: owner-gated renewal. Only the current lease holder may extend;
+ * anyone else (or an expired lease) gets null — the caller must re-claim.
+ */
+export const renewLease = async (bookingId, owner, ttlMs = LEASE_TTL_MS) => {
+  if (!owner || typeof owner !== "string" || !owner.trim()) {
+    throw Object.assign(new Error("renewLease requires a non-empty owner"), { statusCode: 400 });
+  }
+  const now = new Date();
+  return ServiceBooking.findOneAndUpdate(
+    {
+      _id: bookingId,
+      leaseOwner: owner,
+      leaseUntil: { $gt: now },
+    },
+    { $set: { leaseUntil: new Date(now.getTime() + ttlMs) } },
+    { new: true }
+  );
+};
+
+/**
+ * H16: owner-gated release. Only the holder named in leaseOwner may clear
+ * the lease, so an expired/stale worker can never release another worker's
+ * active lease. Repeated release by the owner is safe (second call matches
+ * zero documents → returns false, no error). Returns true iff this call
+ * cleared the lease.
+ */
+export const releaseLease = async (bookingId, expectedOwner = null) => {
+  const filter = expectedOwner
+    ? { _id: bookingId, leaseOwner: expectedOwner }
+    : { _id: bookingId, leaseOwner: null };
+  const res = await ServiceBooking.updateOne(
+    filter,
     { $set: { leaseUntil: null, leaseOwner: null } }
   );
+  return (res.modifiedCount || 0) > 0;
 };
 
 /**
@@ -214,7 +257,7 @@ export const initBookingCrons = (io) => {
                     await notifyCustomer(claimed, message, io);
                     console.log(`[Cron:Expiry] Auto-cancelled ${fresh.bookingType} job ${_id}`);
                 } finally {
-                    await releaseLease(_id);
+                    await releaseLease(_id, "expiry-worker");
                 }
             }
         } catch (err) {
@@ -262,7 +305,7 @@ export const initBookingCrons = (io) => {
                     );
                     console.log(`[Cron:Broadcast] Re-broadcasted job ${_id}`);
                 } finally {
-                    await releaseLease(_id);
+                    await releaseLease(_id, "rebroadcast-worker");
                 }
             }
         } catch (err) {
@@ -366,7 +409,7 @@ export const initBookingCrons = (io) => {
                     );
                     console.log(`[Cron:OTWTimeout] Released + re-dispatched ${_id} (release #${releasedCount + 1})`);
                 } finally {
-                    await releaseLease(_id);
+                    await releaseLease(_id, "otw-timeout-worker");
                 }
             }
         } catch (err) {
@@ -498,7 +541,7 @@ export const initBookingCrons = (io) => {
                             { $set: { [`remindersSent.${stage.flag}`]: true } }
                         );
                     } finally {
-                        await releaseLease(b._id);
+                        await releaseLease(b._id, `escalation-${stage.flag}`);
                     }
                 }
             }
@@ -620,7 +663,9 @@ export const initBookingCrons = (io) => {
 };
 
 // 🧹 CRON 6: ORPHANED JOBBROADCAST CLEANUP (Every 30 min)
-cron.schedule("*/30 * * * *", async () => {
+// Exported handle lets tests stop the module-level timer so the process can
+// exit (regression suites import the lease helpers from this module).
+export const orphanBroadcastCleanupTask = cron.schedule("*/30 * * * *", async () => {
     try {
         if (!dbReady()) return;
         

@@ -19,7 +19,7 @@ export const Auth = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET, verifyTokenOptions());
 
     // 🔒 DB check: block deleted/blocked users even if token is still valid
-    const user = await User.findById(decoded.userId).select("status role").lean();
+    const user = await User.findById(decoded.userId).select("status role tokenVersion").lean();
 
     if (!user) {
       return res.status(401).json({ success: false, message: "Account not found", result: {} });
@@ -33,19 +33,36 @@ export const Auth = async (req, res, next) => {
       return res.status(403).json({ success: false, message: "This account has been blocked. Contact support.", result: {} });
     }
 
-    let resolvedTechProfileId = decoded.technicianProfileId || null;
+    // H4: token-generation check — password change, role change, or explicit
+    // revocation bumps User.tokenVersion and kills all older tokens. Missing
+    // on both sides (legacy) ⇒ 0 ⇒ compatible.
+    if ((decoded.tokenVersion ?? 0) !== (user.tokenVersion ?? 0)) {
+      return res.status(401).json({ success: false, message: "Session revoked. Please login again.", result: {} });
+    }
+
+    // H4: the AUTHORITATIVE role comes from the database, never from the
+    // token claim — a demoted Admin's old token cannot keep privileges.
+    const effectiveRole = user.role || decoded.role;
+
+    let resolvedTechProfileId = null;
 
     // 🔒 Extra check for technicians: also block if profile is soft-deleted, and auto-resolve profile ID if missing
-    if (decoded.role === "Technician") {
-      const techQuery = resolvedTechProfileId
-        ? TechnicianProfile.findById(resolvedTechProfileId)
-        : TechnicianProfile.findOne({ userId: decoded.userId });
-
-      const techProfile = await techQuery.select("_id workStatus").lean();
+    if (effectiveRole === "Technician") {
+      // H6: resolve the profile from the authenticated user identity, never
+      // from a client-influenced token claim. A stale/forged profile id in
+      // the token is discarded, not trusted.
+      const techProfile = await TechnicianProfile.findOne({ userId: decoded.userId })
+        .select("_id workStatus")
+        .lean();
       if (techProfile) {
         resolvedTechProfileId = techProfile._id;
         if (techProfile.workStatus === "deleted") {
           return res.status(403).json({ success: false, message: "User not found", result: {} });
+        }
+        // H5: suspended technicians lose HTTP access consistently (socket
+        // handshake and isTechnician enforce the same rule).
+        if (techProfile.workStatus === "suspended") {
+          return res.status(403).json({ success: false, message: "Technician account suspended. Contact support.", result: {} });
         }
       }
     }
@@ -53,7 +70,7 @@ export const Auth = async (req, res, next) => {
     req.user = {
       _id: decoded.userId,
       userId: decoded.userId,
-      role: decoded.role,
+      role: effectiveRole,
       email: decoded.email,
       technicianProfileId: resolvedTechProfileId,
     };

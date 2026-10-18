@@ -1,7 +1,16 @@
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import User from "../Schemas/User.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { verifyTokenOptions } from "../Utils/token.js";
+
+const mongooseTypesObjectIdValid = (v) => {
+  try {
+    return mongoose.Types.ObjectId.isValid(v);
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Socket handshake auth — token is accepted ONLY from handshake.auth.
@@ -27,7 +36,7 @@ export const socketAuth = (socket, next) => {
         try {
             // Mirror HTTP Auth: block Deleted/Blocked accounts even with a
             // still-valid token so banned users lose real-time access too.
-            const user = await User.findById(decoded.userId).select("status").lean();
+            const user = await User.findById(decoded.userId).select("status role tokenVersion").lean();
             if (!user || user.status === "Deleted") {
                 return next(new Error("Authentication error: Account not found"));
             }
@@ -35,35 +44,61 @@ export const socketAuth = (socket, next) => {
                 return next(new Error("Authentication error: Account blocked"));
             }
 
-            let resolvedTechProfileId = decoded.technicianProfileId || null;
+            // H4: same revocation generation check as HTTP Auth — a password
+            // change, role change, or explicit revocation kills live sockets;
+            // the client must re-authenticate (which re-runs this handshake).
+            if ((decoded.tokenVersion ?? 0) !== (user.tokenVersion ?? 0)) {
+                return next(new Error("Authentication error: Session revoked"));
+            }
 
-            if (decoded.role === "Technician") {
-                // Resolve technicianProfileId from User if missing or validate consistency
-                const techQuery = resolvedTechProfileId
-                    ? TechnicianProfile.findById(resolvedTechProfileId)
-                    : TechnicianProfile.findOne({ userId: decoded.userId });
+            // H4: authoritative role from the database, never the token claim.
+            const effectiveRole = user.role || decoded.role;
 
-                const techProfile = await techQuery.select("_id workStatus userId").lean();
+            let resolvedTechProfileId = null;
 
-                if (techProfile) {
-                    // VALIDATION: Ensure techProfile.userId matches decoded.userId
-                    if (String(techProfile.userId) !== String(decoded.userId)) {
-                        console.error(`❌ [AUTH VALIDATION] Token techProfileId ${techProfile._id} belongs to user ${techProfile.userId}, but token userId is ${decoded.userId}`);
-                        resolvedTechProfileId = techProfile._id;
-                    } else {
-                        resolvedTechProfileId = techProfile._id;
-                    }
-
-                    if (techProfile.workStatus === "deleted") {
-                        return next(new Error("Authentication error: Account not found"));
+            if (effectiveRole === "Technician") {
+                // H6: FAIL CLOSED on identity mismatch. The profile is resolved
+                // strictly from the authenticated user id; a token-carried
+                // profile id belonging to someone else is rejected — never
+                // adopted, never "fixed up" with a warning.
+                if (
+                    decoded.technicianProfileId &&
+                    mongooseTypesObjectIdValid(decoded.technicianProfileId)
+                ) {
+                    const claimed = await TechnicianProfile.findById(decoded.technicianProfileId)
+                        .select("_id userId")
+                        .lean();
+                    if (claimed && String(claimed.userId) !== String(decoded.userId)) {
+                        console.error(
+                            `❌ [AUTH VALIDATION] Rejecting socket: token techProfileId ${claimed._id} belongs to user ${claimed.userId}, but token userId is ${decoded.userId}`
+                        );
+                        return next(new Error("Authentication error: Profile mismatch"));
                     }
                 }
+
+                const techProfile = await TechnicianProfile.findOne({ userId: decoded.userId })
+                    .select("_id workStatus")
+                    .lean();
+
+                if (!techProfile) {
+                    return next(new Error("Authentication error: Technician profile not found"));
+                }
+                if (techProfile.workStatus === "deleted") {
+                    return next(new Error("Authentication error: Account not found"));
+                }
+                // H5: suspended technicians cannot hold or reopen sockets —
+                // matches the HTTP Auth rule and the suspend-time forced
+                // disconnect, so reconnect never restores privileges.
+                if (techProfile.workStatus === "suspended") {
+                    return next(new Error("Authentication error: Account suspended"));
+                }
+                resolvedTechProfileId = techProfile._id;
             }
 
             socket.user = {
                 _id: decoded.userId,
                 userId: decoded.userId,
-                role: decoded.role,
+                role: effectiveRole,
                 email: decoded.email,
                 technicianProfileId: resolvedTechProfileId,
             };

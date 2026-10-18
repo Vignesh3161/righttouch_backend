@@ -73,6 +73,16 @@ const userSchema = new mongoose.Schema(
 
     lastLoginAt: Date,
 
+    // H4: token-generation counter. Every issued JWT embeds this value; Auth
+    // and socketAuth reject tokens whose version no longer matches. Bumped on
+    // password change, role change, and explicit revocation. Missing on legacy
+    // documents ⇒ treated as 0 (compatible: tokens issued before this field
+    // existed also carry no version ⇒ 0).
+    tokenVersion: {
+      type: Number,
+      default: 0,
+    },
+
     // 📱 FCM push tokens (multi-device). Registered on app login/foreground;
     // invalid tokens are pruned on FCM error responses (device-not-registered).
     fcmTokens: {

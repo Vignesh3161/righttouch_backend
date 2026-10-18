@@ -29,6 +29,21 @@ const isTechnician = async (req, res, next) => {
       });
     }
 
+    // H5: suspended/deleted technicians are rejected at every technician-gated
+    // entry point, even if they present an otherwise valid session.
+    if (technician.workStatus === "suspended") {
+      return res.status(403).json({
+        success: false,
+        message: "Technician account suspended. Contact support.",
+      });
+    }
+    if (technician.workStatus === "deleted") {
+      return res.status(403).json({
+        success: false,
+        message: "Technician profile not found",
+      });
+    }
+
     // 3️⃣ Attach technician to request
     req.technician = technician;
 

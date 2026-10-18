@@ -16,6 +16,49 @@ import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import CityZone from "../Schemas/CityZone.js";
 import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
+import { maskAccount } from "../Utils/kycPrivacy.js";
+
+// C3: masked-bank policy for ordinary list/detail responses. Full bank values
+// are only returned to the owning technician (self-service) or via the audited
+// KYC full-PII endpoint; everyone else sees masked values.
+const maskHolderName = (name) => {
+  if (!name) return name;
+  const s = String(name).trim();
+  if (s.length <= 1) return "***";
+  return `${s[0]}***`;
+};
+
+const maskUpiId = (upi) => {
+  if (!upi) return upi;
+  const s = String(upi);
+  const at = s.lastIndexOf("@");
+  if (at <= 0) return maskAccount(s);
+  return `***${s.slice(at)}`;
+};
+
+const maskIfscCode = (ifsc) => {
+  if (!ifsc) return ifsc;
+  const s = String(ifsc);
+  if (s.length <= 4) return "****";
+  return `${s.slice(0, 4)}***`;
+};
+
+const sanitizeBankDetails = (bank, { full = false } = {}) => {
+  if (!bank) return bank;
+  if (full) return bank;
+  const masked = {
+    ...bank,
+    accountHolderName: maskHolderName(bank.accountHolderName ?? bank.accountName),
+    accountNumber: maskAccount(bank.accountNumber),
+    ifscCode: maskIfscCode(bank.ifscCode),
+    upiId: maskUpiId(bank.upiId),
+  };
+  // Legacy alias: never leave the unmasked holder name beside the masked one.
+  if (masked.accountName && masked.accountName !== masked.accountHolderName) {
+    masked.accountName = masked.accountHolderName;
+  }
+  return masked;
+};
 
 import OperationalCity from "../Schemas/OperationalCity.js";
 import { containsRegex } from "../Utils/safeQuery.js";
@@ -119,7 +162,11 @@ const normalizeServiceIdsInput = (body) => {
 };
 
 /* ================= HELPER: ENRICH TECHNICIAN WITH ACTIVATION STATUS & BANK DETAILS ================= */
-const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
+// C3: `includeFullBank` defaults to false — ordinary callers receive MASKED
+// bank values. Pass `includeFullBank: true` only for the owning technician's
+// self-service read. Never log decrypted values (only the technician id).
+const enrichTechnicianWithActivationStatus = async (technicianDoc, opts = {}) => {
+  const { includeFullBank = false } = opts || {};
   try {
     if (!technicianDoc) return null;
 
@@ -139,7 +186,7 @@ const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
       try {
         const dek = await getDekForKycDoc(kyc);
         const plainBank = decryptBankDetails(kyc.bankDetails, dek) || {};
-        techObj.bankDetails = {
+        const fullBank = {
           accountHolderName: plainBank.accountHolderName || techObj.bankDetails?.accountName || techObj.bankDetails?.accountHolderName || null,
           accountNumber: plainBank.accountNumber || techObj.bankDetails?.accountNumber || null,
           bankName: plainBank.bankName || techObj.bankDetails?.bankName || null,
@@ -147,11 +194,15 @@ const enrichTechnicianWithActivationStatus = async (technicianDoc) => {
           ifscCode: plainBank.ifscCode || techObj.bankDetails?.ifscCode || null,
           upiId: plainBank.upiId || techObj.bankDetails?.upiId || null,
         };
+        techObj.bankDetails = sanitizeBankDetails(fullBank, { full: includeFullBank });
         techObj.isBankVerified = isBankVerified;
         techObj.bankVerified = isBankVerified;
       } catch (decErr) {
         console.error("Error decrypting bank details for tech:", technicianDoc._id, decErr.message);
       }
+    } else if (techObj.bankDetails) {
+      // Legacy profile-level bank details — mask them the same way.
+      techObj.bankDetails = sanitizeBankDetails(techObj.bankDetails, { full: includeFullBank });
     }
 
     // Active = KYC + Training approved (Bank verification is for payouts)
@@ -1232,9 +1283,14 @@ export const createTechnician = async (req, res) => {
 };
 
 /* ================= GET ALL TECHNICIANS ================= */
+// C3: Admin/Owner-only listing (route-gated), bounded pagination, masked bank
+// details. `result` stays an array so existing response contracts hold; page
+// metadata is additive via `meta`.
 export const getAllTechnicians = async (req, res) => {
   try {
     const { workStatus, search, districtId, district, cityId, city, zoneId, cityZoneId } = req.query;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
 
     const conditions = [];
 
@@ -1338,6 +1394,7 @@ export const getAllTechnicians = async (req, res) => {
 
     const profileQuery = conditions.length > 1 ? { $and: conditions } : conditions[0] || {};
 
+    const total = await TechnicianProfile.countDocuments(profileQuery);
     const technicians = await TechnicianProfile.find(profileQuery)
       .populate("skills.serviceId", "serviceName")
       .populate({
@@ -1350,12 +1407,16 @@ export const getAllTechnicians = async (req, res) => {
       .populate("allowedCityIds", "name code city state")
       .populate("enabledCityZoneIds", "name zoneCode operationalCityId")
       .select("-password")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
 
-    // Enrich each technician with activation status AND enforce online prerequisites
+    // Enrich each technician with activation status AND enforce online prerequisites.
+    // C3: masked bank details on listing responses — never full values.
     const enrichedTechnicians = await Promise.all(
       technicians.map(async (tech) => {
-        const enriched = await enrichTechnicianWithActivationStatus(tech);
+        const enriched = await enrichTechnicianWithActivationStatus(tech, { includeFullBank: false });
         const enforced = await enforceOnlinePrerequisites(enriched);
         return enforced;
       })
@@ -1365,6 +1426,12 @@ export const getAllTechnicians = async (req, res) => {
       success: true,
       message: "Technicians fetched successfully",
       result: enrichedTechnicians,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit) || 0,
+      },
     });
   } catch (error) {
     console.error("getAllTechnicians Error:", error);
@@ -1377,6 +1444,9 @@ export const getAllTechnicians = async (req, res) => {
 };
 
 /* ================= GET TECHNICIAN BY ID ================= */
+// C3: self-or-privileged read. A technician may read only their own profile
+// via this endpoint; Admin/Owner may read any. Bank details are masked except
+// for the owning technician's own read (self-service preserved).
 export const getTechnicianById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1385,6 +1455,18 @@ export const getTechnicianById = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid Technician ID",
+        result: {},
+      });
+    }
+
+    const viewerRole = req.user?.role;
+    const isPrivileged = viewerRole === "Admin" || viewerRole === "Owner";
+    const isSelf =
+      req.user?.technicianProfileId && String(req.user.technicianProfileId) === String(id);
+    if (!isPrivileged && !isSelf) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
         result: {},
       });
     }
@@ -1406,7 +1488,9 @@ export const getTechnicianById = async (req, res) => {
     }
 
     // Enrich with activation status AND enforce online prerequisites
-    const enrichedTechnician = await enrichTechnicianWithActivationStatus(technician);
+    const enrichedTechnician = await enrichTechnicianWithActivationStatus(technician, {
+      includeFullBank: Boolean(isSelf),
+    });
     const enforcedTechnician = await enforceOnlinePrerequisites(enrichedTechnician);
 
     return res.status(200).json({
@@ -1453,7 +1537,10 @@ export const getMyTechnician = async (req, res) => {
     }
 
     // Enrich with activation status AND enforce online prerequisites
-    const enrichedTechnician = await enrichTechnicianWithActivationStatus(technician);
+    // C3: self-service read — the owning technician keeps full bank access.
+    const enrichedTechnician = await enrichTechnicianWithActivationStatus(technician, {
+      includeFullBank: true,
+    });
     const enforcedTechnician = await enforceOnlinePrerequisites(enrichedTechnician);
 
     return res.status(200).json({

@@ -435,6 +435,15 @@ export const resolveLegacyReportInternal = async ({ reportId, inputStatus, resol
     throw err;
   }
 
+  // H14: terminal resolutions are final — overwriting one terminal state
+  // with another bypasses the canonical update guards and can release
+  // holds twice. Re-resolve only from non-terminal states.
+  if (TERMINAL_STATUSES.includes(report.status)) {
+    const err = new Error(`Complaint already in terminal state (${report.status}) — use the canonical status-update path`);
+    err.statusCode = 409;
+    throw err;
+  }
+
   // Map legacy "resolved" to schema-valid enum
   let targetStatus = "resolved_no_refund";
   if (inputStatus === "resolved_refunded" || refundId) {

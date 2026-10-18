@@ -5,23 +5,55 @@ import WalletTransaction from "../Schemas/WalletTransaction.js";
  * 🔐 ATOMIC WALLET DEBIT
  * Single source of truth for subtracting money from a technician wallet.
  *
- * Guarantees (addresses audit O3/O4/O5):
- *  - Atomic, clamped updates via aggregation-pipeline `$max` so a balance can
- *    NEVER go negative even under concurrent callers (no read-then-write race).
- *  - `walletVersion` is bumped on every write (CAS signal for future predicates).
- *  - Cascade order: reserveBalancePaise → availableBalancePaise →
- *    outstandingDuesPaise (dues absorbs any true unrecoverable shortfall).
+ * H11: the old implementation read balances once (`before`) and computed
+ * every cascade step from that STALE snapshot — two concurrent debits both
+ * observed full balances and both subtracted, double-spending the same funds
+ * (and under-counting dues). This version claims each bucket with a
+ * CONDITIONAL atomic update, so concurrent callers serialize on the document:
+ *   - fast path: take the full need iff the bucket currently holds it;
+ *   - slow path: re-read, then take min(actual, need) iff still present.
+ * A lost race yields 0 for that bucket and the remainder cascades onward, so
+ * the SUM taken across buckets is always exact and dues absorb only the true
+ * shortfall. WalletTransaction rows are written solely for amounts actually
+ * claimed (same idempotency keys as before).
  *
- * The `before` balance is read once to compute how much each cascade step
- * actually took (for the immutable WalletTransaction ledger). Even if two
- * callers race, the final persisted balance is always correct and clamped.
+ * Guarantees:
+ *  - balances NEVER go negative (conditional + clamped updates);
+ *  - `walletVersion` bumped on every write;
+ *  - cascade order: reserveBalancePaise → availableBalancePaise →
+ *    outstandingDuesPaise.
  */
 const clampedSubtract = (field, amount) => ({
   $set: {
-    [field]: { $max: [{ $subtract: [`$${field}`, amount] }, 0] },
-    walletVersion: { $add: ["$walletVersion", 1] },
+    // H11: $ifNull guards legacy documents missing the bucket — without it a
+    // missing field would collapse to 0 instead of being decremented.
+    [field]: { $max: [{ $subtract: [{ $ifNull: [`$${field}`, 0] }, amount] }, 0] },
+    walletVersion: { $add: [{ $ifNull: ["$walletVersion", 0] }, 1] },
   },
 });
+
+// Atomically claim up to `need` paise from one balance bucket. Returns the
+// amount actually claimed (0 when the bucket is empty or a racer won it).
+const claimBucket = async (technicianId, field, need, opts) => {
+  const want = Math.max(Math.round(need || 0), 0);
+  if (want <= 0) return 0;
+  const fast = await TechnicianProfile.updateOne(
+    { _id: technicianId, [field]: { $gte: want } },
+    [clampedSubtract(field, want)],
+    opts
+  );
+  if (fast.modifiedCount > 0) return want;
+  const current = await TechnicianProfile.findById(technicianId).select(field).lean();
+  const actual = Math.max(Math.round(current?.[field]) || 0, 0);
+  const take = Math.min(actual, want);
+  if (take <= 0) return 0;
+  const slow = await TechnicianProfile.updateOne(
+    { _id: technicianId, [field]: { $gte: take } },
+    [clampedSubtract(field, take)],
+    opts
+  );
+  return slow.modifiedCount > 0 ? take : 0;
+};
 
 export const atomicWalletDebit = async ({
   technicianId,
@@ -35,40 +67,20 @@ export const atomicWalletDebit = async ({
   if (total === 0) return { reserve: 0, available: 0, dues: 0 };
   const opts = session ? { session } : {};
 
-  const before = await TechnicianProfile.findById(technicianId)
-    .select("reserveBalancePaise availableBalancePaise outstandingDuesPaise")
-    .lean();
-  if (!before) return { reserve: 0, available: 0, dues: 0 };
+  const profileExists = await TechnicianProfile.exists({ _id: technicianId });
+  if (!profileExists) return { reserve: 0, available: 0, dues: 0 };
 
   let remaining = total;
-  let reserveTaken = 0;
+  const reserveTaken = await claimBucket(technicianId, "reserveBalancePaise", remaining, opts);
+  remaining -= reserveTaken;
+
   let availableTaken = 0;
-  let duesTaken = 0;
-
-  const takeReserve = Math.min(before.reserveBalancePaise || 0, remaining);
-  if (takeReserve > 0) {
-    await TechnicianProfile.updateOne(
-      { _id: technicianId },
-      clampedSubtract("reserveBalancePaise", takeReserve),
-      opts
-    );
-    reserveTaken = takeReserve;
-    remaining -= takeReserve;
-  }
-
   if (remaining > 0) {
-    const takeAvail = Math.min(before.availableBalancePaise || 0, remaining);
-    if (takeAvail > 0) {
-      await TechnicianProfile.updateOne(
-        { _id: technicianId },
-        clampedSubtract("availableBalancePaise", takeAvail),
-        opts
-      );
-      availableTaken = takeAvail;
-      remaining -= takeAvail;
-    }
+    availableTaken = await claimBucket(technicianId, "availableBalancePaise", remaining, opts);
+    remaining -= availableTaken;
   }
 
+  let duesTaken = 0;
   if (remaining > 0 && allowDues) {
     duesTaken = remaining;
     await TechnicianProfile.updateOne(
@@ -76,6 +88,7 @@ export const atomicWalletDebit = async ({
       { $inc: { outstandingDuesPaise: duesTaken, walletVersion: 1 } },
       opts
     );
+    remaining = 0;
   }
 
   const rows = [];
@@ -100,22 +113,12 @@ export const atomicWalletDebit = async ({
 /**
  * Clamp-only decrement of availableBalancePaise (used by payout reserve-debit
  * so the available balance can never drop below 0 even if a concurrent credit
- * is in flight). Returns the amount actually debited.
+ * is in flight). H11: returns the amount ACTUALLY debited (conditional claim),
+ * never a stale-read estimate.
  */
 export const safeDebitAvailable = async ({ technicianId, amountPaise, session = null }) => {
   const amt = Math.max(Math.round(amountPaise || 0), 0);
   if (amt === 0) return 0;
   const opts = session ? { session } : {};
-  const before = await TechnicianProfile.findById(technicianId)
-    .select("availableBalancePaise")
-    .lean();
-  const take = Math.min(before?.availableBalancePaise || 0, amt);
-  if (take > 0) {
-    await TechnicianProfile.updateOne(
-      { _id: technicianId },
-      clampedSubtract("availableBalancePaise", take),
-      opts
-    );
-  }
-  return take;
+  return claimBucket(technicianId, "availableBalancePaise", amt, opts);
 };

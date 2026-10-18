@@ -179,6 +179,12 @@ export const initiatePayment = async (req, res) => {
     if (!booking) return fail(res, 404, "Booking not found");
     if (!isBookingPayable(booking)) return fail(res, 400, "NOT_PAYABLE", { code: "NOT_PAYABLE" });
 
+    // H8: never re-issue a provider order while the payment is under manual
+    // review — ambiguity must be resolved by an admin first (mirrors retry).
+    const existingForGuard = await Payment.findOne({ bookingId: booking._id }).select("status").lean();
+    if (existingForGuard?.status === "manual_review")
+      return fail(res, 409, "UNDER_REVIEW", { code: "UNDER_REVIEW" });
+
     req.body = { ...req.body, bookingId: req.params.bookingId };
     await createPaymentOrder(req, res); // sends its own response (order + split)
 
@@ -299,6 +305,8 @@ export const declareCashPayment = async (req, res) => {
     if (!booking) return fail(res, 404, "Booking not found");
     const payment = await Payment.findOne({ bookingId: booking._id });
     if (payment?.status === "success") return fail(res, 409, "ALREADY_PAID", { code: "ALREADY_PAID" });
+    // H8: cash declaration must not bypass manual-review ambiguity either.
+    if (payment?.status === "manual_review") return fail(res, 409, "UNDER_REVIEW", { code: "UNDER_REVIEW" });
     if (payment && (await hasLiveAttempt(payment._id)))
       return fail(res, 409, "PAYMENT_IN_FLIGHT", { code: "PAYMENT_IN_FLIGHT" });
 

@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import Refund from "../Schemas/Refund.js";
 import Payment from "../Schemas/Payment.js";
 import CustomerRefundPayout from "../Schemas/CustomerRefundPayout.js";
+import RefundOutbox from "../Schemas/RefundOutbox.js";
 import { getRefundPolicy } from "../Utils/refundPolicy.js";
 import {
   previewRefund,
@@ -71,6 +72,10 @@ export const adminCreateRefund = async (req, res) => {
       return fail(res, 409, "AMOUNT_CHANGED", { serverNetRefundPaise: serverNet });
     }
 
+    // H9: request dedupe — clients SHOULD send Idempotency-Key; duplicate
+    // deliveries with the same key return the original refund.
+    const requestIdem = req.get("Idempotency-Key") || req.body.idempotencyKey || null;
+
     const policy = await getRefundPolicy();
     if (serverNet > policy.REFUND_DUAL_APPROVAL_ABOVE_PAISE && !approvedBy) {
       const awaiting = await createRefund({
@@ -83,6 +88,7 @@ export const adminCreateRefund = async (req, res) => {
         speed,
         reportId,
         initiatedBy: req.user.userId,
+        idempotencyKey: requestIdem,
       }).catch((e) => {
         if (e.code === "DUAL_APPROVAL_REQUIRED") return null;
         throw e;
@@ -102,6 +108,7 @@ export const adminCreateRefund = async (req, res) => {
       reportId,
       initiatedBy: req.user.userId,
       approvedBy,
+      idempotencyKey: requestIdem,
     });
     return ok(res, 201, "Refund authorised", { refund, serverNetRefundPaise: serverNet });
   } catch (e) {
@@ -151,6 +158,41 @@ export const adminCreateCustomerPayoutRefund = async (req, res) => {
     if (refund.rail === "razorpayx_payout") {
       return fail(res, 409, "Customer payout refund already created");
     }
+    // H9 Option A (single rail): the razorpay_reverse outbox must be
+    // provably unsubmitted before parking it. If the reverse may already
+    // have reached the provider, STOP — reconcile first, never double-pay.
+    // Reservation + clawback are KEPT (customer is still owed the money).
+    if (refund.providerRefundId) {
+      await writeAuditLog({
+        action: "CUSTOMER_REFUND_PAYOUT_BLOCKED",
+        targetType: "Refund",
+        targetId: refund._id,
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        after: { reason: "reverse already submitted to provider", providerRefundId: refund.providerRefundId },
+      });
+      return fail(res, 409, "RAIL_AUTHORITY_AMBIGUOUS", {
+        code: "RAIL_AUTHORITY_AMBIGUOUS",
+        detail: "Reverse refund already submitted to provider — reconcile provider status before creating a payout rail refund",
+        providerRefundId: refund.providerRefundId,
+      });
+    }
+    const reverseOutbox = await RefundOutbox.findOne({ refundId: refund._id }).lean();
+    if (reverseOutbox && ["processing", "done"].includes(reverseOutbox.status)) {
+      await writeAuditLog({
+        action: "CUSTOMER_REFUND_PAYOUT_BLOCKED",
+        targetType: "Refund",
+        targetId: refund._id,
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        after: { reason: "reverse outbox already claimed/completed", outboxStatus: reverseOutbox.status },
+      });
+      return fail(res, 409, "RAIL_AUTHORITY_AMBIGUOUS", {
+        code: "RAIL_AUTHORITY_AMBIGUOUS",
+        detail: `Reverse outbox is '${reverseOutbox.status}' — reconcile provider status before creating a payout rail refund`,
+        outboxStatus: reverseOutbox.status,
+      });
+    }
 
     const policy = await getRefundPolicy();
     if (refund.netRefundPaise > policy.MAX_CUSTOMER_PAYOUT_REFUND_PAISE) {
@@ -172,6 +214,15 @@ export const adminCreateCustomerPayoutRefund = async (req, res) => {
     });
 
     await Refund.updateOne({ _id: refund._id }, { $set: { rail: "razorpayx_payout", status: "manual_review" } });
+    // H9 Option A: park the unclaimed reverse outbox (new → failed with
+    // reason) so the worker can never charge the provider on the old rail.
+    // Done AFTER the rail flip decision, only for provably-unsubmitted rows.
+    if (reverseOutbox && reverseOutbox.status === "new") {
+      await RefundOutbox.updateOne(
+        { _id: reverseOutbox._id, status: "new" },
+        { $set: { status: "failed", lastError: "parked: superseded by razorpayx_payout rail" } }
+      );
+    }
 
     await writeAuditLog({
       action: "CUSTOMER_REFUND_PAYOUT_CREATED",

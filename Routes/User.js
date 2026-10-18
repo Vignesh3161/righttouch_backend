@@ -135,16 +135,13 @@ import { Auth } from "../Middleware/Auth.js";
 const router = express.Router();
 
 
-// ================= UNIFIED OTP LOGIN (ALL ROLES) =================
-// Use a single endpoint for all roles, DRY and secure
-router.post("/auth/login/request-otp", requestLoginOtp);
-router.post("/auth/login/verify-otp", verifyLoginOtp);
 router.post("/auth/accept-terms", Auth, acceptTerms);
 router.delete("/delete-my-account", Auth, deleteMyAccount);
 
+// H3: limiter keys use Express's `req.ip` (trust-proxy aware) — never a
+// hand-parsed X-Forwarded-For, which clients can spoof to evade limits.
+// Requires TRUST_PROXY to match the real proxy hop count in production.
 const getClientIp = (req) => {
-  const xff = req.headers?.["x-forwarded-for"];
-  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
   if (req.ip) return req.ip;
   return req.socket?.remoteAddress || "unknown";
 };
@@ -174,12 +171,22 @@ const otpLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // H3: default keyGenerator (req.ip, trust-proxy aware) — no XFF parsing.
 });
+
+// ================= UNIFIED OTP LOGIN (ALL ROLES) =================
+// Use a single endpoint for all roles, DRY and secure
+// H2: OTP issuance + verification must always sit behind the OTP limiter —
+// these endpoints previously had no rate limiting at all.
+router.post("/auth/login/request-otp", otpLimiter, requestLoginOtp);
+router.post("/auth/login/verify-otp", otpLimiter, verifyLoginOtp);
 
 /* ================= USER ================= */
 router.post("/signup", authLimiter, signupAndSendOtp);
 router.post("/resend-otp", otpLimiter, resendOtp);
-router.post("/verify-otp", authLimiter, verifyOtp);
+// H1/H2: OTP verification guesses are bounded per-IP (10/min) on top of the
+// per-OTP atomic 5-attempt budget enforced in authService.
+router.post("/verify-otp", otpLimiter, verifyOtp);
 router.post("/set-password", authLimiter, Auth, setPassword);
 router.post("/login", authLimiter, login);
 
@@ -193,7 +200,7 @@ router.post("/signup/customer", authLimiter, async (req, res, next) => {
 });
 
 // Customer: verify OTP after signup
-router.post("/signup/customer/verify-otp", authLimiter, verifyOtp);
+router.post("/signup/customer/verify-otp", otpLimiter, verifyOtp);
 
 /* ================= USER LOGIN ROUTES (Role-specific) ================= */
 // Customer login (default, only allows Customer role)
@@ -204,7 +211,7 @@ router.post("/login/customer", authLimiter, async (req, res, next) => {
 });
 
 // Customer: verify OTP (role pre-filled)
-router.post("/login/customer/verify-otp", authLimiter, verifyOtp);
+router.post("/login/customer/verify-otp", otpLimiter, verifyOtp);
 
 
 // Owner login (only allows Owner role)
@@ -219,7 +226,7 @@ router.post("/owner/signup", authLimiter, async (req, res, next) => {
 });
 
 // Owner: verify OTP
-router.post("/owner/verify-otp", authLimiter, async (req, res, next) => {
+router.post("/owner/verify-otp", otpLimiter, async (req, res, next) => {
   // req.body.role = "Owner";
   return verifyOtp(req, res, next);
 });

@@ -474,6 +474,27 @@ export const respondToJob = async (req, res) => {
           message: "Too late! Booking already taken or closed.",
         });
       }
+      // H19: a booking past its auto-cancel deadline is expired even if the
+      // sweeper has not flipped it yet — never revive it via a late accept.
+      // (The expiry cron owns the terminal transition; the claim only refuses.)
+      if (live.autoCancelAt && new Date(live.autoCancelAt).getTime() <= Date.now()) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "Too late! This booking has expired.",
+          reason: "booking_expired",
+        });
+      }
+      // H19: an offer past its own expiry is dead even if its status row has
+      // not been swept yet — fail before any state changes.
+      if (fresh.expiresAt && new Date(fresh.expiresAt).getTime() <= Date.now()) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This job offer has expired. Please refresh and try again.",
+          reason: "offer_expired",
+        });
+      }
 
       const recheck = await checkTechnicianEligibility({
         technician: technicianProfileId,

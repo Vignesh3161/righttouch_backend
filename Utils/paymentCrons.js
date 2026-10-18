@@ -239,13 +239,23 @@ export const completePayout = async (outbox, payout) => {
       // Legacy/edge path: if the reserve debit was never recorded
       // (pre-reserve-model requests), establish the hold now (available →
       // reserved) so the release below nets to zero instead of driving
-      // reserved negative.
+      // reserved negative. H11: clamped to actual available — never negative.
       if (!alreadyDebited) {
-        await TechnicianProfile.updateOne(
-          { _id: withdrawal.technicianId },
-          { $inc: { availableBalancePaise: -amountPaiseNum, reservedBalancePaise: amountPaiseNum } },
-          { session }
-        );
+        const availDoc = await TechnicianProfile.findById(withdrawal.technicianId)
+          .select("availableBalancePaise")
+          .session(session)
+          .lean();
+        const holdPaise = Math.min(toPaise(availDoc?.availableBalancePaise) || 0, amountPaiseNum);
+        if (holdPaise < amountPaiseNum) {
+          withdrawal.adminNote += ` Reserve-hold shortfall: held ${holdPaise} of ${amountPaiseNum} paise available. Requires human review.`;
+        }
+        if (holdPaise > 0) {
+          await TechnicianProfile.updateOne(
+            { _id: withdrawal.technicianId, availableBalancePaise: { $gte: holdPaise } },
+            { $inc: { availableBalancePaise: -holdPaise, reservedBalancePaise: holdPaise, walletVersion: 1 } },
+            { session }
+          );
+        }
         try {
           await WalletTransaction.create(
             [
@@ -269,16 +279,33 @@ export const completePayout = async (outbox, payout) => {
 
       // Release the reserve (gross) + record lifetime withdrawn (net) —
       // mirrors the manual mark-paid settlement so both paths agree.
-      await TechnicianProfile.updateOne(
-        { _id: withdrawal.technicianId },
-        {
-          $inc: {
-            reservedBalancePaise: -amountPaiseNum,
-            lifetimeWithdrawnPaise: netPayoutAmountPaise,
+      // H11: guarded + clamped — concurrent/retried reconciler cannot drive
+      // reserved negative; shortfall is surfaced, not hidden.
+      const heldDoc = await TechnicianProfile.findById(withdrawal.technicianId)
+        .select("reservedBalancePaise")
+        .session(session)
+        .lean();
+      const releaseHoldPaise = Math.min(toPaise(heldDoc?.reservedBalancePaise) || 0, amountPaiseNum);
+      if (releaseHoldPaise > 0) {
+        await TechnicianProfile.updateOne(
+          { _id: withdrawal.technicianId, reservedBalancePaise: { $gte: releaseHoldPaise } },
+          {
+            $inc: {
+              reservedBalancePaise: -releaseHoldPaise,
+              lifetimeWithdrawnPaise: netPayoutAmountPaise,
+              walletVersion: 1,
+            },
           },
-        },
-        { session }
-      );
+          { session }
+        );
+      } else {
+        await TechnicianProfile.updateOne(
+          { _id: withdrawal.technicianId },
+          { $inc: { lifetimeWithdrawnPaise: netPayoutAmountPaise, walletVersion: 1 } },
+          { session }
+        );
+        console.warn(`[PayoutCron] withdrawal ${withdrawal._id}: no reserve held, lifetime recorded without reserve release`);
+      }
 
       // 🏦 Platform ledger — real money left the platform
       const ledger = await postPayoutLedgerEntry({

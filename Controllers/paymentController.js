@@ -13,10 +13,43 @@ import {
   verifyRazorpaySignature,
   verifyWebhookSignature,
 } from "../Utils/razorpay.js";
-import { toPaise } from "../Utils/money.js";
+import { toPaise, rupeesToPaise } from "../Utils/money.js";
+
+// C6: the record-offline `amount` contract is RUPEES (all admin money inputs
+// in this codebase are rupees; the audit mirror below stores targetPaise/100).
+// Convert exactly once at this boundary via rupeesToPaise. Paise-denominated
+// snapshot fields keep using toPaise — never mix the two converters.
+export const MAX_OFFLINE_AMOUNT_RUPEES = 10000000; // ₹1cr sanity cap per recording
+
+export const parseOfflineRupees = (amount) => {
+  const n = typeof amount === "string" && amount.trim() !== "" ? Number(amount.trim()) : Number(amount);
+  if (!Number.isFinite(n)) {
+    const err = new Error("Invalid amount: must be a finite number in rupees");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (n <= 0) {
+    const err = new Error("Invalid amount: must be greater than zero");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (n > MAX_OFFLINE_AMOUNT_RUPEES) {
+    const err = new Error(`Invalid amount: exceeds maximum of ₹${MAX_OFFLINE_AMOUNT_RUPEES}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const paise = rupeesToPaise(n);
+  if (!Number.isFinite(paise) || paise <= 0) {
+    const err = new Error("Invalid amount: conversion failed");
+    err.statusCode = 400;
+    throw err;
+  }
+  return paise;
+};
 import {
   markPaymentSucceeded,
   markPaymentFailed,
+  resolveManualReview as resolveManualReviewPaymentTransition,
 } from "../Utils/paymentTransitions.js";
 import { settleBookingEarningsIfEligible } from "../Utils/settlement.js";
 import { writeAuditLog } from "../Utils/audit.js";
@@ -604,10 +637,19 @@ export const verifyPayment = async (req, res) => {
         signature: razorpay_signature,
       })
     ) {
+      // H8: never clear manual_review via the generic failed path — a bad
+    // signature on an ambiguous payment must preserve review state.
+    try {
       await markPaymentFailed(payment._id, {
         failureReason: "Invalid signature",
         source: "verify",
       });
+    } catch (sigErr) {
+      if (sigErr?.code === "MANUAL_REVIEW_RESOLUTION_REQUIRED") {
+        return fail(res, 409, "Payment is in manual review — resolve via the manual-review resolution endpoint", { status: "manual_review" });
+      }
+      throw sigErr;
+    }
       return fail(res, 400, "Verification failed", { status: "failed" });
     }
 
@@ -751,10 +793,22 @@ export const razorpayWebhook = async (req, res) => {
     if (event.event === "payment.failed") {
       if (!payment) return ok(res, 200, "Payment not found for order");
 
-      await markPaymentFailed(payment._id, {
-        failureReason: entity?.error_description || entity?.error?.description || "Razorpay reported failure",
-        source: "webhook",
-      });
+      // H8: a provider failure notice must not clear manual_review ambiguity.
+      // Preserve review state and let an admin resolve with evidence.
+      if (payment.status === "manual_review") {
+        return ok(res, 200, "Manual review preserved — resolve via resolve-review");
+      }
+      try {
+        await markPaymentFailed(payment._id, {
+          failureReason: entity?.error_description || entity?.error?.description || "Razorpay reported failure",
+          source: "webhook",
+        });
+      } catch (whErr) {
+        if (whErr?.code === "MANUAL_REVIEW_RESOLUTION_REQUIRED") {
+          return ok(res, 200, "Manual review preserved — resolve via resolve-review");
+        }
+        throw whErr;
+      }
       eventRecord.eventType = `${eventRecord.eventType}:applied`;
       await eventRecord.save().catch(() => {});
       return ok(res, 200, "Payment failed recorded");
@@ -796,6 +850,18 @@ export const updatePaymentStatus = async (req, res) => {
 
     const payment = await Payment.findById(id);
     if (!payment) return fail(res, 404, "Payment not found");
+
+    // H8: manual_review payments carry unresolved provider ambiguity and must
+    // NEVER be cleared through the generic status override (which would mark
+    // success without evidence and trigger settlement). They resolve only via
+    // PUT /:id/resolve-review with verified provider evidence or confirmed
+    // failure, both fully audited.
+    if (payment.status === "manual_review") {
+      return fail(res, 409, "Payment is in manual review — resolve via the manual-review resolution endpoint", {
+        code: "MANUAL_REVIEW_RESOLUTION_REQUIRED",
+        paymentId: payment._id,
+      });
+    }
 
     const before = payment.toObject();
     const actor = { userId: req.user.userId, role: req.user.role };
@@ -863,6 +929,58 @@ export const updatePaymentStatus = async (req, res) => {
   } catch (err) {
     if (res.headersSent) return;
     return fail(res, err.statusCode || 500, err.message);
+  }
+};
+
+/* =====================================================
+   H8 — MANUAL-REVIEW RESOLUTION (Admin/Owner, audited, evidence-gated)
+   The ONLY supported exit from `manual_review`:
+     decision "confirm-failed" → failed (reason required, always allowed)
+     decision "confirm-success" → success ONLY with matching provider
+       evidence (providerPaymentId + providerAmountPaise == booking total)
+   Ambiguous captures stay in manual_review. Concurrent resolutions are
+   serialized by the atomic status claim (losers get 409).
+===================================================== */
+
+export const resolveManualReviewPayment = async (req, res) => {
+  try {
+    if (!requireAdminOrOwner(req, res)) return;
+
+    const { id } = req.params;
+    const { decision, providerPaymentId = null, providerAmountPaise = null, reason } = req.body || {};
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return fail(res, 400, "Invalid payment ID");
+    }
+    if (!["confirm-success", "confirm-failed"].includes(decision)) {
+      return fail(res, 400, "decision must be 'confirm-success' or 'confirm-failed'");
+    }
+    if (!reason || !String(reason).trim()) {
+      return fail(res, 400, "An audit reason is required to resolve manual review");
+    }
+
+    const actor = { userId: req.user.userId, role: req.user.role };
+    const outcome = await resolveManualReviewPaymentTransition(id, {
+      decision,
+      providerPaymentId,
+      providerAmountPaise,
+      actor,
+      reason,
+    });
+
+    return ok(res, 200, "Manual review resolved", {
+      paymentId: outcome.payment._id,
+      status: outcome.payment.status,
+      settlementTriggered: outcome.payment.status === "success",
+    });
+  } catch (err) {
+    if (res.headersSent) return;
+    return fail(
+      res,
+      err.statusCode || 500,
+      err.message,
+      err.code ? { code: err.code } : {}
+    );
   }
 };
 
@@ -1047,10 +1165,17 @@ export const recordAdminOfflinePayment = async (req, res) => {
       });
     }
 
-    // Determine target amount in paise
+    // Determine target amount in paise.
+    // C6: explicit `amount` is RUPEES → rupeesToPaise exactly once. Snapshot
+    // fields are already paise → toPaise. An explicitly supplied amount is
+    // never silently ignored: invalid values fail closed with 400.
     let targetPaise = 0;
-    if (amount != null && Number(amount) > 0) {
-      targetPaise = toPaise(amount);
+    if (amount != null && !(typeof amount === "string" && amount.trim() === "")) {
+      try {
+        targetPaise = parseOfflineRupees(amount);
+      } catch (e) {
+        return fail(res, e.statusCode || 400, e.message);
+      }
     } else if (booking.financialSnapshot?.totalAmountPaise > 0) {
       targetPaise = toPaise(booking.financialSnapshot.totalAmountPaise);
     } else {
@@ -1062,7 +1187,10 @@ export const recordAdminOfflinePayment = async (req, res) => {
         (booking.amountPaise ? booking.amountPaise / 100 : null)
       );
       if (rupees && rupees > 0) {
-        targetPaise = toPaise(rupees);
+        if (rupees > MAX_OFFLINE_AMOUNT_RUPEES) {
+          return fail(res, 400, `Invalid booking amount: exceeds maximum of ₹${MAX_OFFLINE_AMOUNT_RUPEES}`);
+        }
+        targetPaise = rupeesToPaise(rupees);
       }
     }
 

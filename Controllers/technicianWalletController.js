@@ -140,44 +140,56 @@ export const createWalletTransaction = async (req, res) => {
             idempotencyKey: { $regex: `^manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}` },
           }).session(session);
         } else {
-          // Re-check balance inside the txn for other debits
+          // H11: conditional atomic debit — the $gte guard makes concurrent
+          // debits serialize; losers get modifiedCount 0 → 400, never a
+          // negative balance from a stale pre-read.
           if (type === "debit") {
-            const fresh = await TechnicianProfile.findById(technicianId)
-              .select("availableBalancePaise")
-              .session(session);
-            if (!fresh || (fresh.availableBalancePaise ?? 0) < amountPaiseNum) {
+            const guarded = await TechnicianProfile.findOneAndUpdate(
+              { _id: technicianId, availableBalancePaise: { $gte: amountPaiseNum } },
+              { $inc: { availableBalancePaise: -amountPaiseNum, walletVersion: 1 } },
+              { new: true, session }
+            );
+            if (!guarded) {
               const err = new Error("Insufficient balance for manual debit");
               err.statusCode = 400;
               throw err;
             }
+          } else {
+            await TechnicianProfile.updateOne(
+              { _id: technicianId },
+              { $inc: { availableBalancePaise: amountPaiseNum, lifetimeEarnedPaise: amountPaiseNum, walletVersion: 1 } },
+              { session }
+            );
           }
 
-          const inc =
-            type === "credit"
-              ? { availableBalancePaise: amountPaiseNum, lifetimeEarnedPaise: amountPaiseNum }
-              : { availableBalancePaise: -amountPaiseNum };
-
-          await TechnicianProfile.updateOne(
-            { _id: technicianId },
-            { $inc: inc },
-            { session }
-          );
-
-          [transaction] = await WalletTransaction.create(
-            [
-              {
+          // Balance already moved atomically above; record the txn row.
+          // H11: duplicate Idempotency-Key delivery returns the original row.
+          try {
+            [transaction] = await WalletTransaction.create(
+              [
+                {
+                  technicianId,
+                  bookingId,
+                  amountPaise: amountPaiseNum,
+                  amount: paiseToRupees(amountPaiseNum),
+                  type,
+                  source,
+                  idempotencyKey: `manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}`,
+                  note: `Manual ${type} by ${req.user.role} ${req.user.userId}`,
+                },
+              ],
+              { session }
+            );
+          } catch (dupErr) {
+            if (dupErr?.code === 11000) {
+              [transaction] = await WalletTransaction.find({
                 technicianId,
-                bookingId,
-                amountPaise: amountPaiseNum,
-                amount: paiseToRupees(amountPaiseNum),
-                type,
-                source,
                 idempotencyKey: `manual:${technicianId}:${source}:${bookingId || "none"}:${amountPaiseNum}:${type}`,
-                note: `Manual ${type} by ${req.user.role} ${req.user.userId}`,
-              },
-            ],
-            { session }
-          );
+              }).session(session);
+            } else {
+              throw dupErr;
+            }
+          }
         }
       });
     } finally {
@@ -934,7 +946,9 @@ export const cancelMyWithdrawal = async (req, res) => {
       if (reserveDebit && amountPaiseNum > 0) {
         // Move reserved → available, guarded so reserved never goes negative,
         // and bump walletVersion for optimistic-concurrency consumers.
-        await TechnicianProfile.findOneAndUpdate(
+        // H11: honor the guard — on a miss (insufficient reserved) no funds
+        // moved, so no credit row is written and the shortfall is reported.
+        const moved = await TechnicianProfile.findOneAndUpdate(
           { _id: updated.technicianId, reservedBalancePaise: { $gte: amountPaiseNum } },
           [
             {
@@ -945,30 +959,44 @@ export const cancelMyWithdrawal = async (req, res) => {
               },
             },
           ],
-          { session }
+          { session, new: true }
         );
 
-        try {
-          await WalletTransaction.create(
-            [
-              {
-                technicianId: updated.technicianId,
-                amountPaise: amountPaiseNum,
-                amount: paiseToRupees(amountPaiseNum),
-                type: "credit",
-                source: "adjustment",
-                withdrawalId: updated._id,
-                idempotencyKey: `withdrawal-refund:${updated._id}`,
-                note: `Refund for cancelled withdrawal #${updated._id}`,
-              },
-            ],
-            { session }
-          );
-        } catch (creditErr) {
-          // Replay-safe: a retried cancel reuses the same idempotency key.
-          if (creditErr?.code !== 11000) throw creditErr;
+        if (moved) {
+          try {
+            await WalletTransaction.create(
+              [
+                {
+                  technicianId: updated.technicianId,
+                  amountPaise: amountPaiseNum,
+                  amount: paiseToRupees(amountPaiseNum),
+                  type: "credit",
+                  source: "adjustment",
+                  withdrawalId: updated._id,
+                  idempotencyKey: `withdrawal-refund:${updated._id}`,
+                  note: `Refund for cancelled withdrawal #${updated._id}`,
+                },
+              ],
+              { session }
+            );
+          } catch (creditErr) {
+            // Replay-safe: a retried cancel reuses the same idempotency key.
+            if (creditErr?.code !== 11000) throw creditErr;
+          }
+          refundedToWalletPaise = amountPaiseNum;
+        } else {
+          refundedToWalletPaise = 0;
+          await writeAuditLog({
+            actor: req.user?.userId || null,
+            actorRole: req.user?.role || null,
+            action: "WITHDRAWAL_CANCEL_RESERVE_SHORTFALL",
+            targetType: "WithdrawalRequest",
+            targetId: updated._id,
+            after: { requestedPaise: amountPaiseNum, refundedToWalletPaise: 0 },
+            reason: "Reserved balance insufficient at cancel time — requires human review",
+            session,
+          });
         }
-        refundedToWalletPaise = amountPaiseNum;
       }
     });
 
@@ -1043,6 +1071,13 @@ export const getWithdrawalReceipt = async (req, res) => {
 
     if (!withdrawal) {
       return res.status(404).json({ success: false, message: "Receipt not found for specified payout" });
+    }
+
+    if (withdrawal.status !== "paid") {
+      return res.status(422).json({
+        success: false,
+        message: "Official receipt is only available after payout is confirmed paid.",
+      });
     }
 
     const techUser = withdrawal.technicianId?.userId || {};
