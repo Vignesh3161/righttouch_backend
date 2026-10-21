@@ -15,26 +15,39 @@ import { emitJobsChanged } from "./sendNotification.js";
 import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibility.js";
 import { geoSearch } from "./technicianGeo.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
-import {
-  evaluateTechnicianEligibility,
-  getAllowedDistrictIds,
-  getAllowedZoneIds,
-  hasDistrictPermission,
-  hasZonePermission,
-  checkCurrentDistrictMatch,
-  checkCurrentZoneMatch,
-  calculateDistanceMeters,
-  getEffectiveRadiusMeters,
-  MAX_PREFILTER_RADIUS_M,
-} from "../Services/technicianEligibilityService.js";
-import { checkGpsValid, checkGpsFreshness } from "./locationConfig.js";
+import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
+import { STALENESS_SECONDS, stalenessCutoff } from "./locationConfig.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
-import { STALENESS_SECONDS, stalenessCutoff } from "./locationConfig.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
-import { enqueueJobNewNotifications } from "./dispatchQueue.js";
+import { enqueueJobNewNotifications, wakeDispatchWorker } from "./dispatchQueue.js";
+import { offerPurgeAt } from "./broadcastRetention.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const envInt = (name, fallback, min, max) => {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(Math.max(Math.floor(raw), min), max);
+};
+
+const MATCH_CANDIDATE_LIMIT = envInt("MATCH_CANDIDATE_LIMIT", 100, 1, 500);
+const MATCH_EVAL_CONCURRENCY = envInt("MATCH_EVAL_CONCURRENCY", 10, 1, 50);
+const MATCH_LEASE_TTL_MS = envInt("MATCHING_LEASE_TTL_MS", 30 * 1000, 5000, 5 * 60 * 1000);
+
+/** Bounded-concurrency map preserving input order (never unbounded Promise.all). */
+export const mapWithConcurrency = async (items, concurrency, fn) => {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+};
 
 /* =====================================================
    DISPATCH FILTERS (staleness / operational polygon)
@@ -580,10 +593,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         });
 
         let broadcast = null;
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
         if (existing) {
           broadcast = await JobBroadcast.findOneAndUpdate(
             { bookingId: booking._id, technicianId: tech._id },
-            { status: "sent", expiresAt: new Date(Date.now() + 60 * 60 * 1000), $inc: { version: 1 } },
+            { status: "sent", expiresAt, purgeAt: offerPurgeAt(expiresAt), $inc: { version: 1 } },
             { new: true }
           );
         } else {
@@ -591,7 +605,8 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
             bookingId: booking._id,
             technicianId: tech._id,
             status: "sent",
-            expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+            expiresAt,
+            purgeAt: offerPurgeAt(expiresAt),
           });
         }
 
@@ -883,7 +898,6 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   
   // 🔒 MATCHING LEASE — prevents duplicate matching for same booking across workers
   // Uses the same lease pattern as bookingCron.js for consistency
-  const MATCH_LEASE_TTL_MS = 30 * 1000; // 30 second lease
   const leaseClaimed = await ServiceBooking.findOneAndUpdate(
     {
       _id: bookingId,
@@ -896,28 +910,53 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
   if (!leaseClaimed) {
     recordMetric(METRIC_KEYS.MATCHING_LEASE_CONFLICT);
     console.log(`🔒 [MATCH LEASE] Booking ${bookingId} already being matched by another worker, skipping`);
-    return { success: true, count: 0, message: "Matching already in progress" };
+    return {
+      success: true,
+      count: 0,
+      outcome: "MATCH_IN_PROGRESS",
+      retryable: true,
+      message: "Matching already in progress",
+    };
   }
   
   recordMetric(METRIC_KEYS.MATCHING_LEASE_ACQUIRED);
+
+  // Heartbeat: extend the lease between expensive stages without hiding the
+  // work duration. A crash still releases via TTL.
+  const extendMatchLease = async (stage) => {
+    const res = await ServiceBooking.updateOne(
+      { _id: bookingId, matchingLeaseOwner: trc },
+      { $set: { matchingLeaseUntil: new Date(Date.now() + MATCH_LEASE_TTL_MS) } }
+    ).catch(() => null);
+    if (res && res.matchedCount === 0) {
+      console.warn(`⚠️ [MATCH LEASE] Lost lease before stage=${stage} booking=${bookingId} trace=${trc}`);
+    }
+    return Boolean(res && res.matchedCount > 0);
+  };
   
   try {
     const booking = await ServiceBooking.findById(bookingId);
     if (!booking) {
       console.error(`❌ matchAndBroadcastBooking: Booking ${bookingId} not found`);
       recordMetric(METRIC_KEYS.MATCHING_ERROR);
-      return { success: false, message: "Booking not found" };
+      return { success: false, count: 0, outcome: "BOOKING_NOT_FOUND", retryable: false, message: "Booking not found" };
     }
 
     if (!["pending", "broadcasted"].includes(normalizeBookingStatus(booking.status))) {
-      // Already processed or cancelled
-      return { success: false, count: 0, message: `Booking status is ${booking.status}` };
+      // Already processed or cancelled — terminal, never retry the outbox row.
+      return {
+        success: false,
+        count: 0,
+        outcome: "BOOKING_NOT_DISPATCHABLE",
+        retryable: false,
+        message: `Booking status is ${booking.status}`,
+      };
     }
 
     const service = await Service.findById(booking.serviceId);
     if (!service) {
       console.error(`❌ matchAndBroadcastBooking: Service ${booking.serviceId} not found`);
-      return { success: false, message: "Service not found" };
+      return { success: false, count: 0, outcome: "SERVICE_NOT_FOUND", retryable: false, message: "Service not found" };
     }
 
     // Resolve Location for Matching
@@ -936,7 +975,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     if ((latitude === undefined || latitude === null) || (longitude === undefined || longitude === null)) {
       console.error(`❌ matchAndBroadcastBooking: No coordinates for booking ${bookingId}. Location:`, JSON.stringify(booking.location), "Snapshot:", JSON.stringify(booking.addressSnapshot));
-      return { success: false, message: "No coordinates for booking" };
+      return { success: false, count: 0, outcome: "INVALID_BOOKING_LOCATION", retryable: false, message: "No coordinates for booking" };
     }
 
     // 0. Check Service Availability at Customer Location
@@ -967,8 +1006,21 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     if (!avail.available) {
       console.log(`⚠️ matchAndBroadcastBooking: Service ${booking.serviceId} unavailable at customer location (${avail.reason || avail.code})`);
       console.log(`======================================================================\n`);
-      return { success: false, count: 0, message: `Service unavailable at customer location (${avail.reason || avail.code})` };
+      return {
+        success: false,
+        count: 0,
+        outcome: "SERVICE_UNAVAILABLE",
+        retryable: false,
+        message: `Service unavailable at customer location (${avail.reason || avail.code})`,
+      };
     }
+
+    const eligibilityContext = {
+      jobDistrictId: targetDistrictId ? String(targetDistrictId) : null,
+      jobZoneId: booking.cityZoneId ? String(booking.cityZoneId) : null,
+      serviceAvailability: avail,
+      traceId: trc,
+    };
 
     // 1. Find Technicians (prefilter at platform-max ceiling; the
     // per-technician effective radius gates authoritatively below).
@@ -980,8 +1032,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       },
       radiusMeters: MAX_PREFILTER_RADIUS_M,
       enableGeo: true,
-      limit: 100
+      limit: MATCH_CANDIDATE_LIMIT,
     });
+
+    await extendMatchLease("prefilter");
 
     let technicianIds = eligibleTechnicians.map(t => t._id.toString());
 
@@ -1009,7 +1063,14 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         }
       } catch (e) {}
       console.log(`======================================================================\n`);
-      return { success: true, count: 0, message: "No technicians found" };
+      return {
+        success: true,
+        count: 0,
+        outcome: "NO_ELIGIBLE_TECHNICIANS",
+        retryable: false,
+        stage: "prefilter",
+        message: "No technicians found",
+      };
     }
 
     // 🏘 ZONE FILTER — only technicians in the same zone as the booking
@@ -1018,10 +1079,19 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       if (technicianIds.length === 0) {
         console.log(`⚠️ No technicians in zone for booking ${bookingId}`);
         recordMetric(METRIC_KEYS.TECHS_FILTERED_ZONE);
-        return { success: true, count: 0, message: "No technicians in your zone" };
+        return {
+          success: true,
+          count: 0,
+          outcome: "NO_ELIGIBLE_TECHNICIANS",
+          retryable: false,
+          stage: "zone",
+          message: "No technicians in your zone",
+        };
       }
       recordMetric(METRIC_KEYS.TECHS_FILTERED_ZONE, technicianIds.length);
     }
+
+    await extendMatchLease("zone");
 
     // Load full profiles and queues for candidates
     const [techProfiles, queueMap] = await Promise.all([
@@ -1036,67 +1106,101 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     const offerRows = [];
     const validCandidateIds = [];
+    const candidateReasons = {};
+    const bumpReason = (reason) => {
+      candidateReasons[reason] = (candidateReasons[reason] || 0) + 1;
+    };
 
-    for (const techId of technicianIds) {
-      const techProfile = profileById.get(techId);
-      if (!techProfile || !techProfile.location?.coordinates) {
-        console.log(`REJECT TECHNICIAN`, JSON.stringify({
-          technicianId: techId,
-          bookingId: booking._id,
-          reasons: ["MISSING_LOCATION"]
-        }));
-        continue;
-      }
+    // Bounded concurrency: availability and booking context are resolved once
+    // above and shared; each candidate still gets the full authoritative gate.
+    const evaluations = await mapWithConcurrency(
+      technicianIds,
+      MATCH_EVAL_CONCURRENCY,
+      async (techId) => {
+        const techProfile = profileById.get(techId);
+        if (!techProfile || !techProfile.location?.coordinates) {
+          bumpReason("MISSING_LOCATION");
+          console.log(`REJECT TECHNICIAN`, JSON.stringify({
+            technicianId: techId,
+            bookingId: booking._id,
+            reasons: ["MISSING_LOCATION"]
+          }));
+          return null;
+        }
 
-      // Use unified eligibility check for broadcast mode
-      const eligibility = await evaluateTechnicianEligibility({
-        technician: techProfile,
-        booking,
-        mode: "BROADCAST",
-      });
+        const eligibility = await evaluateTechnicianEligibility({
+          technician: techProfile,
+          booking,
+          mode: "BROADCAST",
+          context: eligibilityContext,
+        });
 
-      if (!eligibility.eligible) {
-        console.log(`REJECT TECHNICIAN`, JSON.stringify({
-          technicianId: techId,
-          bookingId: booking._id,
-          reasons: eligibility.reasons
-        }));
-        recordMetric(METRIC_KEYS.TECHS_FILTERED_OTHER);
-        continue;
-      }
-      recordMetric(METRIC_KEYS.TECHS_ELIGIBLE);
+        if (!eligibility.eligible) {
+          for (const reason of eligibility.reasons) bumpReason(reason);
+          console.log(`REJECT TECHNICIAN`, JSON.stringify({
+            technicianId: techId,
+            bookingId: booking._id,
+            reasons: eligibility.reasons
+          }));
+          recordMetric(METRIC_KEYS.TECHS_FILTERED_OTHER);
+          return null;
+        }
+        recordMetric(METRIC_KEYS.TECHS_ELIGIBLE);
 
-      const feasibility = evaluateJobFeasibility({
-        techLocation: techProfile.location,
-        candidateJob: booking,
-        queue: queueMap.get(techId),
-      });
+        const feasibility = evaluateJobFeasibility({
+          techLocation: techProfile.location,
+          candidateJob: booking,
+          queue: queueMap.get(techId),
+        });
 
-      if (!feasibility.feasible) {
-        console.log(`REJECT TECHNICIAN`, JSON.stringify({
-          technicianId: techId,
-          bookingId: booking._id,
-          reasons: [feasibility.reason || "FEASIBILITY_FAILED"]
-        }));
+        if (!feasibility.feasible) {
+          bumpReason(feasibility.reason || "FEASIBILITY_FAILED");
+          console.log(`REJECT TECHNICIAN`, JSON.stringify({
+            technicianId: techId,
+            bookingId: booking._id,
+            reasons: [feasibility.reason || "FEASIBILITY_FAILED"]
+          }));
+          recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
+          return null;
+        }
         recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
-        continue;
-      }
-      recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
 
+        return { techId, eligibility, feasibility };
+      }
+    );
+
+    for (const evaluated of evaluations) {
+      if (!evaluated) continue;
       offerRows.push({
         bookingId: booking._id,
-        technicianId: techId,
-        distanceAtOffer: eligibility.details.distanceMeters,
-        feasibilitySnapshot: feasibility,
+        technicianId: evaluated.techId,
+        distanceAtOffer: evaluated.eligibility.details.distanceMeters,
+        feasibilitySnapshot: evaluated.feasibility,
       });
-      validCandidateIds.push(techId);
+      validCandidateIds.push(evaluated.techId);
     }
 
     technicianIds = validCandidateIds;
 
+    console.log(`📊 [TRACE] ${trc} CANDIDATE_FUNNEL bookingId=${bookingId}`, JSON.stringify({
+      candidates: evaluations.length,
+      eligible: validCandidateIds.length,
+      reasons: candidateReasons,
+    }));
+
+    await extendMatchLease("eligibility");
+
     if (technicianIds.length === 0) {
       console.log(`⏱ [TRACE] ${trc} NO_FEASIBLE_TECHS bookingId=${bookingId}`);
-      return { success: true, count: 0, message: "No feasible technicians" };
+      return {
+        success: true,
+        count: 0,
+        outcome: "NO_ELIGIBLE_TECHNICIANS",
+        retryable: false,
+        stage: "eligibility",
+        reasonTally: candidateReasons,
+        message: "No feasible technicians",
+      };
     }
 
     // 🤝 Offer audit rows — one bulkWrite for the whole candidate set
@@ -1124,6 +1228,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     };
     const session = await mongoose.startSession();
     let broadcastMap = new Map();
+    await extendMatchLease("transaction-start");
     
     try {
       await session.withTransaction(async () => {
@@ -1153,12 +1258,14 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         if (session.__broadcastClaimLost) return;
 
         // 3a. Create/update JobBroadcast records
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
         const bulkOps = technicianIds.map(technicianId => ({
           updateOne: {
             filter: { bookingId: booking._id, technicianId },
             update: { 
               status: "sent", 
-              expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+              expiresAt,
+              purgeAt: offerPurgeAt(expiresAt),
               $inc: { version: 1 },
             },
             upsert: true
@@ -1223,7 +1330,13 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // independently skips non-dispatchable bookings as a second layer.
     if (session.__broadcastClaimLost) {
       console.log(`📭 [TRACE] ${trc} BROADCAST_CLAIM_LOST bookingId=${bookingId} — skipping notify`);
-      return { success: true, count: 0, message: "Booking no longer dispatchable" };
+      return {
+        success: true,
+        count: 0,
+        outcome: "BROADCAST_CLAIM_LOST",
+        retryable: false,
+        message: "Booking no longer dispatchable",
+      };
     }
 
     recordMetric(METRIC_KEYS.BROADCAST_CREATED, technicianIds.length);
@@ -1273,7 +1386,9 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       recordMetric(METRIC_KEYS.SOCKET_EMITTED, technicianIds.length);
     }
 
-    // DispatchOutbox already created in transaction; worker will process for FCM
+    // DispatchOutbox already created in transaction; wake the worker now for
+    // near-zero delivery latency instead of waiting for the next poll tick.
+    wakeDispatchWorker();
     console.log(`📤 [TRACE] ${trc} DISPATCH_OUTBOX_COMMITTED bookingId=${bookingId} techCount=${technicianIds.length}`);
     recordMetric(METRIC_KEYS.OUTBOX_CREATED, technicianIds.length);
 
@@ -1298,11 +1413,24 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       console.log(`   [${i + 1}] Tech ${tid} -> Distance: ${offer ? `${(offer.distanceAtOffer / 1000).toFixed(2)} km (${Math.round(offer.distanceAtOffer)}m)` : "within 10km"}`);
     });
     console.log(`======================================================================\n`);
-    return { success: true, count: technicianIds.length };
+    return {
+      success: true,
+      count: technicianIds.length,
+      outcome: "BROADCASTED",
+      retryable: false,
+      reasonTally: candidateReasons,
+    };
 
   } catch (error) {
     console.error("❌ matchAndBroadcastBooking Error:", error);
-    return { success: false, error: error.message };
+    recordMetric(METRIC_KEYS.MATCHING_ERROR);
+    return {
+      success: false,
+      count: 0,
+      outcome: "MATCH_ERROR",
+      retryable: true,
+      error: error.message,
+    };
   } finally {
     // 🔓 Release matching lease
     await ServiceBooking.updateOne(

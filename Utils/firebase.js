@@ -202,10 +202,33 @@ export const validateFcmConfig = () => {
   return { valid: true, projectId: sa.project_id };
 };
 
+const FCM_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.FCM_SEND_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8000;
+})();
+
+const withTimeout = (promise, ms, label) =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label}_timeout`)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+
 /**
  * Send a notification to a batch of FCM tokens (multicast).
  * Returns { successCount, failureCount, failedTokens } where failedTokens is
  * [{ token, error }] — callers prune device-not-registered tokens.
+ * On transport failure returns { success:false, error, retryable:true } so
+ * callers/outboxes can retry instead of silently treating the send as done.
  */
 export const sendFcmMulticast = async (tokens, { title, body, data = {}, badge = 1 }) => {
   const fcmApp = getFcmApp();
@@ -231,6 +254,8 @@ export const sendFcmMulticast = async (tokens, { title, body, data = {}, badge =
         ttl: 86400 * 1000, // 24 hours
         notification: {
           channelId: "righttouch_alerts",
+          icon: "ic_notification",
+          color: "#16A34A",
           sound: "default",
           priority: "high",
           defaultSound: true,
@@ -255,7 +280,11 @@ export const sendFcmMulticast = async (tokens, { title, body, data = {}, badge =
       },
     };
 
-    const resp = await messaging.sendEachForMulticast(message);
+    const resp = await withTimeout(
+      messaging.sendEachForMulticast(message),
+      FCM_TIMEOUT_MS,
+      "fcm_send"
+    );
     const failedTokens = [];
     resp.responses.forEach((r, i) => {
       if (!r.success) {
@@ -270,9 +299,20 @@ export const sendFcmMulticast = async (tokens, { title, body, data = {}, badge =
       console.warn(`⚠️ FCM failures: ${failedTokens.length}/${tokens.length}`, failedTokens.slice(0, 3).map((f) => f.error));
     }
 
-    return { successCount: resp.successCount, failureCount: resp.failureCount, failedTokens };
+    return {
+      success: resp.successCount > 0,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      failedTokens,
+    };
   } catch (err) {
-    console.error("❌ FCM send error:", err.message);
-    return { skipped: true, reason: err.message };
+    const timedOut = /_timeout$/.test(err.message || "");
+    console.error(`❌ FCM send error${timedOut ? " (timeout)" : ""}:`, err.message);
+    return {
+      success: false,
+      error: timedOut ? "fcm_timeout" : err.message,
+      retryable: true,
+      timeoutMs: FCM_TIMEOUT_MS,
+    };
   }
 };

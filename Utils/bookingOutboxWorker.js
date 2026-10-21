@@ -10,6 +10,7 @@
 import BookingOutbox from "../Schemas/BookingOutbox.js";
 import { processBookingCreatedOutbox } from "./bookingService.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
+import { recordBookingOutbox } from "./broadcastMetrics.js";
 import mongoose from "mongoose";
 
 const POLL_INTERVAL_MS = 1500;
@@ -22,8 +23,10 @@ let pollTimer = null;
 let stopped = false;
 let running = 0;
 
-const backoffFor = (attempts) =>
-  Math.min(BACKOFF_BASE_MS * 2 ** attempts, MAX_BACKOFF_MS);
+const backoffFor = (attempts) => {
+  const ceiling = Math.min(BACKOFF_BASE_MS * 2 ** attempts, MAX_BACKOFF_MS);
+  return Math.max(250, Math.floor(Math.random() * ceiling));
+};
 
 const claimOne = async () => {
   const now = new Date();
@@ -33,57 +36,100 @@ const claimOne = async () => {
     { new: true, sort: { createdAt: 1 } }
   );
   if (row) return row;
+  // Stale claim recovery: keep the row inflight and atomically take ownership.
   return BookingOutbox.findOneAndUpdate(
     {
       status: "inflight",
       claimedAt: { $lte: new Date(Date.now() - CLAIM_TTL_MS) },
     },
-    { $set: { status: "pending", nextAttemptAt: now } },
-    { new: false, sort: { claimedAt: 1 } }
+    { $set: { claimedAt: now, lastError: "reclaimed_after_claim_ttl" } },
+    { new: true, sort: { claimedAt: 1 } }
   );
 };
 
-const processRow = async (row) => {
+const markDone = (row, lastError = null) =>
+  BookingOutbox.updateOne(
+    { _id: row._id },
+    { $set: { status: "done", completedAt: new Date(), lastError } }
+  );
+
+const scheduleRetry = async (row, err) => {
+  const attempts = (row.attempts || 0) + 1;
+  const giveUp = attempts >= (row.maxAttempts || 6);
+  await BookingOutbox.updateOne(
+    { _id: row._id },
+    giveUp
+      ? { $set: { status: "failed", attempts, lastError: err.message?.slice(0, 500) } }
+      : {
+          $set: {
+            status: "pending",
+            attempts,
+            lastError: err.message?.slice(0, 500),
+            nextAttemptAt: new Date(Date.now() + backoffFor(attempts)),
+          },
+        }
+  );
+  recordBookingOutbox(giveUp ? "failed" : "retried");
+  console.warn(`[BookingOutbox] ${giveUp ? "FAILED" : "retry"} ${row.eventType} booking=${row.aggregateId} (attempt ${attempts}): ${err.message}`);
+};
+
+/** Exported for regression tests; production entry remains the poller. */
+export const processRow = async (row) => {
   try {
     const verdict = await processBookingCreatedOutbox(row);
 
     if (verdict.status === "done") {
-      await BookingOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "done", completedAt: new Date(), lastError: verdict.reason || "skipped" } }
-      );
+      await markDone(row, verdict.reason || "skipped");
+      recordBookingOutbox("done");
       return;
     }
 
-    if (verdict.status === "run") {
-      const traceId = verdict.traceId;
-      console.log(`[TRACE] ${traceId} OUTBOX_WORKER_BROADCAST bookingId=${row.aggregateId}`);
-      await matchAndBroadcastBooking(row.aggregateId, ioRef, traceId);
-      await BookingOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "done", completedAt: new Date() } }
+    if (verdict.status !== "run") {
+      throw new Error(`unexpected verdict ${verdict.status}`);
+    }
+
+    const traceId = verdict.traceId;
+    console.log(`[TRACE] ${traceId} OUTBOX_WORKER_BROADCAST bookingId=${row.aggregateId}`);
+    const result = await matchAndBroadcastBooking(row.aggregateId, ioRef, traceId);
+
+    if (result?.success) {
+      if (result.outcome === "MATCH_IN_PROGRESS") {
+        // Another worker holds the matching lease. This is transient, not a
+        // match failure: retry the outbox row with backoff.
+        await scheduleRetry(row, new Error("MATCH_IN_PROGRESS"));
+        return;
+      }
+      if (result.outcome === "BROADCASTED") {
+        await markDone(row, null);
+        recordBookingOutbox("done");
+        return;
+      }
+      // Screened-out or terminal business outcomes are recorded once and
+      // never retried. Operators can see the exact stage/reason.
+      const reason = result.stage
+        ? `${result.outcome}:${result.stage}`
+        : result.outcome || "no_match";
+      await markDone(row, reason);
+      recordBookingOutbox(
+        result.outcome === "NO_ELIGIBLE_TECHNICIANS" ? "no_candidates" : "done"
       );
+      console.log(`[BookingOutbox] DONE_WITHOUT_BROADCAST booking=${row.aggregateId} outcome=${reason} reasons=${JSON.stringify(result.reasonTally || {})}`);
       return;
     }
 
-    throw new Error(`unexpected verdict ${verdict.status}`);
+    if (result?.retryable === false) {
+      await BookingOutbox.updateOne(
+        { _id: row._id },
+        { $set: { status: "failed", attempts: (row.attempts || 0) + 1, lastError: (result.outcome || result.error || "non_retryable").slice(0, 500) } }
+      );
+      recordBookingOutbox("failed");
+      console.warn(`[BookingOutbox] PERMANENT FAILURE booking=${row.aggregateId} outcome=${result.outcome || result.error}`);
+      return;
+    }
+
+    throw new Error(result?.error || result?.outcome || "broadcast_failed");
   } catch (err) {
-    const attempts = (row.attempts || 0) + 1;
-    const giveUp = attempts >= (row.maxAttempts || 6);
-    await BookingOutbox.updateOne(
-      { _id: row._id },
-      giveUp
-        ? { $set: { status: "failed", attempts, lastError: err.message?.slice(0, 500) } }
-        : {
-            $set: {
-              status: "pending",
-              attempts,
-              lastError: err.message?.slice(0, 500),
-              nextAttemptAt: new Date(Date.now() + backoffFor(attempts)),
-            },
-          }
-    );
-    console.warn(`[BookingOutbox] ${giveUp ? "FAILED" : "retry"} ${row.eventType} booking=${row.aggregateId} (attempt ${attempts}): ${err.message}`);
+    await scheduleRetry(row, err);
   }
 };
 

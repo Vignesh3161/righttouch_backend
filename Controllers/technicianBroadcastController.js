@@ -13,6 +13,7 @@ import { canArriveBy, computeLatestArrival, estimateTravelMinutes } from "../Uti
 import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { auditPurgeAt, offerPurgeAt } from "../Utils/broadcastRetention.js";
 
 const DISPATCH_LOCK_MS = 10000;
 
@@ -135,16 +136,88 @@ export const respondToJob = async (req, res) => {
       });
     }
 
+    // 📡 Version the technician is claiming — client may pass the DTO's
+    // broadcast version; otherwise use the broadcast row's version.
+    const requestedVersion =
+      Number.isInteger(req.body?.version) && req.body.version > 0
+        ? req.body.version
+        : broadcast.version || 1;
+
     // 🛑 Handle DECLINE / REJECT in its own short transaction.
     if (isDecline) {
+      await globalThis.__b09OnEligible?.();
       session = await mongoose.startSession();
       session.startTransaction();
       try {
-        await JobBroadcast.updateOne(
-          { bookingId: id, technicianId: technicianProfileId },
-          { status: "rejected" },
+        // Re-read inside the transaction so a re-broadcast/expiry/another
+        // winner that landed after Phase A cannot be overwritten by a stale
+        // decline. Update is version- and status-guarded.
+        const fresh = await JobBroadcast.findOne({
+          bookingId: id,
+          technicianId: technicianProfileId,
+          status: "sent",
+        }).session(session);
+
+        if (!fresh) {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "This job offer is no longer active. Please refresh.",
+            reason: "offer_closed",
+          });
+        }
+        if (fresh.version !== requestedVersion) {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "This job offer has been updated. Please refresh and try again.",
+            reason: "version_mismatch",
+            requestedVersion,
+            currentVersion: fresh.version,
+          });
+        }
+        if (fresh.expiresAt && new Date(fresh.expiresAt).getTime() <= Date.now()) {
+          await session.abortTransaction();
+          return res.status(410).json({
+            success: false,
+            message: "This job offer has expired. Pull to refresh your job list.",
+            reason: "offer_expired",
+            expiresAt: fresh.expiresAt,
+          });
+        }
+
+        const live = await ServiceBooking.findById(id)
+          .session(session)
+          .select("status technicianId");
+        if (!live || live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "Too late! Booking already taken or closed.",
+            reason: "booking_closed",
+          });
+        }
+
+        const declined = await JobBroadcast.updateOne(
+          { _id: fresh._id, status: "sent", version: fresh.version },
+          {
+            $set: {
+              status: "rejected",
+              respondedAt: new Date(),
+              purgeAt: auditPurgeAt(),
+            },
+          },
           { session }
         );
+        if (declined.matchedCount === 0) {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "This job offer has been updated. Please refresh and try again.",
+            reason: "version_mismatch",
+            requestedVersion,
+          });
+        }
 
         const rejectedOffer = await TechnicianBookingOffer.findOneAndUpdate(
           { bookingId: id, technicianId: technicianProfileId },
@@ -238,19 +311,15 @@ export const respondToJob = async (req, res) => {
       });
     }
 
-    // 📡 Version the technician is claiming — client may pass the DTO's
-    // broadcast version; otherwise use the broadcast row's version.
-    const requestedVersion =
-      Number.isInteger(req.body?.version) && req.body.version > 0
-        ? req.body.version
-        : broadcast.version || 1;
-
     // ⏱ Candidate booking snapshot (Phase-A advisory read).
     const candidate = await ServiceBooking.findById(id)
       .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
     if (!candidate) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
+    const observedActiveBroadcastVersion = Number.isFinite(candidate.activeBroadcastVersion)
+      ? candidate.activeBroadcastVersion
+      : 0;
 
     // 🎯 VERSION VALIDATION (advisory) — reject stale broadcast versions.
     // The authoritative version gate runs inside the Phase-B transaction.
@@ -396,7 +465,7 @@ export const respondToJob = async (req, res) => {
         for (const instantJob of allInstantJobs) {
           const feasibility = evaluateJobFeasibility({
             techLocation: techProfileForCheck.location,
-            candidateJob,
+            candidateJob: candidate,
             queue: { activeJob: null, schedules: [instantJob] },
           });
           if (!feasibility.feasible) {
@@ -474,6 +543,22 @@ export const respondToJob = async (req, res) => {
           message: "Too late! Booking already taken or closed.",
         });
       }
+      // The booking's broadcast generation must be the one observed during
+      // Phase A. A re-broadcast committed after the advisory read invalidates
+      // this offer even if the per-technician broadcast row version matched.
+      const liveActiveBroadcastVersion = Number.isFinite(live.activeBroadcastVersion)
+        ? live.activeBroadcastVersion
+        : 0;
+      if (liveActiveBroadcastVersion !== observedActiveBroadcastVersion) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This job offer has been updated. Please refresh and try again.",
+          reason: "version_mismatch",
+          requestedVersion,
+          currentVersion: fresh.version,
+        });
+      }
       // H19: a booking past its auto-cancel deadline is expired even if the
       // sweeper has not flipped it yet — never revive it via a late accept.
       // (The expiry cron owns the terminal transition; the claim only refuses.)
@@ -539,7 +624,13 @@ export const respondToJob = async (req, res) => {
       // after the Phase-A read misses this filter and loses deterministically.
       const flip = await JobBroadcast.updateOne(
         { bookingId: id, technicianId: technicianProfileId, status: "sent", version: fresh.version },
-        { $set: { status: "accepted", respondedAt: new Date() } },
+        {
+          $set: {
+            status: "accepted",
+            respondedAt: new Date(),
+            purgeAt: auditPurgeAt(),
+          },
+        },
         { session }
       );
       if (flip.matchedCount === 0) {
@@ -582,12 +673,14 @@ export const respondToJob = async (req, res) => {
     }
     // Schedule: keep the slot-driven lifecycle (reminders, escalation).
 
+    const claimFilter = {
+      _id: id,
+      status: { $in: ["pending", "broadcasted"] },
+      technicianId: null,
+      activeBroadcastVersion: observedActiveBroadcastVersion,
+    };
     booking = await ServiceBooking.findOneAndUpdate(
-      {
-        _id: id,
-        status: { $in: ["pending", "broadcasted"] },
-        technicianId: null,
-      },
+      claimFilter,
       acceptUpdate,
       { new: true, session }
     ).populate("customerId").populate({
@@ -607,7 +700,11 @@ export const respondToJob = async (req, res) => {
     }).session(session).select("technicianId");
     otherTechIds = otherBroadcasts.map(b => b.technicianId.toString());
 
-    await JobBroadcast.updateMany({ bookingId: id, technicianId: { $ne: technicianProfileId } }, { status: "expired" }, { session });
+    await JobBroadcast.updateMany(
+      { bookingId: id, technicianId: { $ne: technicianProfileId } },
+      { $set: { status: "expired", respondedAt: new Date(), purgeAt: offerPurgeAt() } },
+      { session }
+    );
 
     // 🤝 Offer audit — accepted for this tech, superseded for everyone else (INSIDE transaction)
     const acceptedOffer = await TechnicianBookingOffer.findOneAndUpdate(
@@ -651,6 +748,31 @@ export const respondToJob = async (req, res) => {
         claimErr?.code === 112 ||
         /WriteConflict|WriteConcern|wtimeout|transaction/i.test(msg);
       console.error("respondToJob claim error:", msg);
+      // H19: a conflict raced with the expiry sweeper terminal transition —
+      // classify by re-reading the authoritative booking before the generic
+      // conflict label, or a past-autoCancel booking reports claim_conflict
+      // instead of booking_expired (contract test + client refresh hint).
+      if (retryable) {
+        let expiredNow = false;
+        try {
+          const post = await ServiceBooking.findById(id)
+            .select("autoCancelAt status")
+            .lean();
+          expiredNow =
+            !!post?.autoCancelAt &&
+            new Date(post.autoCancelAt).getTime() <= Date.now() &&
+            (!post.status || ["pending", "broadcasted"].includes(post.status));
+        } catch {
+          /* classification is best-effort */
+        }
+        if (expiredNow) {
+          return res.status(409).json({
+            success: false,
+            message: "Too late! This booking has expired.",
+            reason: "booking_expired",
+          });
+        }
+      }
       return res.status(retryable ? 409 : 500).json({
         success: false,
         message: retryable ? "Too late! Booking already taken or updated. Please retry." : "Failed to accept job",

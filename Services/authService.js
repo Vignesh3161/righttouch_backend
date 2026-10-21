@@ -10,6 +10,7 @@ import { signToken } from "../Utils/token.js";
 import sendSms from "../Utils/sendSMS.js";
 import { broadcastAdminUnreadCounts } from "../Controllers/adminNotificationController.js";
 import { getIo } from "../Utils/ioAccess.js";
+import { sendWelcomeNotification } from "../Utils/sendNotification.js";
 
 /**
  * Internal Auth Service
@@ -467,6 +468,15 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
         broadcastAdminUnreadCounts(getIo());
       }
 
+      // 🔔 Welcome notification (socket + FCM; best-effort)
+      sendWelcomeNotification({
+        userId: user._id,
+        role: record.role,
+        isNewSignup: true,
+        userName: [user.fname, user.lname].filter(Boolean).join(" ").trim(),
+        technicianProfileId: technicianProfile?.[0]?._id || null,
+      }).catch((e) => console.warn("Welcome notification error:", e.message));
+
       const tokenPayload = {
         userId: user._id,
         role: record.role,
@@ -552,6 +562,15 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
       // H4: bind the token to the current revocation generation.
       tokenVersion: user.tokenVersion ?? 0,
     });
+
+    // 🔔 Welcome-back notification (socket + FCM; best-effort)
+    sendWelcomeNotification({
+      userId: user._id,
+      role: user.role,
+      isNewSignup: false,
+      userName: [user.fname, user.lname].filter(Boolean).join(" ").trim(),
+      technicianProfileId,
+    }).catch((e) => console.warn("Welcome notification error:", e.message));
 
     return {
       token,

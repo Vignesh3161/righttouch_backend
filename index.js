@@ -22,8 +22,11 @@ let redisSubClient = null;
 const initRedisAdapter = async (io) => {
   const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
   try {
-    redisPubClient = createClient({ url: redisUrl });
+    redisPubClient = createClient({ url: redisUrl, socket: { connectTimeout: 10000 } });
     redisSubClient = redisPubClient.duplicate();
+    // node-redis emits 'error' on network issues; without listeners Node crashes.
+    redisPubClient.on("error", (err) => console.warn(`[Redis adapter] pub client: ${err.message}`));
+    redisSubClient.on("error", (err) => console.warn(`[Redis adapter] sub client: ${err.message}`));
     await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
     io.adapter(createAdapter(redisPubClient, redisSubClient));
     console.log("🔴 Redis Socket.IO adapter connected — multi-server pub/sub enabled");
@@ -399,6 +402,7 @@ import { initPaymentCrons } from "./Utils/paymentCrons.js";
 import { validateFcmConfig } from "./Utils/firebase.js";
 import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
 import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
+import { getBroadcastMetrics } from "./Utils/broadcastMetrics.js";
 import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
 import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
 import { processQuotationDeliveries } from "./Services/quotationDeliveryService.js";
@@ -510,6 +514,16 @@ const startBackgroundWorkers = async () => {
 
   // 📤 Booking outbox worker — broadcast only AFTER booking transaction commit
   startBookingOutboxWorker(io);
+
+  // 📊 Broadcast funnel metrics (5-minute rolling counters; post to logs so
+  // "matched but never delivered" is visible without a metrics backend).
+  const broadcastMetricsTimer = setInterval(() => {
+    const metrics = getBroadcastMetrics();
+    if (Object.keys(metrics).length > 0) {
+      console.log("📊 broadcast_metrics", JSON.stringify(metrics));
+    }
+  }, 5 * 60 * 1000);
+  broadcastMetricsTimer.unref?.();
 
   // 💰 Initialize payment reconciliation crons (Phase 1 payments + Phase 3 payouts)
   initPaymentCrons();
@@ -790,9 +804,11 @@ const shutdown = async (signal) => {
     io.close();
     await new Promise((resolve) => httpServer.close(resolve));
     await mongoose.connection.close();
-    // Close Redis adapter clients
+    // Close Redis clients (adapter + dedupe/GEO)
     if (redisPubClient?.isOpen) await redisPubClient.quit();
     if (redisSubClient?.isOpen) await redisSubClient.quit();
+    const { closeRedisClient } = await import("./Utils/redisDedupe.js");
+    await closeRedisClient().catch(() => {});
   } catch (err) {
     console.error("Shutdown error:", err.message);
   }

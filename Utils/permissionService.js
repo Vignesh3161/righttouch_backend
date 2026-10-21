@@ -326,7 +326,13 @@ export const hasNotificationPushAllowed = async ({ userId, role }) => {
   const normRole = normalizeRole(role);
   if (!normRole) return false;
   const docs = await Permission.find({ userId, role: normRole }).lean();
-  if (!docs.length) return false; // unknown → conservative: don't push until app reports
+  if (!docs.length) {
+    // Unknown permission state: an active device token means the OS already
+    // granted notifications (no token is issued otherwise), so allow push
+    // instead of silently dropping every notification for fresh installs.
+    const activeToken = await DeviceToken.exists({ userId, isActive: true });
+    return Boolean(activeToken);
+  }
   return docs.some((d) => {
     const s = statusOf(d, "notification");
     return s === "granted" || s === "not_requested";
@@ -357,6 +363,8 @@ export const registerDeviceToken = async ({
     throw e;
   }
 
+  const existingDevice = await DeviceToken.findOne({ userId, deviceId }).select("_id").lean();
+
   await DeviceToken.findOneAndUpdate(
     { userId, deviceId },
     {
@@ -379,7 +387,35 @@ export const registerDeviceToken = async ({
     await TechnicianProfile.updateOne({ userId }, { $addToSet: { fcmTokens: fcmToken } }).catch(() => {});
   }
 
-  return { success: true };
+  // A registered FCM token implies the OS notification permission is granted.
+  // Seed the permission row, but never override an explicit denial/restriction.
+  await Permission.findOneAndUpdate(
+    { userId, deviceId },
+    {
+      $setOnInsert: {
+        role: normRole,
+        platform: platform ? String(platform).toLowerCase() : "android",
+        lastSyncedAt: new Date(),
+      },
+    },
+    { upsert: true, setDefaultsOnInsert: true }
+  ).catch((err) => console.warn("[registerDeviceToken] Permission seed warn:", err.message));
+
+  await Permission.updateOne(
+    {
+      userId,
+      deviceId,
+      "permissions.notification.status": { $nin: ["denied", "restricted"] },
+    },
+    {
+      $set: {
+        "permissions.notification.status": "granted",
+        "permissions.notification.updatedAt": new Date(),
+      },
+    }
+  ).catch((err) => console.warn("[registerDeviceToken] Permission seed warn:", err.message));
+
+  return { success: true, isNewDevice: !existingDevice };
 };
 
 /**

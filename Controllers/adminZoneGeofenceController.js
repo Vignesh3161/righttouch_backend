@@ -921,6 +921,9 @@ export const getZoneHealthDashboard = async (req, res) => {
       ServiceAvailability.countDocuments({ status: "DISABLED" }),
     ]);
 
+    const { getRedisClient } = await import("../Utils/redisDedupe.js");
+    const redisClient = await getRedisClient();
+
     return res.status(200).json({
       success: true,
       result: {
@@ -934,7 +937,7 @@ export const getZoneHealthDashboard = async (req, res) => {
           staleGpsTechnicians: staleTechsCount,
           totalActiveServices: totalServicesCount,
           disabledServiceRules: disabledServicesCount,
-          redisStatus: "CONNECTED",
+          redisStatus: redisClient?.isReady ? "CONNECTED" : "DISCONNECTED",
           mongoSpatialStatus: "OPERATIONAL",
         },
       },

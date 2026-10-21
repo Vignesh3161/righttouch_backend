@@ -8,7 +8,9 @@ import User from "../Schemas/User.js";
 import DeviceToken from "../Schemas/DeviceToken.js";
 import Notification from "../Schemas/Notification.js";
 import { deactivateTokenByValue } from "./permissionService.js";
-import { getRedisClient, isRedisAvailable } from "./redisDedupe.js";
+import { getRedisClient } from "./redisDedupe.js";
+import { getIo } from "./ioAccess.js";
+import { recordPush, recordSocket } from "./broadcastMetrics.js";
 
 /**
  * 📢 NOTIFICATION UTILITY
@@ -154,7 +156,12 @@ const TEMPORARY_TOKEN_FAILURE_CODES = new Set([
 const isPermanentTokenFailure = (errorCode) => {
   if (!errorCode) return false;
   const code = String(errorCode).toLowerCase();
-  return PERMANENT_TOKEN_FAILURE_CODES.has(code);
+  return (
+    PERMANENT_TOKEN_FAILURE_CODES.has(code) ||
+    code.includes("not-registered") ||
+    code.includes("unregistered") ||
+    code.includes("invalid-registration")
+  );
 };
 
 const isTemporaryTokenFailure = (errorCode) => {
@@ -235,6 +242,10 @@ export const sendPushNotification = async (recipientId, payload, options = {}) =
 
     const result = await sendFcmMulticast(tokens, payload);
 
+    if (result?.skipped) {
+      return { success: true, skipped: true, reason: result.reason || "fcm_not_configured" };
+    }
+
     // 🧹 Prune tokens FCM rejected as PERMANENTLY invalid
     // DO NOT prune for temporary/config errors (project mismatch, quota, etc.)
     const permanentFailures = (result.failedTokens || [])
@@ -258,6 +269,19 @@ export const sendPushNotification = async (recipientId, payload, options = {}) =
         `⚠️ FCM temporary/config failures (NOT pruning tokens): ${temporaryFailures.length}/${tokens.length}`,
         temporaryFailures.slice(0, 3).map((f) => f.error)
       );
+    }
+
+    if (result.success === false) {
+      const allPermanent =
+        (result.failedTokens?.length || 0) > 0 &&
+        permanentFailures.length === result.failedTokens.length;
+      return {
+        success: false,
+        error: result.error || "fcm_all_failed",
+        retryable: result.retryable !== false && !allPermanent,
+        permanentFailures: permanentFailures.length,
+        temporaryFailures: temporaryFailures.length,
+      };
     }
 
     return { success: true, ...result, permanentFailures: permanentFailures.length, temporaryFailures: temporaryFailures.length };
@@ -298,21 +322,37 @@ async function alreadySent(broadcastId, technicianId) {
   if (!broadcastId || !technicianId) return false;
   const key = `dedupe:jobnew:${broadcastId}:${technicianId}`;
   
-  // Try Redis first
-  if (isRedisAvailable()) {
-    try {
-      const client = await getRedisClient();
+  // Try Redis first (lazily connects on first use)
+  try {
+    const client = await getRedisClient();
+    if (client) {
       const result = await client.set(key, '1', { NX: true, EX: Math.ceil(DEDUPE_WINDOW_MS / 1000) });
       return result === null; // null means key already existed
-    } catch (err) {
-      console.warn('[Dedupe] Redis error, falling back to memory:', err.message);
     }
+  } catch (err) {
+    console.warn('[Dedupe] Redis error, falling back to memory:', err.message);
   }
   
   // In-memory fallback
   if (IN_MEMORY_FALLBACK.has(key)) return true;
   IN_MEMORY_FALLBACK.set(key, Date.now());
   return false;
+}
+
+/**
+ * Release a reservation when NOTHING was delivered. Without this, a failed
+ * first attempt would suppress the outbox retry for the whole dedupe window.
+ */
+async function releaseDedupe(broadcastId, technicianId) {
+  if (!broadcastId || !technicianId) return;
+  const key = `dedupe:jobnew:${broadcastId}:${technicianId}`;
+  IN_MEMORY_FALLBACK.delete(key);
+  try {
+    const client = await getRedisClient();
+    if (client) await client.del(key);
+  } catch (err) {
+    console.warn('[Dedupe] release failed:', err.message);
+  }
 }
 
 // Fallback cleanup
@@ -324,9 +364,18 @@ setInterval(() => {
 }, FALLBACK_CLEANUP_INTERVAL).unref?.();
 
 /**
- * Notify a single technician about a new job
+ * Notify a single technician about a new job.
+ *
+ * Delivery contract:
+ * - Dedupe is reserved BEFORE delivery and released if nothing was delivered,
+ *   so a transient socket/FCM failure can be retried by the outbox.
+ * - Socket and FCM are both attempted. Success means at least one transport
+ *   delivered; `degraded` exposes socket-ok/push-failed.
+ * - `options.deliverPush === false` is used by the legacy bulk path which
+ *   sends one batched FCM call for all technicians.
  */
-export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadcast) => {
+export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadcast, options = {}) => {
+  const deliverPush = options.deliverPush !== false;
   try {
     const activation = await checkTechnicianActivation(technicianId);
     if (!activation.isActive) {
@@ -334,7 +383,7 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       return { success: false, skipped: true, reason: activation.message };
     }
 
-    const techProfile = await TechnicianProfile.findById(technicianId).select("availability.isOnline").lean();
+    const techProfile = await TechnicianProfile.findById(technicianId).select("availability.isOnline userId").lean();
     if (!techProfile?.availability?.isOnline) {
       console.log(`⚠️ Skipped job:new for offline technician ${technicianId}`);
       return { success: false, skipped: true, reason: "technician_offline" };
@@ -342,51 +391,100 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 
     const jobDTO = toJobNewDTO(jobData, broadcast);
 
-    if (alreadySent(jobDTO.broadcastId, technicianId)) {
+    if (await alreadySent(jobDTO.broadcastId, technicianId)) {
       console.log(`⚠️ Skipped duplicate job:new ${jobDTO.broadcastId} → tech ${technicianId}`);
       return { success: false, skipped: true, reason: "duplicate" };
     }
 
-    // 1️⃣ Send socket notification FIRST (< 5ms hot path)
-    let socketResult = { success: false, offline: true, message: "Technician offline — push queued" };
+    // 1️⃣ Socket notification first (hot path)
+    let socketDelivered = false;
+    let socketError = null;
     if (io) {
-      const userRoom = SOCKET_ROOMS.USER(technicianId);
-      const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianId);
+      try {
+        const userRoom = techProfile?.userId ? SOCKET_ROOMS.USER(techProfile.userId) : null;
+        const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianId);
 
-      // Emit to standardized room and legacy room
-      io.to(userRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-      io.to(techRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-      io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
-        id: `job-${jobDTO.bookingId}`,
-        type: "JOB_NEW",
+        if (userRoom) io.to(userRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        io.to(techRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        if (userRoom) {
+          io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
+            id: `job-${jobDTO.bookingId}`,
+            type: "JOB_NEW",
+            title: "🆕 New Job Available",
+            message: `New ${jobDTO.serviceName || "service"} job in your area`,
+            bookingId: String(jobDTO.bookingId || ""),
+            createdAt: new Date().toISOString(),
+          });
+        }
+        socketDelivered = true;
+        console.log(`⚡ [JOB_NEW EMIT] Dispatched to Tech ${technicianId} (rooms: ${userRoom || "none"}, ${techRoom})`);
+      } catch (err) {
+        socketError = err.message;
+        console.warn(`⚠️ Socket emit failed for tech ${technicianId}:`, err.message);
+      }
+    } else {
+      socketError = "socket_unavailable";
+    }
+    recordSocket(socketDelivered);
+    const socketResult = socketDelivered
+      ? { success: true, message: "Job alert emitted to live socket" }
+      : { success: false, error: socketError };
+
+    // 2️⃣ FCM push (awaited so failures are visible to the outbox)
+    let pushResult = null;
+    if (deliverPush) {
+      pushResult = await sendPushNotification(technicianId, {
         title: "🆕 New Job Available",
-        message: `New ${jobDTO.serviceName || "service"} job in your area`,
-        bookingId: String(jobDTO.bookingId || ""),
-        createdAt: new Date().toISOString(),
+        body: `New ${jobDTO.serviceName || "service"} job in your area`,
+        data: {
+          type: "new_job",
+          bookingId: String(jobDTO.bookingId || ""),
+          serviceId: String(jobDTO.serviceId || ""),
+          scheduledAt: String(jobDTO.scheduledAt || ""),
+        },
+      }, { recipientType: "technician" }).catch((err) => ({
+        success: false,
+        error: err.message,
+      }));
+
+      const pushDelivered = pushResult?.success === true && !pushResult?.skipped;
+      const pushSkipped = pushResult?.skipped === true;
+      recordPush({
+        delivered: pushDelivered,
+        skipped: pushSkipped,
+        failed: !pushDelivered && !pushSkipped,
       });
 
-      console.log(`⚡ [JOB_NEW EMIT] Dispatched to Tech ${technicianId} (rooms: ${userRoom}, ${techRoom})`);
-      socketResult = { success: true, message: "Job alert emitted to live socket" };
+      if (!socketDelivered && !pushDelivered) {
+        await releaseDedupe(jobDTO.broadcastId, technicianId);
+        console.warn(`❌ [JOB_NEW] No transport delivered booking=${jobDTO.bookingId} tech=${technicianId}: ${pushResult?.error || pushResult?.reason || socketError}`);
+        return {
+          success: false,
+          retryable: true,
+          error: pushResult?.error || pushResult?.reason || socketError || "delivery_failed",
+          socket: socketResult,
+          push: pushResult,
+        };
+      }
+
+      return {
+        success: true,
+        delivered: socketDelivered || pushDelivered,
+        degraded: socketDelivered && !pushDelivered,
+        socket: socketResult,
+        push: pushResult,
+      };
     }
 
-    // 2️⃣ Send push notification in background (non-blocking)
-    sendPushNotification(technicianId, {
-      title: "🆕 New Job Available",
-      body: `New ${jobDTO.serviceName || "service"} job in your area`,
-      data: {
-        type: "new_job",
-        bookingId: String(jobDTO.bookingId || ""),
-        serviceId: String(jobDTO.serviceId || ""),
-        scheduledAt: String(jobDTO.scheduledAt || ""),
-      },
-    }, { recipientType: "technician" }).catch((err) => {
-      console.warn(`⚠️ Background push notification error for tech ${technicianId}:`, err.message);
-    });
-
-    return { success: true, socket: socketResult };
+    // Legacy batch path: socket must have succeeded; batch FCM is sent by caller.
+    if (!socketDelivered) {
+      await releaseDedupe(jobDTO.broadcastId, technicianId);
+      return { success: false, retryable: true, error: socketError || "socket_unavailable", socket: socketResult };
+    }
+    return { success: true, delivered: true, socket: socketResult, push: null };
   } catch (error) {
     console.error(`❌ Error notifying technician ${technicianId}:`, error.message);
-    return { success: false, error: error.message };
+    return { success: false, retryable: true, error: error.message };
   }
 };
 
@@ -433,7 +531,10 @@ export const broadcastJobToTechnicians = async (io, technicianIds, jobData, broa
     await Promise.allSettled(
       technicianIds.map(async (technicianId) => {
         const broadcast = broadcastMap?.get(technicianId?.toString?.() || technicianId);
-        const notifyResult = await notifyTechnicianOfNewJob(io, technicianId, jobData, broadcast);
+        const notifyResult = await notifyTechnicianOfNewJob(io, technicianId, jobData, broadcast, {
+          // One batched FCM call below covers every technician.
+          deliverPush: false,
+        });
         results.socket.push({ technicianId, ...notifyResult });
       })
     );
@@ -605,5 +706,73 @@ export const notifyTechnicianWithFallback = async (io, technicianId, payload, cr
   } catch (error) {
     console.error("❌ Reliable notification error:", error.message);
     return { success: false, error: error.message };
+  }
+};
+
+/**
+ * Welcome notification on first signup / login.
+ * Delivers live Socket.IO event + FCM push (best-effort; never blocks auth).
+ * In-app DB rows are intentionally skipped so repeated logins don't spam the feed.
+ */
+export const sendWelcomeNotification = async ({
+  userId,
+  role = "Customer",
+  isNewSignup = true,
+  userName = "",
+  technicianProfileId = null,
+} = {}) => {
+  try {
+    if (!userId) return { success: false, reason: "missing_userId" };
+
+    const normalizedRole = String(role || "Customer").toLowerCase();
+    const recipientType =
+      normalizedRole === "admin" || normalizedRole === "owner"
+        ? "admin"
+        : normalizedRole === "technician"
+        ? "technician"
+        : "customer";
+
+    const greeting = userName ? `, ${userName}` : "";
+    const title = isNewSignup ? "Welcome to RightTouch! 🎉" : "Welcome back! 👋";
+    const body = isNewSignup
+      ? `Welcome to the RightTouch family${greeting}. Your service is our priority!`
+      : `Welcome back${greeting}. Great to see you again!`;
+    const eventType = isNewSignup ? "WELCOME_SIGNUP" : "WELCOME_LOGIN";
+
+    // 1. Real-time Socket.IO emit
+    const io = getIo();
+    if (io) {
+      io.to(SOCKET_ROOMS.USER(userId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
+        type: eventType,
+        title,
+        message: body,
+        body,
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    // 2. FCM push (fire-and-forget so auth responses stay fast).
+    // Technician pushes resolve via profile id (legacy token arrays) and the
+    // profile's userId (DeviceToken rows), so prefer it when available.
+    const pushRecipientId =
+      normalizedRole === "technician" ? technicianProfileId || userId : userId;
+
+    sendPushNotification(
+      pushRecipientId,
+      {
+        title,
+        body,
+        data: {
+          type: "welcome",
+          route: "/notifications",
+        },
+      },
+      { recipientType }
+    ).catch((e) => console.warn("Failed to dispatch welcome push:", e.message));
+
+    return { success: true };
+  } catch (err) {
+    console.warn("sendWelcomeNotification warning:", err.message);
+    return { success: false, error: err.message };
   }
 };

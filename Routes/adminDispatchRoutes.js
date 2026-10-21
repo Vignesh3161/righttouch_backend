@@ -1,7 +1,9 @@
 import express from "express";
 import { Auth, authorizeRoles } from "../Middleware/Auth.js";
 import DispatchOutbox from "../Schemas/DispatchOutbox.js";
+import BookingOutbox from "../Schemas/BookingOutbox.js";
 import { startDispatchWorker, stopDispatchWorker } from "../Utils/dispatchQueue.js";
+import { getBroadcastMetrics } from "../Utils/broadcastMetrics.js";
 
 const router = express.Router();
 const adminOnly = authorizeRoles("Admin", "Owner");
@@ -16,14 +18,30 @@ router.get("/stats", Auth, adminOnly, async (req, res) => {
       inflight,
       done,
       failed,
-      total
+      total,
+      bookingPending,
+      bookingInflight,
+      bookingFailed,
+      oldestDispatch,
+      oldestBooking,
+      staleDispatchInflight,
+      staleBookingInflight,
     ] = await Promise.all([
       DispatchOutbox.countDocuments({ status: "pending" }),
       DispatchOutbox.countDocuments({ status: "inflight" }),
       DispatchOutbox.countDocuments({ status: "done" }),
       DispatchOutbox.countDocuments({ status: "failed" }),
       DispatchOutbox.countDocuments({}),
+      BookingOutbox.countDocuments({ status: "pending" }),
+      BookingOutbox.countDocuments({ status: "inflight" }),
+      BookingOutbox.countDocuments({ status: "failed" }),
+      DispatchOutbox.findOne({ status: "pending" }).sort({ createdAt: 1 }).select("createdAt").lean(),
+      BookingOutbox.findOne({ status: "pending" }).sort({ createdAt: 1 }).select("createdAt").lean(),
+      DispatchOutbox.countDocuments({ status: "inflight", claimedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } }),
+      BookingOutbox.countDocuments({ status: "inflight", claimedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } }),
     ]);
+    const ageSeconds = (doc) =>
+      doc?.createdAt ? Math.round((Date.now() - new Date(doc.createdAt).getTime()) / 1000) : null;
 
     // Average processing time for completed
     const completed = await DispatchOutbox.aggregate([
@@ -49,6 +67,16 @@ router.get("/stats", Auth, adminOnly, async (req, res) => {
         failed,
         completed: completed[0] || { avgMs: 0, maxMs: 0, minMs: 0 },
         retryDistribution: retryDist.map(r => ({ attempts: r._id, count: r.count })),
+        oldestPendingAgeSeconds: ageSeconds(oldestDispatch),
+        staleInflight,
+        bookingOutbox: {
+          pending: bookingPending,
+          inflight: bookingInflight,
+          failed: bookingFailed,
+          oldestPendingAgeSeconds: ageSeconds(oldestBooking),
+          staleInflight: staleBookingInflight,
+        },
+        deliveryMetrics: getBroadcastMetrics(),
       },
     });
   } catch (err) {
@@ -143,8 +171,8 @@ router.post("/:id/retry", Auth, adminOnly, async (req, res) => {
     await item.save();
 
     // Trigger immediate processing
-    const { poll } = await import("../Utils/dispatchQueue.js");
-    poll().catch(() => {});
+    const { wakeDispatchWorker } = await import("../Utils/dispatchQueue.js");
+    wakeDispatchWorker();
 
     res.json({ 
       success: true, 
@@ -172,8 +200,8 @@ router.post("/retry-failed", Auth, adminOnly, async (req, res) => {
     );
 
     // Trigger immediate processing
-    const { poll } = await import("../Utils/dispatchQueue.js");
-    poll().catch(() => {});
+    const { wakeDispatchWorker } = await import("../Utils/dispatchQueue.js");
+    wakeDispatchWorker();
 
     res.json({
       success: true,
@@ -211,6 +239,7 @@ router.post("/worker/stop", Auth, adminOnly, async (req, res) => {
 router.get("/health", Auth, adminOnly, async (req, res) => {
   try {
     const { getRedisClient, isRedisAvailable } = await import("../Utils/redisDedupe.js");
+    await getRedisClient();
     const redisAvailable = isRedisAvailable();
     
     res.json({

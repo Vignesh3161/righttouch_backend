@@ -6,7 +6,7 @@ import { haversineMeters } from "./feasibility.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
-import { STALENESS_SECONDS } from "./locationConfig.js";
+import { getGpsState } from "./locationConfig.js";
 
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
@@ -39,12 +39,14 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
         return [];
     }
 
-    if (STALENESS_SECONDS > 0 && technician.locationUpdatedAt) {
-        const cutoff = new Date(Date.now() - STALENESS_SECONDS * 1000);
-        if (new Date(technician.locationUpdatedAt) < cutoff) {
-            console.log(`[fetchJobsInternal] Tech ${technicianProfileId} GPS is stale (${technician.locationUpdatedAt}). Hiding jobs.`);
-            return [];
-        }
+    const gps = getGpsState(technician, "FETCH");
+    if (!gps.valid) {
+        console.log(`[fetchJobsInternal] Tech ${technicianProfileId} has invalid/missing GPS coordinates. Hiding jobs.`);
+        return [];
+    }
+    if (!gps.fresh) {
+        console.log(`[fetchJobsInternal] Tech ${technicianProfileId} GPS is stale or missing timestamp (${technician.locationUpdatedAt || "none"}, reason=${gps.reason}, age=${gps.ageSeconds}s, threshold=${gps.thresholdSeconds}s). Hiding jobs.`);
+        return [];
     }
 
     // 4. Find active unexpired broadcasts

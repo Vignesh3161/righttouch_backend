@@ -356,5 +356,14 @@ technicianProfileSchema.index({ isRead: 1, workStatus: 1 });
 technicianProfileSchema.index({ allowedCityIds: 1 });
 technicianProfileSchema.index({ "availability.isOnline": 1, workStatus: 1, primaryDistrictId: 1 });
 
+// Matching prefilter: skill + online/approved + fresh GPS. Complements the
+// 2dsphere index (Mongo picks the more selective predicate per booking).
+technicianProfileSchema.index({
+  "skills.serviceId": 1,
+  workStatus: 1,
+  "availability.isOnline": 1,
+  locationUpdatedAt: -1,
+});
+
 export default mongoose.models.TechnicianProfile ||
   mongoose.model("TechnicianProfile", technicianProfileSchema);
