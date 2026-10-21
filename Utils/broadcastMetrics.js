@@ -141,3 +141,51 @@ export function recordHistogram(key, value) {
 export function getBroadcastMetrics() {
   return broadcastMetrics.getAllMetrics();
 }
+
+/* ============================================================
+   Delivery/outbox counters (5-minute rolling window like above)
+   ============================================================ */
+export const PIPELINE_METRIC_KEYS = {
+  PUSH_ATTEMPTED: 'push_attempted',
+  PUSH_SKIPPED: 'push_skipped',
+  DISPATCH_PROCESSED: 'dispatch_processed',
+  DISPATCH_DONE: 'dispatch_done',
+  DISPATCH_RETRIED: 'dispatch_retried',
+  DISPATCH_FAILED: 'dispatch_failed',
+  DISPATCH_SKIPPED: 'dispatch_skipped',
+  BOOKING_OUTBOX_PROCESSED: 'booking_outbox_processed',
+  BOOKING_OUTBOX_DONE: 'booking_outbox_done',
+  BOOKING_OUTBOX_RETRIED: 'booking_outbox_retried',
+  BOOKING_OUTBOX_FAILED: 'booking_outbox_failed',
+  BOOKING_OUTBOX_NO_CANDIDATES: 'booking_outbox_no_candidates',
+  BOOKING_OUTBOX_LEASE_CONFLICT: 'booking_outbox_lease_conflict',
+};
+
+export const recordPush = ({ delivered = false, skipped = false, failed = false } = {}) => {
+  recordMetric(PIPELINE_METRIC_KEYS.PUSH_ATTEMPTED);
+  if (delivered) recordMetric(METRIC_KEYS.FCM_SENT);
+  if (skipped) recordMetric(PIPELINE_METRIC_KEYS.PUSH_SKIPPED);
+  if (failed) recordMetric(METRIC_KEYS.FCM_FAILED);
+};
+
+export const recordSocket = (delivered) => {
+  if (delivered) recordMetric(METRIC_KEYS.SOCKET_DELIVERED);
+  else recordMetric(METRIC_KEYS.SOCKET_EMIT_FAILED);
+};
+
+export const recordDispatch = (status) => {
+  recordMetric(PIPELINE_METRIC_KEYS.DISPATCH_PROCESSED);
+  if (status === "done") recordMetric(PIPELINE_METRIC_KEYS.DISPATCH_DONE);
+  else if (status === "retried") recordMetric(PIPELINE_METRIC_KEYS.DISPATCH_RETRIED);
+  else if (status === "failed") recordMetric(PIPELINE_METRIC_KEYS.DISPATCH_FAILED);
+  else if (status === "skipped") recordMetric(PIPELINE_METRIC_KEYS.DISPATCH_SKIPPED);
+};
+
+export const recordBookingOutbox = (status) => {
+  recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_PROCESSED);
+  if (status === "done") recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_DONE);
+  else if (status === "retried") recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_RETRIED);
+  else if (status === "failed") recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_FAILED);
+  else if (status === "no_candidates") recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_NO_CANDIDATES);
+  else if (status === "lease_conflict") recordMetric(PIPELINE_METRIC_KEYS.BOOKING_OUTBOX_LEASE_CONFLICT);
+};

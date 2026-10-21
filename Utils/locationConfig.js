@@ -36,3 +36,36 @@ export function checkGpsValid(tech) {
 export function checkGpsStale(tech, mode = "BROADCAST") {
   return !checkGpsFreshness(tech, mode);
 }
+
+/**
+ * Structured GPS state used by eligibility diagnostics. Keeps the canonical
+ * 90s (BROADCAST/FETCH) and 15m (ACCEPT) thresholds while exposing WHY a
+ * technician failed so operators can distinguish missing fix / missing
+ * timestamp / stale fix / malformed coordinates.
+ */
+export function getGpsState(tech, mode = "BROADCAST") {
+  const thresholdSeconds =
+    mode === "ACCEPT" ? ACCEPT_GRACE_SECONDS : STALENESS_SECONDS;
+  const valid = checkGpsValid(tech);
+  const hasTimestamp = Boolean(tech?.locationUpdatedAt);
+  const timestampMs = hasTimestamp ? new Date(tech.locationUpdatedAt).getTime() : null;
+  const validTimestamp = Number.isFinite(timestampMs);
+  const ageMs = validTimestamp ? Math.max(0, Date.now() - timestampMs) : null;
+  const fresh =
+    thresholdSeconds <= 0 || (ageMs != null && ageMs <= thresholdSeconds * 1000);
+
+  let reason = null;
+  if (!valid) reason = "MISSING_LOCATION";
+  else if (!hasTimestamp || !validTimestamp) reason = "GPS_TIMESTAMP_MISSING";
+  else if (!fresh) reason = "GPS_STALE";
+
+  return {
+    valid,
+    fresh,
+    hasTimestamp: hasTimestamp && validTimestamp,
+    ageMs,
+    ageSeconds: ageMs != null ? Math.round(ageMs / 1000) : null,
+    thresholdSeconds,
+    reason,
+  };
+}

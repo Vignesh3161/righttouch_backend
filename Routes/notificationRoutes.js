@@ -9,6 +9,7 @@ import {
   markReadAll,
   markReceived,
   markOpened,
+  sendTestNotification,
 } from "../Controllers/notificationController.js";
 import {
   getAdminUnreadCounts,
@@ -27,5 +28,6 @@ router.patch("/:id/read", markRead);
 router.patch("/read-all", markReadAll);
 router.post("/:id/received", markReceived);
 router.post("/:id/opened", markOpened);
+router.post("/test-push", sendTestNotification);
 
 export default router;

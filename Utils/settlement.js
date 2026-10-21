@@ -139,7 +139,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * (never the body); persistently unknown commits throw so we never claim
  * success for uncommitted effects.
  */
-const runSettlementTxn = async (session, fn, { maxAttempts = 8 } = {}) => {
+const runSettlementTxn = async (session, fn, { maxAttempts = 20 } = {}) => {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await session.startTransaction();
@@ -153,7 +153,7 @@ const runSettlementTxn = async (session, fn, { maxAttempts = 8 } = {}) => {
           commitErr.errorLabels.includes("UnknownTransactionCommitResult") &&
           attempt < maxAttempts
         ) {
-          await sleep(100 * attempt + Math.floor(Math.random() * 100));
+          await sleep(150 * attempt + Math.floor(Math.random() * 250));
           try {
             await session.commitTransaction();
           } catch (retryErr) {
@@ -174,7 +174,7 @@ const runSettlementTxn = async (session, fn, { maxAttempts = 8 } = {}) => {
         await session.abortTransaction();
       } catch {}
       if (isTransientTxnError(e) && attempt < maxAttempts) {
-        await sleep(100 * attempt + Math.floor(Math.random() * 100));
+        await sleep(150 * attempt + Math.floor(Math.random() * 250));
         continue;
       }
       throw e;

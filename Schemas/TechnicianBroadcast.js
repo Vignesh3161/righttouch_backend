@@ -22,6 +22,18 @@ const jobBroadcastSchema = new mongoose.Schema(
       type: Date,
     },
 
+    // Retention timestamp. expiresAt is BUSINESS state (when the offer is no
+    // longer actionable); purgeAt is STORAGE policy. Keeping them separate
+    // prevents the TTL monitor from deleting accepted/rejected audit rows.
+    purgeAt: {
+      type: Date,
+    },
+
+    respondedAt: {
+      type: Date,
+      default: null,
+    },
+
     status: {
       type: String,
       enum: ["sent", "accepted", "rejected", "expired", "ACCEPTED"],
@@ -44,8 +56,11 @@ const jobBroadcastSchema = new mongoose.Schema(
 // 🚨 Prevent duplicate job sends
 jobBroadcastSchema.index({ bookingId: 1, technicianId: 1 }, { unique: true });
 
-// TTL index for automatic cleanup of expired broadcasts
-// MongoDB will automatically delete documents where expiresAt < now
-jobBroadcastSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// Feed lookup: technician's live offers ordered by expiry.
+jobBroadcastSchema.index({ technicianId: 1, status: 1, expiresAt: 1 });
+
+// Retention TTL. The old index on `expiresAt` MUST be dropped in production
+// (it deleted offers/audit rows the moment the business offer expired).
+jobBroadcastSchema.index({ purgeAt: 1 }, { expireAfterSeconds: 0 });
 
 export default mongoose.models.JobBroadcast || mongoose.model("JobBroadcast", jobBroadcastSchema);

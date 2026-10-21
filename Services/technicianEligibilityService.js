@@ -7,7 +7,7 @@ import CityZone from "../Schemas/CityZone.js";
 import { resolveOperationalCityFromCoordinates } from "../Utils/technicianMatching.js";
 import { resolveServiceAvailability } from "./serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
-import { STALENESS_SECONDS, ACCEPT_GRACE_SECONDS, checkGpsFreshness, checkGpsValid } from "../Utils/locationConfig.js";
+import { getGpsState } from "../Utils/locationConfig.js";
 
 const MAX_JOB_DISTANCE_KM = 10;
 const MAX_JOB_DISTANCE_METERS = 10000;
@@ -158,12 +158,20 @@ export const getEffectiveRadiusMeters = (tech) => {
  * @param {Object|string} params.technician - TechnicianProfile doc or ID
  * @param {Object} params.booking - ServiceBooking doc (required)
  * @param {string} params.mode - "BROADCAST" | "ACCEPT" | "FETCH"
+ * @param {Object} [params.context] - Booking-level precomputed data shared by
+ *   every candidate (jobDistrictId, jobZoneId, serviceAvailability). Passing
+ *   it avoids repeating the same availability/geo reads for each candidate.
+ * @param {Object} [params.context.currentDistrictCheck] - optional precomputed
+ *   result of checkCurrentDistrictMatch for this technician.
+ * @param {Object} [params.context.currentZoneCheck] - optional precomputed
+ *   result of checkCurrentZoneMatch for this technician.
  * @returns {Promise<Object>} { eligible, reasons, details, distanceMeters, effectiveRadiusMeters }
  */
 export const evaluateTechnicianEligibility = async ({
   technician,
   booking,
   mode = "BROADCAST",
+  context = null,
 }) => {
   const reasons = [];
   const details = {
@@ -207,14 +215,16 @@ export const evaluateTechnicianEligibility = async ({
   const hasJobCoords = Number.isFinite(jobLat) && Number.isFinite(jobLng);
 
   // 1. RESOLVE JOB DISTRICT/ZONE
+  const shared = context || {};
+  const hasShared = (key) => Object.prototype.hasOwnProperty.call(shared, key);
   let targetDistrictId = booking.districtId ? String(booking.districtId._id || booking.districtId) : null;
   let targetZoneId = booking.cityZoneId ? String(booking.cityZoneId._id || booking.cityZoneId) : null;
 
-  if (!targetDistrictId && hasJobCoords) {
+  if (!targetDistrictId && hasJobCoords && !hasShared("jobDistrictId")) {
     const resolvedCity = await resolveOperationalCityFromCoordinates(jobLat, jobLng);
     if (resolvedCity?._id) targetDistrictId = String(resolvedCity._id);
   }
-  if (!targetZoneId && hasJobCoords) {
+  if (!targetZoneId && hasJobCoords && !hasShared("jobZoneId")) {
     const resolvedZone = await CityZone.findOne({
       polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: [jobLng, jobLat] } } },
       active: true,
@@ -222,13 +232,16 @@ export const evaluateTechnicianEligibility = async ({
     if (resolvedZone?._id) targetZoneId = String(resolvedZone._id);
   }
 
+  if (!targetDistrictId && hasShared("jobDistrictId")) targetDistrictId = shared.jobDistrictId;
+  if (!targetZoneId && hasShared("jobZoneId")) targetZoneId = shared.jobZoneId;
+
   details.jobDistrictId = targetDistrictId;
   details.jobZoneId = targetZoneId;
 
   // 2. SERVICE AVAILABILITY AT JOB LOCATION
   if (booking.serviceId && targetDistrictId) {
-    const avail = await resolveServiceAvailability({
-      serviceId: booking.serviceId,
+    const avail = shared.serviceAvailability || await resolveServiceAvailability({
+      serviceId: booking.serviceId._id || booking.serviceId,
       districtId: targetDistrictId,
       cityZoneId: targetZoneId,
     });
@@ -271,13 +284,24 @@ export const evaluateTechnicianEligibility = async ({
     if (!hasSkill) reasons.push("SERVICE_SKILL_MISSING");
   }
 
-  // 6. GPS VALIDITY
-  details.validGps = checkGpsValid(tech);
-  if (!details.validGps) reasons.push("MISSING_LOCATION");
-
-  // 7. GPS FRESHNESS (mode-dependent threshold)
-  details.gpsFresh = checkGpsFreshness(tech, mode);
-  if (!details.gpsFresh) reasons.push("GPS_STALE");
+  // 6. GPS VALIDITY & FRESHNESS (mode-dependent threshold)
+  const gps = getGpsState(tech, mode);
+  details.validGps = gps.valid;
+  details.gpsFresh = gps.fresh;
+  details.gpsReason = gps.reason;
+  details.gpsAgeSeconds = gps.ageSeconds;
+  details.gpsThresholdSeconds = gps.thresholdSeconds;
+  if (!gps.valid) {
+    reasons.push("MISSING_LOCATION");
+  } else if (gps.thresholdSeconds > 0) {
+    if (!gps.hasTimestamp) {
+      // Keep GPS_STALE for backward compatibility but expose the precise cause.
+      if (!reasons.includes("GPS_TIMESTAMP_MISSING")) reasons.push("GPS_TIMESTAMP_MISSING");
+      if (!reasons.includes("GPS_STALE")) reasons.push("GPS_STALE");
+    } else if (!gps.fresh && !reasons.includes("GPS_STALE")) {
+      reasons.push("GPS_STALE");
+    }
+  }
 
   // 8. DISTRICT PERMISSION
   const allowedDistrictIds = getAllowedDistrictIds(tech);
@@ -292,7 +316,8 @@ export const evaluateTechnicianEligibility = async ({
 
   // 9. CURRENT PHYSICAL GPS DISTRICT MATCH
   if (details.validGps && targetDistrictId) {
-    const { match, currentDistrictId } = await checkCurrentDistrictMatch(tech, targetDistrictId);
+    const { match, currentDistrictId } = shared.currentDistrictCheck ||
+      await checkCurrentDistrictMatch(tech, targetDistrictId);
     details.currentDistrictMatch = match;
     details.currentDistrictId = currentDistrictId;
     if (!match) reasons.push("CURRENT_LOCATION_OUTSIDE_DISTRICT");
@@ -309,7 +334,8 @@ export const evaluateTechnicianEligibility = async ({
 
   // 11. CURRENT PHYSICAL GPS ZONE MATCH
   if (details.validGps && targetZoneId) {
-    const { match, currentZoneId } = await checkCurrentZoneMatch(tech, targetZoneId);
+    const { match, currentZoneId } = shared.currentZoneCheck ||
+      await checkCurrentZoneMatch(tech, targetZoneId);
     details.currentZoneMatch = match;
     // Only add reason if zone permission was explicitly configured
     if (!match && getAllowedZoneIds(tech).length > 0) {
@@ -342,6 +368,7 @@ export const evaluateTechnicianEligibility = async ({
 
   // Structured logging for traceability
   console.log(`[ELIGIBILITY:${mode}]`, JSON.stringify({
+    traceId: shared.traceId || null,
     technicianId: tech._id,
     bookingId: booking._id,
     mode,
@@ -354,10 +381,14 @@ export const evaluateTechnicianEligibility = async ({
     zonePermission: details.zonePermission,
     currentZoneMatch: details.currentZoneMatch,
     gpsFresh: details.gpsFresh,
+    gpsReason: details.gpsReason,
+    gpsAgeSeconds: details.gpsAgeSeconds,
+    gpsThresholdSeconds: details.gpsThresholdSeconds,
     online: details.online,
     verified: details.verified,
     hasSkill: details.hasSkill,
     serviceAvailable: details.serviceAvailable,
+    serviceAvailabilitySource: shared.serviceAvailability ? "precomputed" : "resolved",
   }));
 
   return { eligible, reasons, details };
