@@ -547,6 +547,16 @@ const stripSensitiveFinancials = (booking) => {
     delete o.financialSnapshot.commissionRuleSource;
     delete o.financialSnapshot.commissionRuleId;
     delete o.financialSnapshot.commissionOverridden;
+    const totalPaise = o.financialSnapshot.totalAmountPaise;
+    if (Number.isFinite(totalPaise)) {
+      o.totalAmount = paiseToRupees(totalPaise);
+      o.totalAmountPaise = totalPaise;
+    }
+    const basePaise = o.financialSnapshot.baseAmountPaise;
+    if (Number.isFinite(basePaise)) {
+      o.serviceAmount = paiseToRupees(basePaise);
+      o.discountAmount = paiseToRupees(o.financialSnapshot.discountAmountPaise || 0);
+    }
   }
   delete o.technicianAmount;
   delete o.technicianAmountPaise;

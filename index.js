@@ -186,7 +186,7 @@ const httpServer = createServer(App);
 const trustProxyEnv = process.env.TRUST_PROXY;
 const trustProxy =
   typeof trustProxyEnv === "string"
-    ? trustProxyEnv === "true" || trustProxyEnv === "1"
+    ? (/^\d+$/.test(trustProxyEnv.trim()) ? Number(trustProxyEnv.trim()) : trustProxyEnv.trim() === "true")
     : (process.env.NODE_ENV === "production" ? 1 : false);
 App.set("trust proxy", trustProxy);
 
