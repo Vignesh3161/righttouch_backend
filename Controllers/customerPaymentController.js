@@ -94,8 +94,26 @@ export const getMyPaymentDetail = async (req, res) => {
       : [];
 
     const dto = buildCustomerPaymentDTO({ booking, payment, liveAttempt, state });
+
+    let rewardPreview = null;
+    if ((state === "due" || state === "cash_due") && booking.itemType === "service") {
+      try {
+        const { getRewardRedemptionQuote } = await import("../Services/rewardService.js");
+        const requestedCoins = req.query.coins ?? req.query.redeemCoins ?? null;
+        rewardPreview = await getRewardRedemptionQuote({
+          customerId: req.user.userId,
+          booking: { ...booking, itemType: "service" },
+          payment,
+          requestedCoins,
+        });
+      } catch (e) {
+        console.warn("[getMyPaymentDetail] reward preview skipped:", e.message);
+      }
+    }
+
     return ok(res, 200, "Payment detail", {
       ...dto,
+      rewardPreview,
       attempts: attempts.map((a) => ({
         attemptId: a._id?.toString(),
         method: a.method,
