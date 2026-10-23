@@ -62,7 +62,20 @@ const paymentSchema = new mongoose.Schema(
     // snapshot taken at order creation. NEVER recomputed here.
     // ──────────────────────────────────────────────────────────────
     baseAmountPaise: { type: Number, default: 0, min: 0 },
+    // Gross snapshot total before any platform-funded reward discount.
+    // Settlement validates against this (commission/technician math unchanged).
+    grossTotalAmountPaise: { type: Number, default: 0, min: 0 },
+    // Net amount actually payable/captured (gross - rewardDiscountPaise).
     totalAmountPaise: { type: Number, default: 0, min: 0 },
+    // Platform-funded customer coin redemption applied to this payment.
+    rewardDiscountPaise: { type: Number, default: 0, min: 0 },
+    rewardCoinsRedeemed: { type: Number, default: 0, min: 0 },
+    rewardRedemptionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RewardRedemption",
+      default: null,
+      index: true,
+    },
     commissionPercentage: { type: Number, default: 0, min: 0, max: 100 },
     commissionAmountPaise: { type: Number, default: 0, min: 0 },
     technicianAmountPaise: { type: Number, default: 0, min: 0 },

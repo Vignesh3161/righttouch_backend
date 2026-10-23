@@ -1,7 +1,7 @@
 /**
  * ✅ SERVICE COMPLETION VERIFICATION (Checkpoint C).
  *
- * Customer-confirmed job completion: the technician requests a 6-digit OTP,
+ * Customer-confirmed job completion: the technician requests a 4-digit OTP,
  * the customer receives it by SMS, the technician submits it, and the
  * booking flips to `completed` ONLY inside the same transaction that
  * consumes the challenge.
@@ -25,6 +25,7 @@ import User from "../Schemas/User.js";
 import Report from "../Schemas/Report.js";
 import { canTransition } from "../Utils/bookingStatus.js";
 import {
+  OTP_PATTERN,
   OTP_TTL_MS,
   OTP_MAX_RESENDS,
   OTP_ERRORS,
@@ -249,7 +250,7 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
  * effects (settlement + notifications, run by the caller as today).
  */
 export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp }) => {
-  if (!/^\d{6}$/.test(String(otp || ""))) {
+  if (!OTP_PATTERN.test(String(otp || ""))) {
     throw fail(400, OTP_ERRORS.INVALID, "Invalid OTP format");
   }
   const now = new Date();

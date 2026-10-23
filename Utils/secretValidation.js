@@ -9,7 +9,7 @@ const REQUIRED = [
   "KYC_MASTER_KEY_B64",
   "MONGO_URI",
   // Independent HMAC pepper for service-completion OTPs (Checkpoint B).
-  // Must NOT reuse JWT/Razorpay/KYC secrets: a 6-digit OTP has a small
+  // Must NOT reuse JWT/Razorpay/KYC secrets: a short numeric OTP has a small
   // search space, so the pepper is the brute-force backstop.
   // Generate: openssl rand -hex 32
   "COMPLETION_OTP_PEPPER",

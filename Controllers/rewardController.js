@@ -10,7 +10,13 @@ import {
   listRewardTransactionsForAdmin,
   listRewardWalletsForAdmin,
   getCustomerRewardOverview,
+  getRewardRedemptionQuote,
+  getRewardRedemptions,
+  listRewardRedemptionsForAdmin,
+  getRewardLiabilitySummary,
 } from "../Services/rewardService.js";
+import ServiceBooking from "../Schemas/ServiceBooking.js";
+import Payment from "../Schemas/Payment.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { ensureCustomer } from "../Utils/ensureCustomer.js";
 
@@ -49,13 +55,50 @@ export const reconcileMyRewards = async (req, res) => {
   }
 };
 
+export const getMyRedemptionPreview = async (req, res) => {
+  try {
+    ensureCustomer(req);
+    if (!mongoose.Types.ObjectId.isValid(req.query.bookingId)) {
+      return res.status(400).json({ success: false, message: "Valid bookingId required" });
+    }
+    const booking = await ServiceBooking.findOne({
+      _id: req.query.bookingId,
+      customerId: req.user.userId,
+    }).lean();
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+    const payment = await Payment.findOne({ bookingId: booking._id }).lean();
+    const quote = await getRewardRedemptionQuote({
+      customerId: req.user.userId,
+      booking: { ...booking, itemType: "service" },
+      payment,
+      requestedCoins: req.query.coins ?? req.query.redeemCoins ?? null,
+    });
+    return res.json({ success: true, result: quote });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ success: false, message: err.message, details: err.details });
+  }
+};
+
+export const getMyRedemptions = async (req, res) => {
+  try {
+    ensureCustomer(req);
+    const result = await getRewardRedemptions(req.user.userId, {
+      page: req.query.page,
+      limit: req.query.limit,
+    });
+    return res.json({ success: true, result });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ success: false, message: err.message });
+  }
+};
+
 /* ---------------- Admin / Owner ---------------- */
 
 export const getRewardPolicy = async (req, res) => {
   try {
     const [active, history] = await Promise.all([
       RewardPolicy.findOne({ isActive: true }).lean(),
-      RewardPolicy.find({}).select("version isActive earningEnabled redemptionEnabled rewardRateBps expiryMonths createdAt").sort({ version: -1 }).limit(20).lean(),
+      RewardPolicy.find({}).select("version isActive earningEnabled redemptionEnabled rewardRateBps maxRedemptionPct minRedeemCoins redemptionReservationMinutes refundRestoresRedeemedCoins expiryMonths createdAt").sort({ version: -1 }).limit(20).lean(),
     ]);
     return res.json({ success: true, result: { active, history } });
   } catch (err) {
@@ -84,6 +127,21 @@ export const createRewardPolicy = async (req, res) => {
     if (maxRedemptionPct < 0 || maxRedemptionPct > 100) {
       return res.status(400).json({ success: false, message: "maxRedemptionPct must be 0..100" });
     }
+    const minRedeemCoins = toInt(req.body?.minRedeemCoins, 100);
+    if (minRedeemCoins < 1) {
+      return res.status(400).json({ success: false, message: "minRedeemCoins must be at least 1" });
+    }
+    const reservationMinutes = toInt(req.body?.redemptionReservationMinutes, 30);
+    if (reservationMinutes < 5 || reservationMinutes > 1440) {
+      return res.status(400).json({ success: false, message: "redemptionReservationMinutes must be 5..1440" });
+    }
+    const redemptionEnabled = req.body?.redemptionEnabled === true;
+    if (redemptionEnabled && req.user?.role !== "Owner") {
+      return res.status(403).json({
+        success: false,
+        message: "Only an Owner can enable reward redemption",
+      });
+    }
     const result = await session.withTransaction(async () => {
       const maxV = await RewardPolicy.findOne({}).select("version").sort({ version: -1 }).session(session).lean();
       await RewardPolicy.updateMany({ isActive: true }, { $set: { isActive: false } }, { session });
@@ -93,10 +151,13 @@ export const createRewardPolicy = async (req, res) => {
             version: (maxV?.version || 0) + 1,
             isActive: true,
             earningEnabled: req.body?.earningEnabled !== false,
-            redemptionEnabled: false, // redemption stays disabled until accounting approval
+            redemptionEnabled,
             rewardRateBps: rateBps,
             coinsPerRupee: 100,
             maxRedemptionPct,
+            minRedeemCoins,
+            redemptionReservationMinutes: reservationMinutes,
+            refundRestoresRedeemedCoins: req.body?.refundRestoresRedeemedCoins !== false,
             minEligiblePaise: Math.max(0, toInt(req.body?.minEligiblePaise, 0)),
             maxCoinsPerBooking: req.body?.maxCoinsPerBooking != null ? Math.max(1, toInt(req.body.maxCoinsPerBooking)) : null,
             expiryMonths,
@@ -147,19 +208,18 @@ export const getRewardMetrics = async (req, res) => {
       ]),
       RewardPolicy.findOne({ isActive: true }).select("version earningEnabled redemptionEnabled coinsPerRupee").lean(),
     ]);
+    const liability = await getRewardLiabilitySummary();
     return res.json({
       success: true,
       result: {
         byType: Object.fromEntries(byType.map((r) => [r._id, { coins: r.coins, count: r.count }])),
         wallets: wallets[0] || { wallets: 0, available: 0, reserved: 0, earned: 0 },
         outstandingRupees: ((wallets[0]?.available || 0) + (wallets[0]?.reserved || 0)) / 100,
-        // Phase 1 capability flags (additive only): lets the Admin UI
-        // distinguish live earning from unavailable redemption without
-        // guessing from absent REDEEM rows.
+        liability,
         capabilities: {
           earningEnabled: activePolicy?.earningEnabled ?? false,
-          redemptionEnabled: false,
-          redemptionStatus: "disabled_until_accounting_approval",
+          redemptionEnabled: activePolicy?.redemptionEnabled ?? false,
+          redemptionStatus: activePolicy?.redemptionEnabled ? "enabled" : "disabled_until_accounting_approval",
           coinsPerRupee: activePolicy?.coinsPerRupee ?? 100,
           activePolicyVersion: activePolicy?.version ?? null,
         },
@@ -207,5 +267,30 @@ export const adminGetCustomerRewardOverview = async (req, res) => {
     return res.json({ success: true, result });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ success: false, message: err.message });
+  }
+};
+
+
+export const adminListRedemptions = async (req, res) => {
+  try {
+    const result = await listRewardRedemptionsForAdmin({
+      customerId: req.query.customerId,
+      paymentId: req.query.paymentId,
+      status: req.query.status,
+      page: req.query.page,
+      limit: req.query.limit,
+    });
+    return res.json({ success: true, result });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ success: false, message: err.message });
+  }
+};
+
+export const adminGetRewardReconciliation = async (req, res) => {
+  try {
+    const result = await getRewardLiabilitySummary();
+    return res.json({ success: true, result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 };

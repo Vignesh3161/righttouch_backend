@@ -7,7 +7,7 @@
  * atomic update, never read-then-write.
  *
  * Security:
- *  - 6-digit code from crypto.randomInt (never Math.random).
+ *  - 4-digit code from crypto.randomInt (never Math.random).
  *  - HMAC-SHA256 with an INDEPENDENT pepper (COMPLETION_OTP_PEPPER),
  *    bound to `${bookingId}:${generation}:${otp}`.
  *  - Comparison via timingSafeEqual after digest-length validation.
@@ -18,7 +18,8 @@ import crypto from "node:crypto";
 
 import ServiceCompletionChallenge from "../Schemas/ServiceCompletionChallenge.js";
 
-export const OTP_LENGTH = 6;
+export const OTP_LENGTH = 4;
+export const OTP_PATTERN = new RegExp(`^\\d{${OTP_LENGTH}}$`);
 export const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 export const OTP_MAX_ATTEMPTS = 5;
 export const OTP_MAX_RESENDS = 3;
@@ -54,9 +55,9 @@ export const getCompletionOtpPepper = () => {
   return pepper;
 };
 
-/** Cryptographically secure 6-digit code, zero-padded. */
+/** Cryptographically secure 4-digit code, zero-padded. */
 export const generateCompletionOtp = () =>
-  crypto.randomInt(0, 1_000_000).toString().padStart(OTP_LENGTH, "0");
+  crypto.randomInt(0, 10_000).toString().padStart(OTP_LENGTH, "0");
 
 /** HMAC-SHA256 hex digest bound to booking + generation. */
 export const hashCompletionOtp = ({ bookingId, generation, otp, pepper = null }) => {

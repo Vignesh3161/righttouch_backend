@@ -4,7 +4,7 @@ import mongoose from "mongoose";
  * 🪙 CUSTOMER REWARDS WALLET — promotional coins, NOT cash.
  *
  * One wallet per customer (unique index). Coins are earned from eligible
- * service bookings and will be redeemable for discounts (Phase 4). They
+ * service bookings and are redeemable for platform-funded payment discounts. They
  * can never be withdrawn, transferred to technicians, or enter technician
  * earnings/payout math. Integer coins only; `availableCoins`/`reservedCoins`
  * are guarded non-negative at the schema level AND by conditional updates.
@@ -24,6 +24,8 @@ const customerRewardsWalletSchema = new mongoose.Schema(
     lifetimeRedeemedCoins: { type: Number, default: 0, min: 0 },
     lifetimeExpiredCoins: { type: Number, default: 0, min: 0 },
     lifetimeReversedCoins: { type: Number, default: 0, min: 0 },
+    // Coins returned to the customer when a paid booking is refunded.
+    lifetimeRestoredCoins: { type: Number, default: 0, min: 0 },
     walletVersion: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }

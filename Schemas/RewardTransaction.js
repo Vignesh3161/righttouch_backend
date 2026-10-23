@@ -22,13 +22,25 @@ const rewardTransactionSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    paymentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Payment",
+      default: null,
+      index: true,
+    },
+    redemptionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RewardRedemption",
+      default: null,
+      index: true,
+    },
     // Integer coins (1 coin == 1 paise of reward value).
     coins: { type: Number, required: true, min: 0 },
     // Rupee mirror for display/audit (coins / 100), informational only.
     rupees: { type: Number, default: null },
     type: {
       type: String,
-      enum: ["EARN", "REDEEM", "RELEASE", "EXPIRE", "REVERSAL"],
+      enum: ["EARN", "REDEEM", "RELEASE", "RESTORE", "EXPIRE", "REVERSAL"],
       required: true,
       index: true,
     },

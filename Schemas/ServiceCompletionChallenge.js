@@ -4,7 +4,7 @@ import mongoose from "mongoose";
  * 🔐 SERVICE COMPLETION CHALLENGE — customer-confirmed job completion.
  *
  * A technician finishes the work and requests completion confirmation; the
- * backend stores ONLY the HMAC-SHA256 hash of a 6-digit OTP (peppered with
+ * backend stores ONLY the HMAC-SHA256 hash of a 4-digit OTP (peppered with
  * COMPLETION_OTP_PEPPER, bound to bookingId+generation) and sends the
  * plaintext code to the customer's verified phone by SMS. The booking may
  * transition to `completed` only after this challenge is atomically

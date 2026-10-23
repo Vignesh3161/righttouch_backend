@@ -10,9 +10,10 @@ import mongoose from "mongoose";
  * same event are no-ops.
  *
  * Entry types:
- *   customer_payment          credit — gross customer money collected
+ *   customer_payment          credit — net customer money collected (after reward discount)
  *   technician_earning_liability — liability allocation (money owed to techs)
  *   platform_commission       credit — platform revenue (commission)
+ *   reward_discount           debit  — non-cash platform-funded coin discount
  *   customer_refund           debit  — money returned to customer
  *   gateway_fee / gateway_fee_tax — payment gateway costs
  *   technician_payout         debit  — actual bank/UPI payout executed
@@ -44,6 +45,7 @@ const platformLedgerEntrySchema = new mongoose.Schema(
         "payout_fee",
         "payout_fee_tax",
         "platform_commission",
+        "reward_discount",
         "cancellation_fee",
         "chargeback",
         "manual_adjustment",

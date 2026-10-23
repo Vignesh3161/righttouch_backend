@@ -15,15 +15,19 @@ const rewardPolicySchema = new mongoose.Schema(
   {
     version: { type: Number, required: true, unique: true, min: 1 },
     isActive: { type: Boolean, default: false, index: true },
-    // Master switch for earning (redemption has its own flag, Phase 4).
+    // Master switch for earning (redemption has its own Owner-controlled flag).
     earningEnabled: { type: Boolean, default: true },
     redemptionEnabled: { type: Boolean, default: false },
     // 100 = 1%. Integer-only: floor(eligiblePaise * rateBps / 10000).
     rewardRateBps: { type: Number, required: true, min: 0, max: 10000 },
     // Fixed conversion; stored for audit transparency.
     coinsPerRupee: { type: Number, default: 100, min: 1 },
-    // Proposed defaults — require business/finance sign-off (see runbook).
+    // Redemption governance (Owner approval required to enable).
     maxRedemptionPct: { type: Number, default: 20, min: 0, max: 100 },
+    minRedeemCoins: { type: Number, default: 100, min: 1 },
+    redemptionReservationMinutes: { type: Number, default: 30, min: 5, max: 1440 },
+    // Refund policy: restore consumed coins proportionally by default.
+    refundRestoresRedeemedCoins: { type: Boolean, default: true },
     minEligiblePaise: { type: Number, default: 0, min: 0 },
     maxCoinsPerBooking: { type: Number, default: null, min: 1 },
     expiryMonths: { type: Number, default: 12, min: 1, max: 60 },
