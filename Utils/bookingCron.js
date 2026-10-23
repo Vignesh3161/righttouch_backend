@@ -11,7 +11,7 @@ import { notifyTechnicianWithFallback, emitJobsChanged, emitJobExpired } from ".
 import { toBookingCancelledDTO } from "./socketDTO.js";
 import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendReminder.js";
 import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
-import { expireRewards, recoverMissedRewards } from "../Services/rewardService.js";
+import { expireRewards, recoverMissedRewards, expireRedemptionReservations } from "../Services/rewardService.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
@@ -658,6 +658,25 @@ export const initBookingCrons = (io) => {
             }
         } catch (err) {
             console.error("[Cron:RewardRecovery Error]", err);
+        }
+    });
+
+    /**
+     * ─── CRON 10: REWARD REDEMPTION RESERVATION EXPIRY (Every 5 min) ──────
+     * Releases abandoned payment-time reservations and restores their FIFO
+     * lots. Manual-review payments stay held until an operator resolves them;
+     * successful pending captures are consumed instead of released.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("*/5 * * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            const summary = await expireRedemptionReservations({ limit: 200 });
+            if (summary.released > 0 || summary.consumed > 0 || summary.failed.length > 0) {
+                console.log("[Cron:RewardRedemptionExpiry]", JSON.stringify(summary));
+            }
+        } catch (err) {
+            console.error("[Cron:RewardRedemptionExpiry Error]", err);
         }
     });
 };

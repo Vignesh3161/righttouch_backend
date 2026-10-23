@@ -55,6 +55,10 @@ import { settleBookingEarningsIfEligible } from "../Utils/settlement.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { handleRefundWebhook } from "../Utils/refundEngine.js";
 import { sendPushNotification } from "../Utils/sendNotification.js";
+import {
+  applyPaymentRewardDiscount,
+  releaseRedemptionForPayment,
+} from "../Services/rewardService.js";
 
 /* ================= HELPERS ================= */
 
@@ -95,7 +99,10 @@ const createPaymentFromSnapshot = async ({ bookingId, itemType, snapshot, snapsh
       settlementType,
       idempotencyKey: `payment-booking:${bookingId}`,
       baseAmountPaise: snapshot.baseAmountPaise ?? 0,
+      grossTotalAmountPaise: snapshotTotalPaise,
       totalAmountPaise: snapshotTotalPaise,
+      rewardDiscountPaise: 0,
+      rewardCoinsRedeemed: 0,
       commissionPercentage: snapshot.commissionPercentage ?? 0,
       commissionAmountPaise: snapshot.commissionAmountPaise ?? 0,
       technicianAmountPaise: snapshot.technicianAmountPaise ?? 0,
@@ -216,6 +223,7 @@ export const createPaymentOrder = async (req, res) => {
     }
 
     const { bookingId } = req.body;
+    const requestedRedeemCoins = Math.max(0, Math.floor(Number(req.body?.redeemCoins) || 0));
     if (!mongoose.Types.ObjectId.isValid(bookingId)) {
       return fail(res, 400, "Valid bookingId required");
     }
@@ -263,6 +271,16 @@ export const createPaymentOrder = async (req, res) => {
       return fail(res, 409, "Booking already paid", {
         paymentId: existingPayment?._id,
         orderId: existingPayment?.providerOrderId || null,
+      });
+    }
+
+    // Never re-issue a provider order while ambiguity is unresolved. The
+    // manual-review record carries provider evidence that must not be cleared.
+    if (existingPayment && existingPayment.status === "manual_review") {
+      return fail(res, 409, "Payment is in manual review — resolve via the manual-review resolution endpoint", {
+        code: "UNDER_REVIEW",
+        paymentId: existingPayment._id,
+        status: "manual_review",
       });
     }
 
@@ -390,7 +408,11 @@ export const createPaymentOrder = async (req, res) => {
     } else if (payment.status !== "success") {
       // 🔒 SNAPSHOT GUARD (Section 5): the Payment must equal the Booking.
       const mismatches = [];
-      if (toPaise(payment.totalAmountPaise) !== snapshotTotalPaise) mismatches.push("totalAmountPaise");
+      const paymentGrossPaise = toPaise(
+        payment.grossTotalAmountPaise ||
+        (toPaise(payment.totalAmountPaise) + toPaise(payment.rewardDiscountPaise))
+      );
+      if (paymentGrossPaise !== snapshotTotalPaise) mismatches.push("totalAmountPaise");
       if (toPaise(payment.commissionAmountPaise) !== toPaise(snapshot.commissionAmountPaise)) mismatches.push("commissionAmountPaise");
       if (toPaise(payment.technicianAmountPaise) !== toPaise(snapshot.technicianAmountPaise)) mismatches.push("technicianAmountPaise");
 
@@ -448,7 +470,11 @@ export const createPaymentOrder = async (req, res) => {
         });
 
         payment.baseAmountPaise = toPaise(snapshot.baseAmountPaise);
+        payment.grossTotalAmountPaise = snapshotTotalPaise;
         payment.totalAmountPaise = snapshotTotalPaise;
+        payment.rewardDiscountPaise = 0;
+        payment.rewardCoinsRedeemed = 0;
+        payment.rewardRedemptionId = null;
         payment.commissionPercentage = snapshot.commissionPercentage ?? 0;
         payment.commissionAmountPaise = toPaise(snapshot.commissionAmountPaise);
         payment.technicianAmountPaise = toPaise(snapshot.technicianAmountPaise);
@@ -480,12 +506,35 @@ export const createPaymentOrder = async (req, res) => {
       }
     }
 
+    if (itemType !== "service" && requestedRedeemCoins > 0) {
+      return fail(res, 400, "Reward redemption is available for service bookings only");
+    }
+
+    // 🪙 Payment-time redemption: reserve coins + net the payable amount.
+    // Commission/technician snapshot fields are deliberately untouched — the
+    // discount is platform-funded and only reduces the customer's payable.
+    if (itemType === "service") {
+      const rewardResult = await applyPaymentRewardDiscount({
+        paymentId: payment._id,
+        requestedCoins: requestedRedeemCoins,
+      });
+      payment = rewardResult.payment;
+    }
+
+    const payablePaise = toPaise(payment.totalAmountPaise);
+    if (payablePaise > 0 && payablePaise < 100) {
+      return fail(res, 400, "Payable amount must be zero or at least ₹1 after rewards", {
+        payablePaise,
+        grossTotalPaise: toPaise(payment.grossTotalAmountPaise || snapshotTotalPaise),
+      });
+    }
+
     booking.paymentProvider = "razorpay";
     booking.paymentId = payment._id;
 
     if (!payment.providerOrderId) {
       const order = await createRazorpayOrder({
-        amountInPaisa: snapshotTotalPaise,
+        amountInPaisa: payablePaise,
         currency: "INR",
         receipt: `booking_${bookingId}`,
         notes: {
@@ -503,7 +552,7 @@ export const createPaymentOrder = async (req, res) => {
     }
 
     await booking.save();
-    console.log(`[Payment] Razorpay order created for booking ${bookingId}: orderId=${payment.providerOrderId}, amountPaise=${snapshotTotalPaise}`);
+    console.log(`[Payment] Razorpay order created for booking ${bookingId}: orderId=${payment.providerOrderId}, amountPaise=${payablePaise}`);
 
     // Amount is returned in PAISE (as Razorpay Checkout SDK expects).
     return ok(res, 201, "Payment order created", {
@@ -512,10 +561,15 @@ export const createPaymentOrder = async (req, res) => {
       orderId: payment.providerOrderId,
       razorpayOrderId: payment.providerOrderId,
       id: payment.providerOrderId,
-      amount: snapshotTotalPaise,
-      amountInRupees: snapshotTotalPaise / 100,
+      amount: payablePaise,
+      amountInRupees: payablePaise / 100,
       currency: payment.currency || "INR",
       paymentId: payment._id,
+      reward: {
+        coinsRedeemed: payment.rewardCoinsRedeemed || 0,
+        discountPaise: payment.rewardDiscountPaise || 0,
+        redemptionId: payment.rewardRedemptionId || null,
+      },
       split: {
         serviceAmountPaise: toPaise(snapshot.baseAmountPaise),
         gstPercentage: snapshot.gstPercentage ?? 0,
@@ -524,7 +578,9 @@ export const createPaymentOrder = async (req, res) => {
         commissionPercentage: snapshot.commissionPercentage ?? 0,
         commissionAmountPaise: toPaise(snapshot.commissionAmountPaise),
         technicianAmountPaise: toPaise(snapshot.technicianAmountPaise),
-        totalAmountPaise: snapshotTotalPaise,
+        grossTotalAmountPaise: toPaise(payment.grossTotalAmountPaise || snapshotTotalPaise),
+        rewardDiscountPaise: toPaise(payment.rewardDiscountPaise),
+        totalAmountPaise: payablePaise,
         ruleSource: snapshot.commissionRuleSource ?? null,
         calculationVersion: snapshot.calculationVersion ?? 1,
       },
@@ -667,6 +723,14 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
+    if (result.manualReview) {
+      return ok(res, 200, "Payment captured — reward reservation requires manual review", {
+        status: "manual_review",
+        bookingId,
+        paymentId: payment._id,
+      });
+    }
+
     await notifyPaymentSucceeded(req, payment);
 
     // Fetch technician wallet balance after settlement
@@ -783,6 +847,9 @@ export const razorpayWebhook = async (req, res) => {
       await eventRecord.save().catch(() => {});
       if (transition.amountMismatch) {
         return ok(res, 200, "Amount mismatch — manual review required");
+      }
+      if (transition.manualReview) {
+        return ok(res, 200, "Payment captured — reward reservation requires manual review");
       }
       if (!transition.alreadyProcessed) {
         await notifyPaymentSucceeded(req, payment);
@@ -1271,6 +1338,14 @@ export const recordAdminOfflinePayment = async (req, res) => {
       actor,
       reason: notes || `Admin recorded payment via ${modeLower.toUpperCase()}`,
     });
+
+    if (transition.manualReview) {
+      return fail(res, 409, "Payment recorded but reward reservation requires manual review", {
+        status: "manual_review",
+        paymentId: payment._id,
+        code: "REWARD_REDEMPTION_UNBACKED",
+      });
+    }
 
     await writeAuditLog({
       actor: req.user.userId,

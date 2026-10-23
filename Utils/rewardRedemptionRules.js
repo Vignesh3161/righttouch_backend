@@ -1,9 +1,10 @@
 /**
- * 📐 REWARD REDEMPTION RULES — Phase 2 pure calculation (no lifecycle).
+ * 📐 REWARD REDEMPTION RULES — pure calculation used by preview and reserve.
  *
  * Single source of truth for "how much discount can coins buy".
- * Pure function: no DB, no wallet mutation, no routes call it yet.
- * Redemption stays disabled until Phase 3 lifecycle + accounting approval.
+ * Pure function: no DB, no wallet mutation. The redemption lifecycle and
+ * accounting hooks live in Services/rewardService.js; the policy-level
+ * redemptionEnabled switch still gates production use.
  *
  * Money model (mirrors earning basis in Services/rewardService.js):
  * - 100 coins = ₹1, i.e. 1 coin == 1 paise of discount. Integer only.
@@ -35,12 +36,15 @@ const toNonNegInt = (v) => {
  * @param {number} args.availableCoins - wallet.availableCoins (spendable only; reserved excluded by caller)
  * @param {number} args.maxRedemptionPct - active policy maxRedemptionPct 0..100
  * @param {number} [args.minEligiblePaise=0] - active policy minEligiblePaise
- * @param {number} [args.minRedeemCoins=100] - dust guard (Phase 3: policy field)
+ * @param {number} [args.minRedeemCoins=100] - dust guard (policy field)
+ * @param {number|null} [args.totalAmountPaise=null] - gross payment total
+ * @param {number} [args.minPayablePaise=100] - keep provider payments >= ₹1
  * @param {number|null} [args.requestedCoins=null] - customer request; null = preview max
  * @returns {{ eligible: boolean, reason: string,
  *   eligiblePaise: number, availableCoins: number,
  *   maxRedeemableCoins: number, redeemCoins: number,
- *   discountPaise: number, discountRupees: number }}
+ *   discountPaise: number, discountRupees: number,
+ *   payableAfterDiscountPaise: number|null }}
  */
 export const calcRedemptionPreview = ({
   eligiblePaise,
@@ -48,6 +52,8 @@ export const calcRedemptionPreview = ({
   maxRedemptionPct,
   minEligiblePaise = 0,
   minRedeemCoins = DEFAULT_MIN_REDEEM_COINS,
+  totalAmountPaise = null,
+  minPayablePaise = 100,
   requestedCoins = null,
 } = {}) => {
   const eligible = toNonNegInt(eligiblePaise);
@@ -63,6 +69,7 @@ export const calcRedemptionPreview = ({
     redeemCoins: 0,
     discountPaise: 0,
     discountRupees: 0,
+    payableAfterDiscountPaise: totalAmountPaise == null ? null : toNonNegInt(totalAmountPaise),
   };
 
   if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
@@ -80,7 +87,21 @@ export const calcRedemptionPreview = ({
 
   // Integer-only cap: floor, never round up (platform never over-discounts).
   const capPct = Math.floor((eligible * pct) / 100);
-  const maxRedeemable = Math.max(0, Math.min(capPct, available, eligible));
+  let maxRedeemable = Math.max(0, Math.min(capPct, available, eligible));
+
+  // Provider payments must stay >= ₹1. A discount that would leave 1-99
+  // paise is trimmed down to the largest valid amount instead of creating a
+  // sub-minimum Razorpay order.
+  const gross = totalAmountPaise == null ? null : toNonNegInt(totalAmountPaise);
+  const minPayable = toNonNegInt(minPayablePaise);
+  if (gross != null) {
+    if (gross <= minPayable) {
+      maxRedeemable = 0;
+    } else if (gross - maxRedeemable < minPayable) {
+      maxRedeemable = Math.max(0, gross - minPayable);
+    }
+  }
+  const payableAfterDiscountPaise = gross == null ? null : Math.max(0, gross - maxRedeemable);
 
   if (maxRedeemable <= 0) {
     const reason = available <= 0 ? "insufficient_balance" : "zero_cap";
@@ -99,6 +120,7 @@ export const calcRedemptionPreview = ({
       redeemCoins: maxRedeemable,
       discountPaise: maxRedeemable,
       discountRupees: maxRedeemable / COINS_PER_RUPEE,
+      payableAfterDiscountPaise,
     };
   }
 
@@ -124,5 +146,6 @@ export const calcRedemptionPreview = ({
     redeemCoins: requested,
     discountPaise: requested,
     discountRupees: requested / COINS_PER_RUPEE,
+    payableAfterDiscountPaise: gross == null ? null : gross - requested,
   };
 };

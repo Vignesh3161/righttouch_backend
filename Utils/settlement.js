@@ -225,7 +225,10 @@ const settlementEntries = ({ booking, payment, jobAmountPaise, tipAmountPaise })
  */
 export const deriveSettlementSplit = ({ booking, payment }) => {
   const bSnapshot = booking?.financialSnapshot || {};
-  const pTotal = toPaise(payment?.totalAmountPaise);
+  // Compare the GROSS snapshot total; `totalAmountPaise` is the net captured
+  // after any platform-funded reward discount. Legacy payments have no gross
+  // field and fall back to the net total.
+  const pTotal = toPaise(payment?.grossTotalAmountPaise || payment?.totalAmountPaise);
   const bTotal = toPaise(bSnapshot.totalAmountPaise ?? booking?.totalAmountPaise);
   const pTech = toPaise(payment?.technicianAmountPaise);
   const pTip = toPaise(payment?.tipAmountPaise);

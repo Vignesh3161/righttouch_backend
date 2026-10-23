@@ -5,6 +5,10 @@ import WithdrawalRequest from "../Schemas/WithdrawalRequest.js";
 import Payment from "../Schemas/Payment.js";
 import PlatformLedgerEntry from "../Schemas/PlatformLedgerEntry.js";
 import PayoutOutbox from "../Schemas/PayoutOutbox.js";
+import CustomerRewardsWallet from "../Schemas/CustomerRewardsWallet.js";
+import RewardLot from "../Schemas/RewardLot.js";
+import RewardRedemption from "../Schemas/RewardRedemption.js";
+import RewardTransaction from "../Schemas/RewardTransaction.js";
 import { deriveSettlementSplit } from "./settlement.js";
 import { toPaise, rupeesToPaise } from "./money.js";
 
@@ -45,6 +49,10 @@ import { toPaise, rupeesToPaise } from "./money.js";
  * - withdrawal arithmetic: net == requested − (penalty + commission + other).
  * - manual-paid record: status paid + payoutProvider "manual" + utr +
  *   payoutMode + paidAt + paidBy, with ledger `payout:<id>:technician-payout`.
+ * - reward liability: wallet available == EARN + RESTORE - REDEEM - EXPIRE
+ *   - REVERSAL, available == sum(lot coinsRemaining), reserved == active
+ *   redemption reservations, and a success payment's reward discount equals
+ *   its consumed redemption plus the `reward_discount` platform-ledger debit.
  *
  * Result shape: { generatedAt, manualOnly, limit, scanned, truncated,
  * sections, totals } where each finding is { code,
@@ -115,6 +123,15 @@ const scanAll = async (model, filter, select, { batch = SCAN_BATCH, cap }) => {
   return { docs, scanned: docs.length, truncated };
 };
 
+const findInChunks = async (model, ids, select, filter = {}, idField = "_id", batch = SCAN_BATCH) => {
+  const docs = [];
+  for (let i = 0; i < ids.length; i += batch) {
+    const chunk = ids.slice(i, i + batch);
+    docs.push(...(await model.find({ ...filter, [idField]: { $in: chunk } }).select(select).lean()));
+  }
+  return docs;
+};
+
 export const runFinancialReconciliation = async ({ limit = 10000 } = {}) => {
   const cap = Math.max(1, Math.min(Number(limit) || 10000, 100000));
   const report = {
@@ -130,6 +147,7 @@ export const runFinancialReconciliation = async ({ limit = 10000 } = {}) => {
       reserves: section(),
       manualPayments: section(),
       outbox: section(),
+      rewards: section(),
     },
   };
   const S = report.sections;
@@ -660,6 +678,317 @@ export const runFinancialReconciliation = async ({ limit = 10000 } = {}) => {
         attempts: o.attempts ?? 0,
       })),
     });
+  }
+
+  /* ── F. Customer rewards (promotional coins, not cash) ─────────────── */
+  const [rewardWallets, rewardTxns, rewardLots, redemptions, rewardPayments] = await Promise.all([
+    scanAll(
+      CustomerRewardsWallet,
+      {},
+      "customerId availableCoins reservedCoins lifetimeEarnedCoins lifetimeRedeemedCoins lifetimeRestoredCoins lifetimeExpiredCoins lifetimeReversedCoins",
+      { cap }
+    ),
+    scanAll(RewardTransaction, {}, "_id customerId coins type redemptionId idempotencyKey", { cap }),
+    scanAll(RewardLot, {}, "customerId coinsRemaining", { cap }),
+    scanAll(
+      RewardRedemption,
+      {},
+      "customerId paymentId coinsReserved discountPaise status expiresAt consumedTransactionId",
+      { cap }
+    ),
+    scanAll(
+      Payment,
+      {
+        $or: [
+          { rewardDiscountPaise: { $gt: 0 } },
+          { rewardCoinsRedeemed: { $gt: 0 } },
+          { rewardRedemptionId: { $ne: null } },
+        ],
+      },
+      "_id bookingId itemType status totalAmountPaise grossTotalAmountPaise rewardDiscountPaise rewardCoinsRedeemed rewardRedemptionId",
+      { cap }
+    ),
+  ]);
+  report.scanned.rewardWallets = rewardWallets.scanned;
+  report.scanned.rewardTransactions = rewardTxns.scanned;
+  report.scanned.rewardLots = rewardLots.scanned;
+  report.scanned.rewardRedemptions = redemptions.scanned;
+  report.scanned.rewardPayments = rewardPayments.scanned;
+  for (const part of [rewardWallets, rewardTxns, rewardLots, redemptions, rewardPayments]) {
+    markTruncated(part.truncated);
+  }
+
+  const walletByCustomer = new Map(rewardWallets.docs.map((w) => [String(w.customerId), w]));
+  const txnByCustomer = new Map();
+  const redeemByRedemption = new Map();
+  for (const t of rewardTxns.docs) {
+    const c = String(t.customerId);
+    if (!txnByCustomer.has(c)) txnByCustomer.set(c, { EARN: 0, REDEEM: 0, RESTORE: 0, EXPIRE: 0, REVERSAL: 0 });
+    const agg = txnByCustomer.get(c);
+    if (t.type in agg) agg[t.type] += toPaise(t.coins);
+    if (t.type === "REDEEM" && t.redemptionId) {
+      redeemByRedemption.set(String(t.redemptionId), t);
+    }
+  }
+  const lotsByCustomer = new Map();
+  for (const lot of rewardLots.docs) {
+    const c = String(lot.customerId);
+    lotsByCustomer.set(c, (lotsByCustomer.get(c) || 0) + toPaise(lot.coinsRemaining));
+    if (toPaise(lot.coinsRemaining) < 0) {
+      S.rewards.discrepancies.push({ code: "REWARD_LOT_NEGATIVE", lotId: id(lot._id), customerId: c });
+    }
+  }
+  const reservedByCustomer = new Map();
+  for (const r of redemptions.docs) {
+    if (r.status !== "reserved") continue;
+    const c = String(r.customerId);
+    reservedByCustomer.set(c, (reservedByCustomer.get(c) || 0) + toPaise(r.coinsReserved));
+  }
+
+  const rewardCustomers = new Set([
+    ...walletByCustomer.keys(),
+    ...txnByCustomer.keys(),
+    ...lotsByCustomer.keys(),
+    ...reservedByCustomer.keys(),
+  ]);
+  const negativeFields = [
+    "availableCoins",
+    "reservedCoins",
+    "lifetimeEarnedCoins",
+    "lifetimeRedeemedCoins",
+    "lifetimeRestoredCoins",
+    "lifetimeExpiredCoins",
+    "lifetimeReversedCoins",
+  ];
+  const lifetimeFields = {
+    lifetimeEarnedCoins: "EARN",
+    lifetimeRedeemedCoins: "REDEEM",
+    lifetimeRestoredCoins: "RESTORE",
+    lifetimeExpiredCoins: "EXPIRE",
+    lifetimeReversedCoins: "REVERSAL",
+  };
+
+  for (const customerId of rewardCustomers) {
+    const wallet = walletByCustomer.get(customerId);
+    const agg = txnByCustomer.get(customerId) || { EARN: 0, REDEEM: 0, RESTORE: 0, EXPIRE: 0, REVERSAL: 0 };
+    const expectedAvailable = agg.EARN + agg.RESTORE - agg.REDEEM - agg.EXPIRE - agg.REVERSAL;
+
+    if (!wallet) {
+      if (txnByCustomer.has(customerId)) {
+        S.rewards.discrepancies.push({ code: "REWARD_TRANSACTIONS_WITHOUT_WALLET", customerId });
+      }
+      if ((lotsByCustomer.get(customerId) || 0) !== 0) {
+        S.rewards.discrepancies.push({
+          code: "REWARD_LOTS_WITHOUT_WALLET",
+          customerId,
+          coinsRemaining: lotsByCustomer.get(customerId) || 0,
+        });
+      }
+      if ((reservedByCustomer.get(customerId) || 0) !== 0) {
+        S.rewards.discrepancies.push({
+          code: "REWARD_RESERVATION_WITHOUT_WALLET",
+          customerId,
+          coinsReserved: reservedByCustomer.get(customerId) || 0,
+        });
+      }
+      continue;
+    }
+
+    for (const field of negativeFields) {
+      if ((Number(wallet[field]) || 0) < 0) {
+        S.rewards.discrepancies.push({
+          code: "REWARD_WALLET_NEGATIVE",
+          customerId,
+          field,
+          value: wallet[field],
+        });
+      }
+    }
+
+    if (toPaise(wallet.availableCoins) !== expectedAvailable) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_WALLET_LEDGER_MISMATCH",
+        customerId,
+        availableCoins: toPaise(wallet.availableCoins),
+        expectedAvailableCoins: expectedAvailable,
+      });
+    }
+
+    const lifetimeMismatch = {};
+    for (const [field, type] of Object.entries(lifetimeFields)) {
+      if (toPaise(wallet[field]) !== agg[type]) {
+        lifetimeMismatch[field] = { actual: toPaise(wallet[field]), expected: agg[type] };
+      }
+    }
+    if (Object.keys(lifetimeMismatch).length) {
+      S.rewards.discrepancies.push({ code: "REWARD_WALLET_LIFETIME_MISMATCH", customerId, fields: lifetimeMismatch });
+    }
+
+    if ((lotsByCustomer.get(customerId) || 0) !== toPaise(wallet.availableCoins)) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_LOT_BALANCE_MISMATCH",
+        customerId,
+        availableCoins: toPaise(wallet.availableCoins),
+        lotCoinsRemaining: lotsByCustomer.get(customerId) || 0,
+      });
+    }
+
+    if ((reservedByCustomer.get(customerId) || 0) !== toPaise(wallet.reservedCoins)) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_RESERVED_BALANCE_MISMATCH",
+        customerId,
+        reservedCoins: toPaise(wallet.reservedCoins),
+        reservedByRedemptions: reservedByCustomer.get(customerId) || 0,
+      });
+    }
+  }
+
+  const staleCutoff = Date.now() - 60 * 60 * 1000;
+  for (const r of redemptions.docs) {
+    if (
+      r.status === "reserved" &&
+      r.expiresAt &&
+      new Date(r.expiresAt).getTime() < staleCutoff
+    ) {
+      S.rewards.needsInvestigation.push({
+        code: "REWARD_RESERVATION_STALE",
+        redemptionId: id(r._id),
+        paymentId: id(r.paymentId),
+        customerId: id(r.customerId),
+        expiresAt: r.expiresAt,
+        coins: toPaise(r.coinsReserved),
+      });
+    }
+  }
+
+  const consumed = redemptions.docs.filter((r) => r.status === "consumed");
+  const consumedPaymentIds = [...new Set(consumed.map((r) => r.paymentId).filter(Boolean))];
+  const consumedPaymentDocs = await findInChunks(
+    Payment,
+    consumedPaymentIds,
+    "_id bookingId itemType status totalAmountPaise grossTotalAmountPaise rewardDiscountPaise rewardCoinsRedeemed rewardRedemptionId"
+  );
+  const paymentById = new Map();
+  for (const p of [...rewardPayments.docs, ...consumedPaymentDocs]) {
+    paymentById.set(String(p._id), p);
+  }
+  const redemptionByPayment = new Map(
+    redemptions.docs.filter((r) => r.paymentId).map((r) => [String(r.paymentId), r])
+  );
+  const ledgerRows = await findInChunks(
+    PlatformLedgerEntry,
+    [...paymentById.keys()],
+    "paymentId type direction amountPaise",
+    { type: "reward_discount" },
+    "paymentId"
+  );
+  const discountLedgerByPayment = new Map(ledgerRows.map((e) => [String(e.paymentId), e]));
+  for (const r of consumed) {
+    const payment = r.paymentId ? paymentById.get(String(r.paymentId)) : null;
+    const item = {
+      redemptionId: id(r._id),
+      paymentId: id(r.paymentId),
+      customerId: id(r.customerId),
+      coins: toPaise(r.coinsReserved),
+    };
+    if (!payment) {
+      S.rewards.discrepancies.push({ code: "REWARD_REDEMPTION_PAYMENT_MISSING", ...item });
+    } else {
+      if (payment.status !== "success") {
+        S.rewards.discrepancies.push({
+          code: "REWARD_REDEMPTION_PAYMENT_NOT_SUCCESS",
+          ...item,
+          paymentStatus: payment.status,
+        });
+      }
+      if (toPaise(payment.rewardDiscountPaise) !== toPaise(r.discountPaise)) {
+        S.rewards.discrepancies.push({
+          code: "REWARD_REDEMPTION_PAYMENT_DISCOUNT_MISMATCH",
+          ...item,
+          paymentDiscountPaise: toPaise(payment.rewardDiscountPaise),
+          redemptionDiscountPaise: toPaise(r.discountPaise),
+        });
+      }
+      if (String(payment.rewardRedemptionId || "") !== String(r._id)) {
+        S.rewards.discrepancies.push({
+          code: "REWARD_REDEMPTION_PAYMENT_LINK_MISMATCH",
+          ...item,
+          paymentRedemptionId: id(payment.rewardRedemptionId),
+        });
+      }
+    }
+    if (toPaise(r.discountPaise) !== toPaise(r.coinsReserved)) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_REDEMPTION_COIN_VALUE_MISMATCH",
+        ...item,
+        discountPaise: toPaise(r.discountPaise),
+      });
+    }
+    const redeemTxn = redeemByRedemption.get(String(r._id));
+    if (!redeemTxn) {
+      S.rewards.discrepancies.push({ code: "REWARD_REDEMPTION_MISSING_REDEEM_LEDGER", ...item });
+    } else if (toPaise(redeemTxn.coins) !== toPaise(r.coinsReserved)) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_REDEMPTION_LEDGER_AMOUNT_MISMATCH",
+        ...item,
+        ledgerCoins: toPaise(redeemTxn.coins),
+      });
+    }
+  }
+
+  for (const payment of rewardPayments.docs) {
+    const item = {
+      bookingId: id(payment.bookingId),
+      paymentId: id(payment._id),
+      discountPaise: toPaise(payment.rewardDiscountPaise),
+    };
+    const discountPaise = toPaise(payment.rewardDiscountPaise);
+    const gross = toPaise(payment.grossTotalAmountPaise) ||
+      toPaise(payment.totalAmountPaise) + discountPaise;
+    if (payment.itemType !== "service") {
+      S.rewards.discrepancies.push({ code: "REWARD_DISCOUNT_NON_SERVICE_PAYMENT", ...item, itemType: payment.itemType });
+    }
+    if (gross <= 0 || toPaise(payment.totalAmountPaise) + discountPaise !== gross) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_PAYMENT_AMOUNT_MISMATCH",
+        ...item,
+        grossTotalAmountPaise: gross,
+        totalAmountPaise: toPaise(payment.totalAmountPaise),
+      });
+    }
+    if (toPaise(payment.rewardCoinsRedeemed) !== discountPaise) {
+      S.rewards.discrepancies.push({
+        code: "REWARD_PAYMENT_COIN_VALUE_MISMATCH",
+        ...item,
+        rewardCoinsRedeemed: toPaise(payment.rewardCoinsRedeemed),
+      });
+    }
+    if (payment.status === "success") {
+      const redemption = redemptionByPayment.get(String(payment._id));
+      if (!redemption) {
+        S.rewards.discrepancies.push({ code: "REWARD_DISCOUNT_WITHOUT_REDEMPTION", ...item });
+      } else if (redemption.status !== "consumed") {
+        S.rewards.discrepancies.push({
+          code: "REWARD_DISCOUNT_WITHOUT_CONSUMED_REDEMPTION",
+          ...item,
+          redemptionId: id(redemption._id),
+          redemptionStatus: redemption.status,
+        });
+      }
+      if (discountPaise > 0) {
+        const ledger = discountLedgerByPayment.get(String(payment._id));
+        if (!ledger) {
+          S.rewards.discrepancies.push({ code: "REWARD_DISCOUNT_MISSING_LEDGER", ...item });
+        } else if (toPaise(ledger.amountPaise) !== discountPaise || ledger.direction !== "debit") {
+          S.rewards.discrepancies.push({
+            code: "REWARD_DISCOUNT_LEDGER_MISMATCH",
+            ...item,
+            ledgerAmountPaise: toPaise(ledger.amountPaise),
+            ledgerDirection: ledger.direction,
+          });
+        }
+      }
+    }
   }
 
   const countItems = (list) => list.reduce((s, f) => s + (f.items ? f.items.length : 1), 0);

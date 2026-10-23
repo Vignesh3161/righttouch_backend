@@ -538,13 +538,24 @@ export const executeRefund = async (refundId, deps = {}) => {
     // (proposed default — requires finance sign-off). Never throws.
     if (refund.bookingId) {
       try {
-        const { reverseEarnedReward } = await import("../Services/rewardService.js");
-        const paid = await Payment.findById(refund.paymentId).select("totalAmountPaise").lean().catch(() => null);
+        const { reverseEarnedReward, restoreRedeemedCoinsForRefund } = await import("../Services/rewardService.js");
+        const paid = await Payment.findById(refund.paymentId).select("totalAmountPaise grossTotalAmountPaise rewardDiscountPaise").lean().catch(() => null);
+        const payable =
+          paid?.totalAmountPaise ??
+          Math.max(0, toPaise(paid?.grossTotalAmountPaise || 0) - toPaise(paid?.rewardDiscountPaise || 0));
         const ratioBps =
-          paid && paid.totalAmountPaise > 0
-            ? Math.min(10000, Math.floor((refund.netRefundPaise * 10000) / paid.totalAmountPaise))
+          payable > 0
+            ? Math.min(10000, Math.floor((refund.netRefundPaise * 10000) / payable))
             : 10000;
         await reverseEarnedReward({ bookingId: refund.bookingId, refundId: refund._id, ratioBps });
+        // Return the customer's consumed reward coins proportionally. The
+        // service enforces a cumulative cap and only acts on consumed
+        // redemptions linked to this payment.
+        await restoreRedeemedCoinsForRefund({
+          paymentId: refund.paymentId,
+          refundId: refund._id,
+          ratioBps,
+        });
       } catch (err) {
         console.error(`[Refund] reward reversal failed for refund ${refund._id}:`, err.message);
       }

@@ -29,6 +29,8 @@
  */
 import axios from "axios";
 
+import { OTP_PATTERN } from "./completionOtp.js";
+
 const SMS_TIMEOUT_MS = 10000;
 
 /** Mask a phone number for logs — last 2 digits only, never the full number. */
@@ -84,7 +86,7 @@ export const sendCompletionSms = async (
   if (!/^[0-9]{10}$/.test(local)) {
     throw smsError("Completion SMS failed: invalid recipient phone number", { status: 400 });
   }
-  if (!/^\d{6}$/.test(String(otpCode || ""))) {
+  if (!OTP_PATTERN.test(String(otpCode || ""))) {
     throw smsError("Completion SMS failed: invalid OTP format", { status: 500 });
   }
 

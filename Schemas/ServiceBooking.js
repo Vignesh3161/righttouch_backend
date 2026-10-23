@@ -266,6 +266,18 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // 🪙 Reward award lifecycle (bounded recovery cursor). `awarded` and
+    // `skipped` are terminal; any other value (including missing on legacy
+    // bookings) remains eligible for the missed-award sweeper.
+    rewardAwardStatus: {
+      type: String,
+      enum: ["pending", "awarded", "skipped"],
+      default: "pending",
+      index: true,
+    },
+    rewardAwardReason: { type: String, default: null },
+    rewardAwardedAt: { type: Date, default: null },
+
     // 🕒 BOOKING TYPE
     bookingType: {
       type: String,
@@ -625,6 +637,7 @@ serviceBookingSchema.index({ technicianId: 1, status: 1 });
 // Settlement/reconciliation hot paths
 serviceBookingSchema.index({ paymentStatus: 1, settlementStatus: 1 });
 serviceBookingSchema.index({ settlementStatus: 1, status: 1, paymentStatus: 1 });
+serviceBookingSchema.index({ rewardAwardStatus: 1, settlementStatus: 1, status: 1, paymentStatus: 1 });
 
 // 2dsphere index for geo queries (optional, but required when using $near for bookings)
 serviceBookingSchema.index({ location: "2dsphere" });

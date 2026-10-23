@@ -5,8 +5,8 @@ import mongoose from "mongoose";
  *
  * A single aggregate balance cannot expire different earning batches
  * correctly, so each EARN mints a lot. Expiry consumes oldest lots first
- * (FIFO). Refund reversals target the originating lot. Redemption
- * (Phase 4) will also consume lots FIFO.
+ * (FIFO). Refund reversals target the originating lot. Redemption also
+ * consumes lots FIFO and holds the allocation while payment is pending.
  */
 const rewardLotSchema = new mongoose.Schema(
   {

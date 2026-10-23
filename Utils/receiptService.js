@@ -44,7 +44,7 @@ export const ensureReceipt = async (paymentId) => {
     basePaise: payment.baseAmountPaise,
     gstPaise: payment.gstAmountPaise,
     tipPaise: payment.tipAmountPaise,
-    discountPaise: 0,
+    discountPaise: payment.rewardDiscountPaise || 0,
     totalPaise: payment.totalAmountPaise,
     supplierName: PLATFORM_LEGAL_NAME,
     supplierGstin: PLATFORM_GSTIN,
@@ -70,6 +70,7 @@ export const buildInvoiceHtml = (receipt) => {
     <tr><td>Taxable value</td><td>₹${ru(receipt.basePaise)}</td></tr>
     <tr><td>GST</td><td>₹${ru(receipt.gstPaise)}</td></tr>
     <tr><td>Tip</td><td>₹${ru(receipt.tipPaise)}</td></tr>
+    ${receipt.discountPaise > 0 ? `<tr><td>Reward discount</td><td>-₹${ru(receipt.discountPaise)}</td></tr>` : ""}
     <tr><td><b>Total</b></td><td><b>₹${ru(receipt.totalPaise)}</b></td></tr>
   </table>
 </body></html>`;

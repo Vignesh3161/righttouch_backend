@@ -80,6 +80,8 @@ export const postPaymentLedgerEntries = async ({
     `payment:${payment._id}:liability`,
     `payment:${payment._id}:commission`,
   ];
+  const rewardDiscountPaise = Math.max(0, Math.round(Number(payment.rewardDiscountPaise) || 0));
+  if (rewardDiscountPaise > 0) keys.push(`payment:${payment._id}:reward-discount`);
 
   let created = 0;
   const r1 = await postLedgerEntry({
@@ -117,6 +119,25 @@ export const postPaymentLedgerEntries = async ({
     session,
   });
   if (r3.created) created += 1;
+
+  if (rewardDiscountPaise > 0) {
+    const r4 = await postLedgerEntry({
+      type: "reward_discount",
+      direction: "debit",
+      amountPaise: rewardDiscountPaise,
+      idempotencyKey: keys[3],
+      refs,
+      providerReference: payment.providerPaymentId || null,
+      description: "Platform-funded reward coin discount (non-cash contra-revenue)",
+      metadata: {
+        rewardCoinsRedeemed: payment.rewardCoinsRedeemed || 0,
+        rewardRedemptionId: payment.rewardRedemptionId || null,
+        nonCash: true,
+      },
+      session,
+    });
+    if (r4.created) created += 1;
+  }
 
   return { created, keys };
 };

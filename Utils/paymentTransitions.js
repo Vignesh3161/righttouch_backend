@@ -10,6 +10,10 @@ import { settleBookingEarningsIfEligible } from "./settlement.js";
 import { writeAuditLog } from "./audit.js";
 import { postPaymentLedgerEntries } from "./ledger.js";
 import { toPaise } from "./money.js";
+import {
+  consumeRedemptionForPayment,
+  releaseRedemptionForPayment,
+} from "../Services/rewardService.js";
 
 /**
  * 🔄 PAYMENT STATE TRANSITIONS — the ONLY place a Payment changes from
@@ -37,6 +41,51 @@ const isTransactionUnsupported = (err) => {
     msg.includes("Transaction") ||
     msg.includes("mongos")
   );
+};
+
+const REWARD_BACKING_FAILURE_CODES = new Set([
+  "REWARD_REDEMPTION_UNAVAILABLE",
+  "REWARD_WALLET_INCONSISTENT",
+  "REWARD_LOTS_UNAVAILABLE",
+]);
+
+const isRewardBackingFailure = (err) =>
+  REWARD_BACKING_FAILURE_CODES.has(String(err?.code || ""));
+
+const markRewardBackingReview = async ({
+  paymentId,
+  error,
+  providerPaymentId = null,
+  providerAmountPaise = null,
+  source,
+}) => {
+  const current = await Payment.findById(paymentId).lean();
+  if (!current) return null;
+  if (current.status === "success") return current;
+
+  const reason = `Reward redemption could not be backed at capture: ${String(error?.message || error).slice(0, 400)}`;
+  const set = { status: "manual_review", failureReason: reason };
+  if (providerPaymentId) set.providerPaymentId = providerPaymentId;
+  if (providerAmountPaise != null) set.capturedAmountPaise = toPaise(providerAmountPaise);
+
+  const payment = await Payment.findOneAndUpdate(
+    { _id: paymentId, status: { $ne: "success" } },
+    { $set: set },
+    { new: true }
+  );
+  await raiseReconciliationException({
+    code: "REWARD_REDEMPTION_UNBACKED",
+    severity: "critical",
+    details: {
+      bookingId: current.bookingId,
+      paymentId: current._id,
+      redemptionId: error?.details?.redemptionId || null,
+      coins: error?.details?.coins || current.rewardCoinsRedeemed || 0,
+      reason: error?.code || "reward_backing_failure",
+      source,
+    },
+  });
+  return payment;
 };
 
 const settleAfterCommit = async ({ bookingId, itemType, source }) => {
@@ -93,6 +142,16 @@ export const raiseReconciliationException = async ({ code, severity = "warning",
 
 const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, source, actor, reason, session }) => {
   const before = payment.toObject();
+  // 🪙 Consume the payment-time coin reservation in the SAME transaction as
+  // the payment/ledger writes. If the reservation cannot be backed (expired
+  // and balance spent elsewhere), abort rather than grant an unbacked discount.
+  const rewardRedemption = await consumeRedemptionForPayment({
+    paymentId: payment._id,
+    session,
+  });
+  payment.grossTotalAmountPaise = toPaise(
+    payment.grossTotalAmountPaise || (payment.totalAmountPaise + (payment.rewardDiscountPaise || 0))
+  );
   payment.status = "success";
   if (providerPaymentId) payment.providerPaymentId = providerPaymentId;
   if (razorpaySignature) payment.providerSignature = razorpaySignature;
@@ -186,7 +245,13 @@ const applySuccess = async ({ payment, providerPaymentId, razorpaySignature, sou
       totalAmountPaise: toPaise(payment.totalAmountPaise),
     },
     reason,
-    metadata: { source, ledgerKeys: ledger.keys },
+    metadata: {
+      source,
+      ledgerKeys: ledger.keys,
+      rewardRedemption: rewardRedemption.consumed
+        ? { coins: rewardRedemption.coins, redemptionId: String(payment.rewardRedemptionId || "") }
+        : null,
+    },
     session: session || null,
   });
 
@@ -288,10 +353,30 @@ export const markPaymentSucceeded = async (
       result = { alreadyProcessed: false, payment, amountMismatch: false };
     });
   } catch (txErr) {
+    let caught = txErr;
     if (isTransactionUnsupported(txErr)) {
-      result = await doNonTransactional();
-    } else {
-      throw txErr;
+      try {
+        result = await doNonTransactional();
+      } catch (fallbackErr) {
+        caught = fallbackErr;
+      }
+    }
+    if (!result) {
+      if (!isRewardBackingFailure(caught)) throw caught;
+      const payment = await markRewardBackingReview({
+        paymentId,
+        error: caught,
+        providerPaymentId,
+        providerAmountPaise,
+        source,
+      });
+      result = {
+        alreadyProcessed: false,
+        payment,
+        amountMismatch: false,
+        manualReview: true,
+        rewardIssue: true,
+      };
     }
   } finally {
     session.endSession();
@@ -390,6 +475,11 @@ export const resolveManualReview = async (
           metadata: { source: "manual_review_resolution" },
           session,
         });
+        await releaseRedemptionForPayment({
+          paymentId,
+          reason: "manual_review_confirmed_failed",
+          session,
+        });
         outcome = { payment, alreadyProcessed: false };
         return;
       }
@@ -443,6 +533,12 @@ export const resolveManualReview = async (
       throw Object.assign(
         new Error("Manual-review resolution requires a replica set; refusing to resolve non-transactionally"),
         { statusCode: 503, code: "REVIEW_TXN_REQUIRED" }
+      );
+    }
+    if (isRewardBackingFailure(txErr)) {
+      throw Object.assign(
+        new Error("Reward coins are no longer available to back this payment — resolve as failed and refund, or restore the customer's coins"),
+        { statusCode: 409, code: "REWARD_REDEMPTION_UNBACKED", details: txErr.details || null }
       );
     }
     throw txErr;
@@ -502,6 +598,13 @@ export const markPaymentFailed = async (
       session: null,
     });
 
+    await releaseRedemptionForPayment({
+      paymentId,
+      reason: failureReason || "payment_failed",
+    }).catch((err) => {
+      console.error(`[PaymentTransition] reward release failed for ${paymentId}:`, err.message);
+    });
+
     return { alreadyProcessed: false, payment };
   };
 
@@ -526,6 +629,12 @@ export const markPaymentFailed = async (
       after: { status: "failed", failureReason: failureReason || null },
       reason,
       metadata: { source },
+      session: outerSession,
+    });
+
+    await releaseRedemptionForPayment({
+      paymentId,
+      reason: failureReason || "payment_failed",
       session: outerSession,
     });
 
@@ -560,6 +669,12 @@ export const markPaymentFailed = async (
           after: { status: "failed", failureReason: failureReason || null },
           reason,
           metadata: { source },
+          session,
+        });
+
+        await releaseRedemptionForPayment({
+          paymentId,
+          reason: failureReason || "payment_failed",
           session,
         });
 
