@@ -1,0 +1,76 @@
+name: Deploy Righttouch API
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: righttouch-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Lightsail
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          DEPLOY_HOST: ${{ secrets.RIGHTTOUCH_HOST }}
+          DEPLOY_USER: ${{ secrets.RIGHTTOUCH_USER }}
+        with:
+          host: ${{ secrets.RIGHTTOUCH_HOST }}
+          username: ${{ secrets.RIGHTTOUCH_USER }}
+          key: ${{ secrets.RIGHTTOUCH_SSH_KEY }}
+          envs: DEPLOY_HOST,DEPLOY_USER
+          command_timeout: 12m
+          script: |
+            set -eu
+            cd /var/www/righttouch-api
+
+            echo "Checking deployment branch..."
+            git fetch origin main
+            git diff --quiet
+            git diff --cached --quiet
+
+            echo "Checking repository state..."
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              echo "Tracked local changes detected. Aborting deployment."
+              git status --short
+              exit 1
+            fi
+
+            git merge-base --is-ancestor HEAD origin/main || {
+              echo "Server HEAD is not an ancestor of origin/main; refusing deployment."
+              exit 1
+            }
+
+            git pull --ff-only origin main
+
+            echo "Installing production dependencies..."
+            npm ci --omit=dev
+
+            echo "Restarting API..."
+            pm2 restart righttouch-api --update-env
+            pm2 save
+
+            echo "Waiting for API health..."
+            for attempt in $(seq 1 18); do
+              if curl --fail --silent --show-error \
+                https://api.righttouchservice.com/health/ready; then
+                echo
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Health check failed."
+            pm2 logs righttouch-api --lines 80 --nostream
+            exit 1
