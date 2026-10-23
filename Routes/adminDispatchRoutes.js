@@ -68,7 +68,7 @@ router.get("/stats", Auth, adminOnly, async (req, res) => {
         completed: completed[0] || { avgMs: 0, maxMs: 0, minMs: 0 },
         retryDistribution: retryDist.map(r => ({ attempts: r._id, count: r.count })),
         oldestPendingAgeSeconds: ageSeconds(oldestDispatch),
-        staleInflight,
+        staleInflight: staleDispatchInflight,
         bookingOutbox: {
           pending: bookingPending,
           inflight: bookingInflight,
