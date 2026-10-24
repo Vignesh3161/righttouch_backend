@@ -30,11 +30,15 @@ export const checkTechnicianActivation = async (technicianProfileId) => {
     }
 
     const kyc = await TechnicianKyc.findOne({ technicianId: technicianProfileId })
-      .select("verificationStatus bankVerified kycVerified")
+      .select("verificationStatus bankVerified bankVerificationStatus kycVerified")
       .lean();
 
     if (!kyc || (kyc.verificationStatus !== "approved" && !kyc.kycVerified)) {
       return { isActive: false, message: "KYC verification is pending. Please check your document status." };
+    }
+
+    if (kyc.bankVerified !== true && kyc.bankVerificationStatus !== "approved") {
+      return { isActive: false, message: "Bank account verification is pending. Please wait for admin verification." };
     }
 
     return { isActive: true, message: "Technician account is active" };

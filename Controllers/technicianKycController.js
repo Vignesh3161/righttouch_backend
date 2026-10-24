@@ -8,6 +8,7 @@ import { getTechnicianJobEligibility } from "../Utils/technicianEligibility.js";
 import { getSignedKycUrl } from "../Utils/cloudinaryUpload.js";
 import { maskAadhaar, maskPan, maskAccount, hashAccountNumber, fingerprintBankDetails } from "../Utils/kycPrivacy.js";
 import { writeAuditLog } from "../Utils/audit.js";
+import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
 import {
   getDekForKycDoc,
   getOrCreateDekForKycDoc,
@@ -864,6 +865,23 @@ export const verifyTechnicianKyc = async (req, res) => {
           success: false,
           message: "Technician must complete training before KYC approval",
           result: { trainingCompleted: false },
+        });
+      }
+
+      // KYC approval flips workStatus to approved - grant the district/zones in
+      // the same step so the newly approved technician can actually receive jobs.
+      try {
+        await ensureApprovedDistrictZones({
+          technicianId,
+          adminUserId: req.user?.userId,
+          reason: "KYC approved",
+        });
+      } catch (districtErr) {
+        return res.status(districtErr.statusCode || 400).json({
+          success: false,
+          message: districtErr.message,
+          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
+          result: {},
         });
       }
     }

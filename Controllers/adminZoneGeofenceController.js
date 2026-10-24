@@ -18,6 +18,7 @@ import { haversineMeters } from "../Utils/feasibility.js";
 import { isValidObjectId, exactRegex, containsRegex, clampLimit, clampPage, internalError } from "../Utils/safeQuery.js";
 import { seedZoneDisabledServices, recordPolygonVersion, withZoneWriteTransaction, invalidateDistrictPolygonCache } from "../Services/zoneWriteService.js";
 import { writeAuditLog } from "../Utils/audit.js";
+import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -1336,6 +1337,22 @@ export const updateTechnicianVerification = async (req, res) => {
     else if (action === "SUSPEND") tech.workStatus = "suspended";
     else if (action === "REACTIVATE") tech.workStatus = "approved";
     else return res.status(400).json({ success: false, message: "Invalid action. Allowed: APPROVE, REJECT, SUSPEND, REACTIVATE" });
+
+    if (tech.workStatus === "approved") {
+      try {
+        await ensureApprovedDistrictZones({
+          technicianId: tech._id,
+          adminUserId: req.user?.userId,
+          reason: reason || `Technician verification ${action}`,
+        });
+      } catch (districtErr) {
+        return res.status(districtErr.statusCode || 400).json({
+          success: false,
+          message: districtErr.message,
+          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
+        });
+      }
+    }
 
     await tech.save();
 

@@ -10,7 +10,7 @@ import { getDistrictFromCoordinates } from "../Services/districtService.js";
 import { recordLocationUpdate } from "./socketMetrics.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { emitJobExpired, emitJobsChanged } from "./sendNotification.js";
-import { STALENESS_SECONDS } from "./locationConfig.js";
+import { STALENESS_SECONDS, normalizeCoordinates } from "./locationConfig.js";
 
 /**
  * Common logic to update technician location from HTTP or Socket.
@@ -26,18 +26,12 @@ import { STALENESS_SECONDS } from "./locationConfig.js";
 export const handleLocationUpdate = async (technicianProfileId, latitude, longitude, io, via = "socket") => {
     recordLocationUpdate(via);
 
-    if (
-        !Number.isFinite(Number(latitude)) ||
-        !Number.isFinite(Number(longitude)) ||
-        Number(latitude) < -90 ||
-        Number(latitude) > 90 ||
-        Number(longitude) < -180 ||
-        Number(longitude) > 180
-    ) {
+    const coords = normalizeCoordinates(latitude, longitude);
+    if (!coords.valid) {
         throw new Error("Invalid coordinates: latitude must be [-90,90] and longitude [-180,180]");
     }
-    latitude = Number(latitude);
-    longitude = Number(longitude);
+    latitude = coords.latitude;
+    longitude = coords.longitude;
 
     const profile = await TechnicianProfile.findById(technicianProfileId).select("location lastMatchingAt availability workStatus trainingCompleted");
     if (!profile) throw new Error("Technician profile not found");

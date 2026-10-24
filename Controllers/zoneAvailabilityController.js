@@ -4,6 +4,7 @@ import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
 import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import { internalError } from "../Utils/safeQuery.js";
+import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 
 /* =====================================================
    RESOLVE ZONE FROM CUSTOMER LOCATION
@@ -221,10 +222,10 @@ export const getServicesInMyZone = async (req, res) => {
 
     const TechnicianProfile = mongoose.model("TechnicianProfile");
     const profile = await TechnicianProfile.findById(technicianProfileId)
-      .select("cityZoneId")
+      .select("enabledCityZoneIds")
       .lean();
 
-    if (!profile?.cityZoneId) {
+    if (!profile?.enabledCityZoneIds?.length) {
       return res.status(200).json({
         success: true,
         result: [],
@@ -232,9 +233,14 @@ export const getServicesInMyZone = async (req, res) => {
       });
     }
 
-    // Deactivated zone → no services, regardless of cached mappings.
-    const assignedZone = await CityZone.findById(profile.cityZoneId).select("active").lean();
-    if (!assignedZone || assignedZone.active === false) {
+    const zones = await CityZone.find({
+      _id: { $in: profile.enabledCityZoneIds },
+      active: { $ne: false },
+    })
+      .select("_id operationalCityId")
+      .lean();
+
+    if (!zones.length) {
       return res.status(200).json({
         success: true,
         result: [],
@@ -242,8 +248,10 @@ export const getServicesInMyZone = async (req, res) => {
       });
     }
 
+    const zoneIds = zones.map((z) => z._id);
+    const districtIds = [...new Set(zones.map((z) => String(z.operationalCityId)).filter(Boolean))];
     const mappings = await ZoneServiceMapping.find({
-      zoneId: profile.cityZoneId,
+      zoneId: { $in: zoneIds },
       active: true,
     })
       .populate({
@@ -252,10 +260,24 @@ export const getServicesInMyZone = async (req, res) => {
       })
       .lean();
 
-    const services = mappings
-      .filter((m) => m.serviceId)
-      .map((m) => m.serviceId);
+    const serviceIds = mappings.map((m) => m.serviceId?._id).filter(Boolean);
+    const snapshot = await getAvailabilitySnapshot({
+      serviceIds,
+      districtIds,
+      zoneIds,
+    });
 
+    const serviceById = new Map();
+    const zoneById = new Map(zones.map((z) => [String(z._id), z]));
+    for (const mapping of mappings) {
+      const service = mapping.serviceId;
+      const zone = zoneById.get(String(mapping.zoneId));
+      if (!service || !zone) continue;
+      const evaluation = snapshot.evaluate(service._id, zone.operationalCityId, zone._id);
+      if (evaluation.available) serviceById.set(String(service._id), service);
+    }
+
+    const services = [...serviceById.values()];
     return res.status(200).json({
       success: true,
       result: services,

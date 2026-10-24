@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import { haversineMeters } from "./feasibility.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
@@ -26,7 +27,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     // 2. Fetch current technician profile and state
     const technician = await TechnicianProfile.findById(technicianProfileId)
-        .select("location locationUpdatedAt availability workStatus primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds skills serviceRadiusKm")
+        .select("location locationUpdatedAt availability workStatus profileComplete trainingCompleted primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds skills serviceRadiusKm")
         .lean();
 
     if (!technician || technician.workStatus !== "approved" || !technician.availability?.isOnline) {
@@ -48,6 +49,10 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
         console.log(`[fetchJobsInternal] Tech ${technicianProfileId} GPS is stale or missing timestamp (${technician.locationUpdatedAt || "none"}, reason=${gps.reason}, age=${gps.ageSeconds}s, threshold=${gps.thresholdSeconds}s). Hiding jobs.`);
         return [];
     }
+
+    const kyc = await TechnicianKyc.findOne({ technicianId: techId })
+        .select("verificationStatus bankVerified bankVerificationStatus kycVerified")
+        .lean();
 
     // 4. Find active unexpired broadcasts
     const broadcasts = await JobBroadcast.find({
@@ -87,6 +92,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             technician,
             booking,
             mode: "BROADCAST",
+            context: { technicianKyc: kyc },
         });
 
         if (!eligibility.eligible) {
@@ -124,8 +130,8 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             distanceStr: `${distanceKm} km`,
             distanceKm: Number(distanceKm),
             distanceMeters: Math.round(distanceMeters),
-            jobRadiusKm: 10,
-            maxRadiusKm: 10,
+            jobRadiusKm: Number((eligibility.details.effectiveRadiusMeters / 1000).toFixed(1)),
+            maxRadiusKm: Number((eligibility.details.effectiveRadiusMeters / 1000).toFixed(1)),
             maxAllowedMeters: eligibility.details.effectiveRadiusMeters,
             technicianAmount: booking.serviceId?.technicianAmount || booking.technicianAmount || 0,
             service: booking.serviceId || null,

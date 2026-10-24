@@ -3,6 +3,8 @@ import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
+import CityZone from "../Schemas/CityZone.js";
+import ServiceAvailability from "../Schemas/ServiceAvailability.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { sendPushNotification } from "../Utils/sendNotification.js";
 import Notification from "../Schemas/Notification.js";
@@ -161,8 +163,32 @@ export const reviewTechnicianSkillRequest = async (req, res) => {
         }
       }
 
-      // 2. Optionally ensure ZoneServiceMapping is active for this zone + service
+      // 2. Optionally enable the service for the whole zone. The mandatory
+      // mapping alone is not enough: the resolver also reads the canonical
+      // ZONE availability row (new zones are seeded DISABLED), so both must
+      // be written together.
       if (autoEnableInZone && skillReq.zoneId) {
+        const zone = await CityZone.findById(skillReq.zoneId)
+          .select("operationalCityId active")
+          .lean();
+        if (!zone) {
+          return res.status(404).json({
+            success: false,
+            message: "The zone for this skill request no longer exists",
+          });
+        }
+        const techZoneIds = (techProfile?.enabledCityZoneIds || []).map((z) =>
+          String(z._id || z)
+        );
+        if (!techZoneIds.includes(String(skillReq.zoneId))) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Technician does not have permission for this zone. Grant the zone before enabling the service.",
+            code: "ZONE_PERMISSION_REQUIRED",
+          });
+        }
+
         await ZoneServiceMapping.findOneAndUpdate(
           { zoneId: skillReq.zoneId, serviceId: skillReq.serviceId },
           {
@@ -170,6 +196,30 @@ export const reviewTechnicianSkillRequest = async (req, res) => {
               active: true,
               approvedBy: adminUserId || null,
               approvedAt: new Date(),
+            },
+            $setOnInsert: {
+              zoneId: skillReq.zoneId,
+              serviceId: skillReq.serviceId,
+            },
+          },
+          { upsert: true, new: true }
+        );
+
+        await ServiceAvailability.findOneAndUpdate(
+          {
+            serviceId: skillReq.serviceId,
+            districtId: zone.operationalCityId,
+            cityZoneId: skillReq.zoneId,
+            scope: "ZONE",
+          },
+          {
+            $set: {
+              serviceId: skillReq.serviceId,
+              districtId: zone.operationalCityId,
+              cityZoneId: skillReq.zoneId,
+              scope: "ZONE",
+              status: "ENABLED",
+              updatedBy: adminUserId || null,
             },
           },
           { upsert: true, new: true }

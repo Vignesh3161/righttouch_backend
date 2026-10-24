@@ -16,7 +16,7 @@ import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibilit
 import { geoSearch } from "./technicianGeo.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
-import { STALENESS_SECONDS, stalenessCutoff } from "./locationConfig.js";
+import { STALENESS_SECONDS, stalenessCutoff, getGpsState } from "./locationConfig.js";
 import { toJobNewDTO } from "./socketDTO.js";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
@@ -135,49 +135,7 @@ export const resolveOperationalCityFromCoordinates = async (latitude, longitude)
  * Auto-heals legacy profiles without primaryCityId set.
  */
 export const getAllowedDistrictIdsForTechnician = async (techProfile) => {
-  if (!techProfile) return [];
-
-  let primaryId = techProfile.primaryDistrictId || techProfile.primaryCityId;
-  const allowedProfile = [
-    ...(techProfile.enabledDistrictIds || []),
-    ...(techProfile.allowedCityIds || []),
-  ].map((d) => String(d._id || d));
-
-  // Auto-heal legacy profiles if primaryCityId is not set
-  if (!primaryId) {
-    if (techProfile.cityZoneId) {
-      const zone = await CityZone.findById(techProfile.cityZoneId).select("operationalCityId").lean();
-      if (zone?.operationalCityId) {
-        primaryId = zone.operationalCityId;
-        await TechnicianProfile.updateOne({ _id: techProfile._id }, { $set: { primaryDistrictId: primaryId, primaryCityId: primaryId } }).catch(() => {});
-      }
-    } else if (techProfile.city) {
-      const cityRegex = new RegExp(`^${escapeRegExp(String(techProfile.city).trim())}$`, "i");
-      const matchedCity = await OperationalCity.findOne({
-        $or: [
-          { city: cityRegex },
-          { name: cityRegex },
-          { name: new RegExp(escapeRegExp(String(techProfile.city).trim()), "i") },
-        ],
-        active: true,
-      })
-        .select("_id")
-        .lean();
-      if (matchedCity?._id) {
-        primaryId = matchedCity._id;
-        await TechnicianProfile.updateOne(
-          { _id: techProfile._id },
-          {
-            $set: { primaryDistrictId: primaryId, primaryCityId: primaryId },
-            $addToSet: { enabledDistrictIds: primaryId, allowedCityIds: primaryId },
-          }
-        ).catch(() => {});
-      }
-    }
-  }
-
-  const allIds = [primaryId, ...allowedProfile].filter(Boolean).map((id) => String(id._id || id));
-  return Array.from(new Set(allIds));
+  return getAllowedDistrictIds(techProfile);
 };
 
 /** Drop technicians whose last ping is older than the staleness threshold. */
@@ -381,6 +339,10 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       return { success: false, message: "Technician has an active job" };
     }
 
+    const technicianKyc = await TechnicianKyc.findOne({ technicianId: technicianProfileId })
+      .select("verificationStatus bankVerified bankVerificationStatus kycVerified")
+      .lean();
+
     // Guard: Only approved and online technicians receive jobs
     if (tech.workStatus !== "approved" || !tech.availability?.isOnline) {
       console.log(`⚠️ broadcastPendingJobsToTechnician: Tech ${technicianProfileId} not eligible (status: ${tech.workStatus}, online: ${tech.availability?.isOnline})`);
@@ -559,6 +521,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           technician: tech,
           booking,
           mode: "BROADCAST",
+          context: { technicianKyc },
         });
 
         if (!eligibility.eligible) {
@@ -728,11 +691,12 @@ export const findEligibleTechniciansForService = async ({
     if (!techIds?.length) return [];
     let kycQuery = TechnicianKyc.find({
       technicianId: { $in: techIds },
-      verificationStatus: "approved",
-    }).distinct("technicianId");
+      bankVerified: true,
+      $or: [{ verificationStatus: "approved" }, { kycVerified: true }],
+    }).select("technicianId").lean();
     if (session) kycQuery = kycQuery.session(session);
-    const approved = await kycQuery;
-    const approvedSet = new Set(approved.map(String));
+    const approvedDocs = await kycQuery;
+    const approvedSet = new Set(approvedDocs.map((k) => String(k.technicianId)));
     return techIds.filter((id) => approvedSet.has(String(id)));
   };
 
@@ -1043,12 +1007,16 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     if (technicianIds.length === 0) {
       console.log(`   ⚠️ [RADIUS SCAN] 0 technicians found within 10 km of customer GPS [${longitude}, ${latitude}] for Booking ${bookingId}`);
+      let noFreshGps = false;
+      let noSkilledTechnicians = false;
+      let noOnlineTechnicians = false;
+      let staleOnlineCount = 0;
       try {
         const sampleTechs = await TechnicianProfile.find({
           workStatus: "approved",
           "availability.isOnline": true,
           "location.coordinates.0": { $type: "number" },
-        }).select("_id location skills primaryDistrictId cityZoneId").limit(5).lean();
+        }).select("_id location skills primaryDistrictId cityZoneId locationUpdatedAt").limit(5).lean();
 
         if (sampleTechs.length > 0) {
           console.log(`   📍 Distances of online technicians to Customer GPS [${longitude}, ${latitude}]:`);
@@ -1056,10 +1024,43 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
             const sCoords = st.location.coordinates;
             const dist = haversineMeters({ latitude, longitude }, { latitude: sCoords[1], longitude: sCoords[0] });
             const status = dist <= 10000 ? "✅ WITHIN" : "❌ EXCEEDS";
-            console.log(`      • Tech ${st._id}: GPS [${sCoords[0]}, ${sCoords[1]}] | Distance: ${(dist / 1000).toFixed(2)} km (${Math.round(dist)}m) -> ${status} 10 km radius limit`);
+            const gps = getGpsState(st, "BROADCAST");
+            console.log(`      • Tech ${st._id}: GPS [${sCoords[0]}, ${sCoords[1]}] | Distance: ${(dist / 1000).toFixed(2)} km (${Math.round(dist)}m) -> ${status} 10 km radius limit | GPS ${gps.reason || "FRESH"} (${gps.ageSeconds ?? "?"}s)`);
           }
         } else {
           console.log(`   ℹ️ No online approved technicians found in the system.`);
+        }
+
+        const cutoff = stalenessCutoff();
+        const serviceSkill = {
+          "skills.serviceId": { $in: [booking.serviceId, String(booking.serviceId)] },
+        };
+        const onlineBase = {
+          workStatus: "approved",
+          profileComplete: true,
+          trainingCompleted: true,
+          "availability.isOnline": true,
+          ...serviceSkill,
+        };
+        const [skilledCount, onlineSkillCount, freshOnlineCount] = await Promise.all([
+          TechnicianProfile.countDocuments({
+            workStatus: "approved",
+            ...serviceSkill,
+          }),
+          TechnicianProfile.countDocuments(onlineBase),
+          TechnicianProfile.countDocuments({
+            ...onlineBase,
+            "location.coordinates.0": { $type: "number" },
+            "location.coordinates.1": { $type: "number" },
+            locationUpdatedAt: { $gte: cutoff },
+          }),
+        ]);
+        noSkilledTechnicians = skilledCount === 0;
+        noOnlineTechnicians = !noSkilledTechnicians && onlineSkillCount === 0;
+        noFreshGps = !noSkilledTechnicians && !noOnlineTechnicians && freshOnlineCount === 0;
+        staleOnlineCount = Math.max(0, onlineSkillCount - freshOnlineCount);
+        if (noFreshGps) {
+          recordMetric(METRIC_KEYS.TECHS_FILTERED_GPS_STALE, staleOnlineCount);
         }
       } catch (e) {}
       console.log(`======================================================================\n`);
@@ -1069,7 +1070,27 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         outcome: "NO_ELIGIBLE_TECHNICIANS",
         retryable: false,
         stage: "prefilter",
-        message: "No technicians found",
+        reason: noSkilledTechnicians
+          ? "NO_SKILLED_TECHNICIANS"
+          : noOnlineTechnicians
+            ? "NO_ONLINE_TECHNICIANS"
+            : noFreshGps
+              ? "NO_FRESH_GPS"
+              : undefined,
+        reasonTally: noSkilledTechnicians
+          ? { NO_SKILLED_TECHNICIANS: 1 }
+          : noOnlineTechnicians
+            ? { NO_ONLINE_TECHNICIANS: 1 }
+            : noFreshGps
+              ? { GPS_STALE: staleOnlineCount }
+              : undefined,
+        message: noSkilledTechnicians
+          ? "No approved technicians have this service skill"
+          : noOnlineTechnicians
+            ? "No online technicians have this service skill"
+            : noFreshGps
+              ? "No online technicians with fresh GPS"
+              : "No technicians found",
       };
     }
 
@@ -1094,13 +1115,17 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     await extendMatchLease("zone");
 
     // Load full profiles and queues for candidates
-    const [techProfiles, queueMap] = await Promise.all([
+    const [techProfiles, queueMap, kycDocs] = await Promise.all([
       TechnicianProfile.find({ _id: { $in: technicianIds } })
-        .select("_id userId location locationUpdatedAt workStatus availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
+        .select("_id userId location locationUpdatedAt workStatus profileComplete trainingCompleted availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
         .lean(),
       loadCommittedQueues(technicianIds),
+      TechnicianKyc.find({ technicianId: { $in: technicianIds } })
+        .select("technicianId verificationStatus bankVerified bankVerificationStatus kycVerified")
+        .lean(),
     ]);
     const profileById = new Map(techProfiles.map((t) => [String(t._id), t]));
+    eligibilityContext.kycByTechId = new Map(kycDocs.map((k) => [String(k.technicianId), k]));
     // Build userId map for correct room targeting
     const techUserIds = new Map(techProfiles.map((t) => [String(t._id), String(t.userId)]));
 

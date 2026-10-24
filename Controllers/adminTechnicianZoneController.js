@@ -167,24 +167,21 @@ export const enableTechnicianZonePermission = async (req, res) => {
       return res.status(404).json({ success: false, message: "Technician profile not found" });
     }
 
-    const allowedDistrictIds = [
-      tech.primaryDistrictId ? String(tech.primaryDistrictId) : null,
-      tech.primaryCityId ? String(tech.primaryCityId) : null,
-      ...(tech.enabledDistrictIds || []).map((id) => String(id._id || id)),
-      ...(tech.allowedCityIds || []).map((id) => String(id._id || id)),
-    ].filter(Boolean);
-
+    // Zone grants require an explicit enabled district permission row.
+    // Primary district metadata is not authorization.
     const activeDistPerms = await TechnicianDistrictPermission.find({
       technicianId,
       isEnabled: true,
     }).select("districtId").lean();
-
-    activeDistPerms.forEach((p) => {
-      if (p.districtId) allowedDistrictIds.push(String(p.districtId));
-    });
+    const allowedDistrictIds = activeDistPerms
+      .map((p) => (p.districtId ? String(p.districtId) : null))
+      .filter(Boolean);
 
     // 2. Fetch requested zones
-    const zones = await CityZone.find({ _id: { $in: targetZoneIds } }).lean();
+    const zones = await CityZone.find({
+      _id: { $in: targetZoneIds },
+      active: { $ne: false },
+    }).lean();
     if (!zones.length) {
       return res.status(404).json({ success: false, message: "No valid city zones found" });
     }

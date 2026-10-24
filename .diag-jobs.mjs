@@ -10,10 +10,12 @@
  */
 import mongoose from "mongoose";
 import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-dotenv.config({ path: "/home/vicky/flareminds/RightTouch/RighttouchServerNew/.env" });
+const root = path.dirname(fileURLToPath(import.meta.url));
 
-const root = "/home/vicky/flareminds/RightTouch/RighttouchServerNew";
+dotenv.config({ path: path.join(root, ".env") });
 
 const args = process.argv.slice(2);
 const argValue = (name, fallback) => {
@@ -23,11 +25,17 @@ const argValue = (name, fallback) => {
 const bookingIdArg = argValue("booking", null);
 const limit = Math.min(Math.max(Number(argValue("limit", 100)) || 100, 1), 500);
 const days = Math.min(Math.max(Number(argValue("days", 3)) || 3, 1), 30);
+const jsonOutput = args.includes("--json");
 
 const S = 24 * 60 * 60 * 1000;
 const since = new Date(Date.now() - days * S);
 
-await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 });
+await mongoose.connect(process.env.MONGO_URI, {
+  serverSelectionTimeoutMS: 10000,
+  autoIndex: false,
+  autoCreate: false,
+  readPreference: "secondaryPreferred",
+});
 console.log("connected", { database: mongoose.connection.name, bookingIdArg, limit, days });
 
 const { default: TechnicianProfile } = await import(`${root}/Schemas/TechnicianProfile.js`);
@@ -75,7 +83,7 @@ console.log("1 GPS:", {
   thresholdSeconds: STALENESS_SECONDS,
   fresh90s: fresh90,
   fresh15m,
-  staleApprovedOnline: approvedOnline - fresh90,
+  staleApprovedOnline: Math.max(0, approvedOnline - fresh90),
 });
 
 const skillAgg = await TechnicianProfile.aggregate([
@@ -100,10 +108,12 @@ const activeServiceIds = new Set(services.filter((s) => s.isActive !== false).ma
 
 const profiles = await TechnicianProfile.find({})
   .select("_id workStatus availability location locationUpdatedAt primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId currentCityZoneId enabledCityZoneIds skills")
+  .maxTimeMS(15000)
   .lean();
 
 const orphanProfiles = [];
 const gpsReasonTally = {};
+const gpsAgeBuckets = { fresh: 0, "<=5m": 0, "<=1h": 0, "<=24h": 0, ">24h": 0, missing: 0 };
 for (const p of profiles) {
   const issues = [];
   const districtRefs = [p.primaryDistrictId, p.primaryCityId, ...(p.enabledDistrictIds || []), ...(p.allowedCityIds || [])]
@@ -126,6 +136,13 @@ for (const p of profiles) {
   }
   const gps = getGpsState(p, "BROADCAST");
   gpsReasonTally[gps.reason || "FRESH"] = (gpsReasonTally[gps.reason || "FRESH"] || 0) + 1;
+  const age = gps.ageSeconds;
+  if (age == null) gpsAgeBuckets.missing += 1;
+  else if (age <= STALENESS_SECONDS) gpsAgeBuckets.fresh += 1;
+  else if (age <= 5 * 60) gpsAgeBuckets["<=5m"] += 1;
+  else if (age <= 60 * 60) gpsAgeBuckets["<=1h"] += 1;
+  else if (age <= 24 * 60 * 60) gpsAgeBuckets["<=24h"] += 1;
+  else gpsAgeBuckets[">24h"] += 1;
 
   if (issues.length) orphanProfiles.push({ id: String(p._id), workStatus: p.workStatus, online: p.availability?.isOnline === true, issues });
 }
@@ -138,6 +155,7 @@ console.log("2 CANONICAL:", {
   activeServices: activeServiceIds.size,
   orphanProfiles: orphanProfiles.length,
   gpsStates: gpsReasonTally,
+  gpsAgeBuckets,
 });
 for (const p of orphanProfiles.slice(0, 15)) console.log("  ORPHAN PROFILE:", JSON.stringify(p));
 
@@ -146,6 +164,7 @@ const bookings = await ServiceBooking.find({ createdAt: { $gte: since } })
   .select("_id status assignmentStatus serviceId districtId cityZoneId location scheduledAt createdAt broadcastedAt matchingLeaseUntil assignmentAttempts autoCancelAt technicianId")
   .sort({ createdAt: -1 })
   .limit(Math.min(limit, 25))
+  .maxTimeMS(15000)
   .lean();
 console.log(`3 RECENT BOOKINGS (${days}d):`, bookings.length);
 for (const b of bookings) {
@@ -154,9 +173,15 @@ for (const b of bookings) {
   const districtState = !districtId ? "missing" : !cityById.has(districtId) ? "ORPHAN" : !activeCityIds.has(districtId) ? "INACTIVE" : "ok";
   const zoneState = !zoneId ? "missing" : !zoneById.has(zoneId) ? "ORPHAN" : !activeZoneIds.has(zoneId) ? "INACTIVE" : "ok";
   const coords = b.location?.coordinates;
+  const leaseState = b.matchingLeaseUntil
+    ? new Date(b.matchingLeaseUntil) > new Date()
+      ? "held"
+      : "expired"
+    : "-";
+  const attemptCount = Array.isArray(b.assignmentAttempts) ? b.assignmentAttempts.length : 0;
   console.log(
-    `  B ${b._id} status=${b.status}/${b.assignmentStatus} lease=${b.matchingLeaseUntil ? "held" : "-"} ` +
-    `attempts=${b.assignmentAttempts} tech=${b.technicianId ? "SET" : "null"} svc=${b.serviceId} ` +
+    `  B ${b._id} status=${b.status}/${b.assignmentStatus} lease=${leaseState} ` +
+    `attempts=${attemptCount} tech=${b.technicianId ? "SET" : "null"} svc=${b.serviceId} ` +
     `district=${districtId || "-"}:${districtState} zone=${zoneId || "-"}:${zoneState} ` +
     `loc=${Array.isArray(coords) && coords.every(Number.isFinite) ? "yes" : "NO"} ` +
     `at=${b.broadcastedAt || "-"} created=${b.createdAt?.toISOString?.()}`
@@ -185,6 +210,9 @@ const target = bookingIdArg
       .lean()
   : bookings.find((b) => ["pending", "broadcasted"].includes(b.status) && !b.technicianId) || bookings[0];
 
+let stagesReport = null;
+let reasonTallyReport = null;
+
 if (!target) {
   console.log("5 ELIGIBILITY: no booking available");
 } else {
@@ -206,7 +234,6 @@ if (!target) {
     }).select("_id").lean();
     if (zone?._id) jobZoneId = String(zone._id);
   }
-  const area = { latitude: lat, longitude: lng };
   const eligibilityContext = {
     jobDistrictId,
     jobZoneId,
@@ -226,28 +253,36 @@ if (!target) {
     trainingCompleted: true,
     "availability.isOnline": true,
   };
-  if (serviceId) stageBase["skills.serviceId"] = new mongoose.Types.ObjectId(serviceId);
+  const skillOr = serviceId
+    ? { $or: [{ "skills.serviceId": new mongoose.Types.ObjectId(serviceId) }, { "skills.serviceId": serviceId }] }
+    : null;
+  const stageFilter = skillOr ? { $and: [stageBase, skillOr] } : stageBase;
   const stages = {};
   stages.approved = await TechnicianProfile.countDocuments({ workStatus: "approved" });
   stages.approvedOnline = await TechnicianProfile.countDocuments({ workStatus: "approved", "availability.isOnline": true });
-  stages.skill = serviceId ? await TechnicianProfile.countDocuments(stageBase) : null;
+  stages.skill = serviceId ? await TechnicianProfile.countDocuments(stageFilter) : null;
   stages.freshGps = await TechnicianProfile.countDocuments({
-    ...stageBase,
+    ...stageFilter,
     locationUpdatedAt: { $gte: new Date(Date.now() - STALENESS_SECONDS * 1000) },
   });
+  const districtRef = jobDistrictId && mongoose.Types.ObjectId.isValid(jobDistrictId)
+    ? new mongoose.Types.ObjectId(jobDistrictId)
+    : jobDistrictId;
   const districtOr = jobDistrictId ? {
     $or: [
-      { primaryDistrictId: jobDistrictId },
-      { primaryCityId: jobDistrictId },
-      { enabledDistrictIds: jobDistrictId },
-      { allowedCityIds: jobDistrictId },
+      { primaryDistrictId: districtRef },
+      { primaryCityId: districtRef },
+      { enabledDistrictIds: districtRef },
+      { allowedCityIds: districtRef },
     ],
-  } : {};
-  stages.districtPermission = await TechnicianProfile.countDocuments({ ...stageBase, ...districtOr });
+  } : null;
+  const combinedFilter = districtOr ? { $and: [stageFilter, districtOr] } : stageFilter;
+  stages.districtPermission = await TechnicianProfile.countDocuments(combinedFilter);
 
-  let candidates = await TechnicianProfile.find({ ...stageBase, ...districtOr })
+  let candidates = await TechnicianProfile.find(combinedFilter)
     .select("userId location locationUpdatedAt availability skills enabledDistrictIds allowedCityIds primaryDistrictId cityZoneId enabledCityZoneIds serviceRadiusKm workStatus profileComplete")
     .limit(limit)
+    .maxTimeMS(15000)
     .lean();
   stages.districtCandidates = candidates.length;
 
@@ -264,11 +299,19 @@ if (!target) {
     } else {
       stages.zoneCandidates = "skipped";
     }
-    stages.withinRadius = await TechnicianProfile.countDocuments({
-      ...stageBase,
-      ...districtOr,
-      location: { $nearSphere: { $geometry: { type: "Point", coordinates: [lng, lat] }, $maxDistance: radiusKm * 1000 } },
-    });
+    const withinRadiusAgg = await TechnicianProfile.aggregate([
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: [lng, lat] },
+          distanceField: "distanceMeters",
+          maxDistance: radiusKm * 1000,
+          spherical: true,
+          query: combinedFilter,
+        },
+      },
+      { $count: "n" },
+    ]).option({ maxTimeMS: 15000 });
+    stages.withinRadius = withinRadiusAgg[0]?.n || 0;
   } else {
     stages.zoneCandidates = "no_job_coords";
     stages.withinRadius = "no_job_coords";
@@ -315,18 +358,48 @@ if (!target) {
     eligibleIds: eligibleIds.slice(0, 20),
   });
   console.log("5 REASON TALLY:", JSON.stringify(reasonTally));
+  stagesReport = stages;
+  reasonTallyReport = reasonTally;
 }
 
 /* ── 6. Online sample (user/role/profile sanity) ── */
 const onlines = await TechnicianProfile.find({ "availability.isOnline": true })
-  .select("_id userId lastJobsChangeAt locationUpdatedAt workStatus profileComplete")
+  .select("_id userId lastJobsChangeAt location locationUpdatedAt workStatus profileComplete")
   .limit(10)
+  .maxTimeMS(15000)
   .lean();
 console.log("6 ONLINE SAMPLE:");
 for (const t of onlines) {
   const u = await User.findById(t.userId).select("status role").lean();
   const gps = getGpsState(t, "BROADCAST");
   console.log(`  T ${t._id} user=${t.userId} uStatus=${u?.status} role=${u?.role} ws=${t.workStatus} pc=${t.profileComplete} lastJobsChangeAt=${t.lastJobsChangeAt?.toISOString?.()} gps=${gps.reason || "FRESH"} age=${gps.ageSeconds}s`);
+}
+
+if (jsonOutput) {
+  console.log(JSON.stringify({
+    database: mongoose.connection.name,
+    total,
+    byStatus,
+    online,
+    approvedOnline,
+    withGps,
+    fresh90,
+    fresh15m,
+    gpsAgeBuckets,
+    bookings: bookings.length,
+    broadcastCounts,
+    bookingOutboxCounts,
+    dispatchOutboxCounts,
+    target: target
+      ? {
+          id: String(target._id),
+          status: target.status,
+          assignmentStatus: target.assignmentStatus,
+        }
+      : null,
+    stages: stagesReport,
+    reasonTally: reasonTallyReport,
+  }, null, 2));
 }
 
 await mongoose.disconnect();

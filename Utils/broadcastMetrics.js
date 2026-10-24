@@ -93,6 +93,8 @@ export const METRIC_KEYS = {
   TECHS_FILTERED_ZONE: 'techs_filtered_zone',
   TECHS_FILTERED_FEASIBILITY: 'techs_filtered_feasibility',
   TECHS_FILTERED_OTHER: 'techs_filtered_other',
+  TECHS_FILTERED_GPS_STALE: 'techs_filtered_gps_stale',
+  TECHS_AUTO_OFFLINE: 'techs_auto_offline',
   
   // Broadcast creation
   BROADCAST_CREATED: 'broadcast_created',

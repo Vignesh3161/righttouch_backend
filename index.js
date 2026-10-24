@@ -45,6 +45,7 @@ import { createHandshakeLimiter } from "./Middleware/socketRateLimiter.js";
 import { startSocketMetricsLogger, recordLocationDrop } from "./Utils/socketMetrics.js";
 import TechnicianProfile from "./Schemas/TechnicianProfile.js";
 import { setIo } from "./Utils/ioAccess.js";
+import { getGpsState, normalizeCoordinates } from "./Utils/locationConfig.js";
 
 /* ================= ROUTE IMPORTS ================= */
 // Admin Route Imports
@@ -246,6 +247,22 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     socket.join(SOCKET_ROOMS.TECHNICIAN(techProfileId));
     // DO NOT join user_{techProfileId} — causes ID confusion
     console.log(`🏠 [TECH ROOM] Joined: technician_${techProfileId}`);
+
+    TechnicianProfile.findById(techProfileId)
+      .select("availability location locationUpdatedAt")
+      .lean()
+      .then((profile) => {
+        if (!profile?.availability?.isOnline) return;
+        const gps = getGpsState(profile, "BROADCAST");
+        if (gps.valid && gps.fresh) return;
+        socket.emit(SOCKET_EVENTS.TECH_LOCATION_REQUIRED, {
+          code: gps.valid ? "GPS_STALE" : "GPS_REQUIRED",
+          reason: gps.reason,
+          ageSeconds: gps.ageSeconds,
+          thresholdSeconds: gps.thresholdSeconds,
+        });
+      })
+      .catch(() => {});
   }
 
   // Admin/Owner dashboard feed (replaces the old global new_booking io.emit —
@@ -315,10 +332,16 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
         return ack?.({ success: false, throttled: true, retryAfterMs: 5000, message: "Too frequent updates" });
       }
 
-      const { latitude, longitude } = data;
-      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+      const coords = normalizeCoordinates(data?.latitude, data?.longitude);
+      if (!coords.valid) {
+        return ack?.({
+          success: false,
+          code: "INVALID_COORDINATES",
+          message: "Invalid coordinates",
+        });
+      }
 
-      const result = await handleLocationUpdate(techProfileId, latitude, longitude, io);
+      const result = await handleLocationUpdate(techProfileId, coords.latitude, coords.longitude, io);
 
       // ✅ ACK support back to client
       ack?.({ success: true, ...result });
@@ -402,6 +425,7 @@ import { initPaymentCrons } from "./Utils/paymentCrons.js";
 import { validateFcmConfig } from "./Utils/firebase.js";
 import { startDispatchWorker, stopDispatchWorker } from "./Utils/dispatchQueue.js";
 import { startBookingOutboxWorker, stopBookingOutboxWorker } from "./Utils/bookingOutboxWorker.js";
+import { startTechnicianPresenceSweeper, stopTechnicianPresenceSweeper } from "./Utils/technicianPresenceSweeper.js";
 import { getBroadcastMetrics } from "./Utils/broadcastMetrics.js";
 import { startAttemptExpirySweeper, stopAttemptExpirySweeper } from "./Utils/attemptExpirySweeper.js";
 import { startPaymentNotificationWorker, stopPaymentNotificationWorker } from "./Utils/paymentNotificationWorker.js";
@@ -514,6 +538,8 @@ const startBackgroundWorkers = async () => {
 
   // 📤 Booking outbox worker — broadcast only AFTER booking transaction commit
   startBookingOutboxWorker(io);
+
+  startTechnicianPresenceSweeper(io);
 
   // 📊 Broadcast funnel metrics (5-minute rolling counters; post to logs so
   // "matched but never delivered" is visible without a metrics backend).
@@ -798,6 +824,7 @@ const shutdown = async (signal) => {
   try {
     stopDispatchWorker();
     stopBookingOutboxWorker();
+    stopTechnicianPresenceSweeper();
     stopAttemptExpirySweeper();
     stopPaymentNotificationWorker();
     stopNotificationWorker();
