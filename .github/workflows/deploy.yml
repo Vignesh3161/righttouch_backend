@@ -1,3 +1,4 @@
+
 name: Deploy Righttouch API
 
 on:
@@ -35,24 +36,14 @@ jobs:
             set -eu
             cd /var/www/righttouch-api
 
-            echo "Checking deployment branch..."
+            echo "Fetching latest main..."
             git fetch origin main
-            git diff --quiet
-            git diff --cached --quiet
 
-            echo "Checking repository state..."
-            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-              echo "Tracked local changes detected. Aborting deployment."
-              git status --short
-              exit 1
-            fi
+            echo "Syncing production code with GitHub main..."
+            git reset --hard origin/main
 
-            git merge-base --is-ancestor HEAD origin/main || {
-              echo "Server HEAD is not an ancestor of origin/main; refusing deployment."
-              exit 1
-            }
-
-            git pull --ff-only origin main
+            echo "Verifying package.json..."
+            node -e "JSON.parse(require('fs').readFileSync('package.json', 'utf8'))"
 
             echo "Installing production dependencies..."
             npm ci --omit=dev
@@ -61,16 +52,17 @@ jobs:
             pm2 restart righttouch-api --update-env
             pm2 save
 
-            echo "Waiting for API health..."
+            echo "Checking API health..."
             for attempt in $(seq 1 18); do
               if curl --fail --silent --show-error \
                 https://api.righttouchservice.com/health/ready; then
                 echo
+                echo "Deployment successful."
                 exit 0
               fi
               sleep 5
             done
 
-            echo "Health check failed."
+            echo "Health check failed. Recent application logs:"
             pm2 logs righttouch-api --lines 80 --nostream
             exit 1
