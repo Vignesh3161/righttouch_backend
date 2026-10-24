@@ -682,9 +682,10 @@ export const getServiceById = async (req, res) => {
 
 /**
  * 🎯 TOGGLE ZONE RESTRICTION (Admin/Owner)
- * When ON, the service is only visible/bookable in zones with an active
- * ZoneServiceMapping. When OFF, the service is available everywhere.
- * ZoneServiceMapping rows are managed via the existing adminZones routes.
+ * Legacy metadata flag. Availability is always governed by the strict
+ * per-zone ZoneServiceMapping + ServiceAvailability resolver; this flag no
+ * longer bypasses the mapping gate. ZoneServiceMapping rows are managed via
+ * the existing adminZones routes.
  */
 export const toggleZoneRestriction = async (req, res) => {
   try {
@@ -710,9 +711,7 @@ export const toggleZoneRestriction = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: zoneRestricted
-        ? `"${service.serviceName}" is now zone-restricted (visible only in mapped zones).`
-        : `"${service.serviceName}" is now available in all zones.`,
+      message: `"${service.serviceName}" zoneRestricted flag updated. Zone mappings remain authoritative for availability.`,
       result: service,
     });
   } catch (error) {

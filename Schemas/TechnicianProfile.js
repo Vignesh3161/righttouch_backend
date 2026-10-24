@@ -138,6 +138,14 @@ const technicianProfileSchema = new mongoose.Schema(
         type: Boolean,
         default: false,
       },
+      offlineReason: {
+        type: String,
+        default: null,
+      },
+      offlineAt: {
+        type: Date,
+        default: null,
+      },
     },
 
     // 📱 FCM push tokens (multi-device). Registered on app login/foreground;

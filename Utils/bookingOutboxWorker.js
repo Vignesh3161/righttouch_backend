@@ -106,9 +106,9 @@ export const processRow = async (row) => {
       }
       // Screened-out or terminal business outcomes are recorded once and
       // never retried. Operators can see the exact stage/reason.
-      const reason = result.stage
-        ? `${result.outcome}:${result.stage}`
-        : result.outcome || "no_match";
+      const reason = [result.outcome, result.stage, result.reason]
+        .filter(Boolean)
+        .join(":") || "no_match";
       await markDone(row, reason);
       recordBookingOutbox(
         result.outcome === "NO_ELIGIBLE_TECHNICIANS" ? "no_candidates" : "done"

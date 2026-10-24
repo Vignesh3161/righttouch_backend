@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import CityZone from "../Schemas/CityZone.js";
+import Service from "../Schemas/Service.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
 import { writeAuditLog } from "../Utils/audit.js";
@@ -591,10 +592,30 @@ export const toggleZoneServices = async (req, res) => {
       return res.status(404).json({ success: false, message: "City zone not found", result: {} });
     }
 
-    const result = await ZoneServiceMapping.updateMany(
-      { zoneId },
-      { $set: { active: targetActive } }
-    );
+    // Upsert a mapping for every active service so legacy zones with no
+    // mapping rows can still be bulk-enabled/disabled by the admin.
+    const activeServices = await Service.find({ isActive: true }).select("_id").lean();
+    let result = { modifiedCount: 0, upsertedCount: 0 };
+    if (activeServices.length) {
+      result = await ZoneServiceMapping.bulkWrite(
+        activeServices.map((svc) => ({
+          updateOne: {
+            filter: { zoneId, serviceId: svc._id },
+            update: {
+              $set: { active: targetActive },
+              $setOnInsert: {
+                zoneId,
+                serviceId: svc._id,
+                approvedBy: req.user?.userId || null,
+                approvedAt: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false }
+      );
+    }
 
     // Keep the ServiceAvailability ZONE overrides in sync so the unified
     // resolver (ZoneServiceMapping + ServiceAvailability) stays consistent
@@ -643,8 +664,8 @@ export const toggleZoneServices = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `${targetActive ? "Enabled" : "Disabled"} ${result.modifiedCount} service mappings`,
-      result: { modifiedCount: result.modifiedCount },
+      message: `${targetActive ? "Enabled" : "Disabled"} ${(result.modifiedCount || 0) + (result.upsertedCount || 0)} service mappings`,
+      result: { modifiedCount: (result.modifiedCount || 0) + (result.upsertedCount || 0) },
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });

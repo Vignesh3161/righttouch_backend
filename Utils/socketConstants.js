@@ -28,6 +28,8 @@ export const SOCKET_EVENTS = {
     TECH_GET_JOBS: "technician:get_jobs",
     TECH_JOBS_LIST: "technician:jobs_list",
     TECH_JOBS_CHANGED: "technician:jobs_changed",
+    TECH_LOCATION_REQUIRED: "technician:location_required",
+    TECH_OFFLINE: "technician:offline",
     JOB_CANCELLED_BY_CUSTOMER: "job_cancelled_by_customer",
 
     // 📋 Job/Booking Events

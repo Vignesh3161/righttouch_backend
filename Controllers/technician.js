@@ -7,16 +7,43 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
 import { handleLocationUpdate, revalidateActiveBroadcasts } from "../Utils/technicianLocation.js";
+import { getGpsState, normalizeCoordinates } from "../Utils/locationConfig.js";
 import { revokeSocketSession } from "../Utils/socketSessionControl.js";
 import {
   resolveZoneFromCoordinates,
   resolveDistrictAndZoneFromCoordinates,
 } from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
+import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 import CityZone from "../Schemas/CityZone.js";
 import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 import { maskAccount } from "../Utils/kycPrivacy.js";
+
+const getTechnicianPermissionZoneIds = (technician) =>
+  [...new Set((technician?.enabledCityZoneIds || []).map((z) => String(z._id || z)).filter(Boolean))];
+
+// Strict mapping gate shared by onboarding, profile update and add-skills.
+// Returns service IDs that have no active mapping in any of the technician's
+// permitted zones. No zones yet (onboarding) => allow profile skills; job
+// eligibility will still block until a zone is granted.
+const findSkillsBlockedByZone = async ({ technician, serviceIds }) => {
+  const zoneIds = getTechnicianPermissionZoneIds(technician);
+  if (!zoneIds.length || !serviceIds.length) return [];
+
+  const mappings = await ZoneServiceMapping.find({
+    zoneId: { $in: zoneIds },
+    serviceId: { $in: serviceIds },
+    active: true,
+  })
+    .select("serviceId")
+    .lean();
+
+  const approved = new Set(mappings.map((m) => String(m.serviceId)));
+  return serviceIds
+    .map((id) => String(id?._id || id))
+    .filter((id) => !approved.has(id));
+};
 
 // C3: masked-bank policy for ordinary list/detail responses. Full bank values
 // are only returned to the owning technician (self-service) or via the audited
@@ -63,6 +90,7 @@ const sanitizeBankDetails = (bank, { full = false } = {}) => {
 import OperationalCity from "../Schemas/OperationalCity.js";
 import { containsRegex } from "../Utils/safeQuery.js";
 import TechnicianDistrictPermission from "../Schemas/TechnicianDistrictPermission.js";
+import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
@@ -73,11 +101,17 @@ export const updateTechnicianLocation = async (req, res) => {
     if (!technicianProfileId || !mongoose.Types.ObjectId.isValid(technicianProfileId)) {
       return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
     }
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-      return res.status(400).json({ success: false, message: "Invalid coordinates", result: {} });
+    const coords = normalizeCoordinates(latitude, longitude);
+    if (!coords.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_COORDINATES",
+        message: "Invalid coordinates",
+        result: {},
+      });
     }
 
-    const result = await handleLocationUpdate(technicianProfileId, latitude, longitude, req.io, "http");
+    const result = await handleLocationUpdate(technicianProfileId, coords.latitude, coords.longitude, req.io, "http");
 
     return res.json({
       success: true,
@@ -318,38 +352,19 @@ export const addTechnicianSkills = async (req, res) => {
       });
     }
 
-    // 🏘 ZONE-SERVICE CHECK — technician can only add skills for services
-    // approved in ANY of their zones (registered + explicitly enabled).
-    // Services that are not zoneRestricted skip this gate entirely.
+    // Strict per-zone mapping: no active mapping = not available, regardless
+    // of the legacy zoneRestricted flag.
     {
-      const techZoneIds = [
-        ...(technician.enabledCityZoneIds || []),
-        ...(technician.cityZoneId ? [technician.cityZoneId] : []),
-      ].filter(Boolean);
-      if (techZoneIds.length) {
-        const [restrictedCheck, approvedMappings] = await Promise.all([
-          Service.find({ _id: { $in: serviceObjectIds }, zoneRestricted: true }).select("_id").lean(),
-          ZoneServiceMapping.find({
-            zoneId: { $in: techZoneIds },
-            serviceId: { $in: serviceObjectIds },
-            active: true,
-          })
-            .select("serviceId")
-            .lean(),
-        ]);
-        const restrictedSet = new Set(restrictedCheck.map((s) => String(s._id)));
-        const approvedServiceIds = new Set(approvedMappings.map((m) => String(m.serviceId)));
-        const blockedIds = serviceObjectIds.filter(
-          (sid) => restrictedSet.has(String(sid)) && !approvedServiceIds.has(String(sid))
-        );
-
-        if (blockedIds.length > 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Some services are not available in your zone",
-            result: { blockedServiceIds: blockedIds.map(String) },
-          });
-        }
+      const blockedIds = await findSkillsBlockedByZone({
+        technician,
+        serviceIds: serviceObjectIds,
+      });
+      if (blockedIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Some services are not available in your zone",
+          result: { blockedServiceIds: blockedIds },
+        });
       }
     }
 
@@ -697,10 +712,13 @@ export const getZoneServicesForTechnician = async (req, res) => {
   try {
     let zoneId = req.query.zoneId || req.query.cityZoneId;
 
-    // If authenticated technician and zoneId not passed in query, use registered zone
+    // If authenticated technician and zoneId not passed in query, use an
+    // explicitly granted zone. Registered cityZoneId alone is not authorization.
     if (!zoneId && req.user?.technicianProfileId) {
-      const tech = await TechnicianProfile.findById(req.user.technicianProfileId).select("cityZoneId").lean();
-      zoneId = tech?.cityZoneId;
+      const tech = await TechnicianProfile.findById(req.user.technicianProfileId)
+        .select("enabledCityZoneIds")
+        .lean();
+      zoneId = tech?.enabledCityZoneIds?.[0];
     }
 
     if (!zoneId || !isValidObjectId(zoneId)) {
@@ -744,6 +762,15 @@ export const getZoneServicesForTechnician = async (req, res) => {
       .sort({ serviceName: 1 })
       .lean();
 
+    // Availability is the canonical resolver result for this exact zone,
+    // not merely the existence of a mapping row.
+    const districtId = zone.operationalCityId?._id || zone.operationalCityId;
+    const availabilitySnapshot = await getAvailabilitySnapshot({
+      serviceIds: allServices.map((s) => s._id),
+      districtIds: districtId ? [districtId] : [],
+      zoneIds: [zone._id],
+    });
+
     // If technician is authenticated, fetch their current skills and pending skill requests
     let techSkillSet = new Set();
     let pendingRequestMap = new Map();
@@ -768,8 +795,9 @@ export const getZoneServicesForTechnician = async (req, res) => {
 
     const formattedServices = allServices.map((srv) => {
       const srvId = String(srv._id);
-      const isMapped = activeMappedServiceMap.has(srvId);
-      const mappingData = isMapped ? activeMappedServiceMap.get(srvId) : null;
+      const mappingData = activeMappedServiceMap.get(srvId) || null;
+      const isMapped = Boolean(mappingData);
+      const evaluation = availabilitySnapshot.evaluate(srv._id, districtId, zone._id);
 
       let skillStatus = "not_added";
       if (techSkillSet.has(srvId)) {
@@ -786,7 +814,7 @@ export const getZoneServicesForTechnician = async (req, res) => {
         description: srv.description,
         category: srv.category,
         price: srv.price,
-        isAvailableInZone: isMapped,
+        isAvailableInZone: evaluation.available,
         pricingMultiplier: mappingData?.pricingMultiplier || 1.0,
         skillStatus,
         hasSkill: techSkillSet.has(srvId),
@@ -1139,47 +1167,29 @@ export const createTechnician = async (req, res) => {
       }
     }
 
-    // 🏘 Check skills against ZoneServiceMapping if skills are being updated.
-    // Only zoneRestricted services are gated; a service approved in ANY of the
-    // tech's zones (registered + enabled) passes.
+    // Strict per-zone mapping gate for skill updates.
     if (skills !== undefined && Array.isArray(skills) && skills.length > 0) {
       const techDoc = await TechnicianProfile.findById(technicianProfileId)
-        .select("cityZoneId enabledCityZoneIds")
+        .select("enabledCityZoneIds")
         .lean();
-      const techZoneIds = [
-        ...(techDoc?.enabledCityZoneIds || []),
-        ...(profileUpdate.cityZoneId ? [profileUpdate.cityZoneId] : techDoc?.cityZoneId ? [techDoc.cityZoneId] : []),
-      ].filter(Boolean);
+      const skillServiceIds = skills.map((s) => new mongoose.Types.ObjectId(s.serviceId));
+      const unapprovedIds = await findSkillsBlockedByZone({
+        technician: techDoc,
+        serviceIds: skillServiceIds,
+      });
 
-      if (techZoneIds.length) {
-        const skillServiceIds = skills.map((s) => new mongoose.Types.ObjectId(s.serviceId));
-        const [restrictedDocs, approvedMappings] = await Promise.all([
-          Service.find({ _id: { $in: skillServiceIds }, zoneRestricted: true }).select("_id").lean(),
-          ZoneServiceMapping.find({
-            zoneId: { $in: techZoneIds },
-            serviceId: { $in: skillServiceIds },
-            active: true,
-          }).select("serviceId").lean(),
-        ]);
-        const restrictedSet = new Set(restrictedDocs.map((d) => String(d._id)));
-        const approvedSet = new Set(approvedMappings.map((m) => String(m.serviceId)));
-        const unapprovedIds = skillServiceIds.filter(
-          (sid) => restrictedSet.has(String(sid)) && !approvedSet.has(String(sid))
-        );
-
-        if (unapprovedIds.length > 0) {
-          const unapprovedDocs = await Service.find({ _id: { $in: unapprovedIds } }).select("serviceName").lean();
-          const unapprovedNames = unapprovedDocs.map((d) => d.serviceName).join(", ");
-          return res.status(400).json({
-            success: false,
-            code: "SERVICE_NOT_AVAILABLE_IN_ZONE",
-            message: `The following services are not available in your service area: ${unapprovedNames}. Please submit a skill request for approval.`,
-            result: {
-              blockedServiceIds: unapprovedIds.map(String),
-              unapprovedNames,
-            },
-          });
-        }
+      if (unapprovedIds.length > 0) {
+        const unapprovedDocs = await Service.find({ _id: { $in: unapprovedIds } }).select("serviceName").lean();
+        const unapprovedNames = unapprovedDocs.map((d) => d.serviceName).join(", ");
+        return res.status(400).json({
+          success: false,
+          code: "SERVICE_NOT_AVAILABLE_IN_ZONE",
+          message: `The following services are not available in your service area: ${unapprovedNames}. Please submit a skill request for approval.`,
+          result: {
+            blockedServiceIds: unapprovedIds,
+            unapprovedNames,
+          },
+        });
       }
 
       profileUpdate.skills = skills;
@@ -1601,6 +1611,21 @@ export const updateTechnician = async (req, res) => {
       return res.status(404).json({ success: false, message: "Technician not found", result: {} });
     }
 
+    if (skills !== undefined && Array.isArray(skills) && skills.length > 0) {
+      const skillServiceIds = skills.map((s) => new mongoose.Types.ObjectId(s.serviceId));
+      const blockedIds = await findSkillsBlockedByZone({ technician, serviceIds: skillServiceIds });
+      if (blockedIds.length > 0) {
+        const blockedDocs = await Service.find({ _id: { $in: blockedIds } }).select("serviceName").lean();
+        const blockedNames = blockedDocs.map((d) => d.serviceName).join(", ");
+        return res.status(400).json({
+          success: false,
+          code: "SERVICE_NOT_AVAILABLE_IN_ZONE",
+          message: `The following services are not available in your service area: ${blockedNames}. Please submit a skill request for approval.`,
+          result: { blockedServiceIds: blockedIds, unapprovedNames: blockedNames },
+        });
+      }
+    }
+
     await session.withTransaction(async () => {
       // 1. Update TechnicianProfile fields
       if (locality !== undefined) technician.locality = locality;
@@ -1644,8 +1669,27 @@ export const updateTechnician = async (req, res) => {
               `Cannot set online true. First complete: ${pendingRequirements.join(", ")}`
             );
           }
+
+          if (technician.availability.isOnline !== true) {
+            const gps = getGpsState(technician, "BROADCAST");
+            if (!gps.valid || !gps.fresh) {
+              const error = new Error("A fresh GPS location is required before going online");
+              error.statusCode = 409;
+              error.code = gps.valid ? "GPS_STALE" : "GPS_REQUIRED";
+              error.details = {
+                reason: gps.reason,
+                ageSeconds: gps.ageSeconds,
+                thresholdSeconds: gps.thresholdSeconds,
+              };
+              throw error;
+            }
+          }
         }
         technician.availability.isOnline = Boolean(availability.isOnline);
+        if (availability.isOnline) {
+          technician.availability.offlineReason = null;
+          technician.availability.offlineAt = null;
+        }
       }
 
       // 3. Update User fields (Handle both flat and nested user object)
@@ -1687,10 +1731,12 @@ export const updateTechnician = async (req, res) => {
     });
 
     // 5. Proactive Broadcast if technician went online; remove from GEO if offline
+    let broadcastResult = null;
     if (availability?.isOnline === true) {
-      broadcastPendingJobsToTechnician(technicianProfileId, req.io).catch(err =>
-        console.error("Proactive broadcast error:", err)
-      );
+      broadcastResult = await broadcastPendingJobsToTechnician(technicianProfileId, req.io).catch((err) => ({
+        success: false,
+        message: err.message,
+      }));
     } else if (availability?.isOnline === false) {
       // Remove from Redis GEO set so matching doesn't find stale positions
       const { geoRemove } = await import("../Utils/technicianGeo.js");
@@ -1761,15 +1807,17 @@ export const updateTechnician = async (req, res) => {
       success: true,
       message: "Technician profile updated successfully",
       result: updatedProfile,
+      broadcast: broadcastResult,
     });
 
   } catch (error) {
     if (res.headersSent) return;
     console.error("Update technician error:", error);
-    return res.status(400).json({
+    return res.status(error.statusCode || 400).json({
       success: false,
+      code: error.code,
       message: error.message,
-      result: { error: error.message }
+      result: { error: error.message, ...(error.details || {}) }
     });
   } finally {
     session.endSession();
@@ -1825,6 +1873,23 @@ export const updateTechnicianStatus = async (req, res) => {
 
       if (workStatus === "suspended") {
         technician.availability.isOnline = false;
+      }
+    }
+
+    if (workStatus === "approved") {
+      try {
+        await ensureApprovedDistrictZones({
+          technicianId: technician._id,
+          adminUserId: req.user?.userId,
+          reason: "Technician workStatus approved",
+        });
+      } catch (districtErr) {
+        return res.status(districtErr.statusCode || 400).json({
+          success: false,
+          message: districtErr.message,
+          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
+          result: {},
+        });
       }
     }
 

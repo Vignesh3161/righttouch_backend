@@ -34,6 +34,16 @@ const jobBroadcastSchema = new mongoose.Schema(
       default: null,
     },
 
+    expiredAt: {
+      type: Date,
+      default: null,
+    },
+
+    expiredReason: {
+      type: String,
+      default: null,
+    },
+
     status: {
       type: String,
       enum: ["sent", "accepted", "rejected", "expired", "ACCEPTED"],

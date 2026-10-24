@@ -3,12 +3,13 @@ import ServiceAvailability from "../Schemas/ServiceAvailability.js";
 import Service from "../Schemas/Service.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
 import CityZone from "../Schemas/CityZone.js";
+import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Category from "../Schemas/Category.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import AuditLog from "../Schemas/AuditLog.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
-import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
+import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 import { isValidObjectId, containsRegex, internalError } from "../Utils/safeQuery.js";
 
 /**
@@ -47,6 +48,19 @@ export const createServiceAvailability = async (req, res) => {
 
     const finalScope = scope === "CITY" ? "CITY" : "DISTRICT";
     const finalCityId = finalScope === "CITY" && cityId ? cityId : null;
+    if (finalCityId) {
+      const zone = await CityZone.findById(finalCityId).select("operationalCityId").lean();
+      if (!zone) {
+        return res.status(404).json({ success: false, message: "City zone not found" });
+      }
+      if (String(zone.operationalCityId) !== String(districtId)) {
+        return res.status(400).json({
+          success: false,
+          message: "cityId must belong to the supplied districtId",
+          code: "ZONE_DISTRICT_MISMATCH",
+        });
+      }
+    }
     // B-10: dual-write the canonical cityZoneId mirror so legacy CITY rows
     // remain readable after a future cityId retirement (scope stays CITY to
     // preserve CITY_* response reasons; the resolver prefers canonical ZONE
@@ -80,6 +94,24 @@ export const createServiceAvailability = async (req, res) => {
       createdBy: adminId || null,
       updatedBy: adminId || null,
     });
+
+    // A city/zone availability row is only meaningful when the mandatory
+    // per-zone mapping exists. Keep both admin surfaces in sync.
+    if (finalScope === "CITY" && finalCityId) {
+      await ZoneServiceMapping.updateOne(
+        { zoneId: finalCityId, serviceId },
+        {
+          $set: { active: config.status === "ENABLED" },
+          $setOnInsert: {
+            zoneId: finalCityId,
+            serviceId,
+            approvedBy: adminId || null,
+            approvedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    }
 
     // Audit Event
     await AuditLog.create({
@@ -149,8 +181,48 @@ export const updateServiceAvailability = async (req, res) => {
       existing.cityName = cityName;
     }
 
+    const oldZoneId = oldValue.scope === "CITY" ? (oldValue.cityZoneId || oldValue.cityId || null) : null;
+    const newZoneId = existing.scope === "CITY" ? (existing.cityZoneId || existing.cityId || null) : null;
+
+    if (newZoneId) {
+      const zone = await CityZone.findById(newZoneId).select("operationalCityId").lean();
+      if (!zone) {
+        return res.status(404).json({ success: false, message: "City zone not found" });
+      }
+      if (String(zone.operationalCityId) !== String(existing.districtId)) {
+        return res.status(400).json({
+          success: false,
+          message: "cityId must belong to the configuration district",
+          code: "ZONE_DISTRICT_MISMATCH",
+        });
+      }
+    }
+
     existing.updatedBy = adminId || null;
     await existing.save();
+
+    if (oldZoneId && (!newZoneId || String(oldZoneId) !== String(newZoneId))) {
+      await ZoneServiceMapping.updateOne(
+        { zoneId: oldZoneId, serviceId: existing.serviceId },
+        { $set: { active: false } }
+      );
+    }
+
+    if (newZoneId) {
+      await ZoneServiceMapping.updateOne(
+        { zoneId: newZoneId, serviceId: existing.serviceId },
+        {
+          $set: { active: existing.status === "ENABLED" },
+          $setOnInsert: {
+            zoneId: newZoneId,
+            serviceId: existing.serviceId,
+            approvedBy: adminId || null,
+            approvedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    }
 
     // Audit Event
     await AuditLog.create({
@@ -254,6 +326,19 @@ export const deleteServiceAvailability = async (req, res) => {
     const existing = await ServiceAvailability.findByIdAndDelete(id);
     if (!existing) {
       return res.status(404).json({ success: false, message: "Configuration not found" });
+    }
+
+    // Removing a zone/city grant must also remove the mandatory mapping.
+    // Otherwise the mapping alone would let the resolver fall through to a
+    // district default and accidentally re-enable the service.
+    const removedZoneId = existing.scope === "CITY"
+      ? (existing.cityZoneId || existing.cityId || null)
+      : null;
+    if (removedZoneId) {
+      await ZoneServiceMapping.updateOne(
+        { zoneId: removedZoneId, serviceId: existing.serviceId },
+        { $set: { active: false } }
+      );
     }
 
     await AuditLog.create({
@@ -382,30 +467,11 @@ export const getServiceZoneMatrix = async (req, res) => {
       .sort({ categoryId: 1, serviceName: 1 })
       .lean();
 
-    const districts = await OperationalCity.find().lean();
-    const cityZones = await CityZone.find().lean();
-    const availabilities = await ServiceAvailability.find().lean();
-    const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
-    const mappings = await ZoneServiceMapping.find({ active: true }).select("zoneId serviceId").lean();
-    const mappedSet = new Set(mappings.map((m) => `${String(m.serviceId)}_${String(m.zoneId)}`));
-
-    const availMap = new Map();
-    availabilities.forEach((a) => {
-      const key = `${a.serviceId}_${a.districtId}_${a.cityZoneId || a.cityId || "DISTRICT"}`;
-      availMap.set(key, a.status);
+    const snapshot = await getAvailabilitySnapshot({
+      serviceIds: services.map((srv) => srv._id),
     });
-
-    const isZoneEffectivelyEnabled = (srv, distId, zone) => {
-      const key = `${srv._id}_${distId}_${zone._id}`;
-      const distKey = `${srv._id}_${distId}_DISTRICT`;
-      // Explicit ServiceAvailability override wins first
-      const override = availMap.get(key) || availMap.get(distKey);
-      if (override) return override === "ENABLED";
-      // No override → zoneRestricted services need an active mapping; others follow isActive + zone/district flags
-      if (srv.zoneRestricted) return mappedSet.has(`${String(srv._id)}_${String(zone._id)}`);
-      if (!srv.isActive || zone.active === false) return false;
-      return true;
-    };
+    const districts = snapshot.districts;
+    const cityZones = snapshot.zones;
 
     const result = services.map((srv) => {
       let activeZonesCount = 0;
@@ -425,7 +491,7 @@ export const getServiceZoneMatrix = async (req, res) => {
 
         if (distZones.length > 0) {
           distZones.forEach((z) => {
-            const enabled = isZoneEffectivelyEnabled(srv, distId, z);
+            const enabled = snapshot.evaluate(srv._id, d._id, z._id).available;
 
             if (enabled) {
               activeZonesCount++;
@@ -435,10 +501,9 @@ export const getServiceZoneMatrix = async (req, res) => {
             }
           });
         } else {
-          // District-level fallback when no sub-zones exist for this district
-          const distKey = `${srv._id}_${distId}_DISTRICT`;
-          const stat = availMap.get(distKey) || (srv.isActive ? "ENABLED" : "DISABLED");
-          if (stat === "ENABLED") {
+          // District-level fallback when no sub-zones exist for this district.
+          const enabled = snapshot.evaluate(srv._id, d._id, null).available;
+          if (enabled) {
             activeZonesCount++;
             districtSet.add(distId);
           } else {
@@ -497,22 +562,15 @@ export const getServiceZoneDetail = async (req, res) => {
       return res.status(404).json({ success: false, message: "Service not found" });
     }
 
-    const districts = await OperationalCity.find().sort({ name: 1 }).lean();
-    const cityZones = await CityZone.find().sort({ name: 1 }).lean();
-    const availabilities = await ServiceAvailability.find({ serviceId }).lean();
-    const ZoneServiceMapping = (await import("../Schemas/ZoneServiceMapping.js")).default;
-    const zoneMappings = await ZoneServiceMapping.find({ serviceId }).select("zoneId active").lean();
-    const mappingByZone = new Map(zoneMappings.map((m) => [String(m.zoneId), m.active]));
-
-    const availMap = new Map();
-    availabilities.forEach((a) => {
-      const key = `${a.districtId}_${a.cityZoneId || a.cityId || "DISTRICT"}`;
-      availMap.set(key, a.status);
+    const snapshot = await getAvailabilitySnapshot({
+      serviceIds: [service._id],
     });
+    const districts = snapshot.districts.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+    const cityZones = snapshot.zones.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
 
     const districtDetails = districts.map((dist) => {
-      const distKey = `${dist._id}_DISTRICT`;
-      const isDistrictEnabled = availMap.get(distKey) !== "DISABLED";
+      const districtEval = snapshot.evaluate(service._id, dist._id, null);
+      const isDistrictEnabled = districtEval.available;
 
       const zonesInDistrict = cityZones.filter((z) => {
         const zid = z.operationalCityId?._id ? String(z.operationalCityId._id) : String(z.operationalCityId);
@@ -523,18 +581,8 @@ export const getServiceZoneDetail = async (req, res) => {
       let inactiveZonesCount = 0;
 
       const formattedZones = zonesInDistrict.map((z) => {
-        const zoneKey = `${dist._id}_${z._id}`;
-        const override = availMap.get(zoneKey);
-        // Effective status: explicit override wins; otherwise zoneRestricted
-        // services follow the mapping, others follow district+zone active flags.
-        let status;
-        if (override) {
-          status = override;
-        } else if (service.zoneRestricted) {
-          status = mappingByZone.get(String(z._id)) === true ? "ENABLED" : "DISABLED";
-        } else {
-          status = isDistrictEnabled && z.active ? "ENABLED" : "DISABLED";
-        }
+        const evaluation = snapshot.evaluate(service._id, dist._id, z._id);
+        const status = evaluation.available ? "ENABLED" : "DISABLED";
 
         if (status === "ENABLED") {
           activeZonesCount++;
@@ -548,8 +596,8 @@ export const getServiceZoneDetail = async (req, res) => {
           zoneCode: z.zoneCode,
           isDistrictActive: dist.active !== false && dist.isJobEnabled !== false,
           isZoneActive: z.active !== false,
-          isMapped: mappingByZone.has(String(z._id)),
-          isMappingActive: mappingByZone.get(String(z._id)) === true,
+          isMapped: evaluation.mappingExists,
+          isMappingActive: evaluation.mappingActive,
           status, // "ENABLED" or "DISABLED"
         };
       });
@@ -619,6 +667,20 @@ export const toggleZoneAvailability = async (req, res) => {
 
     const targetScope = isDistrictScope ? "DISTRICT" : "ZONE";
     const targetZoneId = isDistrictScope ? null : cityZoneId;
+
+    if (targetZoneId) {
+      const zone = await CityZone.findById(targetZoneId).select("operationalCityId").lean();
+      if (!zone) {
+        return res.status(404).json({ success: false, message: "City zone not found" });
+      }
+      if (String(zone.operationalCityId) !== String(districtId)) {
+        return res.status(400).json({
+          success: false,
+          message: "cityZoneId must belong to the supplied districtId",
+          code: "ZONE_DISTRICT_MISMATCH",
+        });
+      }
+    }
 
     const config = await ServiceAvailability.findOneAndUpdate(
       { serviceId, districtId, cityZoneId: targetZoneId, scope: targetScope },
@@ -707,6 +769,29 @@ export const bulkToggleZoneAvailability = async (req, res) => {
     const malformedBulk = cityZoneIds.filter((z) => z && z !== "DISTRICT" && !isValidObjectId(z));
     if (malformedBulk.length) {
       return res.status(400).json({ success: false, message: "One or more zone IDs are invalid", code: "INVALID_ID" });
+    }
+
+    const requestedZoneIds = cityZoneIds.filter(
+      (z) => z && z !== "DISTRICT" && isValidObjectId(z)
+    );
+    if (requestedZoneIds.length) {
+      const zones = await CityZone.find({ _id: { $in: requestedZoneIds } })
+        .select("_id operationalCityId")
+        .lean();
+      const zoneById = new Map(zones.map((z) => [String(z._id), z]));
+      for (const zoneId of requestedZoneIds) {
+        const zone = zoneById.get(String(zoneId));
+        if (!zone) {
+          return res.status(404).json({ success: false, message: `City zone not found: ${zoneId}` });
+        }
+        if (String(zone.operationalCityId) !== String(districtId)) {
+          return res.status(400).json({
+            success: false,
+            message: `cityZoneId ${zoneId} does not belong to district ${districtId}`,
+            code: "ZONE_DISTRICT_MISMATCH",
+          });
+        }
+      }
     }
 
     const finalStatus = status === "DISABLED" ? "DISABLED" : "ENABLED";
@@ -818,6 +903,16 @@ export const clearDistrictZoneAvailability = async (req, res) => {
         },
       }
     );
+
+    // Disable the mandatory mappings too; otherwise the mapping gate still
+    // passes and the service can fall through to another enabled source.
+    const districtZones = await CityZone.find({ operationalCityId: districtId }).select("_id").lean();
+    if (districtZones.length) {
+      await ZoneServiceMapping.updateMany(
+        { zoneId: { $in: districtZones.map((z) => z._id) }, serviceId },
+        { $set: { active: false } }
+      );
+    }
 
     await AuditLog.create({
       targetType: "ServiceAvailability",

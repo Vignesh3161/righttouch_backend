@@ -37,6 +37,35 @@ export function checkGpsStale(tech, mode = "BROADCAST") {
   return !checkGpsFreshness(tech, mode);
 }
 
+export function normalizeCoordinates(latitude, longitude) {
+  if (
+    latitude === null ||
+    latitude === undefined ||
+    latitude === "" ||
+    longitude === null ||
+    longitude === undefined ||
+    longitude === ""
+  ) {
+    return { valid: false, reason: "INVALID_COORDINATES" };
+  }
+
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return { valid: false, reason: "INVALID_COORDINATES" };
+  }
+
+  return { valid: true, latitude: lat, longitude: lng };
+}
+
 /**
  * Structured GPS state used by eligibility diagnostics. Keeps the canonical
  * 90s (BROADCAST/FETCH) and 15m (ACCEPT) thresholds while exposing WHY a

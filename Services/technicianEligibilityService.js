@@ -22,12 +22,12 @@ export const MAX_PREFILTER_RADIUS_M = MAX_SERVICE_RADIUS_KM * 1000;
  */
 export const getAllowedDistrictIds = (tech) => {
   if (!tech) return [];
-  let primaryId = tech.primaryDistrictId || tech.primaryCityId;
+  // Primary district is registration metadata, NOT authorization. Only the
+  // explicit derived grant arrays authorize work.
   const allowedProfile = [
     ...(tech.enabledDistrictIds || []),
     ...(tech.allowedCityIds || []),
   ].map((d) => String(d._id || d));
-  if (primaryId) allowedProfile.push(String(primaryId._id || primaryId));
   return Array.from(new Set(allowedProfile.filter(Boolean)));
 };
 
@@ -109,10 +109,11 @@ export const checkCurrentZoneMatch = async (tech, targetZoneId) => {
   }).select("_id").lean();
   
   const currentZoneIdStr = currentZone?._id ? String(currentZone._id) : null;
-  if (!currentZoneIdStr) return { match: true, currentZoneId: null };
-  
-  const allowedZones = getAllowedZoneIds(tech);
-  const match = allowedZones.length === 0 ? true : allowedZones.includes(currentZoneIdStr);
+  // Fail closed: a zoned booking can only be served when the technician's
+  // live GPS is demonstrably inside their permitted zone.
+  if (!currentZoneIdStr) return { match: false, currentZoneId: null };
+
+  const match = getAllowedZoneIds(tech).includes(currentZoneIdStr);
   
   return { match, currentZoneId: currentZoneIdStr };
 };
@@ -185,6 +186,9 @@ export const evaluateTechnicianEligibility = async ({
     hasSkill: false,
     gpsFresh: false,
     validGps: false,
+    trainingComplete: false,
+    kycVerified: false,
+    bankVerified: false,
     distanceMeters: null,
     distanceKm: null,
     effectiveRadiusMeters: MAX_JOB_DISTANCE_METERS,
@@ -258,16 +262,36 @@ export const evaluateTechnicianEligibility = async ({
     details.serviceAvailable = true;
   }
 
-  // 3. TECHNICIAN WORK STATUS & VERIFICATION
+  // 3. TECHNICIAN WORK STATUS & PREREQUISITES
+  // Same gates as technicianActivation.checkTechnicianActivation so job feeds,
+  // socket alerts, broadcast and accept can never disagree.
   const isApproved = tech.workStatus === "approved";
-  const profileComplete = tech.profileComplete !== false;
-  details.verified = isApproved && profileComplete;
+  const profileComplete = tech.profileComplete === true;
+  const trainingComplete = tech.trainingCompleted === true;
+  let kyc = shared.technicianKyc;
+  if (kyc === undefined && shared.kycByTechId) {
+    kyc = shared.kycByTechId.get(String(tech._id));
+  }
+  if (kyc === undefined) {
+    kyc = await TechnicianKyc.findOne({ technicianId: tech._id })
+      .select("verificationStatus bankVerified bankVerificationStatus kycVerified")
+      .lean();
+  }
+  const kycVerified = Boolean(kyc && (kyc.verificationStatus === "approved" || kyc.kycVerified === true));
+  const bankVerified = Boolean(kyc && (kyc.bankVerified === true || kyc.bankVerificationStatus === "approved"));
+  details.trainingComplete = trainingComplete;
+  details.kycVerified = kycVerified;
+  details.bankVerified = bankVerified;
+  details.verified = isApproved && profileComplete && trainingComplete && kycVerified && bankVerified;
 
   if (tech.workStatus === "suspended") {
     reasons.push("TECHNICIAN_SUSPENDED");
   } else if (!isApproved || !profileComplete) {
     reasons.push("TECHNICIAN_NOT_VERIFIED");
   }
+  if (!trainingComplete) reasons.push("TRAINING_INCOMPLETE");
+  if (!kycVerified) reasons.push("KYC_NOT_VERIFIED");
+  if (!bankVerified) reasons.push("BANK_NOT_VERIFIED");
 
   // 4. TECHNICIAN ONLINE STATUS
   details.online = tech.availability?.isOnline === true;
@@ -386,6 +410,9 @@ export const evaluateTechnicianEligibility = async ({
     gpsThresholdSeconds: details.gpsThresholdSeconds,
     online: details.online,
     verified: details.verified,
+    trainingComplete: details.trainingComplete,
+    kycVerified: details.kycVerified,
+    bankVerified: details.bankVerified,
     hasSkill: details.hasSkill,
     serviceAvailable: details.serviceAvailable,
     serviceAvailabilitySource: shared.serviceAvailability ? "precomputed" : "resolved",
