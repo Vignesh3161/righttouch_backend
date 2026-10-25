@@ -129,16 +129,17 @@ export const recordCompletionAttempt = async (challengeId, { session = null } = 
  */
 export const registerCompletionResend = async (
   challengeId,
-  { expectedGeneration, otpHash, expiresAt, session = null } = {}
+  { expectedGeneration, otpHash, expiresAt, ignoreResendBudget = false, session = null } = {}
 ) => {
   const opts = session ? { session } : {};
+  const filter = {
+    _id: challengeId,
+    status: { $in: ["pending", "pending_delivery"] },
+    generation: expectedGeneration,
+  };
+  if (!ignoreResendBudget) filter.resendCount = { $lt: OTP_MAX_RESENDS };
   return ServiceCompletionChallenge.findOneAndUpdate(
-    {
-      _id: challengeId,
-      status: { $in: ["pending", "pending_delivery"] },
-      generation: expectedGeneration,
-      resendCount: { $lt: OTP_MAX_RESENDS },
-    },
+    filter,
     {
       $set: {
         otpHash,
@@ -149,6 +150,27 @@ export const registerCompletionResend = async (
       },
       $inc: { resendCount: 1 },
     },
+    { new: true, ...opts }
+  );
+};
+
+/**
+ * Refund a resend whose provider call failed. Guarded on generation so a
+ * concurrent successful resend is never decremented.
+ */
+export const rollbackCompletionResend = async (
+  challengeId,
+  { expectedGeneration, session = null } = {}
+) => {
+  const opts = session ? { session } : {};
+  return ServiceCompletionChallenge.findOneAndUpdate(
+    {
+      _id: challengeId,
+      status: "pending_delivery",
+      generation: expectedGeneration,
+      resendCount: { $gt: 0 },
+    },
+    { $inc: { resendCount: -1 } },
     { new: true, ...opts }
   );
 };
