@@ -54,6 +54,104 @@ const fail = (statusCode, code, message) => {
 
 const toId = (v) => (v == null ? null : String(v));
 
+const sendCooldownMs = () => {
+  const raw = Number(process.env.COMPLETION_OTP_SEND_COOLDOWN_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+};
+
+/**
+ * Milliseconds left before another provider send is allowed for this
+ * challenge. Initial sends and resends both stamp `lastSentAt`, so rapid
+ * client retries cannot turn into a Fast2SMS spam burst (provider error 995).
+ */
+export const completionOtpCooldownRemainingMs = (challenge, now = new Date()) => {
+  if (!challenge) return 0;
+  const lastSentAt = challenge.lastSentAt || challenge.createdAt;
+  if (!lastSentAt) return 0;
+  const elapsed = now.getTime() - new Date(lastSentAt).getTime();
+  return Math.max(0, sendCooldownMs() - elapsed);
+};
+
+const rateLimited = (remainingMs) => {
+  const retryAfterSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
+  const err = fail(
+    429,
+    OTP_ERRORS.RATE_LIMITED,
+    `Please wait ${retryAfterSeconds}s before requesting another OTP`
+  );
+  err.retryAfterSeconds = retryAfterSeconds;
+  return err;
+};
+
+const isValidDeliveryPhone = (phone) =>
+  /^[0-9]{10}$/.test(phone) || (phone.length === 12 && phone.startsWith("91"));
+
+const loadCustomerPhone = async (customerId) => {
+  const customer = await User.findById(customerId).select("mobileNumber").lean();
+  return String(customer?.mobileNumber || "").replace(/\D/g, "");
+};
+
+const providerFailureDetails = (err) => ({
+  error: err?.name || "SmsError",
+  provider: err?.provider || null,
+  providerStatus: err?.providerStatus ?? null,
+  providerMessage: err?.providerMessage ? String(err.providerMessage).slice(0, 300) : null,
+  requestId: err?.requestId || null,
+});
+
+const recordDeliveryFailure = async ({ bookingId, generation, operation, err }) => {
+  const details = providerFailureDetails(err);
+  // Masked phone / OTP / key / raw payload are never logged here.
+  console.error(
+    `[completionOtp] Delivery failed booking=${bookingId} generation=${generation} operation=${operation}`,
+    details
+  );
+  await writeAuditLog({
+    actorRole: "System",
+    action: "COMPLETION_OTP_DELIVERY_FAILED",
+    targetType: "ServiceBooking",
+    targetId: bookingId,
+    after: { generation, operation, ...details },
+    metadata: { source: "completionVerification" },
+  });
+};
+
+const deliveryFailureError = (err) =>
+  fail(
+    err?.provider === "fast2sms" ? 502 : err?.status || 503,
+    OTP_ERRORS.NOT_PENDING,
+    "OTP delivery temporarily unavailable — wait a minute, then resend"
+  );
+
+const deliverChallengeOtp = async ({
+  booking,
+  challenge,
+  phone,
+  otp,
+  generation,
+  smsSender,
+  operation,
+  onFailure = null,
+}) => {
+  try {
+    await smsSender(phone, otp);
+  } catch (err) {
+    if (onFailure) {
+      await onFailure(err).catch((rollbackErr) => {
+        console.error("[completionOtp] Send rollback failed:", rollbackErr.message);
+      });
+    }
+    await recordDeliveryFailure({
+      bookingId: booking._id,
+      generation,
+      operation,
+      err,
+    });
+    throw deliveryFailureError(err);
+  }
+  return markChallengeDelivering(challenge._id, { expectedGeneration: generation });
+};
+
 const assertSmsDeliveryConfigured = () => {
   const cfg = validateCompletionSmsConfig();
   if (!cfg.configured) {
@@ -140,10 +238,16 @@ const activeChallengeFor = (bookingId) =>
   });
 
 /**
- * Request a completion OTP. Idempotent: an unexpired active challenge is
- * returned as-is (no new SMS storm); an expired one is closed and replaced.
- * Concurrent requests collide on the partial unique index — the loser
- * loads and returns the winner (never a second OTP).
+ * Request a completion OTP.
+ *
+ * - An expired challenge is closed and replaced.
+ * - An active challenge inside the send cooldown returns 429 with
+ *   `retryAfterSeconds`; it never reports success without sending an SMS.
+ * - After the cooldown the SAME challenge is re-driven with a new generation
+ *   (old code dies), respecting the resend budget for `pending` challenges and
+ *   ignoring it for `pending_delivery` crash recovery.
+ * - Concurrent creation races collide on the partial unique index — the loser
+ *   loads and returns the winner instead of creating a second OTP.
  */
 export const requestCompletionOtp = async ({ bookingId, technicianProfileId, smsSender = sendCompletionSms }) => {
   const booking = await loadBookingOrFail(bookingId);
@@ -152,24 +256,51 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
   await assertCompletionEligible(booking);
   assertSmsDeliveryConfigured();
 
+  const phone = await loadCustomerPhone(booking.customerId);
+  if (!isValidDeliveryPhone(phone)) {
+    throw fail(409, OTP_ERRORS.NOT_PENDING, "Customer has no verified phone number for OTP delivery");
+  }
+
   const now = new Date();
   let challenge = await activeChallengeFor(booking._id);
   if (challenge && isChallengeExpired(challenge, now)) {
     await closeCompletionChallenge(challenge._id, { to: "expired", now });
     challenge = null;
   }
-  if (challenge && challenge.status === "pending_delivery") {
-    await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
-    challenge = null;
-  }
-  if (challenge) {
-    return { bookingId: String(booking._id), ...publicChallengeState(challenge), alreadyActive: true };
-  }
 
-  const customer = await User.findById(booking.customerId).select("mobileNumber").lean();
-  const phone = String(customer?.mobileNumber || "").replace(/\D/g, "");
-  if (!/^[0-9]{10}$/.test(phone) && !(phone.length === 12 && phone.startsWith("91"))) {
-    throw fail(409, OTP_ERRORS.NOT_PENDING, "Customer has no verified phone number for OTP delivery");
+  if (challenge) {
+    const remainingMs = completionOtpCooldownRemainingMs(challenge, now);
+    if (remainingMs > 0) throw rateLimited(remainingMs);
+
+    const otp = generateCompletionOtp();
+    const generation = challenge.generation + 1;
+    const moved = await registerCompletionResend(challenge._id, {
+      expectedGeneration: challenge.generation,
+      otpHash: hashCompletionOtp({ bookingId: booking._id, generation, otp }),
+      expiresAt: new Date(now.getTime() + OTP_TTL_MS),
+      ignoreResendBudget: challenge.status === "pending_delivery",
+    });
+    if (!moved) {
+      const fresh = await activeChallengeFor(booking._id);
+      if (!fresh) {
+        throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — fetch status and retry");
+      }
+      const freshRemainingMs = completionOtpCooldownRemainingMs(fresh, new Date());
+      if (freshRemainingMs > 0) throw rateLimited(freshRemainingMs);
+      throw fail(429, OTP_ERRORS.RESEND_EXCEEDED, "Resend limit reached — contact support");
+    }
+
+    const delivering = await deliverChallengeOtp({
+      booking,
+      challenge: moved,
+      phone,
+      otp,
+      generation,
+      smsSender,
+      operation: "request_redrive",
+      onFailure: () => rollbackCompletionResend(challenge._id, { expectedGeneration: generation }),
+    });
+    return { bookingId: String(booking._id), ...publicChallengeState(delivering || moved) };
   }
 
   const otp = generateCompletionOtp();
@@ -183,30 +314,34 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
       generation: 1,
       status: "pending_delivery",
       expiresAt,
+      lastSentAt: now,
     });
   } catch (e) {
     if (e?.code !== 11000) throw e;
     // Lost the creation race — return the winner's public state.
     challenge = await activeChallengeFor(booking._id);
-    return { bookingId: String(booking._id), ...publicChallengeState(challenge), alreadyActive: true };
+    if (!challenge) {
+      throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — fetch status and retry");
+    }
+    const remainingMs = completionOtpCooldownRemainingMs(challenge, new Date());
+    return {
+      bookingId: String(booking._id),
+      ...publicChallengeState(challenge),
+      alreadyActive: true,
+      retryAfterSeconds: Math.ceil(remainingMs / 1000),
+    };
   }
 
   // Delivery AFTER commit (never inside a transaction).
-  try {
-    await smsSender(phone, otp);
-  } catch (err) {
-    // Challenge stays pending_delivery for resend recovery; OTP never leaks.
-    await writeAuditLog({
-      actorRole: "System",
-      action: "COMPLETION_OTP_DELIVERY_FAILED",
-      targetType: "ServiceBooking",
-      targetId: booking._id,
-      after: { generation: 1, error: err.name || "SmsError" },
-      metadata: { source: "completionVerification" },
-    });
-    throw fail(err.status || 503, OTP_ERRORS.NOT_PENDING, "OTP delivery temporarily unavailable — retry or resend");
-  }
-  const delivering = await markChallengeDelivering(challenge._id, { expectedGeneration: 1 });
+  const delivering = await deliverChallengeOtp({
+    booking,
+    challenge,
+    phone,
+    otp,
+    generation: 1,
+    smsSender,
+    operation: "request",
+  });
   return { bookingId: String(booking._id), ...publicChallengeState(delivering || challenge) };
 };
 
@@ -231,13 +366,16 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
     await closeCompletionChallenge(challenge._id, { to: "expired", now });
     throw fail(410, OTP_ERRORS.EXPIRED, "OTP expired — request a new OTP");
   }
+
+  const remainingMs = completionOtpCooldownRemainingMs(challenge, now);
+  if (remainingMs > 0) throw rateLimited(remainingMs);
+
   if (challenge.status !== "pending_delivery" && (challenge.resendCount || 0) >= OTP_MAX_RESENDS) {
     throw fail(429, OTP_ERRORS.RESEND_EXCEEDED, "Resend limit reached — contact support");
   }
 
-  const customer = await User.findById(booking.customerId).select("mobileNumber").lean();
-  const phone = String(customer?.mobileNumber || "").replace(/\D/g, "");
-  if (!/^[0-9]{10}$/.test(phone) && !(phone.length === 12 && phone.startsWith("91"))) {
+  const phone = await loadCustomerPhone(booking.customerId);
+  if (!isValidDeliveryPhone(phone)) {
     throw fail(409, OTP_ERRORS.NOT_PENDING, "Customer has no verified phone number for OTP delivery");
   }
 
@@ -252,23 +390,16 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
   if (!moved) {
     throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — fetch status and retry");
   }
-  try {
-    await smsSender(phone, otp);
-  } catch (err) {
-    await rollbackCompletionResend(challenge._id, { expectedGeneration: nextGen }).catch((rollbackErr) => {
-      console.error("[completionOtp] Resend budget rollback failed:", rollbackErr.message);
-    });
-    await writeAuditLog({
-      actorRole: "System",
-      action: "COMPLETION_OTP_DELIVERY_FAILED",
-      targetType: "ServiceBooking",
-      targetId: booking._id,
-      after: { generation: nextGen, error: err.name || "SmsError", operation: "resend" },
-      metadata: { source: "completionVerification" },
-    });
-    throw fail(err.status || 503, OTP_ERRORS.NOT_PENDING, "OTP delivery temporarily unavailable — retry resend");
-  }
-  const delivering = await markChallengeDelivering(challenge._id, { expectedGeneration: nextGen });
+  const delivering = await deliverChallengeOtp({
+    booking,
+    challenge: moved,
+    phone,
+    otp,
+    generation: nextGen,
+    smsSender,
+    operation: "resend",
+    onFailure: () => rollbackCompletionResend(challenge._id, { expectedGeneration: nextGen }),
+  });
   return { bookingId: String(booking._id), ...publicChallengeState(delivering || moved) };
 };
 

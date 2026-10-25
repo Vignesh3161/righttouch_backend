@@ -1,5 +1,10 @@
 import axios from "axios";
 
+// Approved DLT template used by the auth OTP flow. Exported so completion-SMS
+// diagnostics can flag accidental reuse (Fast2SMS treats repeated sends of the
+// same template to the same number as spam).
+export const AUTH_SMS_TEMPLATE_ID = "208466";
+
 export default async function sendSms(phoneNumber, otpCode) {
   try {
     const API_KEY = process.env.FAST2SMS_API_KEY;
@@ -9,7 +14,7 @@ export default async function sendSms(phoneNumber, otpCode) {
     const payload = {
       route: "dlt",
       sender_id: "RTHUBS",
-      message: "208466", // Fast2SMS internal message ID
+      message: AUTH_SMS_TEMPLATE_ID, // Fast2SMS internal message ID
       variables_values: otpCode, // replaces {#var#}
       numbers: phoneNumber, // 10-digit number only
     };

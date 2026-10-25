@@ -30,8 +30,10 @@
 import axios from "axios";
 
 import { OTP_PATTERN } from "./completionOtp.js";
+import { AUTH_SMS_TEMPLATE_ID } from "./sendSMS.js";
 
 const SMS_TIMEOUT_MS = 10000;
+let templateReuseWarned = false;
 
 /** Mask a phone number for logs — last 2 digits only, never the full number. */
 export const maskPhone = (phone) => {
@@ -40,12 +42,23 @@ export const maskPhone = (phone) => {
   return `${"*".repeat(Math.min(digits.length - 2, 8))}${digits.slice(-2)}`;
 };
 
-const smsError = (message, { status = 502, providerMessage = null } = {}) => {
+const providerMessageOf = (data) => {
+  const raw = data?.message || data?.error;
+  if (Array.isArray(raw)) return raw.filter(Boolean).join("; ").slice(0, 300);
+  return raw ? String(raw).slice(0, 300) : null;
+};
+
+const smsError = (
+  message,
+  { status = 502, providerStatus = null, providerMessage = null, requestId = null } = {}
+) => {
   const err = new Error(message);
   err.name = "SmsError";
   err.provider = "fast2sms";
   err.status = status;
+  if (providerStatus != null) err.providerStatus = providerStatus;
   if (providerMessage) err.providerMessage = providerMessage;
+  if (requestId) err.requestId = requestId;
   return err;
 };
 
@@ -63,7 +76,24 @@ export const validateCompletionSmsConfig = () => {
   if (!process.env.FAST2SMS_API_KEY) {
     return { configured: false, reason: "FAST2SMS_API_KEY is not set" };
   }
-  return { configured: true, reason: null };
+  const templateId = process.env.COMPLETION_SMS_TEMPLATE_ID.trim();
+  if (templateId === AUTH_SMS_TEMPLATE_ID) {
+    if (!templateReuseWarned) {
+      templateReuseWarned = true;
+      console.warn(
+        "[completionOtp] COMPLETION_SMS_TEMPLATE_ID reuses the auth-OTP DLT template — " +
+          "Fast2SMS may reject rapid duplicate sends (error 995, spam detected). " +
+          "Prefer a dedicated approved completion template."
+      );
+    }
+    return {
+      configured: true,
+      reason: null,
+      warning:
+        "COMPLETION_SMS_TEMPLATE_ID reuses the auth-OTP template; provider may apply duplicate/spam limits",
+    };
+  }
+  return { configured: true, reason: null, warning: null };
 };
 
 export const isCompletionSmsActive = () => validateCompletionSmsConfig().configured;
@@ -111,22 +141,28 @@ export const sendCompletionSms = async (
     });
   } catch (error) {
     // Never include OTP / phone / key / raw payload in the message.
-    const apiMessage = error.response?.data?.message || error.response?.data?.error || null;
     throw smsError("Completion SMS failed: provider request failed", {
       status: error.response?.status || 502,
-      providerMessage: apiMessage,
+      providerStatus: error.response?.status || null,
+      providerMessage: providerMessageOf(error.response?.data),
+      requestId: error.response?.data?.request_id || null,
     });
   }
 
   if (!response?.data?.return) {
     throw smsError("Completion SMS failed: provider rejected the request", {
       status: 502,
-      providerMessage: response?.data?.message || response?.data?.error || null,
+      providerStatus: response?.status || null,
+      providerMessage: providerMessageOf(response?.data),
+      requestId: response?.data?.request_id || null,
     });
   }
 
-  console.log(`📲 Completion OTP SMS accepted for ${maskPhone(local)}`);
-  return { accepted: true, maskedPhone: maskPhone(local) };
+  const requestId = response?.data?.request_id || null;
+  console.log(
+    `📲 Completion OTP SMS accepted for ${maskPhone(local)}${requestId ? ` request_id=${requestId}` : ""}`
+  );
+  return { accepted: true, maskedPhone: maskPhone(local), requestId };
 };
 
 export default { sendCompletionSms, validateCompletionSmsConfig, isCompletionSmsActive, maskPhone };

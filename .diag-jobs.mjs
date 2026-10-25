@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
-dotenv.config({ path: path.join(root, ".env") });
+dotenv.config({ path: path.join(root, ".env"), quiet: true });
 
 const args = process.argv.slice(2);
 const argValue = (name, fallback) => {
@@ -48,6 +48,10 @@ const { default: Service } = await import(`${root}/Schemas/Service.js`);
 const { default: User } = await import(`${root}/Schemas/User.js`);
 const { default: OperationalCity } = await import(`${root}/Schemas/OperationalCity.js`);
 const { default: CityZone } = await import(`${root}/Schemas/CityZone.js`);
+const { default: ServiceCompletionChallenge } = await import(`${root}/Schemas/ServiceCompletionChallenge.js`);
+const { default: AuditLog } = await import(`${root}/Schemas/AuditLog.js`);
+const { validateCompletionSmsConfig } = await import(`${root}/Utils/sendCompletionSms.js`);
+const { AUTH_SMS_TEMPLATE_ID } = await import(`${root}/Utils/sendSMS.js`);
 const { evaluateTechnicianEligibility } = await import(`${root}/Services/technicianEligibilityService.js`);
 const { resolveServiceAvailability } = await import(`${root}/Services/serviceAvailabilityService.js`);
 const { getGpsState, STALENESS_SECONDS, ACCEPT_GRACE_SECONDS } = await import(`${root}/Utils/locationConfig.js`);
@@ -375,6 +379,152 @@ for (const t of onlines) {
   console.log(`  T ${t._id} user=${t.userId} uStatus=${u?.status} role=${u?.role} ws=${t.workStatus} pc=${t.profileComplete} lastJobsChangeAt=${t.lastJobsChangeAt?.toISOString?.()} gps=${gps.reason || "FRESH"} age=${gps.ageSeconds}s`);
 }
 
+/* ── 7. Service completion OTP health ── */
+const completionTemplate = process.env.COMPLETION_SMS_TEMPLATE_ID || null;
+const smsCfg = validateCompletionSmsConfig();
+const sendCooldownMs = Number(process.env.COMPLETION_OTP_SEND_COOLDOWN_MS) || 60000;
+console.log("7 COMPLETION OTP CONFIG:", {
+  configured: smsCfg.configured,
+  reason: smsCfg.reason,
+  warning: smsCfg.warning || null,
+  templateId: completionTemplate,
+  authTemplateId: AUTH_SMS_TEMPLATE_ID,
+  reusesAuthTemplate: completionTemplate === AUTH_SMS_TEMPLATE_ID,
+  sendCooldownMs,
+});
+
+const challengeStatuses = tally(
+  await ServiceCompletionChallenge.aggregate([{ $group: { _id: "$status", n: { $sum: 1 } } }])
+);
+const openChallengeFilter = { status: { $in: ["pending_delivery", "pending"] } };
+const openChallenges = await ServiceCompletionChallenge.countDocuments(openChallengeFilter);
+const expiredOpen = await ServiceCompletionChallenge.countDocuments({
+  ...openChallengeFilter,
+  expiresAt: { $lte: new Date() },
+});
+const stuckDelivery = await ServiceCompletionChallenge.countDocuments({
+  status: "pending_delivery",
+  updatedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+});
+console.log("7 COMPLETION CHALLENGES:", {
+  allTime: challengeStatuses,
+  open: openChallenges,
+  expiredOpen,
+  stuckDelivery,
+});
+
+const recentChallenges = await ServiceCompletionChallenge.find({ createdAt: { $gte: since } })
+  .sort({ createdAt: -1 })
+  .limit(10)
+  .select("bookingId technicianId customerId status generation resendCount attempts createdAt updatedAt expiresAt lastSentAt")
+  .maxTimeMS(15000)
+  .lean();
+for (const c of recentChallenges) {
+  const ageMin = c.createdAt ? Number(((Date.now() - new Date(c.createdAt).getTime()) / 60000).toFixed(1)) : null;
+  console.log(
+    `  CC booking=${c.bookingId} status=${c.status} gen=${c.generation} resend=${c.resendCount || 0} ` +
+    `attempts=${c.attempts || 0} ageMin=${ageMin} sentAt=${c.lastSentAt || "-"} expires=${c.expiresAt || "-"}`
+  );
+}
+
+const duplicateActive = await ServiceCompletionChallenge.aggregate([
+  { $match: openChallengeFilter },
+  { $group: { _id: "$bookingId", n: { $sum: 1 } } },
+  { $match: { n: { $gt: 1 } } },
+]);
+console.log("7 DUPLICATE ACTIVE:", { bookings: duplicateActive.length, detail: duplicateActive.slice(0, 5) });
+
+const openChallengeDocs = await ServiceCompletionChallenge.find(openChallengeFilter)
+  .select("bookingId customerId")
+  .maxTimeMS(15000)
+  .lean();
+const challengeCustomerIds = [...new Set(openChallengeDocs.map((c) => String(c.customerId)))];
+const challengeCustomers = await User.find({ _id: { $in: challengeCustomerIds } })
+  .select("mobileNumber role status")
+  .lean();
+const challengeCustomerById = new Map(challengeCustomers.map((u) => [String(u._id), u]));
+const phoneStates = {};
+for (const c of openChallengeDocs) {
+  const customer = challengeCustomerById.get(String(c.customerId));
+  const digits = String(customer?.mobileNumber || "").replace(/\D/g, "");
+  const validPhone = /^[0-9]{10}$/.test(digits) || (digits.length === 12 && digits.startsWith("91"));
+  const key = !customer ? "customer_missing" : validPhone ? "ok" : "invalid_phone";
+  phoneStates[key] = (phoneStates[key] || 0) + 1;
+}
+console.log("7 ACTIVE CUSTOMER PHONES:", phoneStates);
+
+const recentFailures = await AuditLog.find({
+  action: "COMPLETION_OTP_DELIVERY_FAILED",
+  createdAt: { $gte: since },
+})
+  .sort({ createdAt: -1 })
+  .limit(20)
+  .select("targetId after createdAt")
+  .maxTimeMS(15000)
+  .lean();
+const failureTally = {};
+for (const f of recentFailures) {
+  const key = [
+    f.after?.error || "unknown",
+    f.after?.providerStatus != null ? `http=${f.after.providerStatus}` : "http=-",
+    f.after?.providerMessage || "-",
+  ].join(" | ");
+  failureTally[key] = (failureTally[key] || 0) + 1;
+}
+console.log("7 DELIVERY FAILURES:", { recent: recentFailures.length, byReason: failureTally });
+for (const f of recentFailures.slice(0, 5)) {
+  console.log(`  FAIL booking=${f.targetId} at=${f.createdAt?.toISOString?.()}`, JSON.stringify(f.after || {}));
+}
+
+let smsProviderReport = null;
+if (args.includes("--sms")) {
+  if (!process.env.FAST2SMS_API_KEY) {
+    smsProviderReport = { error: "FAST2SMS_API_KEY missing" };
+  } else {
+    const { default: axios } = await import("axios");
+    const today = new Date().toISOString().slice(0, 10);
+    const headers = { authorization: process.env.FAST2SMS_API_KEY };
+    smsProviderReport = {};
+    try {
+      const wallet = await axios.get("https://www.fast2sms.com/dev/wallet", { headers, timeout: 15000 });
+      smsProviderReport.wallet = wallet.data;
+    } catch (e) {
+      smsProviderReport.wallet = { error: e.response?.status || e.message };
+    }
+    try {
+      const summary = await axios.get("https://www.fast2sms.com/dev/sms_summary", {
+        headers,
+        params: { from: today, to: today },
+        timeout: 15000,
+      });
+      smsProviderReport.today = summary.data?.data || summary.data;
+    } catch (e) {
+      smsProviderReport.today = { error: e.response?.status || e.message };
+    }
+  }
+  console.log("7 FAST2SMS:", JSON.stringify(smsProviderReport));
+}
+
+const completionOtpReport = {
+  config: {
+    configured: smsCfg.configured,
+    reason: smsCfg.reason,
+    warning: smsCfg.warning || null,
+    templateId: completionTemplate,
+    reusesAuthTemplate: completionTemplate === AUTH_SMS_TEMPLATE_ID,
+    sendCooldownMs,
+  },
+  challengeStatuses,
+  openChallenges,
+  expiredOpen,
+  stuckDelivery,
+  duplicateActiveBookings: duplicateActive.length,
+  phoneStates,
+  deliveryFailuresRecent: recentFailures.length,
+  deliveryFailureReasons: failureTally,
+  smsProvider: smsProviderReport,
+};
+
 if (jsonOutput) {
   console.log(JSON.stringify({
     database: mongoose.connection.name,
@@ -399,6 +549,7 @@ if (jsonOutput) {
       : null,
     stages: stagesReport,
     reasonTally: reasonTallyReport,
+    completionOtp: completionOtpReport,
   }, null, 2));
 }
 

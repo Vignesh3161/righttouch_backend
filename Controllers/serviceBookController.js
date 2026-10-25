@@ -1405,7 +1405,11 @@ export const requestCompletionOtp = async (req, res) => {
     });
     return res.status(200).json({ success: true, message: "Completion verification requested.", result });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+      result: error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {},
+    });
   }
 };
 
@@ -1417,7 +1421,11 @@ export const resendCompletionOtp = async (req, res) => {
     });
     return res.status(200).json({ success: true, message: "Completion OTP resent.", result });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+      result: error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {},
+    });
   }
 };
 
