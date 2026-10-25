@@ -280,7 +280,7 @@ if (!target) {
   stages.districtPermission = await TechnicianProfile.countDocuments(combinedFilter);
 
   let candidates = await TechnicianProfile.find(combinedFilter)
-    .select("userId location locationUpdatedAt availability skills enabledDistrictIds allowedCityIds primaryDistrictId cityZoneId enabledCityZoneIds serviceRadiusKm workStatus profileComplete")
+    .select("userId location locationUpdatedAt availability skills enabledDistrictIds allowedCityIds primaryDistrictId primaryCityId cityZoneId currentCityZoneId enabledCityZoneIds serviceRadiusKm workStatus profileComplete trainingCompleted")
     .limit(limit)
     .maxTimeMS(15000)
     .lean();

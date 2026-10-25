@@ -539,7 +539,12 @@ const startBackgroundWorkers = async () => {
   // 📤 Booking outbox worker — broadcast only AFTER booking transaction commit
   startBookingOutboxWorker(io);
 
-  startTechnicianPresenceSweeper(io);
+  // Auto-offline is disabled by default. A movement/heartbeat ping must never
+  // be the reason a technician is forced offline; enable the legacy sweep
+  // explicitly via env if operations ever need it again.
+  if (process.env.TECH_AUTO_OFFLINE_ENABLED === "true") {
+    startTechnicianPresenceSweeper(io);
+  }
 
   // 📊 Broadcast funnel metrics (5-minute rolling counters; post to logs so
   // "matched but never delivered" is visible without a metrics backend).

@@ -38,11 +38,11 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
 
     // A location/heartbeat ping updates coordinates and freshness ONLY.
     // Online status is owned exclusively by the explicit availability action
-    // (go-online / go-offline); it must never be toggled by a movement ping,
-    // otherwise an intentionally-offline technician would flip online simply
-    // by moving. We read the CURRENT online state to decide geo-matching
-    // membership, but never write `availability.isOnline` here.
-    const isOnlineNow = profile.availability?.isOnline === true;
+    // (go-online / go-offline), so an intentionally-offline technician never
+    // flips online just by moving. The ONE exception is recovery from a
+    // system-induced gps_stale offline: a fresh ping proves the app is active
+    // again, so the technician is restored online automatically below.
+    let isOnlineNow = profile.availability?.isOnline === true;
 
     const [oldLng, oldLat] = profile.location?.coordinates || [0, 0];
 
@@ -80,6 +80,29 @@ export const handleLocationUpdate = async (technicianProfileId, latitude, longit
             { _id: technicianProfileId },
             { locationUpdatedAt: new Date() }
         );
+    }
+
+    // ♻️ Recover technicians that were auto-offlined for stale GPS. An
+    // explicit go-offline never sets offlineReason="gps_stale", so manual
+    // offline choices are preserved.
+    if (
+        !isOnlineNow &&
+        profile.availability?.offlineReason === "gps_stale" &&
+        profile.workStatus === "approved" &&
+        profile.trainingCompleted === true
+    ) {
+        await TechnicianProfile.updateOne(
+            { _id: technicianProfileId },
+            {
+                $set: {
+                    "availability.isOnline": true,
+                    "availability.offlineReason": null,
+                    "availability.offlineAt": null,
+                },
+            }
+        );
+        isOnlineNow = true;
+        console.log(`♻️ Tech ${technicianProfileId} restored online after fresh GPS ping (was gps_stale)`);
     }
 
     // 🗺 Redis GEO hot path — upsert position for sub-ms radius pre-filtering

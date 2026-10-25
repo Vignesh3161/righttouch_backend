@@ -18,7 +18,7 @@ import { haversineMeters } from "../Utils/feasibility.js";
 import { isValidObjectId, exactRegex, containsRegex, clampLimit, clampPage, internalError } from "../Utils/safeQuery.js";
 import { seedZoneDisabledServices, recordPolygonVersion, withZoneWriteTransaction, invalidateDistrictPolygonCache } from "../Services/zoneWriteService.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
+import { ensureApprovedDistrictZones, grantZoneToDistrictTechnicians } from "../Services/technicianDistrictService.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -289,6 +289,15 @@ export const createCityZone = async (req, res) => {
           },
           session
         );
+        if (created.active !== false) {
+          await grantZoneToDistrictTechnicians({
+            zoneId: created._id,
+            districtId: parentId,
+            adminUserId: actorId,
+            reason: "Auto-granted on zone creation",
+            session,
+          });
+        }
         return { created, seeded };
       });
       zone = out.result.created;
