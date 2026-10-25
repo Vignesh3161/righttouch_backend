@@ -59,11 +59,15 @@ node_modules/.cache/
 package-lock.json
 
 postman/
-docs/
 
 scripts/
 Scripts/
 test/
+
+# Project documentation, operational scripts, and tests are tracked
+!docs/
+!scripts/
+!test/
 config/firebase-credentials.json
 *Account.json
 serverAccount.json
