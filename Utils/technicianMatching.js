@@ -17,11 +17,11 @@ import { geoSearch } from "./technicianGeo.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
 import { STALENESS_SECONDS, stalenessCutoff, getGpsState } from "./locationConfig.js";
-import { toJobNewDTO } from "./socketDTO.js";
-import { SOCKET_EVENTS, SOCKET_ROOMS } from "./socketConstants.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
 import { enqueueJobNewNotifications, wakeDispatchWorker } from "./dispatchQueue.js";
 import { offerPurgeAt } from "./broadcastRetention.js";
+import { mergeTechnicianCandidateIds } from "./technicianCandidatePool.js";
+import { buildJobDispatchPayload } from "./jobPayload.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -332,8 +332,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
 
     const activeJob = await ServiceBooking.findOne({
       technicianId: technicianProfileId,
-      status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
-    }).select("_id status");
+      $or: [
+        { status: { $in: ["on_the_way", "reached", "in_progress"] } },
+        { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+      ],
+    }).select("_id status bookingType");
 
     if (activeJob) {
       return { success: false, message: "Technician has an active job" };
@@ -581,7 +584,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           await enqueueJobNewNotifications({
             bookingId: booking._id,
             technicianIds: [tech._id],
-            jobData: {
+            jobData: buildJobDispatchPayload({
               bookingId: booking._id,
               serviceId: service?._id,
               serviceName: service?.serviceName || "New Service",
@@ -592,7 +595,12 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
               baseAmount: booking.baseAmount,
               address: booking.address,
               scheduledAt: booking.scheduledAt,
-            },
+            }, {
+              latitude: booking.location?.coordinates?.[1],
+              longitude: booking.location?.coordinates?.[0],
+              distanceMeters,
+              effectiveRadiusMeters: techEffectiveRadiusM,
+            }),
             broadcastMap: bm,
           });
         }
@@ -659,7 +667,10 @@ export const findEligibleTechniciansForService = async ({
   // ⚡ 1. Efficiently query busy technicians (indexed distinct query on active bookings)
   let activeTechIdsQuery = ServiceBooking.find({
     technicianId: { $ne: null },
-    status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
+    $or: [
+      { status: { $in: ["on_the_way", "reached", "in_progress"] } },
+      { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+    ],
   }).distinct("technicianId");
 
   const activeTechIds = session
@@ -739,92 +750,82 @@ export const findEligibleTechniciansForService = async ({
   }
 
   if (enableGeo && hasCoords) {
-    // Try Redis GEO pre-filter first (fast candidate discovery)
-    let nearby = [];
-    const geoResults = await geoSearch(lng, lat, radiusMeters, limit * 2); // Get more candidates for filtering
-    
-    if (geoResults && geoResults.length > 0) {
-      // Filter by base query criteria (workStatus, skills, etc.) using the geo results
-      const geoTechIds = geoResults.map(r => r.technicianId);
-      const geoTechObjects = await TechnicianProfile.find({
-        _id: { $in: geoTechIds },
-        ...baseQuery,
-      }).select("_id location").lean();
-      
-      nearby = geoTechObjects.filter(tech => {
-        const geoResult = geoResults.find(g => g.technicianId === tech._id.toString());
-        if (!geoResult) return false;
-        
-        // Double check Haversine distance
-        const d = haversineMeters(
-          { latitude: tech.location?.coordinates?.[1], longitude: tech.location?.coordinates?.[0] },
-          { latitude: lat, longitude: lng }
-        );
-        return d != null && d <= radiusMeters;
-      });
-    }
-    
-    if (nearby.length === 0) {
-      // Fallback to MongoDB $nearSphere if Redis GEO unavailable or no results.
-      // NOTE: $nearSphere and $geoIntersects on the same `location` field
-      // must NOT be combined in one query (Mongo picks one predicate and
-      // the other silently mis-filters). So: radius first, then intersect
-      // with the JOB district polygon in a second query.
-      const geoQuery = {
-        ...baseQuery,
-        "location.type": "Point",
-        "location.coordinates.0": { $type: "number" },
-        "location.coordinates.1": { $type: "number" },
-        location: {
-          $nearSphere: {
-            $geometry: {
-              type: "Point",
-              coordinates: [lng, lat],
-            },
-            $maxDistance: radiusMeters,
+    const geoQuery = {
+      ...baseQuery,
+      "location.type": "Point",
+      "location.coordinates.0": { $type: "number" },
+      "location.coordinates.1": { $type: "number" },
+      location: {
+        $nearSphere: {
+          $geometry: {
+            type: "Point",
+            coordinates: [lng, lat],
           },
+          $maxDistance: radiusMeters,
         },
-      };
+      },
+    };
 
-      const nearbyQuery = TechnicianProfile.find(geoQuery).select("_id location").limit(limit);
-      if (session) nearbyQuery = nearbyQuery.session(session);
-      nearby = await nearbyQuery;
+    let nearbyQuery = TechnicianProfile.find(geoQuery)
+      .select("_id location")
+      .limit(limit * 2);
+    if (session) nearbyQuery = nearbyQuery.session(session);
 
-      // Second step: keep only techs inside the JOB district polygon
-      // (district-scoped, never the old single-global-district polygon).
-      if (nearby.length > 0 && jobDistrictId) {
-        const districtPolygon = await getOperationalPolygonForDistrict(jobDistrictId);
-        if (districtPolygon) {
-          const inside = await TechnicianProfile.find({
-            _id: { $in: nearby.map((t) => t._id) },
-            location: { $geoIntersects: { $geometry: districtPolygon } },
-          })
-            .select("_id")
-            .lean();
-          const insideSet = new Set(inside.map((t) => String(t._id)));
-          nearby = nearby.filter((t) => insideSet.has(String(t._id)));
-        }
-      }
+    const [geoResults, mongoNearby] = await Promise.all([
+      geoSearch(lng, lat, radiusMeters, limit * 2),
+      nearbyQuery.lean(),
+    ]);
+
+    const candidateIds = mergeTechnicianCandidateIds(
+      (geoResults || []).map((result) => result.technicianId),
+      (mongoNearby || []).map((tech) => tech._id)
+    );
+
+    if (candidateIds.length === 0) {
+      return [];
     }
 
-    if (nearby.length > 0) {
-      // Double check Haversine distance <= radiusMeters (10,000m)
-      const withinRadiusTechs = nearby.filter((tech) => {
-        const tCoords = tech.location?.coordinates;
-        if (!Array.isArray(tCoords) || tCoords.length !== 2) return false;
-        const d = haversineMeters(
-          { latitude: tCoords[1], longitude: tCoords[0] },
-          { latitude: lat, longitude: lng }
-        );
-        return d != null && d <= radiusMeters;
-      });
+    let candidateQuery = TechnicianProfile.find({
+      ...baseQuery,
+      _id: {
+        $in: candidateIds,
+        ...(baseQuery._id || {}),
+      },
+    }).select("_id location");
+    if (session) candidateQuery = candidateQuery.session(session);
 
-      const verifiedIds = await filterByApprovedKyc(withinRadiusTechs.map((t) => t._id));
-      return verifiedIds;
+    const candidates = (await candidateQuery.lean())
+      .map((tech) => {
+        const coords = tech.location?.coordinates;
+        const distanceMeters =
+          Array.isArray(coords) && coords.length === 2
+            ? haversineMeters(
+                { latitude: coords[1], longitude: coords[0] },
+                { latitude: lat, longitude: lng }
+              )
+            : null;
+        return { tech, distanceMeters };
+      })
+      .filter(({ distanceMeters }) => distanceMeters != null && distanceMeters <= radiusMeters)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters);
+
+    let withinRadiusTechs = candidates;
+    if (jobDistrictId && withinRadiusTechs.length > 0) {
+      const insideIds = new Set(
+        (await filterByOperationalPolygon(
+          withinRadiusTechs.map(({ tech }) => tech._id),
+          jobDistrictId
+        )).map((id) => String(id))
+      );
+      withinRadiusTechs = withinRadiusTechs.filter(({ tech }) =>
+        insideIds.has(String(tech._id))
+      );
     }
 
-    // STRICT: When coordinates are present and enableGeo is true, never fall back to state/city wide search!
-    return [];
+    const verifiedIds = await filterByApprovedKyc(
+      withinRadiusTechs.map(({ tech }) => tech._id)
+    );
+    return verifiedIds.slice(0, limit);
   }
 
   const fallbackQuery = { ...baseQuery };
@@ -1239,7 +1240,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // All in a single transaction for atomicity.
     // NOTE: jobDataPayload is constructed BEFORE the transaction so the
     // DispatchOutbox rows inside the transaction can reference it (B-01 TDZ fix).
-    const jobDataPayload = {
+    const jobDataPayload = buildJobDispatchPayload({
       bookingId: booking._id,
       serviceId: service._id,
       serviceName: service.serviceName,
@@ -1250,7 +1251,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       baseAmount: booking.baseAmount,
       address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
       scheduledAt: booking.scheduledAt,
-    };
+    }, { latitude, longitude });
     const session = await mongoose.startSession();
     let broadcastMap = new Map();
     await extendMatchLease("transaction-start");
@@ -1316,6 +1317,16 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         // txn makes withTransaction retry forever (P1 root cause).
         const outboxOps = technicianIds.map((techId) => {
           const b = broadcastMap.get(String(techId));
+          const techOffer = offerRows.find(
+            (offer) => String(offer.technicianId) === String(techId)
+          );
+          const distanceMeters =
+            techOffer?.distanceAtOffer != null
+              ? Math.round(techOffer.distanceAtOffer)
+              : null;
+          const effectiveRadiusMeters = getEffectiveRadiusMeters(
+            profileById.get(String(techId))
+          );
           return {
             updateOne: {
               filter: {
@@ -1331,7 +1342,15 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
                   kind: "job_new",
                   broadcastId: b?._id || null,
                   version: b?.version || 1,
-                  payload: { ...jobDataPayload, traceId: trc },
+                  payload: {
+                    ...buildJobDispatchPayload(jobDataPayload, {
+                      latitude,
+                      longitude,
+                      distanceMeters,
+                      effectiveRadiusMeters,
+                    }),
+                    traceId: trc,
+                  },
                   status: "pending",
                   nextAttemptAt: new Date(),
                 },
@@ -1367,52 +1386,9 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     recordMetric(METRIC_KEYS.BROADCAST_CREATED, technicianIds.length);
     recordHistogram(METRIC_KEYS.MATCHING_LATENCY_MS, Date.now() - matchStartTime);
 
-    // 4. Send Notifications (AFTER transaction commit for durability)
-
-    // ⚡ INSTANT DIRECT SOCKET DISPATCH (after commit)
-    if (io) {
-      technicianIds.forEach((techId) => {
-        const b = broadcastMap.get(String(techId));
-        const techOffer = offerRows.find(o => String(o.technicianId) === String(techId));
-        const distM = techOffer?.distanceAtOffer != null ? Math.round(techOffer.distanceAtOffer) : null;
-        // B-19: report the per-technician effective radius actually enforced.
-        const techEffectiveM = getEffectiveRadiusMeters(profileById.get(String(techId)));
-        const jobDTO = toJobNewDTO({
-          ...jobDataPayload,
-          latitude,
-          longitude,
-          distanceMeters: distM,
-          distanceKm: distM != null ? Number((distM / 1000).toFixed(2)) : null,
-          distanceStr: distM != null ? `${(distM / 1000).toFixed(1)} km` : null,
-          jobRadiusKm: techEffectiveM / 1000,
-          maxRadiusKm: techEffectiveM / 1000,
-          maxAllowedMeters: techEffectiveM,
-        }, b);
-        // PRIMARY: Technician operational room (always correct)
-        io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-        
-        // SECONDARY: User room — use actual User ID
-        const userId = techUserIds.get(String(techId));
-        if (userId) {
-          io.to(SOCKET_ROOMS.USER(userId)).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-        }
-        
-        // Notification event
-        io.to(SOCKET_ROOMS.TECHNICIAN(techId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
-          id: `job-${jobDTO.bookingId}`,
-          type: "JOB_NEW",
-          title: "🆕 New Job Available",
-          message: `New ${jobDTO.serviceName || "service"} job in your area (${jobDTO.distanceStr || "nearby"})`,
-          bookingId: String(jobDTO.bookingId || ""),
-          createdAt: new Date().toISOString(),
-        });
-      });
-      console.log(`📡 [TRACE] ${trc} SOCKET_EMIT bookingId=${bookingId} techCount=${technicianIds.length}`);
-      recordMetric(METRIC_KEYS.SOCKET_EMITTED, technicianIds.length);
-    }
-
-    // DispatchOutbox already created in transaction; wake the worker now for
-    // near-zero delivery latency instead of waiting for the next poll tick.
+    // DispatchOutbox is the single delivery path for socket + push. The
+    // worker reserves the dedupe key once, preventing direct/outbox double
+    // emits and keeping the payload identical across retries.
     wakeDispatchWorker();
     console.log(`📤 [TRACE] ${trc} DISPATCH_OUTBOX_COMMITTED bookingId=${bookingId} techCount=${technicianIds.length}`);
     recordMetric(METRIC_KEYS.OUTBOX_CREATED, technicianIds.length);

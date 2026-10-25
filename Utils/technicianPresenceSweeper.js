@@ -120,10 +120,12 @@ export const runTechnicianPresenceSweep = async (io = ioRef) => {
         userId: tech.userId ? String(tech.userId) : undefined,
       });
       if (!io) continue;
-      io.to(SOCKET_ROOMS.TECHNICIAN(tech._id)).emit(SOCKET_EVENTS.TECH_OFFLINE, payload);
-      if (tech.userId) {
-        io.to(SOCKET_ROOMS.USER(tech.userId)).emit(SOCKET_EVENTS.TECH_OFFLINE, payload);
-      }
+      // Technician sockets join both the operational and user rooms. Union
+      // them so one socket receives technician:offline exactly once.
+      const target = tech.userId
+        ? io.to(SOCKET_ROOMS.USER(tech.userId)).to(SOCKET_ROOMS.TECHNICIAN(tech._id))
+        : io.to(SOCKET_ROOMS.TECHNICIAN(tech._id));
+      target.emit(SOCKET_EVENTS.TECH_OFFLINE, payload);
     }
 
     const offline = offlineTechs.length;

@@ -17,11 +17,14 @@ import { getGpsState } from "./locationConfig.js";
 export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
     const techId = new mongoose.Types.ObjectId(technicianProfileId);
 
-    // 1. Busy check: technician cannot see/accept new jobs if currently working on a job
+    // 1. Busy check: only current work and accepted instant jobs hide the feed.
     const activeJob = await ServiceBooking.findOne({
         technicianId: techId,
-        status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
-    }).select("_id status");
+        $or: [
+            { status: { $in: ["on_the_way", "reached", "in_progress"] } },
+            { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+        ],
+    }).select("_id status bookingType");
 
     if (activeJob) return [];
 
