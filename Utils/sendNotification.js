@@ -20,10 +20,9 @@ import { recordPush, recordSocket } from "./broadcastMetrics.js";
 /**
  * 🔌 LIVE SOCKET PRESENCE (O(1), synchronous)
  */
-export const hasLiveSocket = (io, technicianId) => {
+const roomHasLiveSockets = (io, room) => {
   try {
-    if (!io || !technicianId) return false;
-    const room = SOCKET_ROOMS.TECHNICIAN(technicianId);
+    if (!io || !room) return false;
     const nsp = io.of?.("/") || io;
     const roomSockets = nsp?.adapter?.rooms?.get(room);
     return Boolean(roomSockets && roomSockets.size > 0);
@@ -32,49 +31,40 @@ export const hasLiveSocket = (io, technicianId) => {
   }
 };
 
+export const hasLiveSocket = (io, technicianId) => {
+  if (!technicianId) return false;
+  return roomHasLiveSockets(io, SOCKET_ROOMS.TECHNICIAN(technicianId));
+};
+
 /**
  * 🛰 JOBS-CHANGED PUSH (Socket Analysis — anti-polling fix)
  */
 export const emitJobsChanged = (io, technicianProfileId, { action, bookingId, broadcastId, reasons, userId } = {}) => {
   try {
     if (!io || !technicianProfileId) return;
-    
-    // PRIMARY: Technician operational room
-    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
-      SOCKET_EVENTS.TECH_JOBS_CHANGED,
-      { changed: true, at: new Date().toISOString() }
-    );
-    
-    // SECONDARY: User room if userId provided
-    if (userId) {
-      io.to(SOCKET_ROOMS.USER(userId)).emit(
-        SOCKET_EVENTS.TECH_JOBS_CHANGED,
-        { changed: true, at: new Date().toISOString() }
-      );
-    }
-    
+
+    // Technician sockets join BOTH technician_<profileId> and user:<userId>.
+    // Union the rooms in one broadcast so the same socket never receives the
+    // event twice (Socket.IO de-duplicates recipients across chained to()).
+    const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianProfileId);
+    const target = userId
+      ? io.to(SOCKET_ROOMS.USER(userId)).to(techRoom)
+      : io.to(techRoom);
+
+    target.emit(SOCKET_EVENTS.TECH_JOBS_CHANGED, {
+      changed: true,
+      at: new Date().toISOString(),
+    });
+
     // Backward compatibility flat event
     if (action || bookingId) {
-      io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(
-        "jobs_changed",
-        {
-          action: action || "changed",
-          bookingId: bookingId ? String(bookingId) : undefined,
-          broadcastId: broadcastId ? String(broadcastId) : undefined,
-          reasons: reasons || [],
-          at: new Date().toISOString()
-        }
-      );
-      
-      if (userId) {
-        io.to(SOCKET_ROOMS.USER(userId)).emit("jobs_changed", {
-          action: action || "changed",
-          bookingId: bookingId ? String(bookingId) : undefined,
-          broadcastId: broadcastId ? String(broadcastId) : undefined,
-          reasons: reasons || [],
-          at: new Date().toISOString()
-        });
-      }
+      target.emit("jobs_changed", {
+        action: action || "changed",
+        bookingId: bookingId ? String(bookingId) : undefined,
+        broadcastId: broadcastId ? String(broadcastId) : undefined,
+        reasons: reasons || [],
+        at: new Date().toISOString(),
+      });
     }
   } catch (err) {
     console.error("emitJobsChanged error:", err.message);
@@ -96,27 +86,23 @@ export const emitJobExpired = (io, technicianProfileId, { bookingId, broadcastId
       reasons: reasons || [reason || "offer_expired"],
     };
     
-    // PRIMARY: Technician room
-    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(SOCKET_EVENTS.JOB_EXPIRED, payload);
-    
-    // SECONDARY: User room
-    if (userId) {
-      io.to(SOCKET_ROOMS.USER(userId)).emit(SOCKET_EVENTS.JOB_EXPIRED, payload);
-    }
-    
+    // Technician sockets join BOTH technician_<profileId> and user:<userId>.
+    // Union the rooms so the same socket receives each event exactly once.
+    const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianProfileId);
+    const target = userId
+      ? io.to(SOCKET_ROOMS.USER(userId)).to(techRoom)
+      : io.to(techRoom);
+
+    target.emit(SOCKET_EVENTS.JOB_EXPIRED, payload);
+
     // Feed removal event
-    const jobsChangedPayload = {
+    target.emit("jobs_changed", {
       action: "removed",
       bookingId: String(bookingId),
       broadcastId: broadcastId ? String(broadcastId) : undefined,
       reasons: reasons || [reason || "offer_expired"],
-      at: new Date().toISOString()
-    };
-    
-    io.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit("jobs_changed", jobsChangedPayload);
-    if (userId) {
-      io.to(SOCKET_ROOMS.USER(userId)).emit("jobs_changed", jobsChangedPayload);
-    }
+      at: new Date().toISOString(),
+    });
   } catch (err) {
     console.error("emitJobExpired error:", err.message);
   }
@@ -403,9 +389,15 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       try {
         const userRoom = techProfile?.userId ? SOCKET_ROOMS.USER(techProfile.userId) : null;
         const techRoom = SOCKET_ROOMS.TECHNICIAN(technicianId);
+        const hasLiveTarget =
+          roomHasLiveSockets(io, techRoom) || roomHasLiveSockets(io, userRoom);
 
-        if (userRoom) io.to(userRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
-        io.to(techRoom).emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
+        // Technician sockets join BOTH rooms; union them so job:new is
+        // delivered once per socket even when both rooms resolve to it.
+        const jobTarget = userRoom
+          ? io.to(userRoom).to(techRoom)
+          : io.to(techRoom);
+        jobTarget.emit(SOCKET_EVENTS.JOB_NEW, jobDTO);
         if (userRoom) {
           io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
             id: `job-${jobDTO.bookingId}`,
@@ -416,8 +408,13 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
             createdAt: new Date().toISOString(),
           });
         }
-        socketDelivered = true;
-        console.log(`⚡ [JOB_NEW EMIT] Dispatched to Tech ${technicianId} (rooms: ${userRoom || "none"}, ${techRoom})`);
+        socketDelivered = hasLiveTarget;
+        if (hasLiveTarget) {
+          console.log(`⚡ [JOB_NEW EMIT] Dispatched to Tech ${technicianId} (rooms: ${userRoom || "none"}, ${techRoom})`);
+        } else {
+          socketError = "no_live_socket";
+          console.log(`📭 [JOB_NEW] No live socket for Tech ${technicianId}; relying on push/outbox retry`);
+        }
       } catch (err) {
         socketError = err.message;
         console.warn(`⚠️ Socket emit failed for tech ${technicianId}:`, err.message);

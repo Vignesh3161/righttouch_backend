@@ -29,9 +29,32 @@ export const toBookingCancelledDTO = (booking, reason) => ({
  * @param {Object} [broadcast] - JobBroadcast doc (broadcastId, version)
  */
 export const toJobNewDTO = (jobData, broadcast) => {
-  const distM = jobData?.distanceMeters ?? (jobData?.distanceAtOffer ? Math.round(jobData.distanceAtOffer) : null);
-  const distKm = distM != null ? Number((distM / 1000).toFixed(2)) : (jobData?.distanceKm != null ? Number(jobData.distanceKm) : null);
-  const distStr = jobData?.distanceStr || (distKm != null ? `${distKm} km` : null);
+  const distanceMeters =
+    jobData?.distanceMeters ??
+    (jobData?.distanceAtOffer != null ? Math.round(jobData.distanceAtOffer) : null);
+  const distanceKm =
+    jobData?.distanceKm != null
+      ? Number(jobData.distanceKm)
+      : distanceMeters != null
+        ? Number((distanceMeters / 1000).toFixed(2))
+        : null;
+  const distanceStr =
+    jobData?.distanceStr ||
+    (distanceMeters != null
+      ? `${(distanceMeters / 1000).toFixed(1)} km`
+      : distanceKm != null
+        ? `${distanceKm.toFixed(1)} km`
+        : null);
+  const maxAllowedMeters =
+    jobData?.maxAllowedMeters != null
+      ? Number(jobData.maxAllowedMeters)
+      : jobData?.maxRadiusKm != null
+        ? Number(jobData.maxRadiusKm) * 1000
+        : 10000;
+  const jobRadiusKm =
+    jobData?.jobRadiusKm != null
+      ? Number(jobData.jobRadiusKm)
+      : Number((maxAllowedMeters / 1000).toFixed(2));
 
   return {
     bookingId: jobData?.bookingId ? jobData.bookingId.toString() : null,
@@ -48,11 +71,11 @@ export const toJobNewDTO = (jobData, broadcast) => {
     scheduledAt: jobData?.scheduledAt || null,
     latitude: jobData?.latitude ?? null,
     longitude: jobData?.longitude ?? null,
-    distanceMeters: distM,
-    distanceKm: distKm,
-    distanceStr: distStr,
-    jobRadiusKm: 10,
-    maxRadiusKm: 10,
-    maxAllowedMeters: 10000,
+    distanceMeters,
+    distanceKm,
+    distanceStr,
+    jobRadiusKm,
+    maxRadiusKm: jobRadiusKm,
+    maxAllowedMeters,
   };
 };

@@ -79,25 +79,32 @@ export const sendAppNotification = async ({
 
     if (socketServer) {
       const userRoom = SOCKET_ROOMS.USER(userId);
+      const normalizedRecipientType = recipientType.toLowerCase();
       console.log(`📡 [NOTIFICATION EMIT] Room: ${userRoom} | Event: ${SOCKET_EVENTS.NOTIFICATION_NEW}`);
 
-      // Emit to standardized user room
-      socketServer.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, notificationPayload);
+      // A socket joins its standardized user room and legacy rooms. Union all
+      // targets into one broadcast so one socket never receives the same
+      // notification twice (Socket.IO de-duplicates chained to() recipients).
+      const notificationRooms = new Set([userRoom]);
+      if (normalizedRecipientType === "customer") {
+        notificationRooms.add(SOCKET_ROOMS.CUSTOMER(userId));
+      } else if (normalizedRecipientType === "technician") {
+        if (technicianProfileId) {
+          notificationRooms.add(SOCKET_ROOMS.TECHNICIAN(technicianProfileId));
+        }
+        notificationRooms.add(SOCKET_ROOMS.TECHNICIAN(userId));
+      }
+
+      const notificationTarget = [...notificationRooms].reduce(
+        (target, room) => target.to(room),
+        socketServer
+      );
+      notificationTarget.emit(SOCKET_EVENTS.NOTIFICATION_NEW, notificationPayload);
 
       // Emit specific event type if mapped (e.g. "booking:accepted", "job:new")
       const specificEvent = metadata?.socketEvent || type?.toLowerCase?.();
       if (specificEvent && specificEvent !== "notification:new") {
         socketServer.to(userRoom).emit(specificEvent, notificationPayload);
-      }
-
-      // Backward compatibility with legacy rooms
-      if (recipientType.toLowerCase() === "customer") {
-        socketServer.to(SOCKET_ROOMS.CUSTOMER(userId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, notificationPayload);
-      } else if (recipientType.toLowerCase() === "technician") {
-        if (technicianProfileId) {
-          socketServer.to(SOCKET_ROOMS.TECHNICIAN(technicianProfileId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, notificationPayload);
-        }
-        socketServer.to(SOCKET_ROOMS.TECHNICIAN(userId)).emit(SOCKET_EVENTS.NOTIFICATION_NEW, notificationPayload);
       }
 
       socketEmitted = true;

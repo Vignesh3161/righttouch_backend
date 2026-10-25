@@ -6,6 +6,7 @@ import Service from "../Schemas/Service.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { broadcastPendingJobsToTechnician } from "../Utils/technicianMatching.js";
+import { geoAdd, geoRemove } from "../Utils/technicianGeo.js";
 import { handleLocationUpdate, revalidateActiveBroadcasts } from "../Utils/technicianLocation.js";
 import { getGpsState, normalizeCoordinates } from "../Utils/locationConfig.js";
 import { revokeSocketSession } from "../Utils/socketSessionControl.js";
@@ -1733,13 +1734,17 @@ export const updateTechnician = async (req, res) => {
     // 5. Proactive Broadcast if technician went online; remove from GEO if offline
     let broadcastResult = null;
     if (availability?.isOnline === true) {
+      const coords = technician.location?.coordinates;
+      if (Array.isArray(coords) && coords.length === 2) {
+        geoAdd(technicianProfileId, coords[0], coords[1]).catch(() => {});
+      }
+
       broadcastResult = await broadcastPendingJobsToTechnician(technicianProfileId, req.io).catch((err) => ({
         success: false,
         message: err.message,
       }));
     } else if (availability?.isOnline === false) {
       // Remove from Redis GEO set so matching doesn't find stale positions
-      const { geoRemove } = await import("../Utils/technicianGeo.js");
       geoRemove(technicianProfileId).catch(() => {});
       
       // 🔄 Revalidate active broadcasts - technician went offline

@@ -8,6 +8,7 @@
     "test": "node --test \"test/*.test.js\"",
     "start": "node index.js",
     "dev": "nodemon index.js",
+    "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
     "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },
   "repository": {
