@@ -1,4 +1,3 @@
-import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import User from "../Schemas/User.js";
@@ -6,6 +5,7 @@ import Otp from "../Schemas/Otp.js";
 import TempUser from "../Schemas/TempUser.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
+import { generateSecureOtp } from "../Utils/otpGenerator.js";
 import { signToken } from "../Utils/token.js";
 import sendSms from "../Utils/sendSMS.js";
 import { broadcastAdminUnreadCounts } from "../Controllers/adminNotificationController.js";
@@ -17,10 +17,8 @@ import { sendWelcomeNotification } from "../Utils/sendNotification.js";
  * Encapsulates authentication, OTP handling, JWT issuance, and login/signup business logic.
  */
 
-// Generate a cryptographically secure 4-digit OTP
-export const generateSecureOtp = () => {
-  return crypto.randomInt(1000, 10000).toString();
-};
+// Shared with service-completion OTP; re-exported for existing callers/tests.
+export { generateSecureOtp };
 
 const normalizeRole = (role) => {
   if (!role) return null;

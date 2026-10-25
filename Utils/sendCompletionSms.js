@@ -1,38 +1,25 @@
 /**
- * 📲 COMPLETION OTP SMS SENDER (Checkpoint B — delivery layer only).
+ * 📲 COMPLETION OTP SMS SENDER (delivery layer only).
  *
- * Separate Fast2SMS sender for service-completion OTPs. The existing
- * auth-OTP sender (`Utils/sendSMS.js`) is bound to its own approved DLT
- * template and is left untouched.
+ * Uses the SAME Fast2SMS credentials as auth/notification SMS
+ * (`FAST2SMS_API_KEY`), but keeps completion OTP handling separate:
+ *  - its own DLT template when COMPLETION_SMS_TEMPLATE_ID is configured,
+ *  - otherwise falls back to the approved auth/notification template,
+ *  - its own logging/audit/error mapping.
  *
- * Activation model (production stays OFF until the DLT template is approved):
- *   COMPLETION_SMS_TEMPLATE_ID=<approved DLT template/message id>
- *   COMPLETION_SMS_ENABLED=true
- * Anything else → sender throws SMS_NOT_CONFIGURED before any provider call.
+ * Enabled automatically whenever the shared FAST2SMS_API_KEY is present —
+ * the same credential auth/notification SMS already use. No separate
+ * activation flag is required for completion OTP.
  *
  * Secrecy rules (enforced, tested):
  *  - NEVER log the OTP, the OTP hash, the API key, full phone numbers, or
  *    raw provider payloads. Logs carry a masked phone (last 2 digits) and
- *    the provider's acceptance boolean only.
+ *    the provider's acceptance/request id only.
  *  - `post` (HTTP) is injectable so tests never touch the network.
- *
- * Crash-safety limitation (documented, not solved here): this is direct
- * post-commit delivery. If the process crashes after the challenge commit
- * but before/while sending, the challenge sits in `pending_delivery`.
- * Recovery: the resend endpoint re-drives delivery idempotently
- * (same-generation guard in `markChallengeDelivering` prevents reviving an
- * old code). Smallest reliable upgrade if loss proves material: a
- * `CompletionSmsOutbox` collection (challengeId, generation, status,
- * attempts, nextRetryAt) + a 1-min sweeper reusing the notification-worker
- * claim pattern — NOT plaintext OTPs in the outbox; re-derive send from
- * the challenge doc (still within TTL) or regenerate the generation.
  */
-import axios from "axios";
-
 import { OTP_PATTERN } from "./completionOtp.js";
-import { AUTH_SMS_TEMPLATE_ID } from "./sendSMS.js";
+import sendSms, { AUTH_SMS_TEMPLATE_ID, providerMessageOf } from "./sendSMS.js";
 
-const SMS_TIMEOUT_MS = 10000;
 let templateReuseWarned = false;
 
 /** Mask a phone number for logs — last 2 digits only, never the full number. */
@@ -40,12 +27,6 @@ export const maskPhone = (phone) => {
   const digits = String(phone || "").replace(/\D/g, "");
   if (digits.length <= 2) return "***";
   return `${"*".repeat(Math.min(digits.length - 2, 8))}${digits.slice(-2)}`;
-};
-
-const providerMessageOf = (data) => {
-  const raw = data?.message || data?.error;
-  if (Array.isArray(raw)) return raw.filter(Boolean).join("; ").slice(0, 300);
-  return raw ? String(raw).slice(0, 300) : null;
 };
 
 const smsError = (
@@ -63,44 +44,48 @@ const smsError = (
 };
 
 /**
- * Validate completion-SMS configuration WITHOUT printing secrets.
- * Returns { configured: boolean, reason: string|null }.
+ * Validate completion-SMS delivery WITHOUT printing secrets.
+ * The only credential required is the shared FAST2SMS_API_KEY.
  */
 export const validateCompletionSmsConfig = () => {
-  if (process.env.COMPLETION_SMS_ENABLED !== "true") {
-    return { configured: false, reason: "COMPLETION_SMS_ENABLED is not 'true' (production activation off)" };
-  }
-  if (!process.env.COMPLETION_SMS_TEMPLATE_ID || !process.env.COMPLETION_SMS_TEMPLATE_ID.trim()) {
-    return { configured: false, reason: "COMPLETION_SMS_TEMPLATE_ID is not set (DLT template pending approval)" };
-  }
   if (!process.env.FAST2SMS_API_KEY) {
-    return { configured: false, reason: "FAST2SMS_API_KEY is not set" };
+    return {
+      configured: false,
+      reason: "FAST2SMS_API_KEY is not set (shared auth/notification SMS credential)",
+      templateId: null,
+      reusesAuthTemplate: false,
+    };
   }
-  const templateId = process.env.COMPLETION_SMS_TEMPLATE_ID.trim();
-  if (templateId === AUTH_SMS_TEMPLATE_ID) {
+
+  const configuredTemplate = (process.env.COMPLETION_SMS_TEMPLATE_ID || "").trim();
+  const templateId = configuredTemplate || AUTH_SMS_TEMPLATE_ID;
+  const reusesAuthTemplate = templateId === AUTH_SMS_TEMPLATE_ID;
+  if (reusesAuthTemplate) {
     if (!templateReuseWarned) {
       templateReuseWarned = true;
       console.warn(
-        "[completionOtp] COMPLETION_SMS_TEMPLATE_ID reuses the auth-OTP DLT template — " +
+        "[completionOtp] Using the shared auth/notification DLT template for completion OTP — " +
           "Fast2SMS may reject rapid duplicate sends (error 995, spam detected). " +
-          "Prefer a dedicated approved completion template."
+          "Set COMPLETION_SMS_TEMPLATE_ID to a dedicated approved completion template when available."
       );
     }
-    return {
-      configured: true,
-      reason: null,
-      warning:
-        "COMPLETION_SMS_TEMPLATE_ID reuses the auth-OTP template; provider may apply duplicate/spam limits",
-    };
   }
-  return { configured: true, reason: null, warning: null };
+  return {
+    configured: true,
+    reason: null,
+    warning: reusesAuthTemplate
+      ? "Using the shared auth/notification template; provider may apply duplicate/spam limits"
+      : null,
+    templateId,
+    reusesAuthTemplate,
+  };
 };
 
 export const isCompletionSmsActive = () => validateCompletionSmsConfig().configured;
 
 /**
- * Send a completion OTP by SMS. Throws SMS_NOT_CONFIGURED / SmsError.
- * `post` defaults to axios.post and is injectable for tests.
+ * Send a completion OTP by SMS using the shared Fast2SMS credential.
+ * Throws SmsError with provider details on failure.
  */
 export const sendCompletionSms = async (
   phoneNumber,
@@ -111,6 +96,7 @@ export const sendCompletionSms = async (
   if (!cfg.configured) {
     throw smsError(`Completion SMS not configured: ${cfg.reason}`, { status: 503 });
   }
+
   const digits = String(phoneNumber || "").replace(/\D/g, "");
   const local = digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
   if (!/^[0-9]{10}$/.test(local)) {
@@ -120,49 +106,28 @@ export const sendCompletionSms = async (
     throw smsError("Completion SMS failed: invalid OTP format", { status: 500 });
   }
 
-  const url = "https://www.fast2sms.com/dev/bulkV2";
-  const payload = {
-    route: "dlt",
-    sender_id: "RTHUBS",
-    message: templateId || process.env.COMPLETION_SMS_TEMPLATE_ID,
-    variables_values: String(otpCode),
-    numbers: local,
-  };
-  const doPost = post || axios.post;
+  const effectiveTemplate = templateId || cfg.templateId || AUTH_SMS_TEMPLATE_ID;
 
-  let response;
   try {
-    response = await doPost(url, payload, {
-      headers: {
-        authorization: process.env.FAST2SMS_API_KEY,
-        "Content-Type": "application/json",
-      },
-      timeout: SMS_TIMEOUT_MS,
+    const result = await sendSms(local, otpCode, {
+      templateId: effectiveTemplate,
+      post,
+      returnResult: true,
     });
+    const requestId = result?.requestId || null;
+    console.log(
+      `📲 Completion OTP SMS accepted for ${maskPhone(local)}${requestId ? ` request_id=${requestId}` : ""}`
+    );
+    return { accepted: true, maskedPhone: maskPhone(local), requestId, templateId: effectiveTemplate };
   } catch (error) {
-    // Never include OTP / phone / key / raw payload in the message.
+    if (error?.name === "SmsError") throw error;
     throw smsError("Completion SMS failed: provider request failed", {
-      status: error.response?.status || 502,
-      providerStatus: error.response?.status || null,
-      providerMessage: providerMessageOf(error.response?.data),
-      requestId: error.response?.data?.request_id || null,
+      status: error?.status || error?.response?.status || 502,
+      providerStatus: error?.response?.status || null,
+      providerMessage: providerMessageOf(error?.response?.data),
+      requestId: error?.response?.data?.request_id || null,
     });
   }
-
-  if (!response?.data?.return) {
-    throw smsError("Completion SMS failed: provider rejected the request", {
-      status: 502,
-      providerStatus: response?.status || null,
-      providerMessage: providerMessageOf(response?.data),
-      requestId: response?.data?.request_id || null,
-    });
-  }
-
-  const requestId = response?.data?.request_id || null;
-  console.log(
-    `📲 Completion OTP SMS accepted for ${maskPhone(local)}${requestId ? ` request_id=${requestId}` : ""}`
-  );
-  return { accepted: true, maskedPhone: maskPhone(local), requestId };
 };
 
 export default { sendCompletionSms, validateCompletionSmsConfig, isCompletionSmsActive, maskPhone };

@@ -14,6 +14,7 @@ import {
   verifyWebhookSignature,
 } from "../Utils/razorpay.js";
 import { toPaise, rupeesToPaise } from "../Utils/money.js";
+import { normalizeBookingStatus } from "../Utils/bookingStatus.js";
 
 // C6: the record-offline `amount` contract is RUPEES (all admin money inputs
 // in this codebase are rupees; the audit mirror below stores targetPaise/100).
@@ -1218,6 +1219,17 @@ export const recordAdminOfflinePayment = async (req, res) => {
 
     if (!booking) {
       return fail(res, 404, "Booking or quotation not found");
+    }
+
+    // Service payments follow the pay-at-completion flow. Recording an
+    // offline service payment before completion would leave the technician
+    // with a paid booking that still asks for a completion OTP.
+    if (itemType === "service" && normalizeBookingStatus(booking.status) !== "completed") {
+      return fail(
+        res,
+        400,
+        `Payment allowed only after service completion (current status: ${booking.status})`
+      );
     }
 
     const existingPayment = await Payment.findOne({ bookingId: booking._id });

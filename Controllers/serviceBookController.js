@@ -53,8 +53,14 @@ import { closeActiveChallengesForBooking } from "../Utils/completionOtp.js";
  * single function so completion can never notify/settle twice.
  */
 export const fireBookingCompletedSideEffects = async (booking, technicianProfileId, io) => {
-  // If payment is already verified, credit technician wallet (idempotent)
-  await settleBookingEarningsIfEligible(booking._id);
+  // Post-completion side effects must never turn a successful OTP
+  // verification into an error response.
+  try {
+    // If payment is already verified, credit technician wallet (idempotent)
+    await settleBookingEarningsIfEligible(booking._id);
+  } catch (settleErr) {
+    console.error("settleBookingEarningsIfEligible error:", settleErr.message);
+  }
 
   // Notify customer — service is complete, payment is now due
   if (booking.customerId) {
@@ -78,8 +84,12 @@ export const fireBookingCompletedSideEffects = async (booking, technicianProfile
   }
 
   // Re-broadcast pending jobs to this technician only
-  const busyStartTime = booking.assignedAt || booking.createdAt || null;
-  await broadcastPendingJobsToTechnician(technicianProfileId, io, busyStartTime);
+  try {
+    const busyStartTime = booking.assignedAt || booking.createdAt || null;
+    await broadcastPendingJobsToTechnician(technicianProfileId, io, busyStartTime);
+  } catch (broadcastErr) {
+    console.error("broadcastPendingJobsToTechnician error:", broadcastErr.message);
+  }
 };
 
 const toNumber = value => {
@@ -1279,6 +1289,17 @@ export const updateBookingStatus = async (req, res) => {
     if (accessError) {
       return res.status(accessError.statusCode || 403).json({ success: false, message: accessError.message, result: {} });
     }
+    // Idempotent completion — checked BEFORE the transition table so a
+    // post-payment "complete" call returns 200 instead of being told to
+    // request another OTP (completed → completed is not a transition).
+    if (status === "completed" && normalizeBookingStatus(booking.status) === "completed") {
+      const completed = booking.toObject ? booking.toObject() : booking;
+      return res.status(200).json({
+        success: true,
+        message: "Booking already completed",
+        result: { ...completed, requiresCompletionOtp: false },
+      });
+    }
     // 🔒 Explicit transition table — the booking must be in a state that
     // allows moving to `status` (canonical state machine only).
     if (!canTransition(booking.status, status)) {
@@ -1288,10 +1309,6 @@ export const updateBookingStatus = async (req, res) => {
         result: {},
       });
     }
-    // Idempotent completion — already completed bookings return OK.
-    if (status === "completed" && booking.status === "completed") {
-      return res.status(200).json({ success: true, message: "Booking already completed", result: booking });
-    }
     // 🔒 Completion requires customer OTP verification. The direct
     // completed transition is closed BEFORE any state write — use POST
     // /api/technician/booking/:id/verify-completion-otp instead.
@@ -1299,7 +1316,7 @@ export const updateBookingStatus = async (req, res) => {
       return res.status(409).json({
         success: false,
         message: "Service completion requires customer OTP verification. Request an OTP, then verify it.",
-        result: {},
+        result: { code: "COMPLETION_OTP_REQUIRED", requiresCompletionOtp: true },
       });
     }
     // Check technician approval status
@@ -1400,6 +1417,12 @@ export const updateBookingStatus = async (req, res) => {
    Customer-confirmed completion — Checkpoint C.
    Responses never contain OTP, hash, pepper, phone, or provider payload.
 ===================================================== */
+const completionOtpErrorResult = (error) => ({
+  ...(error.code ? { code: error.code } : {}),
+  ...(error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+  ...(error.details && typeof error.details === "object" ? error.details : {}),
+});
+
 export const requestCompletionOtp = async (req, res) => {
   try {
     const result = await requestCompletionOtpService({
@@ -1411,7 +1434,7 @@ export const requestCompletionOtp = async (req, res) => {
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
-      result: error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {},
+      result: completionOtpErrorResult(error),
     });
   }
 };
@@ -1427,7 +1450,7 @@ export const resendCompletionOtp = async (req, res) => {
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
-      result: error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {},
+      result: completionOtpErrorResult(error),
     });
   }
 };
@@ -1447,10 +1470,20 @@ export const verifyCompletionOtp = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Service completion verified.",
-      result: { bookingId: String(booking._id), verificationStatus: "verified", generation, booking: updatedBooking },
+      result: {
+        bookingId: String(booking._id),
+        verificationStatus: "verified",
+        requiresCompletionOtp: false,
+        generation,
+        booking: updatedBooking,
+      },
     });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+      result: completionOtpErrorResult(error),
+    });
   }
 };
 
