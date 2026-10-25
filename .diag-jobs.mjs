@@ -380,8 +380,8 @@ for (const t of onlines) {
 }
 
 /* ── 7. Service completion OTP health ── */
-const completionTemplate = process.env.COMPLETION_SMS_TEMPLATE_ID || null;
 const smsCfg = validateCompletionSmsConfig();
+const completionTemplate = smsCfg.templateId || process.env.COMPLETION_SMS_TEMPLATE_ID || null;
 const sendCooldownMs = Number(process.env.COMPLETION_OTP_SEND_COOLDOWN_MS) || 60000;
 console.log("7 COMPLETION OTP CONFIG:", {
   configured: smsCfg.configured,
@@ -389,7 +389,7 @@ console.log("7 COMPLETION OTP CONFIG:", {
   warning: smsCfg.warning || null,
   templateId: completionTemplate,
   authTemplateId: AUTH_SMS_TEMPLATE_ID,
-  reusesAuthTemplate: completionTemplate === AUTH_SMS_TEMPLATE_ID,
+  reusesAuthTemplate: smsCfg.reusesAuthTemplate,
   sendCooldownMs,
 });
 
@@ -544,7 +544,7 @@ const completionOtpReport = {
     reason: smsCfg.reason,
     warning: smsCfg.warning || null,
     templateId: completionTemplate,
-    reusesAuthTemplate: completionTemplate === AUTH_SMS_TEMPLATE_ID,
+    reusesAuthTemplate: smsCfg.reusesAuthTemplate,
     sendCooldownMs,
   },
   challengeStatuses,

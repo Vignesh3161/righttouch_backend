@@ -23,13 +23,14 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import ServiceCompletionChallenge from "../Schemas/ServiceCompletionChallenge.js";
 import User from "../Schemas/User.js";
 import Report from "../Schemas/Report.js";
-import { canTransition } from "../Utils/bookingStatus.js";
+import { canTransition, normalizeBookingStatus } from "../Utils/bookingStatus.js";
 import {
   OTP_PATTERN,
   OTP_TTL_MS,
   OTP_MAX_RESENDS,
   OTP_ERRORS,
   otpError,
+  getCompletionOtpPepper,
   generateCompletionOtp,
   hashCompletionOtp,
   verifyCompletionOtpHash,
@@ -166,6 +167,16 @@ const assertSmsDeliveryConfigured = () => {
   }
 };
 
+/** Fail with a clear 503 instead of a 500 when the HMAC pepper is missing. */
+const assertOtpHashingConfigured = () => {
+  try {
+    getCompletionOtpPepper();
+  } catch (err) {
+    console.error(`[completionOtp] OTP hashing unavailable: ${err.message}`);
+    throw fail(503, OTP_ERRORS.MISSING_PEPPER, "Completion verification is not configured — please contact support");
+  }
+};
+
 /** Public (safe) projection — never OTP, hash, pepper, phone, or payload. */
 export const publicChallengeState = (challenge) => {
   if (!challenge) return { verificationStatus: "none" };
@@ -275,10 +286,22 @@ const assertTechnicianCanComplete = async (technicianProfileId) => {
 
 /** Shared eligibility: bookable → completable, active, undisputed. */
 const assertCompletionEligible = async (booking) => {
-  if (booking.status === "completed") {
-    throw fail(409, OTP_ERRORS.CONSUMED, "Booking already completed");
+  const bookingStatus = normalizeBookingStatus(booking.status);
+  if (bookingStatus === "completed") {
+    const err = fail(409, OTP_ERRORS.CONSUMED, "Booking already completed");
+    err.details = { bookingStatus: "completed", requiresCompletionOtp: false };
+    throw err;
   }
-  if (!canTransition(booking.status, "completed")) {
+  if (booking.paymentStatus === "paid") {
+    const err = fail(409, OTP_ERRORS.CONSUMED, "Payment already recorded — completion OTP is not required");
+    err.details = {
+      bookingStatus,
+      paymentStatus: "paid",
+      requiresCompletionOtp: false,
+    };
+    throw err;
+  }
+  if (!canTransition(bookingStatus, "completed")) {
     throw fail(409, OTP_ERRORS.NOT_PENDING, `Booking in status "${booking.status}" cannot be completed`);
   }
   if (booking.cancellationStatus && booking.cancellationStatus !== "active") {
@@ -359,6 +382,7 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
   assertSmsDeliveryConfigured();
+  assertOtpHashingConfigured();
 
   const phone = await loadCustomerPhone(booking.customerId);
   if (!isValidDeliveryPhone(phone)) {
@@ -468,6 +492,7 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
   assertSmsDeliveryConfigured();
+  assertOtpHashingConfigured();
 
   const now = new Date();
   const challenge = await activeChallengeFor(booking._id);
@@ -538,6 +563,7 @@ export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp 
   await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
+  assertOtpHashingConfigured();
 
   const challenge = await ServiceCompletionChallenge.findOne({
     bookingId: booking._id,
@@ -644,6 +670,35 @@ export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp 
 };
 
 /**
+ * App-facing completion state. A completed booking is terminal: its verified
+ * challenge is no longer "active", so without this branch the app would see
+ * verificationStatus "none" and ask for another OTP after payment.
+ */
+export const buildCompletionStatus = (booking, challenge = null) => {
+  const bookingStatus = normalizeBookingStatus(booking.status);
+  const paymentStatus = booking.paymentStatus || "pending";
+  if (bookingStatus === "completed") {
+    return {
+      bookingId: String(booking._id),
+      bookingStatus: "completed",
+      paymentStatus,
+      verificationStatus: "verified",
+      requiresCompletionOtp: false,
+      completedAt: booking.completedAt || null,
+    };
+  }
+  const requiresCompletionOtp =
+    paymentStatus !== "paid" && canTransition(bookingStatus, "completed");
+  return {
+    bookingId: String(booking._id),
+    bookingStatus,
+    paymentStatus,
+    requiresCompletionOtp,
+    ...publicChallengeState(challenge),
+  };
+};
+
+/**
  * Safe status for technician / customer / admin. Never OTP, hash, pepper,
  * provider payload, or phone numbers.
  */
@@ -655,9 +710,5 @@ export const getCompletionStatus = async ({ bookingId, technicianProfileId = nul
     (customerId && toId(booking.customerId) === toId(customerId));
   if (!mine) throw fail(404, OTP_ERRORS.NOT_FOUND, "Booking not found");
   const challenge = await activeChallengeFor(booking._id).lean();
-  return {
-    bookingId: String(booking._id),
-    bookingStatus: booking.status,
-    ...publicChallengeState(challenge),
-  };
+  return buildCompletionStatus(booking, challenge);
 };
