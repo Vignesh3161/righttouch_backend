@@ -91,6 +91,9 @@ const serviceCompletionChallengeSchema = new mongoose.Schema(
     lockedAt: { type: Date, default: null },
     expiredAt: { type: Date, default: null },
     lastAttemptAt: { type: Date, default: null },
+    // Last time an OTP send was attempted (provider call started). Used for
+    // the per-booking send cooldown that prevents Fast2SMS spam rejections.
+    lastSentAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

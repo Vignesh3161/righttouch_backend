@@ -34,6 +34,7 @@ export const OTP_ERRORS = {
   NOT_FOUND: "NOT_FOUND",
   ATTEMPTS_EXCEEDED: "ATTEMPTS_EXCEEDED",
   RESEND_EXCEEDED: "RESEND_EXCEEDED",
+  RATE_LIMITED: "RATE_LIMITED",
   NOT_PENDING: "NOT_PENDING",
 };
 
@@ -147,6 +148,7 @@ export const registerCompletionResend = async (
         expiresAt,
         status: "pending_delivery",
         lastAttemptAt: new Date(),
+        lastSentAt: new Date(),
       },
       $inc: { resendCount: 1 },
     },
