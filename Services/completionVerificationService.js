@@ -40,6 +40,7 @@ import {
   markChallengeDelivering,
   consumeCompletionChallenge,
   closeCompletionChallenge,
+  closeActiveChallengesForBooking,
 } from "../Utils/completionOtp.js";
 import { sendCompletionSms, validateCompletionSmsConfig } from "../Utils/sendCompletionSms.js";
 import { writeAuditLog } from "../Utils/audit.js";
@@ -57,6 +58,11 @@ const toId = (v) => (v == null ? null : String(v));
 const sendCooldownMs = () => {
   const raw = Number(process.env.COMPLETION_OTP_SEND_COOLDOWN_MS);
   return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+};
+
+const completionGraceMs = () => {
+  const raw = Number(process.env.COMPLETION_OTP_GRACE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 25 * 60_000;
 };
 
 /**
@@ -181,10 +187,68 @@ const loadBookingOrFail = async (bookingId) => {
   return booking;
 };
 
-const assertTechnicianOwns = (booking, technicianProfileId) => {
-  if (!technicianProfileId || !booking.technicianId || toId(booking.technicianId) !== toId(technicianProfileId)) {
-    throw fail(403, OTP_ERRORS.INVALID, "Access denied for this booking");
+const wasPreviouslyAssigned = (booking, technicianProfileId) =>
+  (booking?.assignmentAttempts || []).some(
+    (attempt) => toId(attempt.technicianId) === toId(technicianProfileId)
+  );
+
+/**
+ * Ownership + status error, ordered so the technician who lost the assignment
+ * sees the real reason (expired / no longer assigned) instead of a blanket
+ * 403. An unrelated technician still gets the opaque 403.
+ */
+export const completionAccessError = (booking, technicianProfileId) => {
+  if (!booking) return fail(404, OTP_ERRORS.NOT_FOUND, "Booking not found");
+
+  const assignedTo = toId(booking.technicianId);
+  const caller = toId(technicianProfileId);
+
+  if (assignedTo && assignedTo !== caller) {
+    return fail(403, OTP_ERRORS.INVALID, "Access denied for this booking");
   }
+  if (!assignedTo && !wasPreviouslyAssigned(booking, technicianProfileId)) {
+    return fail(403, OTP_ERRORS.INVALID, "Access denied for this booking");
+  }
+  if (booking.status === "expired" || booking.status === "cancelled") {
+    return fail(410, OTP_ERRORS.NOT_PENDING, `Booking is ${booking.status}; completion is not possible`);
+  }
+  if (!assignedTo) {
+    return fail(409, OTP_ERRORS.NOT_PENDING, "Booking is no longer assigned to you");
+  }
+  return null;
+};
+
+const assertCompletionAccess = async (booking, technicianProfileId) => {
+  let err = completionAccessError(booking, technicianProfileId);
+
+  // Legacy history repair: releases before this fix could record a null
+  // technicianId in `assignmentAttempts`, so the attempt list alone cannot
+  // prove the caller was assigned. A challenge created by this technician is
+  // definitive proof; prefer the real reason over an opaque 403.
+  if (err?.statusCode === 403 && !booking?.technicianId) {
+    const priorChallenge = await ServiceCompletionChallenge.exists({
+      bookingId: booking._id,
+      technicianId: technicianProfileId,
+    });
+    if (priorChallenge) {
+      err =
+        booking.status === "expired" || booking.status === "cancelled"
+          ? fail(410, OTP_ERRORS.NOT_PENDING, `Booking is ${booking.status}; completion is not possible`)
+          : fail(409, OTP_ERRORS.NOT_PENDING, "Booking is no longer assigned to you");
+    }
+  }
+
+  if (!err) return;
+  if (err.statusCode === 410) {
+    await closeActiveChallengesForBooking(booking._id, { to: "expired" }).catch((cleanupErr) => {
+      console.error("[completionOtp] Stale challenge cleanup failed:", cleanupErr.message);
+    });
+  } else if (err.statusCode === 409 && !booking.technicianId) {
+    await closeActiveChallengesForBooking(booking._id, { to: "cancelled" }).catch((cleanupErr) => {
+      console.error("[completionOtp] Stale challenge cleanup failed:", cleanupErr.message);
+    });
+  }
+  throw err;
 };
 
 /**
@@ -231,6 +295,46 @@ const assertCompletionEligible = async (booking) => {
   }
 };
 
+/**
+ * Push the instant on-the-way deadline out once, when the first completion
+ * OTP is requested. Without this the 30-minute travel timeout can release the
+ * technician while the customer is reading/entering the code, after which
+ * verify fails with "Access denied for this booking".
+ *
+ * Bounded: `completionPinnedAt` is written once per assignment and reset on
+ * release, so resends/episodes cannot extend the deadline indefinitely.
+ */
+const pinBookingForCompletion = async (booking, technicianProfileId, now) => {
+  if (booking.bookingType !== "instant" || booking.status !== "accepted" || !booking.autoCancelAt) {
+    return;
+  }
+
+  const currentDeadline = new Date(booking.autoCancelAt).getTime();
+  const graceUntil = new Date(Math.max(currentDeadline, now.getTime() + completionGraceMs()));
+
+  const pinned = await ServiceBooking.findOneAndUpdate(
+    {
+      _id: booking._id,
+      technicianId: technicianProfileId,
+      status: "accepted",
+      completionPinnedAt: null,
+    },
+    { $set: { autoCancelAt: graceUntil, completionPinnedAt: now } },
+    { new: true }
+  );
+
+  if (pinned) {
+    console.log(`[completionOtp] Pinned booking ${booking._id} until ${graceUntil.toISOString()}`);
+    return;
+  }
+
+  // Already pinned (normal on resends) or the booking changed under us.
+  const fresh = await ServiceBooking.findById(booking._id).lean();
+  const err = completionAccessError(fresh, technicianProfileId);
+  if (err) throw err;
+  await assertCompletionEligible(fresh);
+};
+
 const activeChallengeFor = (bookingId) =>
   ServiceCompletionChallenge.findOne({
     bookingId,
@@ -251,7 +355,7 @@ const activeChallengeFor = (bookingId) =>
  */
 export const requestCompletionOtp = async ({ bookingId, technicianProfileId, smsSender = sendCompletionSms }) => {
   const booking = await loadBookingOrFail(bookingId);
-  assertTechnicianOwns(booking, technicianProfileId);
+  await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
   assertSmsDeliveryConfigured();
@@ -262,7 +366,15 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
   }
 
   const now = new Date();
+  await pinBookingForCompletion(booking, technicianProfileId, now);
+
   let challenge = await activeChallengeFor(booking._id);
+  // Safety net for pre-deploy releases that left a challenge behind: an OTP
+  // issued to a previous assignee must never block the current technician.
+  if (challenge && toId(challenge.technicianId) !== toId(booking.technicianId)) {
+    await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
+    challenge = null;
+  }
   if (challenge && isChallengeExpired(challenge, now)) {
     await closeCompletionChallenge(challenge._id, { to: "expired", now });
     challenge = null;
@@ -352,7 +464,7 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
  */
 export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsSender = sendCompletionSms }) => {
   const booking = await loadBookingOrFail(bookingId);
-  assertTechnicianOwns(booking, technicianProfileId);
+  await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
   assertSmsDeliveryConfigured();
@@ -360,6 +472,10 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
   const now = new Date();
   const challenge = await activeChallengeFor(booking._id);
   if (!challenge) {
+    throw fail(409, OTP_ERRORS.NOT_FOUND, "No active verification — request a new OTP first");
+  }
+  if (toId(challenge.technicianId) !== toId(booking.technicianId)) {
+    await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
     throw fail(409, OTP_ERRORS.NOT_FOUND, "No active verification — request a new OTP first");
   }
   if (isChallengeExpired(challenge, now)) {
@@ -378,6 +494,9 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
   if (!isValidDeliveryPhone(phone)) {
     throw fail(409, OTP_ERRORS.NOT_PENDING, "Customer has no verified phone number for OTP delivery");
   }
+
+  // Idempotent safety net for challenges created before the pin existed.
+  await pinBookingForCompletion(booking, technicianProfileId, now);
 
   const otp = generateCompletionOtp();
   const nextGen = challenge.generation + 1;
@@ -416,7 +535,7 @@ export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp 
   }
   const now = new Date();
   const booking = await loadBookingOrFail(bookingId);
-  assertTechnicianOwns(booking, technicianProfileId);
+  await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
 
@@ -429,6 +548,10 @@ export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp 
   if (!challenge) {
     // Distinguish consumed (verified booking would have flipped already —
     // unreachable here since eligible) from never-requested.
+    throw fail(409, OTP_ERRORS.NOT_FOUND, "No active verification — request an OTP first");
+  }
+  if (toId(challenge.technicianId) !== toId(booking.technicianId)) {
+    await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
     throw fail(409, OTP_ERRORS.NOT_FOUND, "No active verification — request an OTP first");
   }
 

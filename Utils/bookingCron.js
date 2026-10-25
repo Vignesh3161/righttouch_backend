@@ -13,6 +13,7 @@ import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendRemind
 import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
 import { expireRewards, recoverMissedRewards, expireRedemptionReservations } from "../Services/rewardService.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
+import { hasActiveCompletionChallenge, closeActiveChallengesForBooking } from "./completionOtp.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
 const MAX_RELEASES_BEFORE_CANCEL = 2; // instant OTW-timeout policy
@@ -130,10 +131,11 @@ const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
         status: "pending",
         assignmentStatus: "unassigned",
         autoCancelAt: new Date(now.getTime() + 5 * 60 * 1000),
+        completionPinnedAt: null,
       },
       $inc: { version: 1 },
     },
-    { new: true }
+    { new: false }
   );
 
   if (booking) {
@@ -142,7 +144,7 @@ const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
       {
         $push: {
           assignmentAttempts: {
-            technicianId: booking.technicianId, // value captured pre-release
+            technicianId: booking.technicianId, // pre-release value ({ new: false })
             attemptNumber: (booking.assignmentAttempts?.length || 0) + 1,
             status: "released",
             acceptedAt: booking.assignedAt || null,
@@ -152,6 +154,9 @@ const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
         },
       }
     );
+    await closeActiveChallengesForBooking(bookingId, { to: "cancelled", now }).catch((err) => {
+      console.error(`[Cron:Release] Challenge cleanup failed for ${bookingId}:`, err.message);
+    });
   }
   return booking;
 };
@@ -241,10 +246,14 @@ export const initBookingCrons = (io) => {
                           cancelledBy: "system",
                           cancellationStatus: "system_cancelled",
                           assignmentStatus: "released",
+                          completionPinnedAt: null,
                         },
                         $inc: { version: 1 },
                       }
                     );
+                    await closeActiveChallengesForBooking(_id, { to: "expired", now }).catch((err) => {
+                      console.error(`[Cron:Expiry] Challenge cleanup failed for ${_id}:`, err.message);
+                    });
 
                     // Batch: expire all broadcasts + offers for this booking,
                     // bump cursors, and tell live techs the offer died
@@ -346,14 +355,28 @@ export const initBookingCrons = (io) => {
                         continue;
                     }
 
+                    // Never release a technician while an unexpired completion
+                    // OTP is outstanding. The challenge expiry bounds the hold.
+                    if (await hasActiveCompletionChallenge(_id, now)) {
+                        console.log(`[Cron:OTWTimeout] Holding ${_id}: completion OTP in progress`);
+                        continue;
+                    }
+
                     const releasedCount = (fresh.assignmentAttempts || []).filter(
                       (a) => a.status === "released" && a.releaseReason === "on_the_way_timeout"
                     ).length;
 
                     if (releasedCount >= MAX_RELEASES_BEFORE_CANCEL) {
                         // Policy escalation: cancel with technician fault.
-                        await ServiceBooking.updateOne(
-                          { _id },
+                        // Guarded by the deadline so a concurrent OTP pin
+                        // (which extends autoCancelAt) aborts the cancel.
+                        const cancelled = await ServiceBooking.updateOne(
+                          {
+                            _id,
+                            status: "accepted",
+                            technicianId: fresh.technicianId,
+                            autoCancelAt: { $lte: now },
+                          },
                           {
                             $set: {
                               status: "cancelled",
@@ -363,10 +386,15 @@ export const initBookingCrons = (io) => {
                               technicianId: null,
                               assignmentStatus: "released",
                               autoCancelAt: null,
+                              completionPinnedAt: null,
                             },
                             $inc: { version: 1 },
                           }
                         );
+                        if (cancelled.modifiedCount === 0) continue;
+                        await closeActiveChallengesForBooking(_id, { to: "cancelled", now }).catch((err) => {
+                            console.error(`[Cron:OTWTimeout] Challenge cleanup failed for ${_id}:`, err.message);
+                        });
                         await expireBroadcastsForBooking(io, _id, "technician_no_action");
                         await notifyCustomer(
                           claimed,
@@ -377,15 +405,23 @@ export const initBookingCrons = (io) => {
                         continue;
                     }
 
-                    // Release + re-dispatch (keeps original booking ID + history)
-                    await ServiceBooking.updateOne(
-                      { _id },
+                    // Release + re-dispatch (keeps original booking ID + history).
+                    // Guarded by the deadline so a concurrent OTP pin aborts
+                    // the release instead of stranding an active challenge.
+                    const released = await ServiceBooking.updateOne(
+                      {
+                        _id,
+                        status: "accepted",
+                        technicianId: fresh.technicianId,
+                        autoCancelAt: { $lte: now },
+                      },
                       {
                         $set: {
                           technicianId: null,
                           status: "pending",
                           assignmentStatus: "unassigned",
                           autoCancelAt: new Date(now.getTime() + 5 * 60 * 1000),
+                          completionPinnedAt: null,
                         },
                         $push: {
                           assignmentAttempts: {
@@ -400,6 +436,10 @@ export const initBookingCrons = (io) => {
                         $inc: { version: 1 },
                       }
                     );
+                    if (released.modifiedCount === 0) continue;
+                    await closeActiveChallengesForBooking(_id, { to: "cancelled", now }).catch((err) => {
+                        console.error(`[Cron:OTWTimeout] Challenge cleanup failed for ${_id}:`, err.message);
+                    });
                     await expireBroadcastsForBooking(io, _id, "on_the_way_timeout", now);
                     await matchAndBroadcastBooking(_id, io);
                     await notifyCustomer(
@@ -519,6 +559,12 @@ export const initBookingCrons = (io) => {
                             }
                         } else {
                             // −10 min: reassign if feasible; otherwise manual escalation.
+                            // Hold the assignment while the customer is confirming
+                            // completion; re-checked next minute if the code expires.
+                            if (await hasActiveCompletionChallenge(b._id, now)) {
+                                console.log(`[Cron:Enforcement] Holding ${b._id}: completion OTP in progress`);
+                                continue;
+                            }
                             const released = await releaseTechnicianAssignment(b._id, "schedule_travel_no_show");
                             if (released) {
                                 await expireBroadcastsForBooking(io, b._id, "schedule_travel_no_show");

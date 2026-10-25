@@ -614,6 +614,14 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Set once when the first completion OTP is requested for an instant
+    // booking. The on-the-way timeout is pushed out so the technician cannot
+    // be released while the customer is confirming the code. Reset on release.
+    completionPinnedAt: {
+      type: Date,
+      default: null,
+    },
+
     // 🏙 OPERATIONAL DISTRICT & 🏘 CITY ZONE — resolved at booking time from customer coordinates.
     districtId: {
       type: mongoose.Schema.Types.ObjectId,
