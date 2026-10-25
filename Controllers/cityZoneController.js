@@ -11,6 +11,7 @@ import {
   recordPolygonVersion,
   withZoneWriteTransaction,
 } from "../Services/zoneWriteService.js";
+import { grantZoneToDistrictTechnicians } from "../Services/technicianDistrictService.js";
 
 const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
 const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
@@ -161,6 +162,15 @@ export const createCityZone = async (req, res) => {
           },
           session
         );
+        if (created.active !== false) {
+          await grantZoneToDistrictTechnicians({
+            zoneId: created._id,
+            districtId: operationalCityId,
+            adminUserId: actorId,
+            reason: "Auto-granted on zone creation",
+            session,
+          });
+        }
         return { created, seeded };
       });
       zone = out.result.created;
@@ -274,6 +284,15 @@ export const updateCityZone = async (req, res) => {
       }
       return updated;
     });
+
+    if (existing.active === false && zone.active === true) {
+      await grantZoneToDistrictTechnicians({
+        zoneId: zone._id,
+        districtId: zone.operationalCityId,
+        adminUserId: actorId,
+        reason: "Auto-granted on zone re-activation",
+      }).catch((err) => console.error("Zone reactivation permission grant failed:", err.message));
+    }
 
     await writeAuditLog({
       actor: req.user.userId,

@@ -97,6 +97,77 @@ const syncDistrictZones = async ({
   return zoneIds;
 };
 
+/**
+ * Grant a newly created (or re-activated) zone to every technician holding an
+ * enabled permission for its parent district. District grants carry their
+ * zones, so a zone created after the district grant must not leave
+ * enabledCityZoneIds empty. Idempotent; writes are batched.
+ */
+export const grantZoneToDistrictTechnicians = async ({
+  zoneId,
+  districtId,
+  adminUserId = null,
+  reason = "Auto-granted with district permission",
+  session = null,
+} = {}) => {
+  if (!zoneId || !districtId) return { granted: 0 };
+  if (!mongoose.Types.ObjectId.isValid(zoneId) || !mongoose.Types.ObjectId.isValid(districtId)) {
+    return { granted: 0 };
+  }
+
+  const zoneObjId = new mongoose.Types.ObjectId(zoneId);
+  const permissionQuery = TechnicianDistrictPermission.find({
+    districtId,
+    isEnabled: true,
+  }).select("technicianId");
+  const permissions = session
+    ? await permissionQuery.session(session).lean()
+    : await permissionQuery.lean();
+
+  const technicianIds = [...new Set(
+    permissions.map((p) => String(p.technicianId)).filter((id) => mongoose.Types.ObjectId.isValid(id))
+  )];
+
+  let granted = 0;
+  const BATCH_SIZE = 500;
+  for (let i = 0; i < technicianIds.length; i += BATCH_SIZE) {
+    const batch = technicianIds.slice(i, i + BATCH_SIZE);
+    const missingQuery = TechnicianProfile.find({
+      _id: { $in: batch },
+      enabledCityZoneIds: { $ne: zoneObjId },
+    }).select("_id");
+    const missing = session
+      ? await missingQuery.session(session).lean()
+      : await missingQuery.lean();
+    if (!missing.length) continue;
+
+    const update = TechnicianProfile.updateMany(
+      { _id: { $in: missing.map((t) => t._id) } },
+      { $addToSet: { enabledCityZoneIds: zoneObjId } }
+    );
+    if (session) await update.session(session);
+    else await update;
+
+    if (adminUserId) {
+      const auditDocs = missing.map((tech) => ({
+        technicianId: tech._id,
+        cityZoneId: zoneObjId,
+        action: "enabled",
+        changedBy: adminUserId,
+        reason,
+      }));
+      if (session) {
+        await TechnicianZonePermissionAudit.insertMany(auditDocs, { session, ordered: false });
+      } else {
+        await TechnicianZonePermissionAudit.insertMany(auditDocs, { ordered: false });
+      }
+    }
+    granted += missing.length;
+  }
+
+  return { granted };
+};
+
 // Controlled-conflict wrapper: duplicate rows and write conflicts become
 // retryable client errors, never silent clobbers or raw driver errors.
 const asConflict = (err, fallbackCode = "PERMISSION_CONFLICT") => {
@@ -588,6 +659,7 @@ export default {
   isTechnicianAllowedInDistrict,
   addDistrictPermission,
   ensureApprovedDistrictZones,
+  grantZoneToDistrictTechnicians,
   toggleDistrictPermission,
   removeDistrictPermission,
 };

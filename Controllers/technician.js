@@ -114,9 +114,15 @@ export const updateTechnicianLocation = async (req, res) => {
 
     const result = await handleLocationUpdate(technicianProfileId, coords.latitude, coords.longitude, req.io, "http");
 
+    const message = result.matchCalculation
+      ? result.success === false
+        ? result.message || "Location updated but job matching failed"
+        : "Location updated and jobs calculated"
+      : "Location updated (matching rate limited)";
+
     return res.json({
       success: true,
-      message: result.matchCalculation ? "Location updated and jobs calculated" : "Location updated (matching rate limited)",
+      message,
       result
     });
   } catch (error) {
