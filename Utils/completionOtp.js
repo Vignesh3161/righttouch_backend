@@ -231,3 +231,36 @@ export const closeCompletionChallenge = async (
     { new: true, ...opts }
   );
 };
+
+/**
+ * True when the booking has an unexpired, still-usable completion code.
+ * Used by the timeout workers to avoid releasing an assignment while the
+ * customer is actively confirming completion.
+ */
+export const hasActiveCompletionChallenge = (bookingId, now = new Date()) =>
+  ServiceCompletionChallenge.exists({
+    bookingId,
+    status: { $in: ["pending_delivery", "pending"] },
+    expiresAt: { $gt: now },
+  });
+
+/**
+ * Close every active challenge for a booking. Called whenever the assignment
+ * ends (release / cancel / expiry / reassign) so a customer is never left
+ * holding an OTP for a booking that no longer has a technician.
+ */
+export const closeActiveChallengesForBooking = async (
+  bookingId,
+  { to = "cancelled", now = new Date(), session = null } = {}
+) => {
+  if (!["expired", "cancelled"].includes(to)) {
+    throw otpError(OTP_ERRORS.INVALID, `Invalid terminal transition: ${to}`);
+  }
+  const opts = session ? { session } : {};
+  const field = to === "expired" ? { expiredAt: now } : {};
+  return ServiceCompletionChallenge.updateMany(
+    { bookingId, status: { $in: ["pending_delivery", "pending"] } },
+    { $set: { status: to, ...field } },
+    opts
+  );
+};

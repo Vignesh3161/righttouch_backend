@@ -435,7 +435,7 @@ const duplicateActive = await ServiceCompletionChallenge.aggregate([
 console.log("7 DUPLICATE ACTIVE:", { bookings: duplicateActive.length, detail: duplicateActive.slice(0, 5) });
 
 const openChallengeDocs = await ServiceCompletionChallenge.find(openChallengeFilter)
-  .select("bookingId customerId")
+  .select("bookingId customerId status technicianId expiresAt")
   .maxTimeMS(15000)
   .lean();
 const challengeCustomerIds = [...new Set(openChallengeDocs.map((c) => String(c.customerId)))];
@@ -452,6 +452,39 @@ for (const c of openChallengeDocs) {
   phoneStates[key] = (phoneStates[key] || 0) + 1;
 }
 console.log("7 ACTIVE CUSTOMER PHONES:", phoneStates);
+
+const openChallengeBookingIds = [...new Set(openChallengeDocs.map((c) => String(c.bookingId)))];
+const openChallengeBookings = await ServiceBooking.find({ _id: { $in: openChallengeBookingIds } })
+  .select("status assignmentStatus technicianId cancellationStatus")
+  .maxTimeMS(15000)
+  .lean();
+const openChallengeBookingById = new Map(openChallengeBookings.map((b) => [String(b._id), b]));
+const staleOpenChallenges = openChallengeDocs
+  .map((c) => {
+    const booking = openChallengeBookingById.get(String(c.bookingId));
+    const reasons = [];
+    if (!booking) reasons.push("booking_missing");
+    else {
+      if (["expired", "cancelled", "completed"].includes(booking.status)) reasons.push(`booking_${booking.status}`);
+      if (!booking.technicianId) reasons.push("technician_released");
+    }
+    if (c.technicianId && booking?.technicianId && String(c.technicianId) !== String(booking.technicianId)) {
+      reasons.push("technician_mismatch");
+    }
+    return {
+      challengeId: String(c._id),
+      bookingId: String(c.bookingId),
+      challengeStatus: c.status,
+      bookingStatus: booking?.status || null,
+      reasons,
+      expiresAt: c.expiresAt,
+    };
+  })
+  .filter((c) => c.reasons.length > 0);
+console.log("7 STALE OPEN CHALLENGES:", {
+  count: staleOpenChallenges.length,
+  detail: staleOpenChallenges.slice(0, 5),
+});
 
 const recentFailures = await AuditLog.find({
   action: "COMPLETION_OTP_DELIVERY_FAILED",
@@ -519,6 +552,8 @@ const completionOtpReport = {
   expiredOpen,
   stuckDelivery,
   duplicateActiveBookings: duplicateActive.length,
+  staleOpenChallenges: staleOpenChallenges.length,
+  staleOpenChallengeDetail: staleOpenChallenges.slice(0, 10),
   phoneStates,
   deliveryFailuresRecent: recentFailures.length,
   deliveryFailureReasons: failureTally,

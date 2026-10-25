@@ -655,6 +655,7 @@ export const respondToJob = async (req, res) => {
       assignmentStatus: "assigned",
       assignedAt: new Date(),
       technicianSnapshot,
+      completionPinnedAt: null,
       $push: {
         assignmentAttempts: {
           technicianId: technicianProfileId,

@@ -41,7 +41,9 @@ import {
   resendCompletionOtp as resendCompletionOtpService,
   verifyCompletionOtp as verifyCompletionOtpService,
   getCompletionStatus as getCompletionStatusService,
+  completionAccessError,
 } from "../Services/completionVerificationService.js";
+import { closeActiveChallengesForBooking } from "../Utils/completionOtp.js";
 
 /**
  * Post-commit completion side effects — the EXISTING completion behavior,
@@ -1273,8 +1275,9 @@ export const updateBookingStatus = async (req, res) => {
     if (userRole !== "Technician") {
       return res.status(403).json({ success: false, message: "Only technician can update status", result: {} });
     }
-    if (!technicianProfileId || !booking.technicianId || booking.technicianId.toString() !== technicianProfileId.toString()) {
-      return res.status(403).json({ success: false, message: "Access denied for this booking", result: {} });
+    const accessError = completionAccessError(booking, technicianProfileId);
+    if (accessError) {
+      return res.status(accessError.statusCode || 403).json({ success: false, message: accessError.message, result: {} });
     }
     // 🔒 Explicit transition table — the booking must be in a state that
     // allows moving to `status` (canonical state machine only).
@@ -1494,8 +1497,9 @@ export const uploadWorkImages = async (req, res) => {
       return res.status(404).json({ success: false, message: "Booking not found", result: {} });
     }
 
-    if (!booking.technicianId || booking.technicianId.toString() !== technicianProfileId.toString()) {
-      return res.status(403).json({ success: false, message: "Access denied for this booking", result: {} });
+    const accessError = completionAccessError(booking, technicianProfileId);
+    if (accessError) {
+      return res.status(accessError.statusCode || 403).json({ success: false, message: accessError.message, result: {} });
     }
 
     if (booking.status === "completed") {
@@ -1623,6 +1627,7 @@ export const cancelBooking = async (req, res) => {
           cancellationFeeStatus: fee > 0 ? "not_collected" : "waived",
           assignmentStatus: "released",
           autoCancelAt: null,
+          completionPinnedAt: null,
         },
         $inc: { version: 1 },
       },
@@ -1632,6 +1637,9 @@ export const cancelBooking = async (req, res) => {
     if (!cancelled) {
       return res.status(409).json({ success: false, message: "Booking cannot be cancelled in its current state" });
     }
+    await closeActiveChallengesForBooking(id, { to: "cancelled" }).catch((cleanupErr) => {
+      console.error("cancelBooking challenge cleanup failed:", cleanupErr.message);
+    });
 
     // Release the technician's assignment history + expire pending offers
     if (cancelled.technicianId) {
@@ -1843,6 +1851,7 @@ export const technicianCancelBooking = async (req, res) => {
       booking.technicianId = null;
       booking.technicianSnapshot = null;
       booking.assignedAt = null;
+      booking.completionPinnedAt = null;
       booking.autoCancelAt = new Date(booking.scheduledAt.getTime() - 5 * 60 * 60 * 1000);
       if (booking.autoCancelAt <= now) booking.autoCancelAt = new Date(now.getTime() + 5 * 60 * 1000);
       booking.cancelReason = null;
@@ -1858,8 +1867,11 @@ export const technicianCancelBooking = async (req, res) => {
       booking.technicianPenalty = penaltyPaise / 100;
       booking.assignmentStatus = "released";
       booking.autoCancelAt = null;
+      booking.completionPinnedAt = null;
       await booking.save({ session });
     }
+
+    await closeActiveChallengesForBooking(id, { to: "cancelled", session });
 
     await session.commitTransaction();
 
@@ -2134,6 +2146,7 @@ export const acceptCancelledJob = async (req, res) => {
           cancelledBy: null,
           cancelReason: null,
           autoCancelAt: live.bookingType === "instant" ? new Date(now.getTime() + 30 * 60 * 1000) : null,
+          completionPinnedAt: null,
           ...(penaltyPaise > 0
             ? {
                 technicianPenaltyPaise: penaltyPaise,
