@@ -1,5 +1,5 @@
 import express from "express";
-import { upload } from "../Utils/cloudinaryUpload.js";
+import { upload } from "../Utils/bunnyUpload.js";
 import rateLimit from 'express-rate-limit';
 import {
   signupAndSendOtp,

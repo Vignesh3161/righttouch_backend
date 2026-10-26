@@ -684,7 +684,7 @@ export const loginInternal = async ({ identifier, mobileNumber, role, password, 
     throw err;
   }
 
-  const user = await User.findOne({ mobileNumber: finalIdentifier }).select("+password role status");
+  const user = await User.findOne({ mobileNumber: finalIdentifier }).select("+password role status tokenVersion");
   if (!user) {
     const err = new Error("User not found. Please signup first.");
     err.statusCode = 404;
