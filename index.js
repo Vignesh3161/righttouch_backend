@@ -56,6 +56,7 @@ import operationalCityRoutes from "./Routes/operationalCityRoutes.js";
 import adminTechnicianDistrictRoutes from "./Routes/adminTechnicianDistrictRoutes.js";
 import adminZoneRoutes from "./Routes/adminZones.js";
 import adminPermissionRoutes from "./Routes/adminPermissionRoutes.js";
+import adminUserRoutes from "./Routes/adminUserRoutes.js";
 import adminProductDashboardRoutes from "./Routes/adminProductDashboardRoutes.js";
 import adminServiceAvailabilityRoutes from "./Routes/adminServiceAvailabilityRoutes.js";
 import adminSkillRequestRoutes from "./Routes/adminSkillRequestRoutes.js";
@@ -680,6 +681,7 @@ App.use("/api/admin", adminSkillRequestRoutes);
 App.use("/api/admin/payments", adminPaymentRoutes);
 App.use("/api/admin/notifications", Auth, authorizeRoles("Admin", "Owner"), notificationRoutes);
 App.use("/api/admin/permissions", adminPermissionRoutes);
+App.use("/api/admin", adminUserRoutes);
 
 /* --------------------------------------------------------------------------
    2. TECHNICIAN ROUTES (/api/technician)

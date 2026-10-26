@@ -5,7 +5,7 @@ import mongoose from "mongoose";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { getTechnicianJobEligibility } from "../Utils/technicianEligibility.js";
-import { getSignedKycUrl } from "../Utils/cloudinaryUpload.js";
+import { getSignedKycUrl } from "../Utils/bunnyUpload.js";
 import { maskAadhaar, maskPan, maskAccount, hashAccountNumber, fingerprintBankDetails } from "../Utils/kycPrivacy.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
