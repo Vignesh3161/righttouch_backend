@@ -9,7 +9,6 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
-    "repair:zone-lifecycle": "node scripts/repairZoneLifecycle.js",
     "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },
   "repository": {
@@ -29,6 +28,7 @@
   "dependencies": {
     "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
+    "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",

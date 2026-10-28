@@ -10,10 +10,6 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import AuditLog from "../Schemas/AuditLog.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
-import {
-  removeZoneServiceMapping,
-  setZoneServiceAvailability,
-} from "../Services/zoneWriteService.js";
 import { isValidObjectId, containsRegex, internalError } from "../Utils/safeQuery.js";
 
 /**
@@ -51,17 +47,8 @@ export const createServiceAvailability = async (req, res) => {
       return res.status(404).json({ success: false, message: "District not found" });
     }
 
-    const finalScope =
-      scope === "ZONE" ? "ZONE" : scope === "CITY" ? "CITY" : "DISTRICT";
-    const finalCityId =
-      finalScope === "DISTRICT" ? null : requestedZoneId || null;
-    if (finalScope !== "DISTRICT" && !finalCityId) {
-      return res.status(400).json({
-        success: false,
-        message: "cityId/cityZoneId is required for ZONE/CITY scope",
-        code: "ZONE_REQUIRED",
-      });
-    }
+    const finalScope = scope === "CITY" ? "CITY" : "DISTRICT";
+    const finalCityId = finalScope === "CITY" && cityId ? cityId : null;
     if (finalCityId) {
       const zone = await CityZone.findById(finalCityId).select("operationalCityId").lean();
       if (!zone) {
@@ -70,7 +57,7 @@ export const createServiceAvailability = async (req, res) => {
       if (String(zone.operationalCityId) !== String(districtId)) {
         return res.status(400).json({
           success: false,
-          message: "cityId/cityZoneId must belong to the supplied districtId",
+          message: "cityId must belong to the supplied districtId",
           code: "ZONE_DISTRICT_MISMATCH",
         });
       }
@@ -113,16 +100,21 @@ export const createServiceAvailability = async (req, res) => {
     });
 
     // A city/zone availability row is only meaningful when the mandatory
-    // per-zone mapping exists. The canonical ZONE row is always written for
-    // both legacy CITY and canonical ZONE scopes; the mapping is the grant.
-    if (finalCityId) {
-      await setZoneServiceAvailability({
-        serviceId,
-        districtId,
-        cityZoneId: finalCityId,
-        enabled: config.status === "ENABLED",
-        actorId: adminId || null,
-      });
+    // per-zone mapping exists. Keep both admin surfaces in sync.
+    if (finalScope === "CITY" && finalCityId) {
+      await ZoneServiceMapping.updateOne(
+        { zoneId: finalCityId, serviceId },
+        {
+          $set: { active: config.status === "ENABLED" },
+          $setOnInsert: {
+            zoneId: finalCityId,
+            serviceId,
+            approvedBy: adminId || null,
+            approvedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
     }
 
     // Audit Event
@@ -195,22 +187,8 @@ export const updateServiceAvailability = async (req, res) => {
       existing.cityName = cityName;
     }
 
-    const oldZoneId =
-      oldValue.scope === "CITY" || oldValue.scope === "ZONE"
-        ? oldValue.cityZoneId || oldValue.cityId || null
-        : null;
-    const newZoneId =
-      existing.scope === "CITY" || existing.scope === "ZONE"
-        ? existing.cityZoneId || existing.cityId || null
-        : null;
-
-    if ((existing.scope === "CITY" || existing.scope === "ZONE") && !newZoneId) {
-      return res.status(400).json({
-        success: false,
-        message: "cityId/cityZoneId is required for ZONE/CITY scope",
-        code: "ZONE_REQUIRED",
-      });
-    }
+    const oldZoneId = oldValue.scope === "CITY" ? (oldValue.cityZoneId || oldValue.cityId || null) : null;
+    const newZoneId = existing.scope === "CITY" ? (existing.cityZoneId || existing.cityId || null) : null;
 
     if (newZoneId) {
       const zone = await CityZone.findById(newZoneId).select("operationalCityId").lean();
@@ -234,24 +212,22 @@ export const updateServiceAvailability = async (req, res) => {
         { zoneId: oldZoneId, serviceId: existing.serviceId },
         { $set: { active: false } }
       );
-      // Leaving zone scope must remove the canonical ZONE row too; a stale
-      // DISABLED override would beat the district default in the resolver.
-      await ServiceAvailability.deleteMany({
-        serviceId: existing.serviceId,
-        scope: "ZONE",
-        $or: [{ cityZoneId: oldZoneId }, { cityId: oldZoneId }],
-        _id: { $ne: existing._id },
-      });
     }
 
     if (newZoneId) {
-      await setZoneServiceAvailability({
-        serviceId: existing.serviceId,
-        districtId: existing.districtId,
-        cityZoneId: newZoneId,
-        enabled: existing.status === "ENABLED",
-        actorId: adminId || null,
-      });
+      await ZoneServiceMapping.updateOne(
+        { zoneId: newZoneId, serviceId: existing.serviceId },
+        {
+          $set: { active: existing.status === "ENABLED" },
+          $setOnInsert: {
+            zoneId: newZoneId,
+            serviceId: existing.serviceId,
+            approvedBy: adminId || null,
+            approvedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
     }
 
     // Audit Event
@@ -380,29 +356,14 @@ export const deleteServiceAvailability = async (req, res) => {
     // Removing a zone/city grant must also remove the mandatory mapping.
     // Otherwise the mapping alone would let the resolver fall through to a
     // district default and accidentally re-enable the service.
-    const removedZoneId =
-      existing.scope === "CITY" || existing.scope === "ZONE"
-        ? existing.cityZoneId || existing.cityId || null
-        : null;
+    const removedZoneId = existing.scope === "CITY"
+      ? (existing.cityZoneId || existing.cityId || null)
+      : null;
     if (removedZoneId) {
-      try {
-        await removeZoneServiceMapping({
-          serviceId: existing.serviceId,
-          districtId: existing.districtId,
-          cityZoneId: removedZoneId,
-        });
-      } catch (error) {
-        if (error.code !== "ZONE_NOT_FOUND") throw error;
-        await ZoneServiceMapping.deleteOne({
-          zoneId: removedZoneId,
-          serviceId: existing.serviceId,
-        });
-        await ServiceAvailability.deleteMany({
-          serviceId: existing.serviceId,
-          scope: "ZONE",
-          $or: [{ cityZoneId: removedZoneId }, { cityId: removedZoneId }],
-        });
-      }
+      await ZoneServiceMapping.updateOne(
+        { zoneId: removedZoneId, serviceId: existing.serviceId },
+        { $set: { active: false } }
+      );
     }
 
     await AuditLog.create({

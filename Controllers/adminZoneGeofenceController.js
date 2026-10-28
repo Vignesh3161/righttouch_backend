@@ -27,11 +27,7 @@ import {
   ZONE_SERVICE_MODES,
 } from "../Services/zoneWriteService.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import {
-  ensureApprovedDistrictZones,
-  grantZoneToDistrictTechnicians,
-  grantZoneToApprovedTechnicians,
-} from "../Services/technicianDistrictService.js";
+import { ensureApprovedDistrictZones, grantZoneToDistrictTechnicians } from "../Services/technicianDistrictService.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -384,25 +380,16 @@ export const createCityZone = async (req, res) => {
           },
           session
         );
-        let grantedCount = 0;
-        if (created.active !== false && normalizedGrantMode !== "NONE") {
-          const grantFn =
-            normalizedGrantMode === "ALL_APPROVED"
-              ? grantZoneToApprovedTechnicians
-              : grantZoneToDistrictTechnicians;
-          const grantResult = await grantFn({
+        if (created.active !== false) {
+          await grantZoneToDistrictTechnicians({
             zoneId: created._id,
             districtId: parentId,
             adminUserId: actorId,
-            reason:
-              normalizedGrantMode === "ALL_APPROVED"
-                ? "Auto-granted to approved district technicians on zone creation"
-                : "Auto-granted on zone creation",
+            reason: "Auto-granted on zone creation",
             session,
           });
-          grantedCount = grantResult?.granted || 0;
         }
-        return { created, seeded: seededResult, granted: grantedCount };
+        return { created, seeded };
       });
       zone = out.result.created;
       seeded = out.result.seeded;

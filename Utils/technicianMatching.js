@@ -1380,21 +1380,37 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           const effectiveRadiusMeters = getEffectiveRadiusMeters(
             profileById.get(String(techId))
           );
-          return buildDispatchOutboxOp({
-            bookingId: booking._id,
-            technicianId: techId,
-            broadcastId: b?._id || null,
-            version: b?.version || 1,
-            payload: {
-              ...buildJobDispatchPayload(jobDataPayload, {
-                latitude,
-                longitude,
-                distanceMeters,
-                effectiveRadiusMeters,
-              }),
-              traceId: trc,
+          return {
+            updateOne: {
+              filter: {
+                bookingId: booking._id,
+                technicianId: techId,
+                kind: "job_new",
+                status: { $in: ["pending", "inflight"] },
+              },
+              update: {
+                $setOnInsert: {
+                  bookingId: booking._id,
+                  technicianId: techId,
+                  kind: "job_new",
+                  broadcastId: b?._id || null,
+                  version: b?.version || 1,
+                  payload: {
+                    ...buildJobDispatchPayload(jobDataPayload, {
+                      latitude,
+                      longitude,
+                      distanceMeters,
+                      effectiveRadiusMeters,
+                    }),
+                    traceId: trc,
+                  },
+                  status: "pending",
+                  nextAttemptAt: new Date(),
+                },
+              },
+              upsert: true,
             },
-          });
+          };
         });
         if (outboxOps.length) {
           await DispatchOutbox.bulkWrite(outboxOps, { session, ordered: false });
