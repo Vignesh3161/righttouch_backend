@@ -1,7 +1,9 @@
+// Load environment variables before importing any module that reads process.env
+// at module scope (JWT config, timezone, mail transport, payment TTL, etc.).
+import "dotenv/config";
+
 import express from "express";
-import bodyParser from "body-parser";
 import mongoose from "mongoose";
-import dotenv from "dotenv";
 import cors from "cors";
 import helmet from "helmet";
 import multer from "multer";
@@ -11,9 +13,6 @@ import { Server } from "socket.io";
 import { SOCKET_EVENTS, SOCKET_ROOMS } from "./Utils/socketConstants.js";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { createClient } from "redis";
-
-// Load environment variables
-dotenv.config();
 
 // 🔴 Redis Socket.IO Adapter (multi-server support)
 // Initialized lazily; if Redis unavailable, runs single-node with warning.
