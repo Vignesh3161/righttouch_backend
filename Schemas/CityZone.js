@@ -55,6 +55,18 @@ const cityZoneSchema = new mongoose.Schema(
       index: true,
     },
 
+    // How services are seeded when this zone is created and when a new
+    // service is added later.
+    // - INHERIT: copy the parent district's DISTRICT-level availability.
+    // - ENABLE_ALL: every active service is enabled in this zone.
+    // - DISABLE_ALL: every active service starts disabled (legacy behavior).
+    serviceMode: {
+      type: String,
+      enum: ["INHERIT", "ENABLE_ALL", "DISABLE_ALL"],
+      default: "INHERIT",
+      index: true,
+    },
+
     description: {
       type: String,
       trim: true,

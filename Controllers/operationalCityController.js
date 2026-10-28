@@ -8,10 +8,24 @@ import {
   sanitizePolygon,
   recordPolygonVersion,
   withZoneWriteTransaction,
+  assertDistrictPlacement,
+  assertDistrictContainsZones,
+  deleteDistrictCascade,
 } from "../Services/zoneWriteService.js";
 
 const isOwnerOrAdmin = (req) => ["Owner", "Admin"].includes(req.user?.role);
 const isValidObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
+
+const parseBoolean = (value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  }
+  return Boolean(value);
+};
 
 /* =====================================================
    LIST OPERATIONAL CITIES / DISTRICTS
@@ -145,7 +159,19 @@ export const createOperationalCity = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
     }
 
-    const finalActive = isActive !== undefined ? Boolean(isActive) : Boolean(active);
+    const finalActive = isActive !== undefined ? parseBoolean(isActive) : parseBoolean(active);
+
+    const placement = await assertDistrictPlacement({
+      sanitizedPolygon: validation.sanitizedPolygon,
+    });
+    if (!placement.ok) {
+      return res.status(placement.status).json({
+        success: false,
+        code: placement.code,
+        message: placement.message,
+        result: {},
+      });
+    }
 
     // B-05: district + v1 history commit atomically.
     const actorId = req.user?.userId || null;
@@ -162,8 +188,8 @@ export const createOperationalCity = async (req, res) => {
             cityId: cityId || null,
             polygon: validation.sanitizedPolygon,
             active: finalActive,
-            isRegistrationEnabled: Boolean(isRegistrationEnabled),
-            isJobEnabled: Boolean(isJobEnabled),
+            isRegistrationEnabled: parseBoolean(isRegistrationEnabled),
+            isJobEnabled: parseBoolean(isJobEnabled),
             createdBy: actorId,
             updatedBy: actorId,
             version: 1,
@@ -233,10 +259,10 @@ export const updateOperationalCity = async (req, res) => {
     if (req.body.country !== undefined) update.country = req.body.country ? String(req.body.country).trim() : "India";
     if (req.body.code !== undefined) update.code = req.body.code ? String(req.body.code).trim().toUpperCase() : null;
     if (req.body.cityId !== undefined) update.cityId = req.body.cityId;
-    if (req.body.active !== undefined) update.active = Boolean(req.body.active);
-    if (req.body.isActive !== undefined) update.active = Boolean(req.body.isActive);
-    if (req.body.isRegistrationEnabled !== undefined) update.isRegistrationEnabled = Boolean(req.body.isRegistrationEnabled);
-    if (req.body.isJobEnabled !== undefined) update.isJobEnabled = Boolean(req.body.isJobEnabled);
+    if (req.body.active !== undefined) update.active = parseBoolean(req.body.active);
+    if (req.body.isActive !== undefined) update.active = parseBoolean(req.body.isActive);
+    if (req.body.isRegistrationEnabled !== undefined) update.isRegistrationEnabled = parseBoolean(req.body.isRegistrationEnabled);
+    if (req.body.isJobEnabled !== undefined) update.isJobEnabled = parseBoolean(req.body.isJobEnabled);
 
     let sanitizedPolygon = null;
     if (req.body.polygon !== undefined) {
@@ -246,7 +272,49 @@ export const updateOperationalCity = async (req, res) => {
         return res.status(400).json({ success: false, message: "Invalid GeoJSON Polygon", errors: validation.errors, result: {} });
       }
       sanitizedPolygon = validation.sanitizedPolygon;
+
+      const placement = await assertDistrictPlacement({
+        sanitizedPolygon,
+        excludeDistrictId: id,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status).json({
+          success: false,
+          code: placement.code,
+          message: placement.message,
+          result: {},
+        });
+      }
+
+      const childZones = await assertDistrictContainsZones({
+        districtId: id,
+        sanitizedPolygon,
+      });
+      if (!childZones.ok) {
+        return res.status(childZones.status).json({
+          success: false,
+          code: childZones.code,
+          message: childZones.message,
+          result: {},
+        });
+      }
+
       update.polygon = sanitizedPolygon;
+    }
+
+    if (update.active === true && existing.active !== true && !sanitizedPolygon) {
+      const placement = await assertDistrictPlacement({
+        sanitizedPolygon: existing.polygon,
+        excludeDistrictId: id,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status).json({
+          success: false,
+          code: placement.code,
+          message: placement.message,
+          result: {},
+        });
+      }
     }
 
     // B-05: district save + history row commit atomically on geometry change.
@@ -285,6 +353,24 @@ export const updateOperationalCity = async (req, res) => {
 
     invalidateOperationalPolygonCache();
 
+    if (
+      sanitizedPolygon ||
+      update.active !== undefined ||
+      update.isJobEnabled !== undefined
+    ) {
+      const { revalidateTechniciansForService, backfillBroadcastsForScope } = await import(
+        "../Utils/technicianLocation.js"
+      );
+      await revalidateTechniciansForService(null, cityDoc._id, null, req.io).catch((e) =>
+        console.warn("district update revalidation warning:", e.message)
+      );
+      if (cityDoc.active !== false && cityDoc.isJobEnabled !== false) {
+        await backfillBroadcastsForScope({ districtId: cityDoc._id, io: req.io }).catch((e) =>
+          console.warn("district update backfill warning:", e.message)
+        );
+      }
+    }
+
     return res.status(200).json({ success: true, message: "District updated successfully", result: cityDoc });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message, result: {} });
@@ -306,7 +392,28 @@ export const updateDistrictStatus = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid district ID", result: {} });
     }
 
-    const targetActive = active !== undefined ? Boolean(active) : Boolean(isActive);
+    const targetActive = active !== undefined ? parseBoolean(active) : parseBoolean(isActive);
+
+    if (targetActive) {
+      const existing = await OperationalCity.findById(id).select("polygon active").lean();
+      if (!existing) {
+        return res.status(404).json({ success: false, message: "District not found", result: {} });
+      }
+      if (existing.active !== true) {
+        const placement = await assertDistrictPlacement({
+          sanitizedPolygon: existing.polygon,
+          excludeDistrictId: id,
+        });
+        if (!placement.ok) {
+          return res.status(placement.status).json({
+            success: false,
+            code: placement.code,
+            message: placement.message,
+            result: {},
+          });
+        }
+      }
+    }
 
     const cityDoc = await OperationalCity.findByIdAndUpdate(
       id,
@@ -365,7 +472,7 @@ export const updateDistrictRegistration = async (req, res) => {
 
     const cityDoc = await OperationalCity.findByIdAndUpdate(
       id,
-      { isRegistrationEnabled: Boolean(isRegistrationEnabled), updatedBy: req.user?.userId || null },
+      { isRegistrationEnabled: parseBoolean(isRegistrationEnabled), updatedBy: req.user?.userId || null },
       { new: true }
     );
 
@@ -408,7 +515,7 @@ export const updateDistrictJobs = async (req, res) => {
 
     const cityDoc = await OperationalCity.findByIdAndUpdate(
       id,
-      { isJobEnabled: Boolean(isJobEnabled), updatedBy: req.user?.userId || null },
+      { isJobEnabled: parseBoolean(isJobEnabled), updatedBy: req.user?.userId || null },
       { new: true }
     );
 
@@ -500,6 +607,13 @@ export const activateOperationalCity = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid city ID", result: {} });
     }
 
+    const previouslyActive = await OperationalCity.find({
+      _id: { $ne: id },
+      active: true,
+    })
+      .select("_id")
+      .lean();
+
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
@@ -513,6 +627,17 @@ export const activateOperationalCity = async (req, res) => {
         return res.status(404).json({ success: false, message: "Operational city not found", result: {} });
       }
       await session.commitTransaction();
+
+      if (previouslyActive.length) {
+        const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+        await Promise.all(
+          previouslyActive.map((district) =>
+            revalidateTechniciansForService(null, district._id, null, req.io).catch((e) =>
+              console.warn("district deactivate revalidation warning:", e.message)
+            )
+          )
+        );
+      }
 
       await writeAuditLog({
         actor: req.user.userId,
@@ -548,8 +673,12 @@ export const deleteOperationalCity = async (req, res) => {
     if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid city ID", result: {} });
     }
-    const city = await OperationalCity.findByIdAndDelete(id);
-    if (!city) {
+    const result = await deleteDistrictCascade({
+      districtId: id,
+      actorId: req.user?.userId || null,
+      io: req.io,
+    });
+    if (!result) {
       return res.status(404).json({ success: false, message: "Operational city not found", result: {} });
     }
 
@@ -559,13 +688,30 @@ export const deleteOperationalCity = async (req, res) => {
       action: "OPERATIONAL_CITY_DELETED",
       targetType: "OperationalCity",
       targetId: id,
-      before: { name: city.name, active: city.active },
+      before: {
+        name: result.district.name,
+        active: result.district.active,
+        zoneCount: result.zoneCount,
+      },
     });
 
     invalidateOperationalPolygonCache();
 
-    return res.status(200).json({ success: true, message: "Operational city deleted", result: {} });
+    return res.status(200).json({
+      success: true,
+      message: "Operational city deleted",
+      result: { deletedZones: result.zoneCount },
+    });
   } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({
+        success: false,
+        code: err.code,
+        message: err.message,
+        details: err.details || undefined,
+        result: {},
+      });
+    }
     return res.status(500).json({ success: false, message: err.message, result: {} });
   }
 };

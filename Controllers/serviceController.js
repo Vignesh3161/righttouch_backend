@@ -1,6 +1,10 @@
 import mongoose from "mongoose";
 import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
+import {
+  syncServiceToZones,
+  withZoneWriteTransaction,
+} from "../Services/zoneWriteService.js";
 
 const SERVICE_TYPES = ["Repair", "Installation", "Maintenance", "Inspection"];
 const PRICING_TYPES = ["fixed", "after_inspection", "per_unit"];
@@ -105,7 +109,7 @@ export const createService = async (req, res) => {
       });
     }
 
-    const service = await Service.create({
+    const serviceData = {
       categoryId,
       serviceName,
       description,
@@ -131,18 +135,31 @@ export const createService = async (req, res) => {
       siteVisitRequired,
       serviceWarranty,
       isPopular: isPopular || false,
-      isRecommended: isRecommended || false
+      isRecommended: isRecommended || false,
+    };
+
+    const { result } = await withZoneWriteTransaction(async (session) => {
+      const docs = await Service.create([serviceData], session ? { session } : {});
+      const created = Array.isArray(docs) ? docs[0] : docs;
+      const synced = await syncServiceToZones({
+        serviceId: created._id,
+        actorId: req.user?.userId || req.user?._id || null,
+        session,
+      });
+      return { created, synced };
     });
 
     // Re-fetch with hidden fields and populated category for response
-    const responseDoc = await Service.findById(service._id)
-
-      .populate("categoryId", "category categoryType description");
+    const responseDoc = await Service.findById(result.created._id).populate(
+      "categoryId",
+      "category categoryType description"
+    );
 
     return res.status(201).json({
       success: true,
       message: "Service created successfully",
       result: responseDoc,
+      meta: { zoneSync: result.synced },
     });
   } catch (error) {
     if (res.headersSent) return;
@@ -785,6 +802,21 @@ export const updateService = async (req, res) => {
       service.serviceDiscountPercentage = discountNum;
     }
 
+    if (updateData.isActive !== undefined) {
+      const raw = updateData.isActive;
+      updateData.isActive =
+        raw === true ||
+        raw === 1 ||
+        ["true", "1", "yes", "on"].includes(String(raw).trim().toLowerCase());
+    }
+    const wasActive = service.isActive !== false;
+    const isActiveChanged =
+      updateData.isActive !== undefined && Boolean(updateData.isActive) !== wasActive;
+    if (updateData.isActive === true) {
+      service.deletedAt = null;
+      service.deletedBy = null;
+    }
+
     // Handle other fields (arrays, strings, bools)
     const allowedUpdates = [
       "categoryId", "serviceName", "description", "serviceType", "pricingType",
@@ -801,8 +833,35 @@ export const updateService = async (req, res) => {
       }
     });
 
-    // Save triggers the pre-save hook for auto-calculations
-    const updated = await service.save();
+    // Save triggers the pre-save hook for auto-calculations. Activation /
+    // deactivation syncs every active zone in the same transaction.
+    const { result } = await withZoneWriteTransaction(async (session) => {
+      const saved = await service.save(session ? { session } : {});
+      let synced = null;
+      if (isActiveChanged) {
+        synced = await syncServiceToZones({
+          serviceId: saved._id,
+          actorId: req.user?.userId || req.user?._id || null,
+          session,
+        });
+      }
+      return { saved, synced };
+    });
+    const updated = result.saved;
+
+    if (isActiveChanged) {
+      const { revalidateTechniciansForService, backfillBroadcastsForScope } = await import(
+        "../Utils/technicianLocation.js"
+      );
+      await revalidateTechniciansForService(updated._id, null, null, req.io).catch((e) =>
+        console.warn("service status revalidation warning:", e.message)
+      );
+      if (updated.isActive !== false) {
+        await backfillBroadcastsForScope({ serviceId: updated._id, io: req.io }).catch((e) =>
+          console.warn("service status backfill warning:", e.message)
+        );
+      }
+    }
 
     // Re-fetch with populated category for response
     const responseDoc = await Service.findById(updated._id)
@@ -812,6 +871,7 @@ export const updateService = async (req, res) => {
       success: true,
       message: "Service updated successfully",
       result: responseDoc,
+      ...(isActiveChanged ? { meta: { zoneSync: result.synced } } : {}),
     });
   } catch (error) {
     if (res.headersSent) return;
@@ -836,20 +896,52 @@ export const deleteService = async (req, res) => {
       });
     }
 
-    const deleted = await Service.findByIdAndDelete(id);
-
-    if (!deleted) {
+    const existing = await Service.findById(id).select("_id serviceName isActive deletedAt");
+    if (!existing) {
       return res.status(404).json({
         success: false,
         message: "Service not found",
         result: {},
       });
     }
+    if (existing.isActive === false && existing.deletedAt) {
+      return res.status(200).json({
+        success: true,
+        message: "Service already deleted",
+        result: {},
+      });
+    }
+
+    const { result } = await withZoneWriteTransaction(async (session) => {
+      const opts = { new: true, ...(session ? { session } : {}) };
+      const deleted = await Service.findByIdAndUpdate(
+        id,
+        {
+          $set: {
+            isActive: false,
+            deletedAt: new Date(),
+            deletedBy: req.user?.userId || req.user?._id || null,
+          },
+        },
+        opts
+      );
+      const synced = await syncServiceToZones({
+        serviceId: id,
+        actorId: req.user?.userId || req.user?._id || null,
+        session,
+      });
+      return { deleted, synced };
+    });
+
+    const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
+    await revalidateTechniciansForService(id, null, null, req.io).catch((e) =>
+      console.warn("service delete revalidation warning:", e.message)
+    );
 
     return res.status(200).json({
       success: true,
       message: "Service deleted successfully",
-      result: {},
+      result: { service: result.deleted, zoneSync: result.synced },
     });
   } catch (error) {
     if (res.headersSent) return;

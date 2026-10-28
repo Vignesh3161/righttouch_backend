@@ -869,7 +869,11 @@ export const verifyTechnicianKyc = async (req, res) => {
       }
 
       // KYC approval flips workStatus to approved - grant the district/zones in
-      // the same step so the newly approved technician can actually receive jobs.
+      // the same step when the technician already has a district, so the newly
+      // approved technician can receive jobs immediately. KYC itself does not
+      // depend on operational assignment: when no district is assigned yet,
+      // approval proceeds and zones are granted later by the district-grant
+      // workflow (addDistrictPermission/toggleDistrictPermission).
       try {
         await ensureApprovedDistrictZones({
           technicianId,
@@ -877,12 +881,17 @@ export const verifyTechnicianKyc = async (req, res) => {
           reason: "KYC approved",
         });
       } catch (districtErr) {
-        return res.status(districtErr.statusCode || 400).json({
-          success: false,
-          message: districtErr.message,
-          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
-          result: {},
-        });
+        if (districtErr.code !== "PRIMARY_DISTRICT_REQUIRED") {
+          return res.status(districtErr.statusCode || 400).json({
+            success: false,
+            message: districtErr.message,
+            code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
+            result: {},
+          });
+        }
+        console.warn(
+          `[verifyTechnicianKyc] Technician ${technicianId} has no district/zone; approving KYC without district grants.`
+        );
       }
     }
 

@@ -14,6 +14,7 @@
 
 import DispatchOutbox from "../Schemas/DispatchOutbox.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import { normalizeBookingStatus } from "./bookingStatus.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { notifyTechnicianOfNewJob } from "./sendNotification.js";
 import { recordDispatch } from "./broadcastMetrics.js";
@@ -40,6 +41,16 @@ const backoffFor = (attempts) => {
   const ceiling = Math.min(BACKOFF_BASE_MS * 2 ** attempts, MAX_BACKOFF_MS);
   return Math.max(250, Math.floor(Math.random() * ceiling));
 };
+
+// Claim fencing: a stale worker must not overwrite a row that was reclaimed,
+// re-enqueued for a new broadcast, or manually retried after its claim.
+const claimUpdateFilter = (row) => ({
+  _id: row._id,
+  ...(row.claimedAt ? { status: "inflight", claimedAt: row.claimedAt } : {}),
+});
+
+const updateClaimedRow = (row, update) =>
+  DispatchOutbox.updateOne(claimUpdateFilter(row), update);
 
 /** Claim one row atomically: pending → inflight. Returns doc or null. */
 export const claimOne = async () => {
@@ -75,12 +86,19 @@ export const processRow = async (row) => {
     // while this outbox row was pending/inflight, skip notification entirely.
     if (bookingId) {
       const booking = await ServiceBooking.findById(bookingId).select("status").lean();
-      if (booking && !["pending", "broadcasted"].includes(booking.status)) {
-        await DispatchOutbox.updateOne(
-          { _id: row._id },
-          { $set: { status: "done", completedAt: new Date(), lastError: `booking_${booking.status}` } }
-        );
-        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_status_${booking.status}`);
+      if (!booking) {
+        await updateClaimedRow(row, {
+          $set: { status: "done", completedAt: new Date(), lastError: "booking_missing" },
+        });
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_missing`);
+        return;
+      }
+      const bookingStatus = normalizeBookingStatus(booking.status);
+      if (!["pending", "broadcasted"].includes(bookingStatus)) {
+        await updateClaimedRow(row, {
+          $set: { status: "done", completedAt: new Date(), lastError: `booking_${bookingStatus}` },
+        });
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_status_${bookingStatus}`);
         return;
       }
     }
@@ -102,10 +120,9 @@ export const processRow = async (row) => {
         (version != null && live.version !== version) ||
         (live.expiresAt && new Date(live.expiresAt).getTime() <= Date.now());
       if (stale) {
-        await DispatchOutbox.updateOne(
-          { _id: row._id },
-          { $set: { status: "done", completedAt: new Date(), lastError: "stale_broadcast" } }
-        );
+        await updateClaimedRow(row, {
+          $set: { status: "done", completedAt: new Date(), lastError: "stale_broadcast" },
+        });
         console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=stale_broadcast`);
         return;
       }
@@ -114,19 +131,17 @@ export const processRow = async (row) => {
 
     if (result?.skipped) {
       // Duplicate or ineligible — nothing to deliver, don't burn retries.
-      await DispatchOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "done", completedAt: new Date(), lastError: result.reason || "skipped" } }
-      );
+      await updateClaimedRow(row, {
+        $set: { status: "done", completedAt: new Date(), lastError: result.reason || "skipped" },
+      });
       recordDispatch("skipped");
       console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=${result.reason}`);
       return;
     }
     if (result?.success) {
-      await DispatchOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "done", completedAt: new Date(), lastError: null } }
-      );
+      await updateClaimedRow(row, {
+        $set: { status: "done", completedAt: new Date(), lastError: null },
+      });
       recordDispatch("done");
       console.log(`📬 [TRACE] ${traceId} DISPATCH_SUCCESS bookingId=${bookingId} tech=${technicianId} socket=${result.socket?.success} push=${result.push ? !result.push.skipped : "batched"} degraded=${result.degraded === true}`);
       return;
@@ -134,10 +149,14 @@ export const processRow = async (row) => {
     if (result?.retryable === false) {
       // Permanent business failure (e.g. all device tokens permanently
       // invalid). Retrying cannot help; surface it for operational review.
-      await DispatchOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "failed", attempts: (row.attempts || 0) + 1, lastError: (result.error || "non_retryable").slice(0, 500) } }
-      );
+      await updateClaimedRow(row, {
+        $set: {
+          status: "failed",
+          attempts: (row.attempts || 0) + 1,
+          completedAt: new Date(),
+          lastError: (result.error || "non_retryable").slice(0, 500),
+        },
+      });
       recordDispatch("failed");
       console.warn(`[DispatchQueue] PERMANENT FAILURE booking=${bookingId} tech=${technicianId}: ${result.error}`);
       return;
@@ -146,14 +165,22 @@ export const processRow = async (row) => {
   } catch (err) {
     const attempts = (row.attempts || 0) + 1;
     const giveUp = attempts >= (row.maxAttempts || 6);
-    await DispatchOutbox.updateOne(
-      { _id: row._id },
+    await updateClaimedRow(
+      row,
       giveUp
-        ? { $set: { status: "failed", attempts, lastError: err.message?.slice(0, 500) } }
+        ? {
+            $set: {
+              status: "failed",
+              attempts,
+              completedAt: new Date(),
+              lastError: err.message?.slice(0, 500),
+            },
+          }
         : {
             $set: {
               status: "pending",
               attempts,
+              claimedAt: null,
               lastError: err.message?.slice(0, 500),
               nextAttemptAt: new Date(Date.now() + backoffFor(attempts)),
             },
@@ -175,7 +202,10 @@ export const poll = async () => {
   polling = true;
   try {
     const batch = [];
-    while (batch.length < BATCH_SIZE && running < CONCURRENCY) {
+    while (
+      batch.length < BATCH_SIZE &&
+      running + batch.length < CONCURRENCY
+    ) {
       const row = await claimOne();
       if (!row) break;
       batch.push(row);
@@ -192,35 +222,60 @@ export const poll = async () => {
   }
 };
 
+export const buildDispatchOutboxOp = ({
+  bookingId,
+  technicianId,
+  broadcastId = null,
+  version = 1,
+  kind = "job_new",
+  payload = null,
+}) => ({
+  updateOne: {
+    filter: {
+      bookingId,
+      technicianId,
+      kind,
+      status: { $in: ["pending", "inflight"] },
+    },
+    update: {
+      $set: {
+        broadcastId: broadcastId || null,
+        version: version || 1,
+        payload,
+        status: "pending",
+        nextAttemptAt: new Date(),
+        attempts: 0,
+        lastError: null,
+        claimedAt: null,
+        completedAt: null,
+      },
+      $setOnInsert: {
+        bookingId,
+        technicianId,
+        kind,
+      },
+    },
+    upsert: true,
+  },
+});
+
 export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, jobData, broadcastMap, traceId }) => {
   if (!technicianIds?.length) return { count: 0 };
   const trc = traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  // H25: idempotent enqueue via updateOne+upsert+$setOnInsert (the same
-  // pattern as the matching transaction's outbox write). A duplicate enqueue
-  // matches the live row instead of inserting — deterministic even before
-  // the partial unique index finishes building (insertMany would
-  // double-insert in that window). The partial index remains as backstop.
+  // H25: idempotent enqueue via updateOne+upsert. A re-broadcast matches the
+  // existing live row and refreshes its broadcast/version/payload so the
+  // worker cannot deliver a stale offer or silently skip the new cycle.
+  // The partial unique index remains the duplicate backstop.
   const ops = technicianIds.map((techId) => {
     const idStr = String(techId);
     const broadcast = broadcastMap?.get(idStr);
-    return {
-      updateOne: {
-        filter: { bookingId, technicianId: idStr, kind: "job_new", status: { $in: ["pending", "inflight"] } },
-        update: {
-          $setOnInsert: {
-            bookingId,
-            technicianId: idStr,
-            kind: "job_new",
-            broadcastId: broadcast?._id || null,
-            version: broadcast?.version || 1,
-            payload: { ...jobData, traceId: trc },
-            status: "pending",
-            nextAttemptAt: new Date(),
-          },
-        },
-        upsert: true,
-      },
-    };
+    return buildDispatchOutboxOp({
+      bookingId,
+      technicianId: idStr,
+      broadcastId: broadcast?._id || null,
+      version: broadcast?.version || 1,
+      payload: { ...jobData, traceId: trc },
+    });
   });
 
   try {
@@ -239,8 +294,8 @@ export const enqueueJobNewNotifications = async ({ bookingId, technicianIds, job
 };
 
 export const startDispatchWorker = (io) => {
-  if (pollTimer) return;
   ioRef = io;
+  if (pollTimer) return;
   stopped = false;
   started = true;
   pollTimer = setInterval(() => poll().catch(() => {}), POLL_INTERVAL_MS);

@@ -304,9 +304,9 @@ const DEDUPE_WINDOW_MS = 5 * 60 * 1000;
 const IN_MEMORY_FALLBACK = new Map();
 const FALLBACK_CLEANUP_INTERVAL = 60000;
 
-async function alreadySent(broadcastId, technicianId) {
+async function alreadySent(broadcastId, technicianId, version = 1) {
   if (!broadcastId || !technicianId) return false;
-  const key = `dedupe:jobnew:${broadcastId}:${technicianId}`;
+  const key = `dedupe:jobnew:${broadcastId}:${version}:${technicianId}`;
   
   // Try Redis first (lazily connects on first use)
   try {
@@ -329,9 +329,9 @@ async function alreadySent(broadcastId, technicianId) {
  * Release a reservation when NOTHING was delivered. Without this, a failed
  * first attempt would suppress the outbox retry for the whole dedupe window.
  */
-async function releaseDedupe(broadcastId, technicianId) {
+async function releaseDedupe(broadcastId, technicianId, version = 1) {
   if (!broadcastId || !technicianId) return;
-  const key = `dedupe:jobnew:${broadcastId}:${technicianId}`;
+  const key = `dedupe:jobnew:${broadcastId}:${version}:${technicianId}`;
   IN_MEMORY_FALLBACK.delete(key);
   try {
     const client = await getRedisClient();
@@ -377,7 +377,7 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 
     const jobDTO = toJobNewDTO(jobData, broadcast);
 
-    if (await alreadySent(jobDTO.broadcastId, technicianId)) {
+    if (await alreadySent(jobDTO.broadcastId, technicianId, jobDTO.version)) {
       console.log(`⚠️ Skipped duplicate job:new ${jobDTO.broadcastId} → tech ${technicianId}`);
       return { success: false, skipped: true, reason: "duplicate" };
     }
@@ -453,7 +453,7 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       });
 
       if (!socketDelivered && !pushDelivered) {
-        await releaseDedupe(jobDTO.broadcastId, technicianId);
+        await releaseDedupe(jobDTO.broadcastId, technicianId, jobDTO.version);
         console.warn(`❌ [JOB_NEW] No transport delivered booking=${jobDTO.bookingId} tech=${technicianId}: ${pushResult?.error || pushResult?.reason || socketError}`);
         return {
           success: false,
@@ -475,7 +475,7 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
 
     // Legacy batch path: socket must have succeeded; batch FCM is sent by caller.
     if (!socketDelivered) {
-      await releaseDedupe(jobDTO.broadcastId, technicianId);
+      await releaseDedupe(jobDTO.broadcastId, technicianId, jobDTO.version);
       return { success: false, retryable: true, error: socketError || "socket_unavailable", socket: socketResult };
     }
     return { success: true, delivered: true, socket: socketResult, push: null };

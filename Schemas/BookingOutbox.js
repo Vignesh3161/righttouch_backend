@@ -90,5 +90,11 @@ const bookingOutboxSchema = new mongoose.Schema(
 bookingOutboxSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
 bookingOutboxSchema.index({ status: 1, claimedAt: 1 });
 
+// TTL: completed/failed rows are operational history, not permanent state.
+bookingOutboxSchema.index(
+  { completedAt: 1 },
+  { expireAfterSeconds: 86400, partialFilterExpression: { status: { $in: ["done", "failed"] } } }
+);
+
 export default mongoose.models.BookingOutbox ||
   mongoose.model("BookingOutbox", bookingOutboxSchema);

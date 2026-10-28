@@ -242,20 +242,32 @@ export function isPointInPolygonRing(point, ring) {
 }
 
 const EPS = 1e-9;
+// Absorbs only floating-point noise around the district edge (≈1 cm at
+// Indian latitudes). It is deliberately not large enough to accept zones
+// that genuinely extend beyond the boundary.
+export const CONTAINMENT_TOLERANCE_DEG = 1e-7;
 
-const pointOnSegment = (pt, a, b) => {
-  if (orientation(a, b, pt) !== 0) {
-    // Allow tiny floating-point tolerance around exact collinearity.
-    const cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]);
-    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
-    if (Math.abs(cross) / len > EPS) return false;
+const pointOnSegment = (pt, a, b, tolerance = 0) => {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const lenSq = dx * dx + dy * dy;
+
+  if (lenSq === 0) {
+    return Math.hypot(pt[0] - a[0], pt[1] - a[1]) <= Math.max(EPS, tolerance);
   }
-  return onSegment(a, pt, b);
+
+  // Clamped projection gives the closest point on the segment, including
+  // the endpoints. Distance (not signed collinearity) is compared so a
+  // point just past a vertex is handled the same as one beside the edge.
+  const t = Math.max(0, Math.min(1, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / lenSq));
+  const projX = a[0] + t * dx;
+  const projY = a[1] + t * dy;
+  return Math.hypot(pt[0] - projX, pt[1] - projY) <= Math.max(EPS, tolerance);
 };
 
-const pointOnRingBoundary = (pt, ring) => {
+const pointOnRingBoundary = (pt, ring, tolerance = 0) => {
   for (let i = 0; i < ring.length - 1; i++) {
-    if (pointOnSegment(pt, ring[i], ring[i + 1])) return true;
+    if (pointOnSegment(pt, ring[i], ring[i + 1], tolerance)) return true;
   }
   return false;
 };
@@ -267,8 +279,8 @@ const pointOnRingBoundary = (pt, ring) => {
  * - A point strictly inside another zone, or proper edge crossings between
  *   two zones, count as overlap. Mere shared borders/vertices do NOT.
  */
-export const pointInRingInclusive = (pt, ring) =>
-  isPointInPolygonRing(pt, ring) || pointOnRingBoundary(pt, ring);
+export const pointInRingInclusive = (pt, ring, tolerance = 0) =>
+  isPointInPolygonRing(pt, ring) || pointOnRingBoundary(pt, ring, tolerance);
 
 const outerRingsOf = (polygon) => {
   if (!polygon || !Array.isArray(polygon.coordinates)) return [];
@@ -287,48 +299,96 @@ const allRingsOf = (polygon) => {
 const ringsProperlyCross = (ringA, ringB) => eachEdgePair(ringA, ringB, segmentsProperlyIntersect);
 
 /**
- * Verifies that EVERY ring (outer + holes, all MultiPolygon components) of
- * the sub-zone lies inside the parent district's outer ring, with no edge
- * properly crossing the district boundary and without swallowing the
- * district. Replaces the old 50%-of-vertices shortcut, which accepted zones
- * straddling the boundary or bulging outside it.
+ * Crossings caused only by a vertex that sits a floating-point hair outside
+ * the district (within `tolerance`) are tolerated. A crossing between two
+ * well-inside vertices that leaves and re-enters a concave district boundary
+ * is still rejected because neither edge endpoint is near the boundary.
  */
-export function validateZoneInsideDistrict(zonePolygon, districtPolygon) {
+const ringsCrossBeyondTolerance = (ringA, ringB, tolerance) => {
+  if (tolerance <= EPS) return ringsProperlyCross(ringA, ringB);
+
+  const n = ringA.length - 1;
+  const m = ringB.length - 1;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < m; j++) {
+      if (!segmentsProperlyIntersect(ringA[i], ringA[i + 1], ringB[j], ringB[j + 1])) continue;
+      const endpointNearBoundary =
+        pointOnRingBoundary(ringA[i], ringB, tolerance) ||
+        pointOnRingBoundary(ringA[i + 1], ringB, tolerance);
+      if (!endpointNearBoundary) return true;
+    }
+  }
+  return false;
+};
+
+/**
+ * Verifies that EVERY ring (outer + holes, all MultiPolygon components) of
+ * the sub-zone lies inside one of the parent district's outer rings, with no
+ * edge properly crossing any district boundary and without swallowing any
+ * district component. Replaces the old 50%-of-vertices shortcut, which
+ * accepted zones straddling the boundary or bulging outside it.
+ *
+ * `options.tolerance` (degrees) absorbs floating-point noise at the shared
+ * boundary; defaults to CONTAINMENT_TOLERANCE_DEG.
+ */
+export function validateZoneInsideDistrict(zonePolygon, districtPolygon, options = {}) {
   if (!zonePolygon || !districtPolygon) return { valid: false, reason: "Missing polygon geometry" };
+
+  const tolerance =
+    Number.isFinite(options.tolerance) && options.tolerance >= 0
+      ? options.tolerance
+      : CONTAINMENT_TOLERANCE_DEG;
 
   const zoneRings = allRingsOf(zonePolygon);
   const districtOuters = outerRingsOf(districtPolygon);
 
   if (!zoneRings.length || !districtOuters.length) return { valid: false, reason: "Empty polygon coordinate rings" };
-  const districtOuterRing = districtOuters[0];
 
+  // A district may legitimately be a MultiPolygon (mainland plus islands or
+  // disjoint wards). Every zone ring must be contained by one of the
+  // district's outer rings — checking only districtOuters[0] incorrectly
+  // rejected zones located in any later component.
   for (let r = 0; r < zoneRings.length; r++) {
     const ring = zoneRings[r];
     for (let i = 0; i < ring.length; i++) {
-      if (!pointInRingInclusive(ring[i], districtOuterRing)) {
+      const insideAnyDistrictRing = districtOuters.some((outer) =>
+        pointInRingInclusive(ring[i], outer, tolerance)
+      );
+      if (!insideAnyDistrictRing) {
+        const [lng, lat] = ring[i];
         return {
           valid: false,
-          reason: `Sub-zone polygon extends outside the parent Operational District boundary (ring ${r} vertex ${i} is outside).`,
+          reason: `Sub-zone polygon extends outside the parent Operational District boundary (ring ${r} vertex ${i} [${lng}, ${lat}] is outside).`,
+          details: { ring: r, vertex: i, coordinate: [lng, lat] },
         };
       }
     }
-    if (ringsProperlyCross(ring, districtOuterRing)) {
-      return {
-        valid: false,
-        reason: `Sub-zone polygon edge crosses the parent Operational District boundary (ring ${r}).`,
-      };
+
+    for (const outer of districtOuters) {
+      if (ringsCrossBeyondTolerance(ring, outer, tolerance)) {
+        return {
+          valid: false,
+          reason: `Sub-zone polygon edge crosses the parent Operational District boundary (ring ${r}).`,
+          details: { ring: r },
+        };
+      }
     }
   }
 
-  // The zone must not swallow the district: a district vertex strictly
-  // inside the zone outer means the zone contains (not sits inside) it.
-  const zoneOuter = outerRingsOf(zonePolygon)[0] || [];
-  for (const pt of districtOuterRing) {
-    if (isPointInPolygonRing(pt, zoneOuter) && !pointOnRingBoundary(pt, zoneOuter)) {
-      return {
-        valid: false,
-        reason: "Sub-zone polygon contains the parent district boundary instead of sitting inside it.",
-      };
+  // The zone must not swallow any district component: a district vertex
+  // strictly inside a zone outer means the zone contains (not sits inside)
+  // that part of the district. Check every outer component on both sides.
+  const zoneOuters = outerRingsOf(zonePolygon);
+  for (const zoneOuter of zoneOuters) {
+    for (const districtOuter of districtOuters) {
+      for (const pt of districtOuter) {
+        if (isPointInPolygonRing(pt, zoneOuter) && !pointOnRingBoundary(pt, zoneOuter, tolerance)) {
+          return {
+            valid: false,
+            reason: "Sub-zone polygon contains the parent district boundary instead of sitting inside it.",
+          };
+        }
+      }
     }
   }
 
