@@ -16,9 +16,22 @@ import { checkTechnicianEligibility } from "../Services/technicianEligibilitySer
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
 import { isValidObjectId, exactRegex, containsRegex, clampLimit, clampPage, internalError } from "../Utils/safeQuery.js";
-import { seedZoneDisabledServices, recordPolygonVersion, withZoneWriteTransaction, invalidateDistrictPolygonCache } from "../Services/zoneWriteService.js";
+import {
+  seedZoneServices,
+  recordPolygonVersion,
+  withZoneWriteTransaction,
+  invalidateDistrictPolygonCache,
+  assertDistrictPlacement,
+  assertDistrictContainsZones,
+  normalizeZoneServiceMode,
+  ZONE_SERVICE_MODES,
+} from "../Services/zoneWriteService.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { ensureApprovedDistrictZones, grantZoneToDistrictTechnicians } from "../Services/technicianDistrictService.js";
+import {
+  ensureApprovedDistrictZones,
+  grantZoneToDistrictTechnicians,
+  grantZoneToApprovedTechnicians,
+} from "../Services/technicianDistrictService.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -39,6 +52,17 @@ export const createDistrict = async (req, res) => {
         success: false,
         message: "Invalid GeoJSON Polygon definition",
         errors: validation.errors,
+      });
+    }
+
+    const placement = await assertDistrictPlacement({
+      sanitizedPolygon: validation.sanitizedPolygon,
+    });
+    if (!placement.ok) {
+      return res.status(placement.status).json({
+        success: false,
+        code: placement.code,
+        message: placement.message,
       });
     }
 
@@ -114,6 +138,44 @@ export const updateDistrict = async (req, res) => {
       }
       updatedPolygon = validation.sanitizedPolygon;
       versionIncremented = true;
+
+      const placement = await assertDistrictPlacement({
+        sanitizedPolygon: updatedPolygon,
+        excludeDistrictId: id,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status).json({
+          success: false,
+          code: placement.code,
+          message: placement.message,
+        });
+      }
+
+      const childZones = await assertDistrictContainsZones({
+        districtId: id,
+        sanitizedPolygon: updatedPolygon,
+      });
+      if (!childZones.ok) {
+        return res.status(childZones.status).json({
+          success: false,
+          code: childZones.code,
+          message: childZones.message,
+        });
+      }
+    }
+
+    if (status === "ACTIVE" && !versionIncremented) {
+      const placement = await assertDistrictPlacement({
+        sanitizedPolygon: updatedPolygon,
+        excludeDistrictId: id,
+      });
+      if (!placement.ok) {
+        return res.status(placement.status).json({
+          success: false,
+          code: placement.code,
+          message: placement.message,
+        });
+      }
     }
 
     if (name) district.name = name;
@@ -149,17 +211,19 @@ export const updateDistrict = async (req, res) => {
     });
     if (versionIncremented) invalidateDistrictPolygonCache(String(district._id));
 
-    // B-12: a status flip through the geofence path changes dispatch
-    // eligibility the same way the standard status toggle does.
-    if (status) {
+    // B-12: a status flip or boundary change through the geofence path changes
+    // dispatch eligibility the same way the standard update path does.
+    if (status || versionIncremented) {
+      const { revalidateTechniciansForService, backfillBroadcastsForScope } = await import(
+        "../Utils/technicianLocation.js"
+      );
+      await revalidateTechniciansForService(null, district._id, null, req.io).catch((e) =>
+        console.warn("geofence update revalidation warning:", e.message)
+      );
       if (district.active) {
-        const { backfillBroadcastsForScope } = await import("../Utils/technicianLocation.js");
-        await backfillBroadcastsForScope({ districtId: district._id, io: req.io })
-          .catch((e) => console.warn("geofence status backfill warning:", e.message));
-      } else {
-        const { revalidateTechniciansForService } = await import("../Utils/technicianLocation.js");
-        await revalidateTechniciansForService(null, district._id, null, req.io)
-          .catch((e) => console.warn("geofence status revalidation warning:", e.message));
+        await backfillBroadcastsForScope({ districtId: district._id, io: req.io }).catch((e) =>
+          console.warn("geofence update backfill warning:", e.message)
+        );
       }
     }
 
@@ -219,7 +283,31 @@ export const createCityZone = async (req, res) => {
     const parentId = operationalCityId || districtId;
     const zoneName = req.body.name || req.body.zoneName;
     const zoneCode = req.body.zoneCode || req.body.code;
-    const { polygon, description, active = true } = req.body;
+    const {
+      polygon,
+      description,
+      active = true,
+      serviceMode = "INHERIT",
+      grantMode = "DISTRICT_PERMISSION",
+    } = req.body;
+
+    const normalizedServiceMode = normalizeZoneServiceMode(serviceMode);
+    if (
+      serviceMode != null &&
+      String(serviceMode).trim().toUpperCase() !== normalizedServiceMode
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `serviceMode must be one of: ${ZONE_SERVICE_MODES.join(", ")}`,
+      });
+    }
+    const normalizedGrantMode = String(grantMode || "DISTRICT_PERMISSION").trim().toUpperCase();
+    if (!["DISTRICT_PERMISSION", "ALL_APPROVED", "NONE"].includes(normalizedGrantMode)) {
+      return res.status(400).json({
+        success: false,
+        message: "grantMode must be one of: DISTRICT_PERMISSION, ALL_APPROVED, NONE",
+      });
+    }
 
     if (!parentId || !zoneName || !polygon) {
       return res.status(400).json({ success: false, message: "operationalCityId, zoneName (name), and polygon are required." });
@@ -260,7 +348,8 @@ export const createCityZone = async (req, res) => {
     const activeFlag = active === undefined ? true : active === true || String(active).toLowerCase() === "true";
     const actorId = req.user?._id || req.user?.userId || null;
     let zone;
-    let seededCount = 0;
+    let seeded = { total: 0, enabled: 0, disabled: 0, mode: normalizedServiceMode };
+    let granted = 0;
     try {
       const out = await withZoneWriteTransaction(async (session) => {
         const createOpts = session ? { session } : {};
@@ -272,13 +361,19 @@ export const createCityZone = async (req, res) => {
               zoneCode: String(zoneCode).trim().toUpperCase(),
               polygon: validation.sanitizedPolygon,
               active: activeFlag,
+              serviceMode: normalizedServiceMode,
               description: description || null,
             },
           ],
           createOpts
         );
         const created = Array.isArray(docs) ? docs[0] : docs;
-        const seeded = await seedZoneDisabledServices({ zone: created, actorId, session });
+        const seededResult = await seedZoneServices({
+          zone: created,
+          serviceMode: normalizedServiceMode,
+          actorId,
+          session,
+        });
         await recordPolygonVersion(
           {
             entityType: "CITY_ZONE",
@@ -289,19 +384,29 @@ export const createCityZone = async (req, res) => {
           },
           session
         );
-        if (created.active !== false) {
-          await grantZoneToDistrictTechnicians({
+        let grantedCount = 0;
+        if (created.active !== false && normalizedGrantMode !== "NONE") {
+          const grantFn =
+            normalizedGrantMode === "ALL_APPROVED"
+              ? grantZoneToApprovedTechnicians
+              : grantZoneToDistrictTechnicians;
+          const grantResult = await grantFn({
             zoneId: created._id,
             districtId: parentId,
             adminUserId: actorId,
-            reason: "Auto-granted on zone creation",
+            reason:
+              normalizedGrantMode === "ALL_APPROVED"
+                ? "Auto-granted to approved district technicians on zone creation"
+                : "Auto-granted on zone creation",
             session,
           });
+          grantedCount = grantResult?.granted || 0;
         }
-        return { created, seeded };
+        return { created, seeded: seededResult, granted: grantedCount };
       });
       zone = out.result.created;
-      seededCount = out.result.seeded;
+      seeded = out.result.seeded;
+      granted = out.result.granted;
     } catch (e) {
       if (e.code === 11000) {
         return res.status(409).json({ success: false, code: "ZONE_CODE_EXISTS", message: "Zone code already exists. Use a unique zoneCode." });
@@ -309,7 +414,16 @@ export const createCityZone = async (req, res) => {
       throw e;
     }
 
-    return res.status(201).json({ success: true, message: "CityZone created successfully", result: { ...zone.toObject(), seededDisabledServices: seededCount } });
+    return res.status(201).json({
+      success: true,
+      message: "CityZone created successfully",
+      result: {
+        ...zone.toObject(),
+        seededServices: seeded,
+        seededDisabledServices: seeded.disabled,
+        grantedTechnicians: granted,
+      },
+    });
   } catch (error) {
     return internalError(res, error);
   }
@@ -495,6 +609,7 @@ export const getImpactAnalysis = async (req, res) => {
         }),
         ServiceAvailability.countDocuments({ districtId: id, status: "ENABLED" }),
         ServiceBooking.countDocuments({
+          districtId: id,
           status: { $in: ["pending", "broadcasted", "accepted", "on_the_way", "reached", "in_progress"] },
         }),
       ]);
@@ -882,14 +997,18 @@ export const validatePolygonPreview = async (req, res) => {
       if (placement.status === 404) {
         return res.status(404).json({ success: false, message: placement.message, code: placement.code });
       }
-      const outside = placement.code === "ZONE_OUTSIDE_PARENT_DISTRICT";
+      const containmentInfo = placement.containment || { fullyContained: true, reason: null };
       result.containment = {
         checked: true,
-        // Render-compatible keys (both spellings).
-        isFullyContained: placement.ok || !outside,
-        isContained: placement.ok || !outside,
-        message: placement.ok ? "Polygon completely contained within district limits." : placement.message,
-        reason: placement.ok ? null : placement.message,
+        // Render-compatible keys (both spellings). Partial boundary
+        // overshoot is allowed as long as the zone still overlaps the
+        // parent district, so only isFullyContained reflects containment.
+        isFullyContained: containmentInfo.fullyContained,
+        isContained: placement.ok,
+        message: containmentInfo.fullyContained
+          ? "Polygon completely contained within district limits."
+          : "Polygon extends outside the district boundary but overlaps the district; creation is allowed.",
+        reason: containmentInfo.fullyContained ? null : containmentInfo.reason,
       };
       const overlap = !placement.ok && placement.code === "ZONE_OVERLAP_DETECTED";
       result.overlap = {

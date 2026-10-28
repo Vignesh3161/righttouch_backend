@@ -168,6 +168,71 @@ export const grantZoneToDistrictTechnicians = async ({
   return { granted };
 };
 
+/**
+ * Opt-in alternative to district permissions: grant a new zone to every
+ * approved technician who is registered in, currently in, or already
+ * permissioned for the parent district. Used by zones created with
+ * grantMode=ALL_APPROVED. Idempotent and transactional.
+ */
+export const grantZoneToApprovedTechnicians = async ({
+  zoneId,
+  districtId,
+  adminUserId = null,
+  reason = "Auto-granted to approved district technicians",
+  session = null,
+} = {}) => {
+  if (!zoneId || !districtId) return { granted: 0 };
+  if (!mongoose.Types.ObjectId.isValid(zoneId) || !mongoose.Types.ObjectId.isValid(districtId)) {
+    return { granted: 0 };
+  }
+
+  const zoneObjId = new mongoose.Types.ObjectId(zoneId);
+  const profileQuery = TechnicianProfile.find({
+    workStatus: "approved",
+    $or: [
+      { primaryDistrictId: districtId },
+      { primaryCityId: districtId },
+      { currentDistrictId: districtId },
+      { enabledDistrictIds: districtId },
+      { allowedCityIds: districtId },
+    ],
+    enabledCityZoneIds: { $ne: zoneObjId },
+  }).select("_id");
+  const profiles = session
+    ? await profileQuery.session(session).lean()
+    : await profileQuery.lean();
+  if (!profiles.length) return { granted: 0 };
+
+  const BATCH_SIZE = 500;
+  let granted = 0;
+  for (let i = 0; i < profiles.length; i += BATCH_SIZE) {
+    const batch = profiles.slice(i, i + BATCH_SIZE);
+    const update = TechnicianProfile.updateMany(
+      { _id: { $in: batch.map((profile) => profile._id) } },
+      { $addToSet: { enabledCityZoneIds: zoneObjId } }
+    );
+    if (session) await update.session(session);
+    else await update;
+
+    if (adminUserId) {
+      const auditDocs = batch.map((profile) => ({
+        technicianId: profile._id,
+        cityZoneId: zoneObjId,
+        action: "enabled",
+        changedBy: adminUserId,
+        reason,
+      }));
+      if (session) {
+        await TechnicianZonePermissionAudit.insertMany(auditDocs, { session, ordered: false });
+      } else {
+        await TechnicianZonePermissionAudit.insertMany(auditDocs, { ordered: false });
+      }
+    }
+    granted += batch.length;
+  }
+  return { granted };
+};
+
 // Controlled-conflict wrapper: duplicate rows and write conflicts become
 // retryable client errors, never silent clobbers or raw driver errors.
 const asConflict = (err, fallbackCode = "PERMISSION_CONFLICT") => {

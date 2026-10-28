@@ -18,7 +18,11 @@ import { resolveServiceAvailability } from "../Services/serviceAvailabilityServi
 import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
 import { STALENESS_SECONDS, stalenessCutoff, getGpsState } from "./locationConfig.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
-import { enqueueJobNewNotifications, wakeDispatchWorker } from "./dispatchQueue.js";
+import {
+  buildDispatchOutboxOp,
+  enqueueJobNewNotifications,
+  wakeDispatchWorker,
+} from "./dispatchQueue.js";
 import { offerPurgeAt } from "./broadcastRetention.js";
 import { mergeTechnicianCandidateIds } from "./technicianCandidatePool.js";
 import { buildJobDispatchPayload } from "./jobPayload.js";
@@ -210,6 +214,48 @@ export const filterByBookingZone = async (techIds, bookingId) => {
    bulkWrite upsert, ordered:false — $setOnInsert ONLY so
    re-broadcast cycles never reset accepted/superseded rows.
 ===================================================== */
+
+export const supersedeStaleOffers = async ({
+  bookingId,
+  keepTechnicianIds = [],
+  session = null,
+  reason,
+}) => {
+  const opts = session ? { session } : {};
+  const now = new Date();
+  const keep = keepTechnicianIds.map((id) => id);
+  const broadcastFilter = { bookingId, status: "sent" };
+  const dispatchFilter = {
+    bookingId,
+    status: { $in: ["pending", "inflight"] },
+  };
+  if (keep.length) {
+    broadcastFilter.technicianId = { $nin: keep };
+    dispatchFilter.technicianId = { $nin: keep };
+  }
+  await JobBroadcast.updateMany(
+    broadcastFilter,
+    {
+      $set: {
+        status: "expired",
+        expiredAt: now,
+        expiredReason: reason,
+      },
+    },
+    opts
+  );
+  await DispatchOutbox.updateMany(
+    dispatchFilter,
+    {
+      $set: {
+        status: "done",
+        completedAt: now,
+        lastError: reason,
+      },
+    },
+    opts
+  );
+};
 
 export const upsertTechnicianOffers = async ({
   bookingId,
@@ -1218,6 +1264,13 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     if (technicianIds.length === 0) {
       console.log(`⏱ [TRACE] ${trc} NO_FEASIBLE_TECHS bookingId=${bookingId}`);
+      await supersedeStaleOffers({
+        bookingId: booking._id,
+        keepTechnicianIds: [],
+        reason: "rebroadcast_no_candidates",
+      }).catch((err) =>
+        console.warn(`[TRACE] ${trc} supersede offers failed: ${err.message}`)
+      );
       return {
         success: true,
         count: 0,
@@ -1327,41 +1380,35 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           const effectiveRadiusMeters = getEffectiveRadiusMeters(
             profileById.get(String(techId))
           );
-          return {
-            updateOne: {
-              filter: {
-                bookingId: booking._id,
-                technicianId: techId,
-                kind: "job_new",
-                status: { $in: ["pending", "inflight"] },
-              },
-              update: {
-                $setOnInsert: {
-                  bookingId: booking._id,
-                  technicianId: techId,
-                  kind: "job_new",
-                  broadcastId: b?._id || null,
-                  version: b?.version || 1,
-                  payload: {
-                    ...buildJobDispatchPayload(jobDataPayload, {
-                      latitude,
-                      longitude,
-                      distanceMeters,
-                      effectiveRadiusMeters,
-                    }),
-                    traceId: trc,
-                  },
-                  status: "pending",
-                  nextAttemptAt: new Date(),
-                },
-              },
-              upsert: true,
+          return buildDispatchOutboxOp({
+            bookingId: booking._id,
+            technicianId: techId,
+            broadcastId: b?._id || null,
+            version: b?.version || 1,
+            payload: {
+              ...buildJobDispatchPayload(jobDataPayload, {
+                latitude,
+                longitude,
+                distanceMeters,
+                effectiveRadiusMeters,
+              }),
+              traceId: trc,
             },
-          };
+          });
         });
         if (outboxOps.length) {
           await DispatchOutbox.bulkWrite(outboxOps, { session, ordered: false });
         }
+
+        // Drop offers for technicians who are no longer candidates. Their
+        // old broadcasts become stale, so the dispatch worker skips them
+        // instead of delivering a dead job after the re-broadcast.
+        await supersedeStaleOffers({
+          bookingId: booking._id,
+          keepTechnicianIds: technicianIds,
+          session,
+          reason: "superseded_by_rebroadcast",
+        });
       });
     } finally {
       await session.endSession();

@@ -164,11 +164,38 @@ router.post("/:id/retry", Auth, adminOnly, async (req, res) => {
       });
     }
 
+    const liveDuplicate = await DispatchOutbox.exists({
+      bookingId: item.bookingId,
+      technicianId: item.technicianId,
+      kind: item.kind,
+      status: { $in: ["pending", "inflight"] },
+      _id: { $ne: item._id },
+    });
+    if (liveDuplicate) {
+      return res.status(409).json({
+        success: false,
+        message: "A live dispatch row already exists for this booking and technician",
+        result: { existingId: liveDuplicate._id },
+      });
+    }
+
     item.status = "pending";
     item.nextAttemptAt = new Date();
     item.attempts = 0;
     item.lastError = null;
-    await item.save();
+    item.claimedAt = null;
+    item.completedAt = null;
+    try {
+      await item.save();
+    } catch (err) {
+      if (err?.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: "A live dispatch row already exists for this booking and technician",
+        });
+      }
+      throw err;
+    }
 
     // Trigger immediate processing
     const { wakeDispatchWorker } = await import("../Utils/dispatchQueue.js");
@@ -187,17 +214,46 @@ router.post("/:id/retry", Auth, adminOnly, async (req, res) => {
 // POST /api/admin/dispatch/retry-failed — Bulk retry all failed items
 router.post("/retry-failed", Auth, adminOnly, async (req, res) => {
   try {
-    const result = await DispatchOutbox.updateMany(
-      { status: "failed" },
-      { 
-        $set: { 
-          status: "pending", 
-          nextAttemptAt: new Date(),
-          attempts: 0,
-          lastError: null,
-        } 
+    const failedItems = await DispatchOutbox.find({ status: "failed" })
+      .select("_id bookingId technicianId kind")
+      .limit(1000)
+      .lean();
+
+    let queued = 0;
+    let skipped = 0;
+    for (const item of failedItems) {
+      const liveDuplicate = await DispatchOutbox.exists({
+        bookingId: item.bookingId,
+        technicianId: item.technicianId,
+        kind: item.kind,
+        status: { $in: ["pending", "inflight"] },
+        _id: { $ne: item._id },
+      });
+      if (liveDuplicate) {
+        skipped += 1;
+        continue;
       }
-    );
+      try {
+        const result = await DispatchOutbox.updateOne(
+          { _id: item._id, status: "failed" },
+          {
+            $set: {
+              status: "pending",
+              nextAttemptAt: new Date(),
+              attempts: 0,
+              lastError: null,
+              claimedAt: null,
+              completedAt: null,
+            },
+          }
+        );
+        if (result.modifiedCount) queued += 1;
+        else skipped += 1;
+      } catch (err) {
+        if (err?.code === 11000) skipped += 1;
+        else throw err;
+      }
+    }
 
     // Trigger immediate processing
     const { wakeDispatchWorker } = await import("../Utils/dispatchQueue.js");
@@ -205,8 +261,8 @@ router.post("/retry-failed", Auth, adminOnly, async (req, res) => {
 
     res.json({
       success: true,
-      message: `${result.modifiedCount} failed items queued for retry`,
-      result: { modifiedCount: result.modifiedCount },
+      message: `${queued} failed items queued for retry`,
+      result: { modifiedCount: queued, skipped },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

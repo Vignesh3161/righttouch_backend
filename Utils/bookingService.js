@@ -338,6 +338,9 @@ export const processBookingCreatedOutbox = async (booking) => {
   if (["cancelled", "expired", "completed"].includes(status)) {
     return { status: "done", reason: `terminal_${status}` };
   }
+  if (!["pending", "broadcasted"].includes(status)) {
+    return { status: "done", reason: `not_dispatchable_${status}` };
+  }
 
   if ((current.activeBroadcastVersion || 0) > 0) {
     return { status: "done", reason: "already_broadcast" };

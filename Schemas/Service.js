@@ -190,6 +190,20 @@ const serviceSchema = new mongoose.Schema(
       default: true,
     },
 
+    // Soft-delete marker. Customer listings filter on isActive; keeping the
+    // document preserves historical bookings and audit references.
+    deletedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    deletedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
     /**
      * 🎯 ZONE RESTRICTED — when true, the service is ONLY visible and bookable
      * in zones where an active ZoneServiceMapping exists for it (per city zone).

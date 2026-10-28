@@ -14,6 +14,8 @@ import { recordBookingOutbox } from "./broadcastMetrics.js";
 import mongoose from "mongoose";
 
 const POLL_INTERVAL_MS = 1500;
+const BATCH_SIZE = 10;
+const CONCURRENCY = 3;
 const CLAIM_TTL_MS = 2 * 60 * 1000;
 const MAX_BACKOFF_MS = 60 * 1000;
 const BACKOFF_BASE_MS = 1000;
@@ -21,12 +23,24 @@ const BACKOFF_BASE_MS = 1000;
 let ioRef = null;
 let pollTimer = null;
 let stopped = false;
+let started = false;
 let running = 0;
+let polling = false;
 
 const backoffFor = (attempts) => {
   const ceiling = Math.min(BACKOFF_BASE_MS * 2 ** attempts, MAX_BACKOFF_MS);
   return Math.max(250, Math.floor(Math.random() * ceiling));
 };
+
+// Claim fencing: a stale worker must not overwrite a row that was reclaimed
+// or otherwise re-claimed after its own claim expired.
+const claimUpdateFilter = (row) => ({
+  _id: row._id,
+  ...(row.claimedAt ? { status: "inflight", claimedAt: row.claimedAt } : {}),
+});
+
+const updateClaimedRow = (row, update) =>
+  BookingOutbox.updateOne(claimUpdateFilter(row), update);
 
 const claimOne = async () => {
   const now = new Date();
@@ -42,28 +56,38 @@ const claimOne = async () => {
       status: "inflight",
       claimedAt: { $lte: new Date(Date.now() - CLAIM_TTL_MS) },
     },
-    { $set: { claimedAt: now, lastError: "reclaimed_after_claim_ttl" } },
+    {
+      $set: { claimedAt: now, lastError: "reclaimed_after_claim_ttl" },
+      $inc: { attempts: 1 },
+    },
     { new: true, sort: { claimedAt: 1 } }
   );
 };
 
 const markDone = (row, lastError = null) =>
-  BookingOutbox.updateOne(
-    { _id: row._id },
-    { $set: { status: "done", completedAt: new Date(), lastError } }
-  );
+  updateClaimedRow(row, {
+    $set: { status: "done", completedAt: new Date(), lastError },
+  });
 
 const scheduleRetry = async (row, err) => {
   const attempts = (row.attempts || 0) + 1;
   const giveUp = attempts >= (row.maxAttempts || 6);
-  await BookingOutbox.updateOne(
-    { _id: row._id },
+  await updateClaimedRow(
+    row,
     giveUp
-      ? { $set: { status: "failed", attempts, lastError: err.message?.slice(0, 500) } }
+      ? {
+          $set: {
+            status: "failed",
+            attempts,
+            completedAt: new Date(),
+            lastError: err.message?.slice(0, 500),
+          },
+        }
       : {
           $set: {
             status: "pending",
             attempts,
+            claimedAt: null,
             lastError: err.message?.slice(0, 500),
             nextAttemptAt: new Date(Date.now() + backoffFor(attempts)),
           },
@@ -118,10 +142,14 @@ export const processRow = async (row) => {
     }
 
     if (result?.retryable === false) {
-      await BookingOutbox.updateOne(
-        { _id: row._id },
-        { $set: { status: "failed", attempts: (row.attempts || 0) + 1, lastError: (result.outcome || result.error || "non_retryable").slice(0, 500) } }
-      );
+      await updateClaimedRow(row, {
+        $set: {
+          status: "failed",
+          attempts: (row.attempts || 0) + 1,
+          completedAt: new Date(),
+          lastError: (result.outcome || result.error || "non_retryable").slice(0, 500),
+        },
+      });
       recordBookingOutbox("failed");
       console.warn(`[BookingOutbox] PERMANENT FAILURE booking=${row.aggregateId} outcome=${result.outcome || result.error}`);
       return;
@@ -134,23 +162,35 @@ export const processRow = async (row) => {
 };
 
 const poll = async () => {
-  if (stopped) return;
-  if (running >= 3) return;
+  if (stopped || polling || running >= CONCURRENCY) return;
   // 🔌 Don't touch Mongo while disconnected — avoids 10s buffer timeouts.
-  if (mongoose.connection.readyState !== 1) return;
+  if (mongoose.connection.readyState !== 1) {
+    if (!stopped) pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
+    return;
+  }
+  polling = true;
   try {
-    const row = await claimOne();
-    if (row) {
-      running += 1;
+    const batch = [];
+    while (
+      batch.length < BATCH_SIZE &&
+      running + batch.length < CONCURRENCY
+    ) {
+      const row = await claimOne();
+      if (!row) break;
+      batch.push(row);
+    }
+    if (batch.length) {
+      running += batch.length;
       try {
-        await processRow(row);
+        await Promise.allSettled(batch.map(processRow));
       } finally {
-        running -= 1;
+        running -= batch.length;
       }
     }
   } catch (err) {
     console.error("[BookingOutbox] poll error:", err.message);
   } finally {
+    polling = false;
     if (!stopped) {
       pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
     }
@@ -159,6 +199,8 @@ const poll = async () => {
 
 export const startBookingOutboxWorker = (io) => {
   ioRef = io;
+  if (started) return;
+  started = true;
   stopped = false;
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
@@ -167,5 +209,7 @@ export const startBookingOutboxWorker = (io) => {
 
 export const stopBookingOutboxWorker = () => {
   stopped = true;
+  started = false;
   if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
 };

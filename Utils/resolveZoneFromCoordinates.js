@@ -19,39 +19,19 @@ export const resolveZoneFromCoordinates = async (
   longitude,
   { operationalCityId, session, includeInactive = false } = {}
 ) => {
-  const lat = Number(latitude);
-  const lng = Number(longitude);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return { zone: null, error: "Invalid coordinates" };
-  }
-
-  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-    return { zone: null, error: "Coordinates out of range" };
-  }
-
-  // Required architecture: deactivated zones must BLOCK booking.
-  // Callers that enforce checkout/listing must pass includeInactive:true so an
-  // inactive polygon is still detected (otherwise active-only lookup returns
-  // null and the resolver would fall back to district and wrongly allow).
-  const query = {
-    ...(includeInactive ? {} : { active: true }),
-    polygon: {
-      $geoIntersects: {
-        $geometry: { type: "Point", coordinates: [lng, lat] },
-      },
-    },
+  // Single source of truth: always resolve the parent district first, then a
+  // zone inside that district. This prevents orphan zones (parent deleted) and
+  // cross-district overlap from producing a different answer than booking.
+  const resolved = await resolveDistrictAndZoneFromCoordinates(latitude, longitude, {
+    session,
+    includeInactiveZone: includeInactive,
+    districtId: operationalCityId || null,
+  });
+  return {
+    zone: resolved.zone,
+    district: resolved.district,
+    error: resolved.error,
   };
-
-  if (operationalCityId) {
-    query.operationalCityId = operationalCityId;
-  }
-
-  let zoneQuery = CityZone.findOne(query).lean();
-  if (session) zoneQuery = zoneQuery.session(session);
-
-  const zone = await zoneQuery;
-  return { zone: zone || null };
 };
 
 /**
@@ -70,13 +50,23 @@ export const resolveAllZonesFromCoordinates = async (
     return [];
   }
 
+  const pointGeo = {
+    $geoIntersects: {
+      $geometry: { type: "Point", coordinates: [lng, lat] },
+    },
+  };
+
+  let districtQuery = OperationalCity.find({
+    active: true,
+    polygon: pointGeo,
+  }).select("_id").lean();
+  if (session) districtQuery = districtQuery.session(session);
+  const districts = await districtQuery;
+
   let zoneQuery = CityZone.find({
     active: true,
-    polygon: {
-      $geoIntersects: {
-        $geometry: { type: "Point", coordinates: [lng, lat] },
-      },
-    },
+    operationalCityId: { $in: districts.map((district) => district._id) },
+    polygon: pointGeo,
   }).lean();
 
   if (session) zoneQuery = zoneQuery.session(session);
@@ -93,7 +83,7 @@ export const resolveAllZonesFromCoordinates = async (
 export const resolveDistrictAndZoneFromCoordinates = async (
   latitude,
   longitude,
-  { session, includeInactiveZone = false } = {}
+  { session, includeInactiveZone = false, districtId = null, includeInactiveDistrict = false } = {}
 ) => {
   const lat = Number(latitude);
   const lng = Number(longitude);
@@ -112,29 +102,55 @@ export const resolveDistrictAndZoneFromCoordinates = async (
     },
   };
 
-  let distQuery = OperationalCity.findOne({
-    active: true,
-    polygon: pointGeo,
-  }).lean();
-  if (session) distQuery = distQuery.session(session);
-  const district = await distQuery;
+  let district;
+  if (districtId) {
+    let distQuery = OperationalCity.findOne({
+      _id: districtId,
+      ...(includeInactiveDistrict ? {} : { active: true }),
+    }).lean();
+    if (session) distQuery = distQuery.session(session);
+    district = await distQuery;
+    if (!district) {
+      return { district: null, zone: null, error: "NO_ACTIVE_DISTRICT" };
+    }
+    if (district.polygon) {
+      let insideQuery = OperationalCity.exists({
+        _id: district._id,
+        polygon: pointGeo,
+      });
+      if (session) insideQuery = insideQuery.session(session);
+      const inside = await insideQuery;
+      if (!inside) {
+        return { district: null, zone: null, error: "POINT_OUTSIDE_DISTRICT" };
+      }
+    }
+  } else {
+    let distQuery = OperationalCity.findOne({
+      active: true,
+      polygon: pointGeo,
+    })
+      .sort({ _id: 1 })
+      .lean();
+    if (session) distQuery = distQuery.session(session);
+    district = await distQuery;
+  }
 
-  let zoneQuery = null;
-  const zoneFilter = {
+  if (!district) {
+    // No active parent district means no valid zone either — orphan zones are
+    // never returned to booking/listing callers.
+    return { district: null, zone: null, error: "NO_ACTIVE_DISTRICT" };
+  }
+
+  let zoneQuery = CityZone.findOne({
+    operationalCityId: district._id,
     ...(includeInactiveZone ? {} : { active: true }),
     polygon: pointGeo,
-  };
-  if (district) {
-    zoneQuery = CityZone.findOne({
-      operationalCityId: district._id,
-      ...zoneFilter,
-    }).lean();
-  } else {
-    zoneQuery = CityZone.findOne(zoneFilter).lean();
-  }
-  if (session && zoneQuery) zoneQuery = zoneQuery.session(session);
-  const zone = zoneQuery ? await zoneQuery : null;
+  })
+    .sort({ _id: 1 })
+    .lean();
+  if (session) zoneQuery = zoneQuery.session(session);
+  const zone = await zoneQuery;
 
-  return { district: district || null, zone: zone || null };
+  return { district, zone: zone || null };
 };
 

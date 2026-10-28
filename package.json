@@ -9,6 +9,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
+    "repair:zone-lifecycle": "node scripts/repairZoneLifecycle.js",
     "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },
   "repository": {
@@ -26,15 +27,11 @@
   },
   "homepage": "https://github.com/FlareMindsTech/righttouch_backend#readme",
   "dependencies": {
-    "@google-cloud/storage": "^7.19.0",
-    "@sendgrid/mail": "^8.1.6",
     "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
-    "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
-    "express-mongo-sanitize": "^2.2.0",
     "express-rate-limit": "^8.2.1",
     "firebase-admin": "^14.2.0",
     "helmet": "^7.1.0",
@@ -43,16 +40,16 @@
     "multer": "^2.1.1",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.5",
-    "nodemon": "^3.1.10",
     "razorpay": "^2.9.6",
     "redis": "^4.6.13",
-    "resend": "^6.6.0",
-    "sharp": "^0.34.5",
     "socket.io": "^4.8.3",
-    "twilio": "^5.9.0",
-    "xss-clean": "^0.1.4"
+    "twilio": "^5.9.0"
   },
   "devDependencies": {
-    "mongodb-memory-server": "^11.3.0"
+    "mongodb-memory-server": "^11.3.0",
+    "nodemon": "^3.1.14"
+  },
+  "engines": {
+    "node": ">=22.6.0"
   }
 }
