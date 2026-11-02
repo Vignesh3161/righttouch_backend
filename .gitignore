@@ -71,4 +71,4 @@ test/
 config/firebase-credentials.json
 *Account.json
 serverAccount.json
-serviceAccount.json
+serviceAccount.jsonserverAccount.json
