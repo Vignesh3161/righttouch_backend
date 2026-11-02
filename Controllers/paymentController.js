@@ -238,20 +238,10 @@ export const createPaymentOrder = async (req, res) => {
     }
 
     if (!booking) {
-      const quote = await Quotation.findById(bookingId);
-      if (quote) {
-        const existingPb = await ProductBooking.findOne({ quotationId: quote._id });
-        if (existingPb) {
-          booking = existingPb;
-          itemType = "product";
-        } else {
-          booking = quote;
-          itemType = "quotation";
-        }
-      }
+      return fail(res, 404, "Booking not found. Accept the product quotation to create a booking before paying.", {
+        code: "PRODUCT_BOOKING_REQUIRED",
+      });
     }
-
-    if (!booking) return fail(res, 404, "Booking not found");
 
     if (!isPrivileged) {
       const custId = booking.customerId || booking.userId;
@@ -285,8 +275,8 @@ export const createPaymentOrder = async (req, res) => {
       });
     }
 
-    // Status gate for services only — payment is allowed only AFTER the
-    // service has been completed (pay-at-completion flow).
+    // Service payment is allowed only AFTER completion (pay-at-completion).
+    // Product payment is allowed only while the booking is active.
     if (itemType === "service") {
       if (booking.status !== "completed") {
         return fail(
@@ -295,6 +285,10 @@ export const createPaymentOrder = async (req, res) => {
           `Payment allowed only after service completion (current status: ${booking.status})`
         );
       }
+    } else if (itemType === "product" && booking.status !== "active") {
+      return fail(res, 400, `Payment is not available for a ${booking.status} product booking`, {
+        code: "PRODUCT_BOOKING_NOT_PAYABLE",
+      });
     }
 
     let payableAmount;
@@ -1213,12 +1207,9 @@ export const recordAdminOfflinePayment = async (req, res) => {
     }
 
     if (!booking) {
-      booking = await Quotation.findById(bookingId);
-      itemType = "quotation";
-    }
-
-    if (!booking) {
-      return fail(res, 404, "Booking or quotation not found");
+      return fail(res, 404, "Booking not found. Accept the product quotation to create a booking before recording payment.", {
+        code: "PRODUCT_BOOKING_REQUIRED",
+      });
     }
 
     // Service payments follow the pay-at-completion flow. Recording an
@@ -1230,6 +1221,11 @@ export const recordAdminOfflinePayment = async (req, res) => {
         400,
         `Payment allowed only after service completion (current status: ${booking.status})`
       );
+    }
+    if (itemType === "product" && booking.status !== "active") {
+      return fail(res, 400, `Payment is not available for a ${booking.status} product booking`, {
+        code: "PRODUCT_BOOKING_NOT_PAYABLE",
+      });
     }
 
     const existingPayment = await Payment.findOne({ bookingId: booking._id });

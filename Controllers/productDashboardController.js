@@ -1,6 +1,6 @@
 import ProductBooking from "../Schemas/ProductBooking.js";
-import Quotation from "../Schemas/Quotation.js";
 import Product from "../Schemas/Product.js";
+import Quotation from "../Schemas/Quotation.js";
 import Payment from "../Schemas/Payment.js";
 import AuditLog from "../Schemas/AuditLog.js";
 import User from "../Schemas/User.js";
@@ -18,15 +18,11 @@ export const getProductDashboardSummaryController = async (req, res) => {
       productPayments,
       allQuotations,
       productsCount,
-      lowStockCount,
-      outOfStockCount
     ] = await Promise.all([
       ProductBooking.find({}).lean(),
       Payment.find({ itemType: "product", status: "success" }).lean(),
       Quotation.find({}).lean(),
       Product.countDocuments({}),
-      Product.countDocuments({ status: "LOW_STOCK" }),
-      Product.countDocuments({ status: "OUT_OF_STOCK" }),
     ]);
 
     let totalPaidPaise = 0;
@@ -43,7 +39,7 @@ export const getProductDashboardSummaryController = async (req, res) => {
       const isPaid = b.paymentStatus === "paid";
       const isCancelled = b.status === "cancelled";
 
-      if (b.status === "active" || b.status === "processing") activeBookingsCount++;
+      if (b.status === "active") activeBookingsCount++;
       if (b.status === "completed") completedBookingsCount++;
       if (isCancelled) cancelledBookingsCount++;
 
@@ -96,8 +92,8 @@ export const getProductDashboardSummaryController = async (req, res) => {
       completedBookingsCount,
       cancelledBookingsCount,
       totalProductsCount: productsCount,
-      lowStockCount,
-      outOfStockCount,
+      lowStockCount: 0,
+      outOfStockCount: 0,
     };
 
     return res.status(200).json({

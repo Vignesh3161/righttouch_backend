@@ -1,4 +1,4 @@
-import { getCustomerQuotations, getCustomerQuotationById, viewQuotation, getAdminQuotations, getAdminQuotationById, createQuotationDraft, updateQuotationDraft, sendQuotation, resendQuotation, reviseQuotation, updateQuotationPaymentStatus } from "../Services/quotationService.js";
+import { getCustomerQuotations, getCustomerQuotationById, viewQuotation, getAdminQuotations, getAdminQuotationById, createQuotationDraft, updateQuotationDraft, sendQuotation, resendQuotation, reviseQuotation } from "../Services/quotationService.js";
 import { acceptQuotation, rejectQuotation } from "../Services/quotationAcceptanceService.js";
 import Quotation from "../Schemas/Quotation.js";
 
@@ -38,18 +38,19 @@ export const customerViewQuotationController = async (req, res) => {
 
 export const customerAcceptQuotationController = async (req, res) => {
   try {
-    // acceptedItemIds (optional) enables partial acceptance of a multi-product
-    // quotation (architecture §14/§15): customer accepts a subset, rejects the rest.
+    // acceptedItemIds is accepted only for backward compatibility with the
+    // previous multi-item API. New quotations are single-product.
     const { acceptedItemIds } = req.body || {};
     const result = await acceptQuotation({
       quotationId: req.params.id,
       customerId: req.user.userId,
       acceptedItemIds,
     });
-    return ok(res, 200, "Quotation accepted — order(s) created. Proceed to payment.", {
-      bookingIds: result.bookings.map((b) => b._id),
-      paymentGroupId: result.paymentGroupId,
-      totalAmountPaise: result.bookings.reduce((s, b) => s + (b.amountPaise || 0), 0),
+    const booking = result.booking || result.bookings?.[0] || null;
+    return ok(res, 200, "Quotation accepted — order created. Proceed to payment.", {
+      bookingId: booking?._id || null,
+      bookingIds: booking ? [booking._id] : [],
+      totalAmountPaise: booking?.amountPaise || 0,
     });
   } catch (err) {
     return failErr(res, err);
@@ -147,11 +148,7 @@ export const adminDeleteQuotationController = async (req, res) => {
 };
 
 export const adminUpdatePaymentStatusController = async (req, res) => {
-  try {
-    const { paymentStatus } = req.body || {};
-    const quotation = await updateQuotationPaymentStatus({ quotationId: req.params.id, paymentStatus });
-    return ok(res, 200, "Quotation payment status updated", quotation);
-  } catch (err) {
-    return failErr(res, err);
-  }
+  return fail(res, 409, "Quotation payment status is derived from the product booking. Use the product booking manual-payment endpoint instead.", {
+    code: "QUOTATION_PAYMENT_STATUS_DISABLED",
+  });
 };

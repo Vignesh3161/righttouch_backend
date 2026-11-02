@@ -73,11 +73,11 @@ The **RightTouch Backend** powers an electronics and home-appliance services mar
 
 ### Product Catalog & Quotations
 
-- Product catalog, cart, and product booking flows.
-- Customer product quote requests with requirement details.
-- Admin-authored quotations with line-item pricing, delivery, and validity rules.
+- Product catalog with quotation-only ordering (no product cart).
+- Customer product quote requests, one product per request, with requirement details.
+- Admin-authored single-product quotations with pricing, delivery, and validity rules.
 - Quotation state machine with acceptance, rejection, expiry, and delivery tracking.
-- Quotation-to-booking conversion with immutable pricing snapshots.
+- Quotation-to-booking conversion with immutable pricing snapshots and per-booking online/offline payment.
 
 ### Payments, Wallets, Ledger & Payouts
 

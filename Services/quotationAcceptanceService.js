@@ -3,7 +3,7 @@
  *
  * Inside ONE MongoDB transaction:
  *   1. atomically claim the quotation (sent/viewed + not expired) as accepted,
- *   2. create the ProductBooking exactly once (unique quotationId index is the
+ *   2. create exactly one ProductBooking (unique bookingKey index is the
  *      idempotency backstop — a lost-response retry returns the same booking),
  *   3. advance the request to `accepted`,
  *   4. enqueue outbox delivery events.
@@ -74,7 +74,7 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
   if (existingQuote.status === "accepted" || existingQuote.status === "converted") {
     const existingBookings = await ProductBooking.find({ quotationId });
     if (existingBookings.length > 0) {
-      return { bookings: existingBookings, paymentGroupId: existingBookings[0]?.paymentGroupId };
+      return { booking: existingBookings[0], bookings: existingBookings.slice(0, 1), paymentGroupId: null };
     }
   }
   if (existingQuote.status === "expired" || (existingQuote.validUntil && new Date(existingQuote.validUntil) < new Date())) {
@@ -128,68 +128,69 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
         throw new ConflictError("Quotation is unavailable or expired");
       }
 
-      // Multi-product: decide which items are accepted.
-      // Legacy (no items[]) => the whole quotation is one product.
-      const isMulti = Array.isArray(quote.items) && quote.items.length > 0;
-      const acceptedItemIdSet = Array.isArray(acceptedItemIds)
-        ? new Set(acceptedItemIds.map((id) => id.toString()))
-        : null;
+      // New flow: every quote request represents exactly ONE product. Legacy
+      // quotations may omit `items[]`; both shapes produce a single booking.
+      // Multi-product quotations are rejected instead of silently creating
+      // multiple orders that would need group payment.
+      const hasItems = Array.isArray(quote.items) && quote.items.length > 0;
+      if (hasItems && quote.items.length > 1) {
+        const err = new ConflictError("Multi-product quotations are no longer supported. Ask the admin to send a single-product quotation.");
+        err.code = "QUOTATION_SINGLE_PRODUCT_REQUIRED";
+        throw err;
+      }
 
-      const itemsToBook = isMulti
-        ? quote.items.filter((it) => {
-            const keep =
-              acceptedItemIdSet === null || acceptedItemIdSet.has(it._id.toString());
-            // Mark the rejected items on the quotation for audit.
-            if (!keep) it.status = "rejected";
-            else it.status = "accepted";
-            return keep;
-          })
-        : [{ productId: quote.productId, quantity: quote.quantity, financialSnapshot: quote.financialSnapshot, _id: null }];
+      const item = hasItems ? quote.items[0] : null;
+      if (item && Array.isArray(acceptedItemIds) && acceptedItemIds.length > 0) {
+        const accepted = new Set(acceptedItemIds.map((id) => id.toString()));
+        if (!accepted.has(item._id.toString())) {
+          const err = new ConflictError("The quoted product must be accepted.");
+          err.code = "QUOTATION_ITEM_NOT_ACCEPTED";
+          throw err;
+        }
+      }
+      if (item) item.status = "accepted";
 
-      // Idempotent: a prior commit (lost response) already created the orders.
+      // Idempotent: a prior commit (lost response) already created the order.
       const existing = await ProductBooking.find({ quotationId }).session(session);
       if (existing.length > 0) {
-        bookings = existing;
+        bookings = existing.slice(0, 1);
         return;
       }
 
-      const paymentGroupId = new mongoose.Types.ObjectId();
       const address = quote.customerSnapshot?.address;
       const location = buildLocation(address);
       const locationType = location ? "gps" : "saved";
 
       const isPaidOnQuote = quote.paymentStatus === "paid";
-      const docs = itemsToBook.map((item) => {
-        const itemSnap = item.financialSnapshot || quote.financialSnapshot || {};
-        const totalPaise = itemSnap.totalAmountPaise ?? quote.financialSnapshot?.totalAmountPaise ?? 0;
-        const amountRupees = totalPaise > 0 ? totalPaise / 100 : (quote.amount || 0);
-        const finalPaise = totalPaise > 0 ? totalPaise : Math.round(amountRupees * 100);
+      const itemSnap = item?.financialSnapshot || quote.financialSnapshot || {};
+      const totalPaise = itemSnap.totalAmountPaise ?? quote.financialSnapshot?.totalAmountPaise ?? 0;
+      const amountRupees = totalPaise > 0 ? totalPaise / 100 : (quote.amount || 0);
+      const finalPaise = totalPaise > 0 ? totalPaise : Math.round(amountRupees * 100);
 
-        return {
-          quotationId: quote._id,
-          quoteRequestId: quote.quoteRequestId,
-          paymentGroupId,
-          productId: item.productId,
-          customerId: quote.customerId,
-          quantity: item.quantity || 1,
-          amount: amountRupees,
-          amountPaise: finalPaise,
-          financialSnapshot: convertQuotationSnapshot({ financialSnapshot: itemSnap }),
-          addressSnapshot: address,
-          location,
-          locationType,
-          paymentStatus: isPaidOnQuote ? "paid" : "pending",
-          paidAmount: isPaidOnQuote ? amountRupees : 0,
-          paidAmountPaise: isPaidOnQuote ? finalPaise : 0,
-          status: "active",
-        };
-      });
+      const docs = [{
+        quotationId: quote._id,
+        bookingKey: String(quote._id),
+        quoteRequestId: quote.quoteRequestId,
+        productId: item?.productId || quote.productId,
+        customerId: quote.customerId,
+        quantity: item?.quantity || quote.quantity || 1,
+        amount: amountRupees,
+        amountPaise: finalPaise,
+        financialSnapshot: convertQuotationSnapshot({ financialSnapshot: itemSnap }),
+        addressSnapshot: address,
+        location,
+        locationType,
+        paymentStatus: isPaidOnQuote ? "paid" : "pending",
+        paidAmount: isPaidOnQuote ? amountRupees : 0,
+        paidAmountPaise: isPaidOnQuote ? finalPaise : 0,
+        status: "active",
+      }];
 
       const created = await ProductBooking.create(docs, { session });
       bookings = created;
 
-      // Persist per-item accept/reject decisions on the quotation.
-      if (isMulti) await quote.save({ session });
+      // Persist the accepted item decision on the quotation.
+      if (item) await quote.save({ session });
 
       await ProductQuoteRequest.updateOne(
         { _id: quote.quoteRequestId, status: { $in: ["quote_requested", "under_review", "quotation_prepared", "quotation_sent", "viewed"] } },
@@ -203,10 +204,7 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
         requestId: quote.quoteRequestId,
         notificationType: "PRODUCT_QUOTATION_ACCEPTED",
         title: "Quotation accepted",
-        body:
-          `Your quotation ${quote.quotationNumber} was accepted` +
-          (docs.length > 1 ? ` (${docs.length} products).` : ".") +
-          " Proceed to payment to confirm your order.",
+        body: `Your quotation ${quote.quotationNumber} was accepted. Proceed to payment to confirm your order.`,
         session,
       });
     });
@@ -228,12 +226,12 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
     targetId: quotationId,
     after: {
       bookingIds: bookings.map((b) => b._id),
-      paymentGroupId: bookings[0]?.paymentGroupId,
+      bookingKey: bookings[0]?.bookingKey,
       totalPaise: bookings.reduce((s, b) => s + (b.amountPaise || 0), 0),
     },
   });
 
-  return { bookings, paymentGroupId: bookings[0]?.paymentGroupId };
+  return { booking: bookings[0], bookings, paymentGroupId: null };
 };
 
 export const rejectQuotation = async ({ quotationId, customerId, reason }) => {

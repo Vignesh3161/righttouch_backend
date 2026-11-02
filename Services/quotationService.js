@@ -30,6 +30,22 @@ const loadRequest = async (quoteRequestId) => {
   return request;
 };
 
+const assertSingleQuotationProduct = (body = {}, expectedProductId = null) => {
+  if (!Array.isArray(body.items) || body.items.length === 0) return;
+  if (body.items.length > 1) {
+    const err = new Error("A quotation can contain exactly one product. Create separate quote requests for additional products.");
+    err.statusCode = 400;
+    err.code = "QUOTATION_SINGLE_PRODUCT_ONLY";
+    throw err;
+  }
+  if (expectedProductId && body.items[0]?.productId && String(body.items[0].productId) !== String(expectedProductId)) {
+    const err = new Error("Quotation item must match the product in the quote request");
+    err.statusCode = 400;
+    err.code = "QUOTATION_PRODUCT_MISMATCH";
+    throw err;
+  }
+};
+
 const snapshotProduct = async (productId) => {
   const product = await Product.findById(productId).lean();
   if (!product) return {};
@@ -80,6 +96,7 @@ const resolveGstPercent = (source = {}, fallback = 0) => {
 export const createQuotationDraft = async ({ adminId, body = {} }) => {
   const { quoteRequestId } = body;
   const request = await loadRequest(quoteRequestId);
+  assertSingleQuotationProduct(body, request.productId);
   if (!["quote_requested", "under_review", "quotation_prepared"].includes(request.status)) {
     const err = new Error(`Cannot prepare a quotation for a request in '${request.status}' state`);
     err.statusCode = 409;
@@ -228,6 +245,7 @@ export const updateQuotationDraft = async ({ adminId, quotationId, body = {} }) 
     throw err;
   }
 
+  assertSingleQuotationProduct(body, quotation.productId);
   const existingFs = quotation.financialSnapshot || {};
   const topUnitPaise = resolveUnitPaise(body, existingFs.unitPricePaise || 0);
   const topQuantity = body.quantity ?? quotation.quantity;
@@ -446,6 +464,7 @@ export const reviseQuotation = async ({ adminId, quotationId, body = {} }) => {
 
   const existingFs = existing.financialSnapshot || {};
   const topUnitPaise = resolveUnitPaise(body, existingFs.unitPricePaise || 0);
+  assertSingleQuotationProduct(body, existing.productId);
   const topQuantity = body.quantity || existing.quantity || 1;
   const topInstPaise = resolveInstallationPaise(body, existingFs.installationAmountPaise || 0);
   const topAddPaise = resolveAdditionalPaise(body, existingFs.additionalChargesPaise || 0);

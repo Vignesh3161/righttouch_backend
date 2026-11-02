@@ -129,20 +129,21 @@ const ProductBookingSchema = new mongoose.Schema(
       default: "active",
     },
 
-    // 🔒 Quotation linkage — a ProductBooking created from an accepted quotation
-    // carries the quotation reference. A multi-product quotation produces several
-    // ProductBookings that SHARE the same quotationId (and paymentGroupId), so
-    // this index is intentionally NON-unique. Idempotency of quote→order
-    // conversion is enforced in the acceptance service by counting bookings.
+    // Quotation linkage. New quotations are single-product, so one quotation
+    // creates exactly one ProductBooking. `bookingKey` is the idempotency
+    // backstop for quote→order conversion (unique, sparse for legacy rows).
     quotationId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Quotation",
     },
-    // Groups the bookings produced from one (possibly multi-product) quotation
-    // so they can be paid via a single payment order.
+    bookingKey: {
+      type: String,
+      trim: true,
+    },
+    // Retained only for legacy data. Group payments are no longer supported:
+    // every ProductBooking is paid independently.
     paymentGroupId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "PaymentGroup",
     },
     quoteRequestId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -152,9 +153,9 @@ const ProductBookingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// NOTE: quotationId is no longer unique — a multi-product quotation yields
-// multiple ProductBookings sharing the same quotationId. Idempotency is handled
-// in the acceptance service by counting existing bookings for the quotation.
+// New flow: exactly one ProductBooking per quotation. The unique sparse
+// bookingKey guarantees a retried acceptance cannot create a second order.
+ProductBookingSchema.index({ bookingKey: 1 }, { unique: true, sparse: true });
 ProductBookingSchema.index({ quotationId: 1 }, { sparse: true });
 
 // ── Indexes (architecture §51) ──

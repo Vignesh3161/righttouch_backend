@@ -4,6 +4,7 @@ import User from "../Schemas/User.js";
 import Otp from "../Schemas/Otp.js";
 import TempUser from "../Schemas/TempUser.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import { isStandaloneTransactionError } from "../Utils/mongoTransactions.js";
 import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
 import { generateSecureOtp } from "../Utils/otpGenerator.js";
 import { signToken } from "../Utils/token.js";
@@ -51,6 +52,18 @@ const assertPublicSignupRole = (normRole, rawRole) => {
     throw err;
   }
   return normRole;
+};
+
+const mobileAlreadyExistsError = (existingUser, identifier) => {
+  const message =
+    existingUser.role === "Technician"
+      ? "Mobile number already registered as a Technician. Please login with your technician account."
+      : "Mobile number already registered as a Customer. Please login with your Customer account.";
+  const err = new Error(message);
+  err.statusCode = 409;
+  err.code = "MOBILE_ALREADY_EXISTS";
+  err.details = { identifier, existingRole: existingUser.role };
+  return err;
 };
 
 /**
@@ -120,15 +133,7 @@ export const signupAndSendOtpInternal = async ({ identifier, role, termsAndServi
         { $set: { mobileNumber: anonymizedMobile, email: anonymizedEmail } }
       );
     } else {
-      const message =
-        existingUser.role === "Technician"
-          ? "Mobile number already registered as a Technician. Please login with your technician account."
-          : "Mobile number already registered as a Customer. Please login with your Customer account.";
-      const err = new Error(message);
-      err.statusCode = 409;
-      err.code = "MOBILE_ALREADY_EXISTS";
-      err.details = { identifier: normalizedIdentifier, existingRole: existingUser.role };
-      throw err;
+      throw mobileAlreadyExistsError(existingUser, normalizedIdentifier);
     }
   }
 
@@ -241,7 +246,7 @@ export const OTP_TTL_MS = 5 * 60 * 1000;
 // delete+create then serialize, so concurrent resends on any replica collapse
 // to a single SMS. Standalone/dev falls back to sequential ops (documented,
 // not distributed-safe).
-const withOtpTxn = async (fn) => {
+const withOtpTxn = async (fn, label = "OTP operation") => {
   let session = null;
   try {
     session = await mongoose.startSession();
@@ -249,10 +254,21 @@ const withOtpTxn = async (fn) => {
     await session.withTransaction(() => fn(session).then((r) => { result = r; }));
     return result;
   } catch (e) {
-    if (/replica set|Transaction|mongos/.test(String(e?.message || ""))) {
-      return await fn(null);
+    if (!isStandaloneTransactionError(e)) throw e;
+    if (process.env.NODE_ENV === "production") {
+      const err = new Error("Database transactions are required for this operation");
+      err.statusCode = 503;
+      err.code = "DATABASE_TRANSACTION_UNAVAILABLE";
+      throw err;
     }
-    throw e;
+    console.warn(
+      `[authService] standalone topology — retrying ${label} non-transactionally (dev-only fallback)`
+    );
+    if (session) {
+      await session.endSession().catch(() => {});
+      session = null;
+    }
+    return await fn(null);
   } finally {
     if (session) await session.endSession().catch(() => {});
   }
@@ -346,6 +362,108 @@ export const resendOtpInternal = async ({ identifier, mobileNumber }) => {
   };
 };
 
+const completeSignup = async ({ record, finalIdentifier, session }) => {
+  const opts = session ? { session } : {};
+  const tempUser = await TempUser.findOne({
+    identifier: finalIdentifier,
+    role: record.role,
+  }).session(session || undefined);
+  if (!tempUser) {
+    const err = new Error("No signup request found. Please signup first.");
+    err.statusCode = 404;
+    err.code = "TEMPUSER_NOT_FOUND";
+    throw err;
+  }
+
+  let user = await User.findOne({ mobileNumber: finalIdentifier }).session(
+    session || undefined
+  );
+  if (user) {
+    if (user.role !== record.role) {
+      throw mobileAlreadyExistsError(user, finalIdentifier);
+    }
+    if (user.status === "Deleted") {
+      const err = new Error("Account deleted");
+      err.statusCode = 403;
+      err.code = "ACCOUNT_DELETED";
+      throw err;
+    }
+    if (user.status === "Blocked") {
+      const err = new Error("Account blocked");
+      err.statusCode = 403;
+      err.code = "ACCOUNT_BLOCKED";
+      throw err;
+    }
+  } else {
+    try {
+      const created = await User.create(
+        [
+          {
+            role: record.role,
+            mobileNumber: finalIdentifier,
+            status: "Active",
+            termsAndServices: tempUser.termsAndServices || false,
+            privacyPolicy: tempUser.privacyPolicy || false,
+            termsAndServicesAt: tempUser.termsAndServicesAt || null,
+            privacyPolicyAt: tempUser.privacyPolicyAt || null,
+          },
+        ],
+        opts
+      );
+      user = created[0];
+    } catch (err) {
+      if (!session && err?.code === 11000) {
+        user = await User.findOne({ mobileNumber: finalIdentifier });
+        if (!user || user.role !== record.role) {
+          throw user ? mobileAlreadyExistsError(user, finalIdentifier) : err;
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  let technicianProfile = null;
+  if (record.role === "Technician") {
+    try {
+      technicianProfile = await TechnicianProfile.findOneAndUpdate(
+        { userId: user._id },
+        {
+          $setOnInsert: {
+            userId: user._id,
+            location: null,
+            workStatus: "pending",
+            profileComplete: false,
+          },
+        },
+        {
+          upsert: true,
+          new: true,
+          session: session || undefined,
+          setDefaultsOnInsert: true,
+        }
+      );
+    } catch (err) {
+      if (!session && err?.code === 11000) {
+        technicianProfile = await TechnicianProfile.findOne({ userId: user._id });
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  await TempUser.deleteOne(
+    { identifier: finalIdentifier, role: record.role },
+    opts
+  );
+  await Otp.deleteMany(
+    { identifier: finalIdentifier, role: record.role },
+    opts
+  );
+
+  return { user, technicianProfile };
+};
+
 /**
  * Verifies OTP for SIGNUP or LOGIN in a transaction-safe manner.
  */
@@ -408,103 +526,56 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
     throw err;
   }
 
-  await Otp.updateOne({ _id: record._id }, { $set: { verified: true } });
-
   if (record.purpose === "SIGNUP") {
     // C1: OTP completion cannot bypass the public-signup allowlist, even if a
     // stale/forged OTP record carries a privileged role.
     assertPublicSignupRole(record.role, record.role);
-    const tempUser = await TempUser.findOne({ identifier: finalIdentifier, role: record.role });
-    if (!tempUser) {
-      const err = new Error("No signup request found. Please signup first.");
-      err.statusCode = 404;
-      err.code = "TEMPUSER_NOT_FOUND";
-      throw err;
+
+    const { user, technicianProfile } = await withOtpTxn(
+      (session) => completeSignup({ record, finalIdentifier, session }),
+      "signup verification"
+    );
+
+    if (record.role === "Technician") {
+      broadcastAdminUnreadCounts(getIo());
     }
 
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    try {
-      const userDoc = await User.create(
-        [
-          {
-            role: record.role,
-            mobileNumber: finalIdentifier,
-            status: "Active",
-            termsAndServices: tempUser.termsAndServices || false,
-            privacyPolicy: tempUser.privacyPolicy || false,
-            termsAndServicesAt: tempUser.termsAndServicesAt || null,
-            privacyPolicyAt: tempUser.privacyPolicyAt || null,
-          },
-        ],
-        { session }
-      );
-      const user = userDoc[0];
+    // 🔔 Welcome notification (socket + FCM; best-effort)
+    sendWelcomeNotification({
+      userId: user._id,
+      role: record.role,
+      isNewSignup: true,
+      userName: [user.fname, user.lname].filter(Boolean).join(" ").trim(),
+      technicianProfileId: technicianProfile?._id || null,
+    }).catch((e) => console.warn("Welcome notification error:", e.message));
 
-      let technicianProfile = null;
-      if (record.role === "Technician") {
-        technicianProfile = await TechnicianProfile.create(
-          [
-            {
-              userId: user._id,
-              location: null,
-              workStatus: "pending",
-              profileComplete: false,
-            },
-          ],
-          { session }
-        );
-      }
-
-      await TempUser.deleteOne({ identifier: finalIdentifier, role: record.role }, { session });
-      await Otp.deleteMany({ identifier: finalIdentifier, role: record.role }, { session });
-
-      await session.commitTransaction();
-      session.endSession();
-
-      if (record.role === "Technician") {
-        broadcastAdminUnreadCounts(getIo());
-      }
-
-      // 🔔 Welcome notification (socket + FCM; best-effort)
-      sendWelcomeNotification({
-        userId: user._id,
-        role: record.role,
-        isNewSignup: true,
-        userName: [user.fname, user.lname].filter(Boolean).join(" ").trim(),
-        technicianProfileId: technicianProfile?.[0]?._id || null,
-      }).catch((e) => console.warn("Welcome notification error:", e.message));
-
-      const tokenPayload = {
-        userId: user._id,
-        role: record.role,
-        // H4: bind the token to the current revocation generation.
-        tokenVersion: user.tokenVersion ?? 0,
-      };
-      if (technicianProfile && technicianProfile[0]) {
-        tokenPayload.technicianProfileId = technicianProfile[0]._id;
-      }
-      const token = signToken(tokenPayload);
-
-      return {
-        token,
-        user: {
-          _id: user._id,
-          fname: user.fname || "",
-          lname: user.lname || "",
-          mobileNumber: user.mobileNumber,
-          email: user.email || "",
-          role: record.role,
-          profileComplete: false,
-        },
-        technicianProfileId: technicianProfile?.[0]?._id || null,
-      };
-    } catch (err) {
-      await session.abortTransaction();
-      session.endSession();
-      throw err;
+    const tokenPayload = {
+      userId: user._id,
+      role: record.role,
+      // H4: bind the token to the current revocation generation.
+      tokenVersion: user.tokenVersion ?? 0,
+    };
+    if (technicianProfile) {
+      tokenPayload.technicianProfileId = technicianProfile._id;
     }
+    const token = signToken(tokenPayload);
+
+    return {
+      token,
+      user: {
+        _id: user._id,
+        fname: user.fname || "",
+        lname: user.lname || "",
+        mobileNumber: user.mobileNumber,
+        email: user.email || "",
+        role: record.role,
+        profileComplete: false,
+      },
+      technicianProfileId: technicianProfile?._id || null,
+    };
   } else if (record.purpose === "LOGIN") {
+    await Otp.updateOne({ _id: record._id }, { $set: { verified: true } });
+
     if (["Owner", "Admin"].includes(record.role)) {
       const err = new Error("Owner/Admin accounts use phone number and password login only");
       err.statusCode = 403;
