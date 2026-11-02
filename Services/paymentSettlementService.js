@@ -1,7 +1,6 @@
 import ProductBooking from "../Schemas/ProductBooking.js";
 import Quotation from "../Schemas/Quotation.js";
 import Payment from "../Schemas/Payment.js";
-import Product from "../Schemas/Product.js";
 import PlatformLedgerEntry from "../Schemas/PlatformLedgerEntry.js";
 import Receipt from "../Schemas/Receipt.js";
 import AuditLog from "../Schemas/AuditLog.js";
@@ -32,13 +31,14 @@ export const settleProductPayment = async ({
     quotation = await Quotation.findById(booking.quotationId);
   }
 
-  if (!booking && !quotation) {
-    const err = new Error("Product booking or quotation not found");
+  if (!booking) {
+    const err = new Error("Product booking not found. Accept the quotation before recording payment.");
     err.statusCode = 404;
+    err.code = "PRODUCT_BOOKING_REQUIRED";
     throw err;
   }
 
-  if (booking && booking.paymentStatus === "paid") {
+  if (booking.paymentStatus === "paid") {
     if (quotation && quotation.paymentStatus !== "paid") {
       quotation.paymentStatus = "paid";
       await quotation.save().catch(() => {});
@@ -108,35 +108,11 @@ export const settleProductPayment = async ({
   booking.paymentProviderPaymentId = refId;
   booking.paidAmountPaise = targetPaise;
   booking.paidAmount = targetPaise / 100;
-  if (booking.status === "active" || booking.status === "pending") {
-    booking.status = "processing";
-  }
   await booking.save();
 
   if (quotation) {
     quotation.paymentStatus = "paid";
     await quotation.save().catch(() => {});
-  }
-
-  // Stock updates: transition reserved quantity to sold quantity
-  if (booking.productId) {
-    try {
-      const prod = await Product.findById(booking.productId);
-      if (prod) {
-        const qty = booking.quantity || 1;
-        prod.reservedQuantity = Math.max(0, (prod.reservedQuantity || 0) - qty);
-        prod.soldQuantity = (prod.soldQuantity || 0) + qty;
-        const available = Math.max(0, (prod.stockQuantity || 0) - prod.reservedQuantity);
-        if (available <= 0) {
-          prod.status = "OUT_OF_STOCK";
-        } else if (available <= (prod.lowStockThreshold || 5)) {
-          prod.status = "LOW_STOCK";
-        }
-        await prod.save();
-      }
-    } catch (e) {
-      console.error("Stock settlement sync non-fatal error:", e);
-    }
   }
 
   // Ledger entry & Receipt creation (schema-valid, idempotent, no silent swallow)

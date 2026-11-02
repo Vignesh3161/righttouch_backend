@@ -1,5 +1,13 @@
 import mongoose from "mongoose";
 
+export const isStandaloneTransactionError = (err) => {
+  const msg = String(err?.message || "");
+  return (
+    msg.includes("replica set member") ||
+    (msg.includes("mongos") && msg.includes("Transaction numbers"))
+  );
+};
+
 /**
  * 🗄 MONGODB TRANSACTION READINESS (Stage 6)
  *

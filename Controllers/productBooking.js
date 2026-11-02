@@ -186,14 +186,12 @@ export const productBookingUpdate = async (req, res) => {
     }
 
     if (quantity !== undefined) {
-      if (booking.paymentStatus === "paid") {
-        return res.status(409).json({
-          success: false,
-          message: "Cannot modify a booking that is already paid",
-          result: {},
-        });
-      }
-      update.quantity = quantity;
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_BOOKING_QUANTITY_LOCKED",
+        message: "Quantity is locked to the accepted quotation. Create a new quote request to change quantity.",
+        result: {},
+      });
     }
 
     if (Object.keys(update).length === 0) {
@@ -261,10 +259,19 @@ export const productBookingCancel = async (req, res) => {
       });
     }
 
-    if (["ready_for_delivery", "out_for_delivery", "completed"].includes(booking.status)) {
+    if (booking.status !== "active") {
       return res.status(409).json({
         success: false,
         message: `Order cannot be cancelled in '${booking.status}' status. Please contact customer support.`,
+        result: {}
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(409).json({
+        success: false,
+        code: "PAID_PRODUCT_CANCELLATION_REQUIRES_ADMIN",
+        message: "This order is already paid. Please contact support to cancel and process a refund.",
         result: {}
       });
     }
@@ -282,6 +289,59 @@ export const productBookingCancel = async (req, res) => {
       success: false,
       message: "Server error",
       result: { error: error.message }
+    });
+  }
+};
+
+/* ===============================
+   ADMIN / OWNER — CANCEL PRODUCT BOOKING
+   Unpaid active bookings can be cancelled directly. Paid bookings must go
+   through the refund pipeline before cancellation.
+   =============================== */
+export const adminCancelProductBooking = async (req, res) => {
+  try {
+    ensureAdminOrOwner(req);
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID format", result: {} });
+    }
+
+    const booking = await ProductBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
+    }
+    if (booking.status === "cancelled") {
+      return res.status(200).json({ success: true, message: "Product booking is already cancelled", result: booking });
+    }
+    if (booking.status === "completed") {
+      return res.status(409).json({
+        success: false,
+        code: "COMPLETED_PRODUCT_CANNOT_BE_CANCELLED",
+        message: "Completed product bookings cannot be cancelled",
+        result: {},
+      });
+    }
+    if (booking.paymentStatus === "paid") {
+      return res.status(409).json({
+        success: false,
+        code: "REFUND_REQUIRED_BEFORE_CANCELLATION",
+        message: "Process the product payment refund before cancelling this booking",
+        result: { paymentId: booking.paymentId || null },
+      });
+    }
+
+    booking.status = "cancelled";
+    await booking.save();
+    return res.status(200).json({
+      success: true,
+      message: "Product booking cancelled",
+      result: booking,
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      success: false,
+      message: "Server error",
+      result: { error: error.message },
     });
   }
 };
@@ -320,6 +380,20 @@ export const adminCompleteProductBooking = async (req, res) => {
         success: true,
         message: "Product booking is already completed",
         result: booking,
+      });
+    }
+
+    const totalPaise = Number(
+      booking.amountPaise ||
+      booking.financialSnapshot?.totalAmountPaise ||
+      (booking.amount ? Math.round(booking.amount * 100) : 0)
+    );
+    if (booking.paymentStatus !== "paid" && totalPaise > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_PAYMENT_REQUIRED",
+        message: "Product booking can only be completed after payment is recorded",
+        result: { paymentStatus: booking.paymentStatus, amountPaise: totalPaise },
       });
     }
 

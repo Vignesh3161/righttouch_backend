@@ -640,8 +640,8 @@ export const deleteProduct = async (req, res) => {
       });
     }
 
-    const activeBooking = await ProductBooking.findOne({ productId: id, status: { $ne: "cancelled" } });
-    if (activeBooking && req.query.force !== "true" && req.body?.force !== true) {
+    const activeBooking = await ProductBooking.findOne({ productId: id });
+    if (activeBooking) {
       const archived = await Product.findByIdAndUpdate(id, { isActive: false }, { new: true });
       if (!archived) {
         return res.status(404).json({

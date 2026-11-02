@@ -16,9 +16,8 @@ export const SERVICE_BOOKING_STATUS = {
 // Product Booking Status
 export const PRODUCT_BOOKING_STATUS = {
   ACTIVE: "active",
-  DELIVERED: "delivered",
+  COMPLETED: "completed",
   CANCELLED: "cancelled",
-  RETURNED: "returned",
 };
 
 

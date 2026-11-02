@@ -81,6 +81,12 @@ export const createQuoteRequest = async ({ customerId, body = {} }) => {
     preferredContactMethod,
   } = body;
 
+  if (Array.isArray(body.items) && body.items.length > 1) {
+    const err = new Error("A quote request can contain exactly one product. Please submit separate requests for additional products.");
+    err.statusCode = 400;
+    err.code = "QUOTE_REQUEST_SINGLE_PRODUCT_ONLY";
+    throw err;
+  }
   if (!productId || !mongoose.Types.ObjectId.isValid(productId)) {
     const err = new Error("Valid productId is required");
     err.statusCode = 400;

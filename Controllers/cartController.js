@@ -1,27 +1,16 @@
 import Cart from "../Schemas/Cart.js";
-import Product from "../Schemas/Product.js";
 import Service from "../Schemas/Service.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
-import ProductBooking from "../Schemas/ProductBooking.js";
 import Address from "../Schemas/Address.js";
 import User from "../Schemas/User.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
-import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
-import { generateRequestNumber } from "../Utils/quotationNumber.js";
-import { writeAuditLog } from "../Utils/audit.js";
 import mongoose from "mongoose";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { ensureCustomer } from "../Utils/ensureCustomer.js";
 import { resolveDistrictAndZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
-import {
-    SERVICE_BOOKING_STATUS,
-    PRODUCT_BOOKING_STATUS,
-    PAYMENT_STATUS,
-} from "../Utils/constants.js";
-import { resolveCommissionSnapshot } from "../Utils/commission.js";
 import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import {
   resolveScheduleInput,
@@ -98,10 +87,19 @@ export const addToCart = async (req, res) => {
             });
         }
 
-        if (!["product", "service"].includes(itemType)) {
+        if (itemType === "product") {
             return res.status(400).json({
                 success: false,
-                message: "Invalid item type. Must be 'product' or 'service'",
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only. Request a product quote instead of adding it to the cart.",
+                result: {},
+            });
+        }
+
+        if (itemType !== "service") {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid item type. Cart supports services only.",
                 result: {},
             });
         }
@@ -126,7 +124,7 @@ export const addToCart = async (req, res) => {
             }
         ).populate({
             path: "itemId",
-            model: itemType === "product" ? "Product" : "Service"
+            model: "Service",
         });
 
         if (!cartItem) {
@@ -167,8 +165,8 @@ export const getMyCart = async (req, res) => {
         ensureCustomer(req);
         const customerId = req.user.userId;
 
-        // 🚀 SCALABILITY: Lean query for performance
-        const cartItems = await Cart.find({ customerId }).lean();
+        // Product carts are disabled: the cart is service-only.
+        const cartItems = await Cart.find({ customerId, itemType: "service" }).lean();
         if (!cartItems.length) {
             return res.status(200).json({
                 success: true,
@@ -177,31 +175,14 @@ export const getMyCart = async (req, res) => {
             });
         }
 
-        // 🚀 BULK POPULATION: Group by type to minimize DB hits (3 queries total)
-        const productIds = [];
-        const serviceIds = [];
-        cartItems.forEach(item => {
-            if (item.itemType === "product") productIds.push(item.itemId);
-            else if (item.itemType === "service") serviceIds.push(item.itemId);
-        });
+        const serviceIds = cartItems.map((item) => item.itemId);
+        const services = await Service.find({ _id: { $in: serviceIds } }).lean();
+        const itemMap = Object.fromEntries(services.map((service) => [service._id.toString(), service]));
 
-        const [products, services] = await Promise.all([
-            Product.find({ _id: { $in: productIds } }).lean(),
-            Service.find({ _id: { $in: serviceIds } }).lean()
-        ]);
-
-        const itemMap = {
-            product: Object.fromEntries(products.map(p => [p._id.toString(), p])),
-            service: Object.fromEntries(services.map(s => [s._id.toString(), s]))
-        };
-
-        const result = cartItems.map((cartItem) => {
-            const item = itemMap[cartItem.itemType][cartItem.itemId.toString()];
-            return {
-                ...cartItem,
-                item: item || null,
-            };
-        });
+        const result = cartItems.map((cartItem) => ({
+            ...cartItem,
+            item: itemMap[cartItem.itemId.toString()] || null,
+        }));
 
         res.status(200).json({
             success: true,
@@ -230,6 +211,15 @@ export const updateCartItem = async (req, res) => {
             return res.status(400).json({ success: false, message: "Missing required fields" });
         }
 
+        if (itemType === "product" && quantity > 0) {
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only and cannot be updated in the cart.",
+                result: {},
+            });
+        }
+
         if (quantity <= 0) {
             await Cart.findOneAndDelete({ customerId, itemType, itemId });
             return res.status(200).json({ success: true, message: "Item removed", result: { deleted: true, itemId } });
@@ -242,7 +232,7 @@ export const updateCartItem = async (req, res) => {
             { new: true, runValidators: true }
         ).populate({
             path: "itemId",
-            model: itemType === "product" ? "Product" : "Service"
+            model: "Service",
         }).lean();
 
         if (!cartItem) {
@@ -282,9 +272,17 @@ export const getCartById = async (req, res) => {
             });
         }
 
+        if (cartItem.itemType === "product") {
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only and are not available in the cart.",
+                result: {},
+            });
+        }
+
         // Populate the item (uses populate; keeps response shape the same)
-        const model = cartItem.itemType === "product" ? "Product" : "Service";
-        await cartItem.populate({ path: "itemId", model });
+        await cartItem.populate({ path: "itemId", model: "Service" });
 
         const obj = cartItem.toObject();
         const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
@@ -338,9 +336,17 @@ export const getCartByIdUnrestricted = async (req, res) => {
             });
         }
 
+        if (cartItem.itemType === "product") {
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only and are not available in the cart.",
+                result: {},
+            });
+        }
+
         // Populate the item (uses populate; keeps response shape the same)
-        const model = cartItem.itemType === "product" ? "Product" : "Service";
-        await cartItem.populate({ path: "itemId", model });
+        await cartItem.populate({ path: "itemId", model: "Service" });
 
         const obj = cartItem.toObject();
         const isPopulated = obj.itemId && typeof obj.itemId === "object" && obj.itemId._id;
@@ -407,23 +413,29 @@ export const updateCartById = async (req, res) => {
             });
         }
 
+        const existing = await Cart.findOne({ _id: id, customerId }).select("itemType").lean();
+        if (!existing) {
+            return res.status(404).json({ success: false, message: "Cart item not found" });
+        }
+        if (existing.itemType === "product") {
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only and cannot be updated in the cart.",
+                result: {},
+            });
+        }
+
         // 🚀 SCALABILITY: Populate and return lean object for speed
         const cartItem = await Cart.findOneAndUpdate(
             { _id: id, customerId },
             { quantity },
             { new: true, runValidators: true }
-        ).populate({
-            path: "itemId",
-            model: "will_be_resolved_by_refPath_if_configured_but_here_we_manual"
-        });
+        ).populate({ path: "itemId", model: "Service" });
 
         if (!cartItem) {
             return res.status(404).json({ success: false, message: "Cart item not found" });
         }
-
-        // Manual populate if needed, but safer to use the type
-        const model = cartItem.itemType === "product" ? "Product" : "Service";
-        await cartItem.populate({ path: "itemId", model });
 
         const obj = cartItem.toObject();
         res.status(200).json({
@@ -564,6 +576,15 @@ export const setCartItemSchedule = async (req, res) => {
             });
         }
 
+        if (itemType === "product") {
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only and cannot be scheduled in the cart.",
+                result: {},
+            });
+        }
+
         const effectiveDate = scheduledDate || bookingDate;
         const rawTime = scheduledTime || timeSlot;
         const parsedTime = parseTimeString(rawTime);
@@ -624,7 +645,7 @@ export const setCartItemSchedule = async (req, res) => {
             { new: true, runValidators: true }
         ).populate({
             path: "itemId",
-            model: itemType === "product" ? "Product" : "Service"
+            model: "Service",
         }).lean();
 
         if (!cartItem) {
@@ -750,6 +771,20 @@ export const checkout = async (req, res) => {
         }
         // Check for required user fields - REMOVED to allow ad-hoc checkout with provided name/phone
         // Logical validation happens later with derivedName/derivedPhone
+
+        const productCartItem = await Cart.findOne({ customerId, itemType: "product" })
+            .select("_id itemId")
+            .session(session)
+            .lean();
+        if (productCartItem) {
+            await session.abortTransaction();
+            return res.status(400).json({
+                success: false,
+                code: "PRODUCT_CART_DISABLED",
+                message: "Products are quotation-only. Remove product items from your cart and request a quote instead.",
+                result: { cartItemId: productCartItem._id, itemId: productCartItem.itemId },
+            });
+        }
 
         const addressId = normalizeAddressId(req.body?.addressId);
         const scheduledAt = req.body?.scheduledAt;
@@ -923,8 +958,8 @@ export const checkout = async (req, res) => {
             }
         }
 
-        // Get all cart items for the user
-        const cartItems = await Cart.find({ customerId }).session(session);
+        // Get all service cart items for the user (product carts are disabled)
+        const cartItems = await Cart.find({ customerId, itemType: "service" }).session(session);
 
         if (cartItems.length === 0) {
             await session.abortTransaction();
@@ -937,7 +972,6 @@ export const checkout = async (req, res) => {
 
         // 🔒 VALIDATE: Remove deleted/inactive items and check for price changes/invalid schedules
         const validServiceItems = [];
-        const validProductItems = [];
         const removedItems = [];
         const invalidSchedules = [];
 
@@ -964,14 +998,6 @@ export const checkout = async (req, res) => {
                     }
                     validServiceItems.push(cartItem);
                 }
-            } else if (cartItem.itemType === "product") {
-                const product = await Product.findById(cartItem.itemId).session(session);
-                if (!product || !product.isActive) {
-                    await Cart.findOneAndDelete({ _id: cartItem._id, customerId }).session(session);
-                    removedItems.push({ id: cartItem.itemId, type: "product", reason: "not found or inactive" });
-                } else {
-                    validProductItems.push(cartItem);
-                }
             }
         }
 
@@ -987,7 +1013,7 @@ export const checkout = async (req, res) => {
             });
         }
 
-        if (validServiceItems.length === 0 && validProductItems.length === 0) {
+        if (validServiceItems.length === 0) {
             await session.abortTransaction();
             return res.status(400).json({
                 success: false,
@@ -1009,8 +1035,6 @@ export const checkout = async (req, res) => {
                 longitude: addressSnapshot.longitude,
             },
             serviceBookings: [],
-            productBookings: [],
-            productQuoteRequests: [],
             totalAmount: 0,
             totalAmountPaise: 0,
         };
@@ -1112,80 +1136,6 @@ export const checkout = async (req, res) => {
             bookingResults.totalAmountPaise += toPaise(doc.financialSnapshot?.totalAmountPaise);
         }
 
-        // Create ProductQuoteRequest instead of ProductBooking for product items
-        if (validProductItems.length > 0) {
-            const firstCartItem = validProductItems[0];
-            const primaryProduct = await Product.findById(firstCartItem.itemId).session(session);
-            const userProfile = await User.findById(customerId).select("fname lname mobileNumber email").session(session);
-
-            const requestNumber = await generateRequestNumber();
-            const quoteItems = validProductItems.map(item => ({
-                productId: item.itemId,
-                quantity: item.quantity || 1
-            }));
-
-            const totalProductQty = validProductItems.reduce((acc, item) => acc + (item.quantity || 1), 0);
-
-            const reqDesc = [
-                req.body?.requirementDescription,
-                req.body?.requirements,
-                req.body?.productRequirements,
-                req.body?.capacity ? `Capacity: ${req.body.capacity}` : null,
-                req.body?.usage ? `Usage: ${req.body.usage}` : null,
-            ].filter(Boolean).join(" | ");
-
-            const quoteReqDoc = {
-                requestNumber,
-                customerId,
-                productId: firstCartItem.itemId,
-                items: quoteItems,
-                customerSnapshot: {
-                    name: addressSnapshot.name || [userProfile?.fname, userProfile?.lname].filter(Boolean).join(" ").trim(),
-                    phone: addressSnapshot.phone || userProfile?.mobileNumber,
-                    email: userProfile?.email || undefined,
-                },
-                productSnapshot: {
-                    productName: primaryProduct?.productName || "Requested Product",
-                    productType: primaryProduct?.productType || "Appliance",
-                    imageUrl: primaryProduct?.productImages?.[0] || null,
-                },
-                quantity: totalProductQty,
-                locationType: resolvedLocation.locationType || "saved",
-                addressSnapshot: addressSnapshot,
-                requirementDescription: reqDesc ? reqDesc.slice(0, 5000) : undefined,
-                additionalNotes: req.body?.additionalNotes ? String(req.body.additionalNotes).slice(0, 2000) : undefined,
-                preferredContactMethod: req.body?.preferredContactMethod || "whatsapp",
-                status: "quote_requested",
-            };
-
-            if (resolvedLocation.longitude !== null && resolvedLocation.latitude !== null) {
-                quoteReqDoc.location = {
-                    type: "Point",
-                    coordinates: [resolvedLocation.longitude, resolvedLocation.latitude],
-                };
-            }
-
-            const createdQuoteReqs = await ProductQuoteRequest.create([quoteReqDoc], { session });
-            const quoteRequest = createdQuoteReqs[0];
-
-            bookingResults.productQuoteRequests.push({
-                requestId: quoteRequest._id,
-                requestNumber: quoteRequest.requestNumber,
-                status: quoteRequest.status,
-                itemsCount: validProductItems.length,
-            });
-            bookingResults.productQuoteRequest = quoteRequest;
-
-            await writeAuditLog({
-                actor: customerId,
-                actorRole: "customer",
-                action: "QUOTE_REQUEST_CREATED_VIA_CHECKOUT",
-                targetType: "ProductQuoteRequest",
-                targetId: quoteRequest._id,
-                after: { requestNumber, itemsCount: validProductItems.length, status: "quote_requested" },
-            });
-        }
-
         // Clear the cart only after all items are processed successfully
         await Cart.deleteMany({ customerId }).session(session);
 
@@ -1200,18 +1150,9 @@ export const checkout = async (req, res) => {
             })();
         }
 
-        let responseMessage = "Order placed successfully";
-        if (validServiceItems.length > 0 && validProductItems.length > 0) {
-            responseMessage = "Service booking confirmed and product quotation request submitted successfully";
-        } else if (validProductItems.length > 0) {
-            responseMessage = "Product quotation request submitted successfully. Admin will review and send your quotation.";
-        } else if (validServiceItems.length > 0) {
-            responseMessage = "Service booking confirmed successfully";
-        }
+        const responseMessage = "Service booking confirmed successfully";
 
-        const firstId =
-            bookingResults.serviceBookings?.[0]?.bookingId ||
-            bookingResults.productQuoteRequests?.[0]?.requestId;
+        const firstId = bookingResults.serviceBookings?.[0]?.bookingId;
 
         bookingResults.totalAmount = bookingResults.totalAmountPaise / 100;
 
@@ -1222,7 +1163,6 @@ export const checkout = async (req, res) => {
                 ...bookingResults,
                 _id: firstId,
                 bookingId: firstId,
-                requestId: bookingResults.productQuoteRequests?.[0]?.requestId,
             },
         });
     } catch (error) {

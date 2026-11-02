@@ -9,6 +9,8 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
+    "backfill:product-booking-keys": "node scripts/backfillProductBookingKeys.js",
+    "migrate:product-carts": "node scripts/migrateProductCartToQuoteRequests.js",
     "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },
   "repository": {
