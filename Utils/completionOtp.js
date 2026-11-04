@@ -33,6 +33,7 @@ export const OTP_ERRORS = {
   CONSUMED: "CONSUMED",
   SUPERSEDED: "SUPERSEDED",
   NOT_FOUND: "NOT_FOUND",
+  PAYMENT_REQUIRED: "PAYMENT_REQUIRED",
   ATTEMPTS_EXCEEDED: "ATTEMPTS_EXCEEDED",
   RESEND_EXCEEDED: "RESEND_EXCEEDED",
   RATE_LIMITED: "RATE_LIMITED",
@@ -151,6 +152,36 @@ export const registerCompletionResend = async (
         lastSentAt: new Date(),
       },
       $inc: { resendCount: 1 },
+    },
+    { new: true, ...opts }
+  );
+};
+
+/**
+ * Prepare an active challenge for its first/redelivered SMS without spending
+ * a resend. Used after payment succeeds — the OTP is generated at delivery
+ * time, never before the customer has paid.
+ */
+export const prepareCompletionChallengeDelivery = async (
+  challengeId,
+  { expectedGeneration, otpHash, expiresAt, session = null } = {}
+) => {
+  const opts = session ? { session } : {};
+  return ServiceCompletionChallenge.findOneAndUpdate(
+    {
+      _id: challengeId,
+      status: { $in: ["pending_delivery", "pending"] },
+      generation: expectedGeneration,
+    },
+    {
+      $set: {
+        otpHash,
+        generation: expectedGeneration + 1,
+        expiresAt,
+        status: "pending_delivery",
+        lastAttemptAt: new Date(),
+        lastSentAt: new Date(),
+      },
     },
     { new: true, ...opts }
   );

@@ -52,6 +52,28 @@ const technicianProfileSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Stable home/base location used as the travel origin for scheduled
+    // feasibility checks. Unlike `location` (live GPS), this does not go
+    // stale when the technician is offline. `location` remains the runtime
+    // fallback when this is absent.
+    serviceBaseLocation: {
+      type: geoPointSchema,
+      default: null,
+    },
+    serviceBaseLocationSource: {
+      type: String,
+      enum: ["registration", "admin", "self", "last_known", "backfill", null],
+      default: null,
+    },
+    serviceBaseLocationUpdatedAt: {
+      type: Date,
+      default: null,
+    },
+    serviceBaseLocationVerified: {
+      type: Boolean,
+      default: false,
+    },
+
     /* ==========================
        🛠 WORK DETAILS
     ========================== */
@@ -133,6 +155,11 @@ const technicianProfileSchema = new mongoose.Schema(
       default: "pending",
     },
 
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+
     availability: {
       isOnline: {
         type: Boolean,
@@ -146,6 +173,16 @@ const technicianProfileSchema = new mongoose.Schema(
         type: Date,
         default: null,
       },
+    },
+
+    // Scheduled-offer delivery preferences. Instant dispatch continues to
+    // require online presence; scheduled offers may be pushed while offline.
+    notificationPreferences: {
+      scheduledOffersEnabled: { type: Boolean, default: true },
+      quietHoursStart: { type: Number, default: 22, min: 0, max: 23 },
+      quietHoursEnd: { type: Number, default: 8, min: 0, max: 23 },
+      maxActiveScheduledOffers: { type: Number, default: 5, min: 1, max: 50 },
+      maxScheduledJobsPerDay: { type: Number, default: 8, min: 1, max: 50 },
     },
 
     // 📱 FCM push tokens (multi-device). Registered on app login/foreground;

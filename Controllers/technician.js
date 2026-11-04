@@ -20,6 +20,8 @@ import CityZone from "../Schemas/CityZone.js";
 import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 import { maskAccount } from "../Utils/kycPrivacy.js";
+import { writeAuditLog } from "../Utils/audit.js";
+import { getAllowedDistrictIds, getAllowedZoneIds } from "../Services/technicianEligibilityService.js";
 
 const getTechnicianPermissionZoneIds = (technician) =>
   [...new Set((technician?.enabledCityZoneIds || []).map((z) => String(z._id || z)).filter(Boolean))];
@@ -92,6 +94,7 @@ import OperationalCity from "../Schemas/OperationalCity.js";
 import { containsRegex } from "../Utils/safeQuery.js";
 import TechnicianDistrictPermission from "../Schemas/TechnicianDistrictPermission.js";
 import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
+import { assertTechnicianActivationPrerequisites } from "../Services/technicianApprovalService.js";
 
 // ================= UPDATE TECHNICIAN LIVE LOCATION ================= //sk
 export const updateTechnicianLocation = async (req, res) => {
@@ -246,8 +249,9 @@ const enrichTechnicianWithActivationStatus = async (technicianDoc, opts = {}) =>
       techObj.bankDetails = sanitizeBankDetails(techObj.bankDetails, { full: includeFullBank });
     }
 
-    // Active = KYC + Training approved (Bank verification is for payouts)
-    techObj.isActiveTechnician = isKycApproved && isTrainingCompleted;
+    // Active = KYC + Training + final workStatus approved (Bank verification is for payouts)
+    techObj.isActiveTechnician =
+      isKycApproved && isTrainingCompleted && techObj.workStatus === "approved";
 
     return techObj;
   } catch (error) {
@@ -1645,11 +1649,8 @@ export const updateTechnician = async (req, res) => {
       if (skills !== undefined) technician.skills = skills;
 
       // 2. Handle Online Status & Verification Logic
-      // If trainingCompleted is being updated to false, force offline
-      if (userData?.trainingCompleted === false || req.body.trainingCompleted === false) {
-        technician.availability.isOnline = false;
-      }
-
+      // Training/work approval is Admin/Owner-only; self-update payloads that
+      // include these fields are ignored rather than applied.
       if (availability?.isOnline !== undefined) {
         if (availability.isOnline) {
           const pendingRequirements = [];
@@ -1866,8 +1867,9 @@ export const updateTechnicianStatus = async (req, res) => {
 
     if (trainingCompleted !== undefined) {
       technician.trainingCompleted = Boolean(trainingCompleted);
-      if (trainingCompleted === true) {
-        technician.workStatus = "trained";
+      if (trainingCompleted === false) {
+        technician.availability = technician.availability || {};
+        technician.availability.isOnline = false;
       }
     }
 
@@ -1880,28 +1882,34 @@ export const updateTechnicianStatus = async (req, res) => {
         });
       }
 
-      technician.workStatus = workStatus;
+      if (workStatus === "approved") {
+        try {
+          await assertTechnicianActivationPrerequisites(technician._id, { trainingCompleted });
+          await ensureApprovedDistrictZones({
+            technicianId: technician._id,
+            adminUserId: req.user?.userId,
+            reason: "Technician workStatus approved",
+          });
+        } catch (approvalErr) {
+          return res.status(approvalErr.statusCode || 400).json({
+            success: false,
+            message: approvalErr.message,
+            code: approvalErr.code || "TECHNICIAN_APPROVAL_FAILED",
+            result: {},
+          });
+        }
 
-      if (workStatus === "suspended") {
-        technician.availability.isOnline = false;
+        technician.workStatus = "approved";
+        technician.approvedAt = new Date();
+      } else {
+        technician.workStatus = workStatus;
+        if (workStatus === "suspended") {
+          technician.availability = technician.availability || {};
+          technician.availability.isOnline = false;
+        }
       }
-    }
-
-    if (workStatus === "approved") {
-      try {
-        await ensureApprovedDistrictZones({
-          technicianId: technician._id,
-          adminUserId: req.user?.userId,
-          reason: "Technician workStatus approved",
-        });
-      } catch (districtErr) {
-        return res.status(districtErr.statusCode || 400).json({
-          success: false,
-          message: districtErr.message,
-          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
-          result: {},
-        });
-      }
+    } else if (trainingCompleted === true && technician.workStatus === "pending") {
+      technician.workStatus = "trained";
     }
 
     await technician.save();
@@ -2049,11 +2057,11 @@ export const updateTechnicianTraining = async (req, res) => {
     const { technicianId } = req.params;
     const { trainingCompleted } = req.body;
 
-    // 🛡️ Owner access only
-    if (req.user?.role !== "Owner") {
+    // 🛡️ Admin/Owner access only — technicians can never self-approve training.
+    if (!["Admin", "Owner"].includes(req.user?.role)) {
       return res.status(403).json({
         success: false,
-        message: "Owner access only",
+        message: "Admin or Owner access only",
         result: {},
       });
     }
@@ -2086,6 +2094,13 @@ export const updateTechnicianTraining = async (req, res) => {
 
     // Update training status
     technician.trainingCompleted = trainingCompleted;
+
+    if (trainingCompleted && technician.workStatus === "pending") {
+      technician.workStatus = "trained";
+    }
+    if (!trainingCompleted && technician.workStatus === "trained") {
+      technician.workStatus = "pending";
+    }
 
     // If training is being set to false, force offline
     if (!trainingCompleted && technician.availability?.isOnline) {
@@ -2177,5 +2192,264 @@ export const uploadProfileImage = async (req, res) => {
       message: "Server error",
       result: { error: error.message },
     });
+  }
+};
+
+/* =====================================================
+   SERVICE BASE LOCATION (SCHEDULED TRAVEL ORIGIN)
+   ===================================================== */
+
+const normalizeBaseLocationInput = (body = {}) => {
+  const rawLatitude = body.latitude ?? body.lat;
+  const rawLongitude = body.longitude ?? body.lng ?? body.lon;
+  const isBlank = (value) =>
+    value === undefined ||
+    value === null ||
+    (typeof value === "string" && value.trim() === "");
+  if (isBlank(rawLatitude) || isBlank(rawLongitude)) {
+    return { error: "latitude and longitude are required" };
+  }
+  const latitude = Number(rawLatitude);
+  const longitude = Number(rawLongitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return { error: "latitude and longitude are required" };
+  }
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    return { error: "Coordinates out of range" };
+  }
+  return { latitude, longitude };
+};
+
+const describeBaseLocation = (technician) => ({
+  serviceBaseLocation: technician.serviceBaseLocation || null,
+  serviceBaseLocationSource: technician.serviceBaseLocationSource || null,
+  serviceBaseLocationUpdatedAt: technician.serviceBaseLocationUpdatedAt || null,
+  serviceBaseLocationVerified: technician.serviceBaseLocationVerified === true,
+  fallbackLocation: technician.location || null,
+});
+
+export const getTechnicianServiceBaseLocation = async (req, res) => {
+  try {
+    const technicianId = req.params.technicianId || req.user?.technicianProfileId;
+    if (!mongoose.Types.ObjectId.isValid(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technician id", result: {} });
+    }
+    const technician = await TechnicianProfile.findById(technicianId)
+      .select("serviceBaseLocation serviceBaseLocationSource serviceBaseLocationUpdatedAt serviceBaseLocationVerified location enabledDistrictIds allowedCityIds enabledCityZoneIds")
+      .lean();
+    if (!technician) {
+      return res.status(404).json({ success: false, message: "Technician not found", result: {} });
+    }
+    return res.status(200).json({
+      success: true,
+      message: "Service base location",
+      result: {
+        ...describeBaseLocation(technician),
+        allowedDistrictIds: getAllowedDistrictIds(technician),
+        allowedZoneIds: getAllowedZoneIds(technician),
+      },
+    });
+  } catch (error) {
+    console.error("getTechnicianServiceBaseLocation Error:", error);
+    return res.status(500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+const applyServiceBaseLocation = async ({ technician, latitude, longitude, source, verified, actor, actorRole, reason, force }) => {
+  const { district, zone, error } = await resolveDistrictAndZoneFromCoordinates(latitude, longitude);
+  if (error || !district) {
+    const err = new Error(error || "Unable to resolve district for these coordinates");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const allowedDistricts = getAllowedDistrictIds(technician);
+  const districtAllowed = allowedDistricts.length === 0
+    || allowedDistricts.includes(String(district._id));
+  if (!districtAllowed && !force) {
+    const err = new Error("Base location is outside the technician's approved service districts");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const allowedZones = getAllowedZoneIds(technician);
+  const zoneAllowed = !zone || allowedZones.length === 0 || allowedZones.includes(String(zone._id));
+
+  const before = describeBaseLocation(technician);
+  const now = new Date();
+  const updated = await TechnicianProfile.findByIdAndUpdate(
+    technician._id,
+    {
+      $set: {
+        serviceBaseLocation: {
+          type: "Point",
+          coordinates: [longitude, latitude],
+        },
+        serviceBaseLocationSource: source,
+        serviceBaseLocationUpdatedAt: now,
+        serviceBaseLocationVerified: verified === true,
+      },
+    },
+    { new: true, runValidators: true }
+  ).select("serviceBaseLocation serviceBaseLocationSource serviceBaseLocationUpdatedAt serviceBaseLocationVerified location enabledDistrictIds allowedCityIds enabledCityZoneIds");
+
+  await writeAuditLog({
+    actor,
+    actorRole,
+    action: "SERVICE_BASE_LOCATION_UPDATED",
+    targetType: "TechnicianProfile",
+    targetId: technician._id,
+    before,
+    after: describeBaseLocation(updated),
+    reason: reason || null,
+    metadata: {
+      districtId: String(district._id),
+      zoneId: zone ? String(zone._id) : null,
+      districtAllowed,
+      zoneAllowed,
+      forced: force === true,
+    },
+  });
+
+  return { technician: updated, district, zone, districtAllowed, zoneAllowed };
+};
+
+export const updateTechnicianServiceBaseLocation = async (req, res) => {
+  try {
+    const { technicianId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(technicianId)) {
+      return res.status(400).json({ success: false, message: "Invalid technician id", result: {} });
+    }
+    const input = normalizeBaseLocationInput(req.body);
+    if (input.error) {
+      return res.status(400).json({ success: false, message: input.error, result: {} });
+    }
+    const technician = await TechnicianProfile.findById(technicianId)
+      .select("serviceBaseLocation serviceBaseLocationSource serviceBaseLocationUpdatedAt serviceBaseLocationVerified location enabledDistrictIds allowedCityIds enabledCityZoneIds");
+    if (!technician) {
+      return res.status(404).json({ success: false, message: "Technician not found", result: {} });
+    }
+
+    const result = await applyServiceBaseLocation({
+      technician,
+      latitude: input.latitude,
+      longitude: input.longitude,
+      source: "admin",
+      verified: req.body?.verified === true,
+      actor: req.user?.userId || null,
+      actorRole: req.user?.role || "Admin",
+      reason: req.body?.reason || null,
+      force: req.body?.force === true,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Service base location updated",
+      result: {
+        ...describeBaseLocation(result.technician),
+        districtId: String(result.district._id),
+        zoneId: result.zone ? String(result.zone._id) : null,
+        districtAllowed: result.districtAllowed,
+        zoneAllowed: result.zoneAllowed,
+      },
+    });
+  } catch (error) {
+    console.error("updateTechnicianServiceBaseLocation Error:", error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+export const updateMyServiceBaseLocation = async (req, res) => {
+  try {
+    const technicianProfileId = req.user?.technicianProfileId;
+    if (!mongoose.Types.ObjectId.isValid(technicianProfileId)) {
+      return res.status(400).json({ success: false, message: "Invalid technician id", result: {} });
+    }
+    const input = normalizeBaseLocationInput(req.body);
+    if (input.error) {
+      return res.status(400).json({ success: false, message: input.error, result: {} });
+    }
+    const technician = await TechnicianProfile.findById(technicianProfileId)
+      .select("serviceBaseLocation serviceBaseLocationSource serviceBaseLocationUpdatedAt serviceBaseLocationVerified location enabledDistrictIds allowedCityIds enabledCityZoneIds");
+    if (!technician) {
+      return res.status(404).json({ success: false, message: "Technician not found", result: {} });
+    }
+
+    const result = await applyServiceBaseLocation({
+      technician,
+      latitude: input.latitude,
+      longitude: input.longitude,
+      source: "self",
+      verified: false,
+      actor: req.user?.userId || null,
+      actorRole: req.user?.role || "Technician",
+      reason: req.body?.reason || null,
+      force: false,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Service base location updated",
+      result: {
+        ...describeBaseLocation(result.technician),
+        districtId: String(result.district._id),
+        zoneId: result.zone ? String(result.zone._id) : null,
+        districtAllowed: result.districtAllowed,
+        zoneAllowed: result.zoneAllowed,
+      },
+    });
+  } catch (error) {
+    console.error("updateMyServiceBaseLocation Error:", error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message, result: {} });
+  }
+};
+
+export const listTechniciansMissingServiceBaseLocation = async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const skip = (page - 1) * limit;
+    const filter = {
+      workStatus: "approved",
+      $or: [
+        { serviceBaseLocation: null },
+        { serviceBaseLocation: { $exists: false } },
+        { serviceBaseLocationVerified: { $ne: true } },
+        { serviceBaseLocationSource: "last_known" },
+      ],
+    };
+    if (req.query.districtId && mongoose.Types.ObjectId.isValid(req.query.districtId)) {
+      filter.enabledDistrictIds = new mongoose.Types.ObjectId(req.query.districtId);
+    }
+
+    const [technicians, total] = await Promise.all([
+      TechnicianProfile.find(filter)
+        .select("_id userId serviceBaseLocation serviceBaseLocationSource serviceBaseLocationUpdatedAt serviceBaseLocationVerified location enabledDistrictIds allowedCityIds")
+        .sort({ serviceBaseLocationVerified: 1, _id: 1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      TechnicianProfile.countDocuments(filter),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: "Technicians needing service base location review",
+      result: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+        technicians: technicians.map((technician) => ({
+          technicianId: technician._id,
+          userId: technician.userId,
+          ...describeBaseLocation(technician),
+          allowedDistrictIds: getAllowedDistrictIds(technician),
+        })),
+      },
+    });
+  } catch (error) {
+    console.error("listTechniciansMissingServiceBaseLocation Error:", error);
+    return res.status(500).json({ success: false, message: error.message, result: {} });
   }
 };

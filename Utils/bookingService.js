@@ -23,6 +23,7 @@ import { paiseToRupees } from "./money.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
 import { validateSlot, BUSINESS_TIMEZONE, localDateInBusinessTimezone, formatInBusinessTimezone } from "./slots.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
+import { computeDispatchEligibleAt } from "./schedulingConfig.js";
 
 /**
  * Validate that a service may be booked from the given zone.
@@ -221,6 +222,8 @@ export const buildServiceBookingDoc = async ({
     baseAmount,
     financialSnapshot: snapshot,
     scheduledAt,
+    estimatedDurationMinutes: service.durationMinutes || 60,
+    dispatchEligibleAt: computeDispatchEligibleAt(bookingType, scheduledAt, now),
     timezone: schedule.timezone,
     scheduledDateLocal: schedule.scheduledDateLocal,
     scheduledTimeLocal: schedule.scheduledTimeLocal,

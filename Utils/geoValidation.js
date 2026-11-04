@@ -174,6 +174,14 @@ function calculateSignedArea(ring) {
 // vertex or edge are NOT reported as overlapping).
 const orientation = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
 
+const ORIENTATION_EPSILON = 1e-12;
+
+const orientationSign = (value) => {
+  if (value > ORIENTATION_EPSILON) return 1;
+  if (value < -ORIENTATION_EPSILON) return -1;
+  return 0;
+};
+
 const onSegment = (a, b, c) =>
   Math.min(a[0], c[0]) <= b[0] && b[0] <= Math.max(a[0], c[0]) &&
   Math.min(a[1], c[1]) <= b[1] && b[1] <= Math.max(a[1], c[1]);
@@ -191,11 +199,11 @@ const segmentsIntersectInclusive = (p1, p2, p3, p4) => {
 };
 
 const segmentsProperlyIntersect = (p1, p2, p3, p4) => {
-  const o1 = orientation(p1, p2, p3);
-  const o2 = orientation(p1, p2, p4);
-  const o3 = orientation(p3, p4, p1);
-  const o4 = orientation(p3, p4, p2);
-  return o1 * o2 < 0 && o3 * o4 < 0;
+  const o1 = orientationSign(orientation(p1, p2, p3));
+  const o2 = orientationSign(orientation(p1, p2, p4));
+  const o3 = orientationSign(orientation(p3, p4, p1));
+  const o4 = orientationSign(orientation(p3, p4, p2));
+  return o1 !== 0 && o2 !== 0 && o3 !== 0 && o4 !== 0 && o1 !== o2 && o3 !== o4;
 };
 
 const eachEdgePair = (ringA, ringB, fn) => {
@@ -295,6 +303,40 @@ const allRingsOf = (polygon) => {
   if (polygon.type === "MultiPolygon") return polygon.coordinates.flatMap((p) => (Array.isArray(p) ? p : []));
   return [];
 };
+
+const polygonPartsOf = (polygon) => {
+  if (!polygon || !Array.isArray(polygon.coordinates)) return [];
+  if (polygon.type === "Polygon") {
+    const part = polygon.coordinates.filter(Array.isArray);
+    return part.length ? [part] : [];
+  }
+  if (polygon.type === "MultiPolygon") {
+    return polygon.coordinates
+      .map((part) => (Array.isArray(part) ? part.filter(Array.isArray) : []))
+      .filter((part) => part.length > 0);
+  }
+  return [];
+};
+
+const pointOnAnyRing = (pt, part) => part.some((ring) => pointOnRingBoundary(pt, ring));
+
+const pointStrictlyInsidePart = (pt, part) => {
+  if (!part.length || pointOnAnyRing(pt, part)) return false;
+  if (!isPointInPolygonRing(pt, part[0])) return false;
+  for (let i = 1; i < part.length; i++) {
+    if (isPointInPolygonRing(pt, part[i])) return false;
+  }
+  return true;
+};
+
+const allVerticesOnPartBoundary = (part, peerPart) =>
+  part.every((ring) =>
+    ring.slice(0, -1).every((pt) => pointOnAnyRing(pt, peerPart))
+  );
+
+const partsShareBoundary = (partA, partB) =>
+  allVerticesOnPartBoundary(partA, partB) &&
+  allVerticesOnPartBoundary(partB, partA);
 
 const ringsProperlyCross = (ringA, ringB) => eachEdgePair(ringA, ringB, segmentsProperlyIntersect);
 
@@ -402,44 +444,38 @@ export function validateZoneInsideDistrict(zonePolygon, districtPolygon, options
  * geometry and crossing a hole boundary still counts.
  */
 export function checkZoneOverlap(zonePolygon1, zonePolygon2) {
-  const outers1 = outerRingsOf(zonePolygon1);
-  const outers2 = outerRingsOf(zonePolygon2);
-  if (!outers1.length || !outers2.length) return false;
+  const parts1 = polygonPartsOf(zonePolygon1);
+  const parts2 = polygonPartsOf(zonePolygon2);
+  if (!parts1.length || !parts2.length) return false;
 
   const midpoint = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-  // Ring centroid (average of distinct vertices). For identical or fully
-  // coincident geometries every edge lies exactly on the peer boundary, so
-  // vertex/midpoint/crossing tests all abstain — but the shared interior
-  // point is strictly inside both rings, which still proves duplication.
-  const centroid = (ring) => {
-    const pts = ring.slice(0, -1);
-    if (!pts.length) return null;
-    return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
-  };
-  for (const r1 of outers1) {
-    for (const r2 of outers2) {
-      const c1 = centroid(r1);
-      const c2 = centroid(r2);
-      if (c1 && isPointInPolygonRing(c1, r2) && !pointOnRingBoundary(c1, r2)) return true;
-      if (c2 && isPointInPolygonRing(c2, r1) && !pointOnRingBoundary(c2, r1)) return true;
-      for (const pt of r1) {
-        if (isPointInPolygonRing(pt, r2) && !pointOnRingBoundary(pt, r2)) return true;
+
+  for (const part1 of parts1) {
+    for (const part2 of parts2) {
+      if (partsShareBoundary(part1, part2)) return true;
+
+      for (const ring of part1) {
+        for (const pt of ring) {
+          if (pointStrictlyInsidePart(pt, part2)) return true;
+        }
       }
-      for (const pt of r2) {
-        if (isPointInPolygonRing(pt, r1) && !pointOnRingBoundary(pt, r1)) return true;
+      for (const ring of part2) {
+        for (const pt of ring) {
+          if (pointStrictlyInsidePart(pt, part1)) return true;
+        }
       }
-      if (ringsProperlyCross(r1, r2)) return true;
-      // Edge-midpoint sampling: catches edges that pass through the other
-      // ring with both endpoints on/outside its boundary (e.g. a vertex
-      // landing exactly on the peer edge). Midpoints of genuinely shared
-      // tiling borders lie ON the boundary, never strictly inside.
-      for (let i = 0; i < r1.length - 1; i++) {
-        const mid = midpoint(r1[i], r1[i + 1]);
-        if (isPointInPolygonRing(mid, r2) && !pointOnRingBoundary(mid, r2)) return true;
-      }
-      for (let j = 0; j < r2.length - 1; j++) {
-        const mid = midpoint(r2[j], r2[j + 1]);
-        if (isPointInPolygonRing(mid, r1) && !pointOnRingBoundary(mid, r1)) return true;
+
+      for (const r1 of part1) {
+        for (const r2 of part2) {
+          if (ringsProperlyCross(r1, r2)) return true;
+
+          for (let i = 0; i < r1.length - 1; i++) {
+            if (pointStrictlyInsidePart(midpoint(r1[i], r1[i + 1]), part2)) return true;
+          }
+          for (let j = 0; j < r2.length - 1; j++) {
+            if (pointStrictlyInsidePart(midpoint(r2[j], r2[j + 1]), part1)) return true;
+          }
+        }
       }
     }
   }

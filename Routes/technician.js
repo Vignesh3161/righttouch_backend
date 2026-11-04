@@ -22,6 +22,10 @@ import {
   getZoneServicesForTechnician,
   submitTechnicianSkillRequest,
   getMyTechnicianSkillRequests,
+  getTechnicianServiceBaseLocation,
+  updateTechnicianServiceBaseLocation,
+  updateMyServiceBaseLocation,
+  listTechniciansMissingServiceBaseLocation,
 } from "../Controllers/technician.js";
 import { technicianLogin, verifyTechnicianOtp } from "../Controllers/User.js";
 import { respondToJob, getMyJobs } from "../Controllers/technicianBroadcastController.js";
@@ -134,6 +138,11 @@ router.post("/login/technician", authLimiter, technicianLogin);
 router.post("/login/technician/verify-otp", otpLimiter, verifyTechnicianOtp);
 router.put("/location", Auth, isTechnician, locationLimiter, updateTechnicianLocation);
 router.put("/fcm-token", Auth, isTechnician, registerTechnicianFcmToken);
+router.get("/service-base-location/me", Auth, isTechnician, getTechnicianServiceBaseLocation);
+router.put("/service-base-location/me", Auth, isTechnician, updateMyServiceBaseLocation);
+router.get("/admin/service-base-location/missing", Auth, authorizeRoles("Admin", "Owner"), listTechniciansMissingServiceBaseLocation);
+router.get("/admin/technicians/:technicianId/service-base-location", Auth, authorizeRoles("Admin", "Owner"), getTechnicianServiceBaseLocation);
+router.put("/admin/technicians/:technicianId/service-base-location", Auth, authorizeRoles("Admin", "Owner"), updateTechnicianServiceBaseLocation);
 router.post("/technicianData", Auth, createTechnician);
 // C3: privileged technician PII listing — Admin/Owner only. Detail endpoint
 // keeps Auth and enforces self-or-privileged inside the controller.
@@ -144,7 +153,7 @@ router.put("/updateTechnician", Auth, updateTechnician);
 router.put("/technician/skills/add", Auth, isTechnician, addTechnicianSkills);
 router.put("/technician/skills/remove", Auth, isTechnician, removeTechnicianSkills);
 router.put("/technician/status", Auth, updateTechnicianStatus);
-router.put("/:technicianId/training", Auth, updateTechnicianTraining);
+router.put("/:technicianId/training", Auth, authorizeRoles("Admin", "Owner"), updateTechnicianTraining);
 router.post("/technician/profile-image", Auth, isTechnician, upload.single("profileImage"), uploadProfileImage);
 router.delete("/technicianDelete/:id", Auth, deleteTechnician);
 

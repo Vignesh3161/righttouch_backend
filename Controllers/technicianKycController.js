@@ -8,7 +8,6 @@ import { getTechnicianJobEligibility } from "../Utils/technicianEligibility.js";
 import { getSignedKycUrl } from "../Utils/bunnyUpload.js";
 import { maskAadhaar, maskPan, maskAccount, hashAccountNumber, fingerprintBankDetails } from "../Utils/kycPrivacy.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { ensureApprovedDistrictZones } from "../Services/technicianDistrictService.js";
 import {
   getDekForKycDoc,
   getOrCreateDekForKycDoc,
@@ -857,35 +856,6 @@ export const verifyTechnicianKyc = async (req, res) => {
     kyc.verifiedAt = new Date();
     kyc.verifiedBy = req.user.userId;
 
-    if (status === "approved") {
-      // Training is a prerequisite for KYC approval
-      const technicianProfile = await TechnicianProfile.findById(technicianId).select("trainingCompleted");
-      if (!technicianProfile || !technicianProfile.trainingCompleted) {
-        return res.status(400).json({
-          success: false,
-          message: "Technician must complete training before KYC approval",
-          result: { trainingCompleted: false },
-        });
-      }
-
-      // KYC approval flips workStatus to approved - grant the district/zones in
-      // the same step so the newly approved technician can actually receive jobs.
-      try {
-        await ensureApprovedDistrictZones({
-          technicianId,
-          adminUserId: req.user?.userId,
-          reason: "KYC approved",
-        });
-      } catch (districtErr) {
-        return res.status(districtErr.statusCode || 400).json({
-          success: false,
-          message: districtErr.message,
-          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
-          result: {},
-        });
-      }
-    }
-
     await kyc.save();
 
     // 🔏 Audit the approval/rejection decision
@@ -901,16 +871,26 @@ export const verifyTechnicianKyc = async (req, res) => {
       metadata: { technicianId },
     });
 
+    let technicianProfile = await TechnicianProfile.findById(technicianId)
+      .select("trainingCompleted workStatus")
+      .lean();
+
     if (status === "approved") {
-      await TechnicianProfile.findByIdAndUpdate(technicianId, {
-        workStatus: "approved",
-        approvedAt: new Date(),
-      });
+      if (technicianProfile?.trainingCompleted && technicianProfile.workStatus === "pending") {
+        await TechnicianProfile.updateOne(
+          { _id: technicianId, workStatus: "pending" },
+          { $set: { workStatus: "trained" } }
+        );
+        technicianProfile = { ...technicianProfile, workStatus: "trained" };
+      }
     } else {
-      await TechnicianProfile.findByIdAndUpdate(technicianId, {
-        workStatus: "suspended",
-        "availability.isOnline": false,
-      });
+      const suspension = await TechnicianProfile.updateOne(
+        { _id: technicianId, workStatus: "approved" },
+        { $set: { workStatus: "suspended", "availability.isOnline": false } }
+      );
+      if (suspension.modifiedCount > 0 && technicianProfile) {
+        technicianProfile = { ...technicianProfile, workStatus: "suspended" };
+      }
     }
 
     const kycObj = await maskKycPii(kyc.toObject());
@@ -919,7 +899,13 @@ export const verifyTechnicianKyc = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `KYC ${status} successfully`,
-      result: kycObj,
+      result: {
+        ...kycObj,
+        workStatus: technicianProfile?.workStatus || null,
+        nextStep: status === "approved"
+          ? (technicianProfile?.trainingCompleted ? "district_assignment" : "training")
+          : null,
+      },
     });
   } catch (error) {
     console.error("verifyTechnicianKyc error:", error);

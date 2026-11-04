@@ -143,6 +143,58 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Numeric estimate copied from Service.durationMinutes at booking time.
+    estimatedDurationMinutes: {
+      type: Number,
+      default: 60,
+      min: 15,
+      max: 480,
+    },
+
+    // Earliest instant at which scheduled dispatch should begin. Instant
+    // bookings use createdAt/now; scheduled bookings use
+    // scheduledAt - SCHEDULED_DISPATCH_LEAD_HOURS. Null/absent on legacy
+    // bookings means "eligible now".
+    dispatchEligibleAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
+    // Reschedule state (customer-initiated, unassigned scheduled bookings).
+    rescheduleStatus: {
+      type: String,
+      enum: ["none", "requested", "accepted", "declined", "expired"],
+      default: "none",
+    },
+    rescheduleRequestedAt: {
+      type: Date,
+      default: null,
+    },
+    rescheduleRequestedBy: {
+      type: String,
+      enum: ["customer", "technician", "admin", null],
+      default: null,
+    },
+    rescheduleReason: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    rescheduleRespondBy: {
+      type: Date,
+      default: null,
+    },
+    rescheduleCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    originalScheduledAt: {
+      type: Date,
+      default: null,
+    },
+
     // 💳 PAYMENT
     paymentStatus: {
       type: String,
@@ -622,6 +674,15 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Set when the technician first requests completion verification. This is
+    // the payment-due marker: the customer may pay only after this timestamp,
+    // and the OTP SMS is sent only after a successful online payment.
+    completionOtpRequestedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+
     // 🏙 OPERATIONAL DISTRICT & 🏘 CITY ZONE — resolved at booking time from customer coordinates.
     districtId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -657,6 +718,8 @@ serviceBookingSchema.index({ status: 1, "remindersSent.h24": 1, scheduledAt: 1 }
 serviceBookingSchema.index({ status: 1, "remindersSent.h1": 1, scheduledAt: 1 });
 serviceBookingSchema.index({ status: 1, "remindersSent.min15": 1, scheduledAt: 1 });
 serviceBookingSchema.index({ status: 1, technicianId: 1, autoCancelAt: 1 });
+serviceBookingSchema.index({ bookingType: 1, status: 1, scheduledAt: 1, technicianId: 1 });
+serviceBookingSchema.index({ bookingType: 1, status: 1, dispatchEligibleAt: 1 });
 
 // Worker lease / expiry hot path
 serviceBookingSchema.index({ leaseUntil: 1, status: 1 });

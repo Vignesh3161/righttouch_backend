@@ -7,10 +7,16 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import User from "../Schemas/User.js";
 import DeviceToken from "../Schemas/DeviceToken.js";
 import Notification from "../Schemas/Notification.js";
+import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import { deactivateTokenByValue } from "./permissionService.js";
 import { getRedisClient } from "./redisDedupe.js";
 import { getIo } from "./ioAccess.js";
 import { recordPush, recordSocket } from "./broadcastMetrics.js";
+import {
+  isScheduledQuietHours,
+  nextQuietHoursEnd,
+  SCHEDULED_PUSH_COOLDOWN_MINUTES,
+} from "./schedulingConfig.js";
 
 /**
  * 📢 NOTIFICATION UTILITY
@@ -361,7 +367,8 @@ setInterval(() => {
  *   sends one batched FCM call for all technicians.
  */
 export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadcast, options = {}) => {
-  const deliverPush = options.deliverPush !== false;
+  let deliverPush = options.deliverPush !== false;
+  const isScheduled = jobData?.bookingType === "schedule" || Boolean(jobData?.scheduledAt);
   try {
     const activation = await checkTechnicianActivation(technicianId);
     if (!activation.isActive) {
@@ -369,10 +376,15 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       return { success: false, skipped: true, reason: activation.message };
     }
 
-    const techProfile = await TechnicianProfile.findById(technicianId).select("availability.isOnline userId").lean();
-    if (!techProfile?.availability?.isOnline) {
+    const techProfile = await TechnicianProfile.findById(technicianId)
+      .select("availability.isOnline userId notificationPreferences")
+      .lean();
+    if (!techProfile?.availability?.isOnline && !isScheduled) {
       console.log(`⚠️ Skipped job:new for offline technician ${technicianId}`);
       return { success: false, skipped: true, reason: "technician_offline" };
+    }
+    if (isScheduled && techProfile?.notificationPreferences?.scheduledOffersEnabled === false) {
+      return { success: false, skipped: true, reason: "scheduled_offers_disabled" };
     }
 
     const jobDTO = toJobNewDTO(jobData, broadcast);
@@ -427,6 +439,49 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
       ? { success: true, message: "Job alert emitted to live socket" }
       : { success: false, error: socketError };
 
+    // Scheduled offers: quiet hours and push cooldown are enforced only when
+    // no live socket is present. A foreground app already received job:new.
+    if (isScheduled && socketDelivered) {
+      deliverPush = false;
+    }
+
+    const prefs = techProfile?.notificationPreferences || {};
+    if (isScheduled && deliverPush && !socketDelivered &&
+        isScheduledQuietHours(new Date(), prefs.quietHoursStart, prefs.quietHoursEnd)) {
+      const deferUntil = nextQuietHoursEnd(new Date(), prefs.quietHoursEnd);
+      const autoCancelAtMs = options.autoCancelAt
+        ? new Date(options.autoCancelAt).getTime()
+        : NaN;
+      // If quiet hours would outlast the booking's auto-cancel deadline,
+      // delivering at quiet-hours end would be useless — notify now instead.
+      if (!Number.isFinite(autoCancelAtMs) || deferUntil.getTime() < autoCancelAtMs) {
+        await releaseDedupe(jobDTO.broadcastId, technicianId, jobDTO.version);
+        console.log(`🌙 [JOB_NEW] Deferring push for tech ${technicianId} until quiet hours end`);
+        return {
+          success: false,
+          skipped: true,
+          deferUntil: deferUntil.toISOString(),
+          reason: "quiet_hours",
+          socket: socketResult,
+        };
+      }
+      console.log(`🌙 [JOB_NEW] Bypassing quiet hours for tech ${technicianId} — auto-cancel precedes quiet-hours end`);
+    }
+
+    const cooldownMs = SCHEDULED_PUSH_COOLDOWN_MINUTES * 60 * 1000;
+    if (isScheduled && deliverPush && !socketDelivered && cooldownMs > 0 &&
+        broadcast?.lastPushedAt) {
+      const lastPushedAt = new Date(broadcast.lastPushedAt).getTime();
+      if (Number.isFinite(lastPushedAt) && Date.now() - lastPushedAt < cooldownMs) {
+        return {
+          success: false,
+          skipped: true,
+          reason: "push_cooldown",
+          socket: socketResult,
+        };
+      }
+    }
+
     // 2️⃣ FCM push (awaited so failures are visible to the outbox)
     let pushResult = null;
     if (deliverPush) {
@@ -451,6 +506,25 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
         skipped: pushSkipped,
         failed: !pushDelivered && !pushSkipped,
       });
+
+      if (isScheduled && pushDelivered && broadcast?._id) {
+        await JobBroadcast.updateOne(
+          {
+            _id: broadcast._id,
+            status: "sent",
+            ...(broadcast.version != null ? { version: broadcast.version } : {}),
+          },
+          {
+            $set: {
+              lastPushedAt: new Date(),
+              lastPushedVersion: broadcast.version || 1,
+            },
+            $inc: { pushCount: 1 },
+          }
+        ).catch((err) => {
+          console.warn(`[JOB_NEW] Failed to record push cooldown for ${broadcast._id}:`, err.message);
+        });
+      }
 
       if (!socketDelivered && !pushDelivered) {
         await releaseDedupe(jobDTO.broadcastId, technicianId, jobDTO.version);

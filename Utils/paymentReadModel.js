@@ -4,6 +4,7 @@ import ProductBooking from "../Schemas/ProductBooking.js";
 import Payment from "../Schemas/Payment.js";
 import PaymentAttempt from "../Schemas/PaymentAttempt.js";
 import { toPaise } from "./money.js";
+import { isServicePaymentEligible } from "./servicePaymentEligibility.js";
 
 const toObjectId = (v) => (mongoose.Types.ObjectId.isValid(v) ? new mongoose.Types.ObjectId(v) : null);
 
@@ -20,7 +21,7 @@ export const findBookingForCustomer = async (userId, bookingId) => {
 
 /** Whether a booking is currently payable by the customer. */
 export const isBookingPayable = (booking) => {
-  if (booking.itemType === "service") return booking.status === "completed";
+  if (booking.itemType === "service") return isServicePaymentEligible(booking);
   return booking.status === "active" && booking.paymentStatus !== "paid";
 };
 

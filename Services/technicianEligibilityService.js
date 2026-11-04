@@ -138,6 +138,32 @@ export const calculateDistanceMeters = (techLocation, jobLocation) => {
 };
 
 /**
+ * Travel origin for a technician.
+ * - Scheduled work uses the stable service base location so offline
+ *   technicians are not penalised for stale live GPS.
+ * - Instant work keeps using live GPS (callers gate freshness separately).
+ */
+const hasValidPointCoordinates = (point) => {
+  const coords = point?.coordinates;
+  return Array.isArray(coords) &&
+    coords.length === 2 &&
+    Number.isFinite(coords[0]) &&
+    Number.isFinite(coords[1]);
+};
+
+export const getTechnicianOrigin = (tech, bookingType) => {
+  const isScheduled = bookingType === "schedule";
+  const base = isScheduled ? tech?.serviceBaseLocation : null;
+  if (hasValidPointCoordinates(base)) {
+    return { location: base, source: "service_base" };
+  }
+  if (hasValidPointCoordinates(tech?.location)) {
+    return { location: tech.location, source: isScheduled ? "last_known" : "live_gps" };
+  }
+  return null;
+};
+
+/**
  * Get effective radius for technician (per-tech config or global default)
  */
 export const getEffectiveRadiusMeters = (tech) => {
@@ -293,9 +319,14 @@ export const evaluateTechnicianEligibility = async ({
   if (!kycVerified) reasons.push("KYC_NOT_VERIFIED");
   if (!bankVerified) reasons.push("BANK_NOT_VERIFIED");
 
+  const isScheduled = booking.bookingType === "schedule";
+
   // 4. TECHNICIAN ONLINE STATUS
+  // Scheduled offers may be pushed to offline technicians. Online presence is
+  // still required when accepting a job (and for the instant feed).
   details.online = tech.availability?.isOnline === true;
-  if (!details.online) reasons.push("TECHNICIAN_OFFLINE");
+  const requireOnline = !isScheduled || mode === "ACCEPT";
+  if (requireOnline && !details.online) reasons.push("TECHNICIAN_OFFLINE");
 
   // 5. SERVICE SKILL CHECK
   if (booking.serviceId) {
@@ -309,21 +340,34 @@ export const evaluateTechnicianEligibility = async ({
   }
 
   // 6. GPS VALIDITY & FRESHNESS (mode-dependent threshold)
-  const gps = getGpsState(tech, mode);
-  details.validGps = gps.valid;
-  details.gpsFresh = gps.fresh;
-  details.gpsReason = gps.reason;
-  details.gpsAgeSeconds = gps.ageSeconds;
-  details.gpsThresholdSeconds = gps.thresholdSeconds;
-  if (!gps.valid) {
-    reasons.push("MISSING_LOCATION");
-  } else if (gps.thresholdSeconds > 0) {
-    if (!gps.hasTimestamp) {
-      // Keep GPS_STALE for backward compatibility but expose the precise cause.
-      if (!reasons.includes("GPS_TIMESTAMP_MISSING")) reasons.push("GPS_TIMESTAMP_MISSING");
-      if (!reasons.includes("GPS_STALE")) reasons.push("GPS_STALE");
-    } else if (!gps.fresh && !reasons.includes("GPS_STALE")) {
-      reasons.push("GPS_STALE");
+  // Scheduled matching is based on the registered service area and the stable
+  // service base location; stale live GPS must not block an offer.
+  const origin = getTechnicianOrigin(tech, booking.bookingType);
+  details.originSource = origin?.source || null;
+  if (isScheduled) {
+    details.validGps = Boolean(origin);
+    details.gpsFresh = true;
+    details.gpsReason = origin ? "SCHEDULED_ORIGIN" : "NO_SCHEDULED_ORIGIN";
+    details.gpsAgeSeconds = null;
+    details.gpsThresholdSeconds = 0;
+    if (!origin) reasons.push("MISSING_LOCATION");
+  } else {
+    const gps = getGpsState(tech, mode);
+    details.validGps = gps.valid;
+    details.gpsFresh = gps.fresh;
+    details.gpsReason = gps.reason;
+    details.gpsAgeSeconds = gps.ageSeconds;
+    details.gpsThresholdSeconds = gps.thresholdSeconds;
+    if (!gps.valid) {
+      reasons.push("MISSING_LOCATION");
+    } else if (gps.thresholdSeconds > 0) {
+      if (!gps.hasTimestamp) {
+        // Keep GPS_STALE for backward compatibility but expose the precise cause.
+        if (!reasons.includes("GPS_TIMESTAMP_MISSING")) reasons.push("GPS_TIMESTAMP_MISSING");
+        if (!reasons.includes("GPS_STALE")) reasons.push("GPS_STALE");
+      } else if (!gps.fresh && !reasons.includes("GPS_STALE")) {
+        reasons.push("GPS_STALE");
+      }
     }
   }
 
@@ -338,8 +382,8 @@ export const evaluateTechnicianEligibility = async ({
     details.districtPermission = allowedDistrictIds.length > 0;
   }
 
-  // 9. CURRENT PHYSICAL GPS DISTRICT MATCH
-  if (details.validGps && targetDistrictId) {
+  // 9. CURRENT PHYSICAL GPS DISTRICT MATCH (instant only)
+  if (!isScheduled && details.validGps && targetDistrictId) {
     const { match, currentDistrictId } = shared.currentDistrictCheck ||
       await checkCurrentDistrictMatch(tech, targetDistrictId);
     details.currentDistrictMatch = match;
@@ -356,8 +400,8 @@ export const evaluateTechnicianEligibility = async ({
     details.zonePermission = true;
   }
 
-  // 11. CURRENT PHYSICAL GPS ZONE MATCH
-  if (details.validGps && targetZoneId) {
+  // 11. CURRENT PHYSICAL GPS ZONE MATCH (instant only)
+  if (!isScheduled && details.validGps && targetZoneId) {
     const { match, currentZoneId } = shared.currentZoneCheck ||
       await checkCurrentZoneMatch(tech, targetZoneId);
     details.currentZoneMatch = match;
@@ -368,8 +412,10 @@ export const evaluateTechnicianEligibility = async ({
   }
 
   // 12. DYNAMIC RADIUS GATE (single canonical haversine)
+  // Scheduled: distance is measured from the service base location (or
+  // last-known GPS fallback) instead of requiring a fresh live ping.
   if (details.validGps && hasJobCoords) {
-    const distMeters = calculateDistanceMeters(tech.location, booking.location);
+    const distMeters = calculateDistanceMeters(origin?.location, booking.location);
     details.distanceMeters = distMeters;
     details.distanceKm = distMeters != null ? Number((distMeters / 1000).toFixed(2)) : null;
     

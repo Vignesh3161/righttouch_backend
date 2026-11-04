@@ -393,20 +393,66 @@ export const ensureApprovedDistrictZones = async ({
   };
 
   const profile = await TechnicianProfile.findById(technicianId).select(
-    "primaryDistrictId primaryCityId cityZoneId enabledDistrictIds allowedCityIds enabledCityZoneIds"
+    "primaryDistrictId primaryCityId cityZoneId enabledDistrictIds allowedCityIds enabledCityZoneIds currentDistrictId currentCityZoneId"
   );
   if (!profile) fail("TECHNICIAN_NOT_FOUND", "Technician not found", 404);
 
-  let districtId = profile.primaryDistrictId || profile.primaryCityId;
-  if (!districtId && profile.cityZoneId) {
-    const zone = await CityZone.findById(profile.cityZoneId).select("operationalCityId").lean();
-    districtId = zone?.operationalCityId || null;
+  const candidates = [];
+  const addCandidate = (value) => {
+    const id = value?._id || value;
+    const normalized = id ? String(id) : null;
+    if (
+      normalized &&
+      mongoose.Types.ObjectId.isValid(normalized) &&
+      !candidates.includes(normalized)
+    ) {
+      candidates.push(normalized);
+    }
+  };
+
+  addCandidate(profile.primaryDistrictId);
+  addCandidate(profile.primaryCityId);
+
+  const registeredZone = profile.cityZoneId
+    ? await CityZone.findById(profile.cityZoneId).select("operationalCityId").lean()
+    : null;
+  addCandidate(registeredZone?.operationalCityId);
+
+  const permissionRows = await TechnicianDistrictPermission.find({
+    technicianId,
+    isEnabled: true,
+  }).select("districtId").lean();
+  for (const row of permissionRows) addCandidate(row.districtId);
+
+  for (const id of [...(profile.enabledDistrictIds || []), ...(profile.allowedCityIds || [])]) {
+    addCandidate(id);
   }
-  if (!districtId) {
-    districtId = [...(profile.enabledDistrictIds || []), ...(profile.allowedCityIds || [])][0] || null;
-  }
-  if (!districtId) {
+
+  const currentZone = profile.currentCityZoneId
+    ? await CityZone.findById(profile.currentCityZoneId).select("operationalCityId").lean()
+    : null;
+  addCandidate(currentZone?.operationalCityId);
+  addCandidate(profile.currentDistrictId);
+
+  if (candidates.length === 0) {
     fail("PRIMARY_DISTRICT_REQUIRED", "Assign the technician to a district/zone before approval");
+  }
+
+  let districtId = candidates[0];
+  for (const candidate of candidates) {
+    const candidateDistrict = await OperationalCity.findById(candidate)
+      .select("active isActive isJobEnabled")
+      .lean();
+    if (!candidateDistrict) continue;
+    if (candidateDistrict.active === false || candidateDistrict.isActive === false) continue;
+    if (candidateDistrict.isJobEnabled === false) continue;
+    const zoneCount = await CityZone.countDocuments({
+      operationalCityId: candidate,
+      active: { $ne: false },
+    });
+    if (zoneCount === 0) continue;
+    districtId = candidate;
+    break;
   }
 
   const district = await OperationalCity.findById(districtId);
@@ -459,11 +505,17 @@ export const ensureApprovedDistrictZones = async ({
       }).select("_id isEnabled");
       if (session) existingQuery = existingQuery.session(session);
       const existing = await existingQuery.lean();
+      await TechnicianDistrictPermission.updateMany(
+        { technicianId, permissionType: "PRIMARY", districtId: { $ne: districtId } },
+        { $set: { permissionType: "ADDITIONAL" } },
+        opts
+      );
       await TechnicianDistrictPermission.updateOne(
         { technicianId, districtId },
         {
-          $setOnInsert: { technicianId, districtId, permissionType: "PRIMARY" },
+          $setOnInsert: { technicianId, districtId },
           $set: {
+            permissionType: "PRIMARY",
             isEnabled: true,
             enabledBy: adminUserId || null,
             enabledAt: new Date(),

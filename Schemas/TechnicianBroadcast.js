@@ -59,6 +59,23 @@ const jobBroadcastSchema = new mongoose.Schema(
       default: 1,
       min: 1,
     },
+
+    // Push delivery tracking (scheduled offers may be delivered while the
+    // technician is offline). Cooldown is based on lastPushedAt; a reschedule
+    // clears it so the revived offer can be pushed immediately.
+    lastPushedAt: {
+      type: Date,
+      default: null,
+    },
+    lastPushedVersion: {
+      type: Number,
+      default: null,
+    },
+    pushCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   { timestamps: true }
 );

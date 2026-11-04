@@ -104,7 +104,7 @@ export const getMyProfileInternal = async ({ userId, role }) => {
     result.bankVerified = isBankApproved;
     result.bankVerificationStatus = kyc?.bankVerificationStatus || "pending";
     result.trainingCompleted = isTrainingDone;
-    result.isActiveTechnician = isKycApproved && (isTrainingDone || profile.workStatus === "approved");
+    result.isActiveTechnician = isKycApproved && isTrainingDone && profile.workStatus === "approved";
 
     if (kyc && kyc.bankDetails) {
       try {

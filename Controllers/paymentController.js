@@ -15,6 +15,7 @@ import {
 } from "../Utils/razorpay.js";
 import { toPaise, rupeesToPaise } from "../Utils/money.js";
 import { normalizeBookingStatus } from "../Utils/bookingStatus.js";
+import { isServicePaymentEligible } from "../Utils/servicePaymentEligibility.js";
 
 // C6: the record-offline `amount` contract is RUPEES (all admin money inputs
 // in this codebase are rupees; the audit mirror below stores targetPaise/100).
@@ -163,13 +164,25 @@ const notifyPaymentSucceeded = async (req, payment) => {
     const io = req?.io;
     const bodyText = (payment.itemType === "product" || payment.itemType === "quotation")
       ? `Product payment successful. ₹${payment.totalAmount} payment received. Your product order is confirmed.`
-      : `Your payment of ₹${payment.totalAmount} for the service is confirmed. Thank you!`;
+      : `Your payment of ₹${payment.totalAmount} for the service is confirmed.`;
 
-    await sendPushNotification(customerId.toString(), {
-      title: "Payment Successful",
-      body: bodyText,
-      data: { bookingId: payment.bookingId?.toString(), type: "PAYMENT_SUCCESS" },
-    }, { recipientType: "customer" });
+    try {
+      const { sendAppNotification } = await import("../Services/unifiedNotificationService.js");
+      await sendAppNotification({
+        userId: customerId.toString(),
+        recipientType: "customer",
+        type: "PAYMENT_SUCCESS",
+        title: "Payment Successful",
+        message: bodyText,
+        bookingId: payment.bookingId,
+        metadata: { socketEvent: "payment_success", stage: "payment_success" },
+        priority: "high",
+        category: "payment",
+        io,
+      });
+    } catch (notifyErr) {
+      console.error("notifyPaymentSucceeded notification error:", notifyErr.message);
+    }
 
     if (io) {
       io.to(`customer_${customerId}`).emit("payment_success", {
@@ -275,14 +288,16 @@ export const createPaymentOrder = async (req, res) => {
       });
     }
 
-    // Service payment is allowed only AFTER completion (pay-at-completion).
-    // Product payment is allowed only while the booking is active.
+    // Service payment opens when the technician requests completion
+    // verification (completionOtpRequestedAt) and must be settled before the
+    // OTP can be verified. Product payment is allowed only while active.
     if (itemType === "service") {
-      if (booking.status !== "completed") {
+      if (!isServicePaymentEligible(booking)) {
         return fail(
           res,
           400,
-          `Payment allowed only after service completion (current status: ${booking.status})`
+          "Payment is not due yet — the technician must request completion verification first",
+          { code: "PAYMENT_NOT_DUE", bookingStatus: normalizeBookingStatus(booking.status) }
         );
       }
     } else if (itemType === "product" && booking.status !== "active") {
@@ -1212,9 +1227,9 @@ export const recordAdminOfflinePayment = async (req, res) => {
       });
     }
 
-    // Service payments follow the pay-at-completion flow. Recording an
-    // offline service payment before completion would leave the technician
-    // with a paid booking that still asks for a completion OTP.
+    // Service completion uses the pay-before-OTP flow. Admin offline
+    // recording is only a legacy/post-completion fallback; it cannot satisfy
+    // the completion payment gate and is rejected before completion.
     if (itemType === "service" && normalizeBookingStatus(booking.status) !== "completed") {
       return fail(
         res,

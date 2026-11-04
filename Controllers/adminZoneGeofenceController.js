@@ -28,6 +28,7 @@ import {
 } from "../Services/zoneWriteService.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { ensureApprovedDistrictZones, grantZoneToDistrictTechnicians } from "../Services/technicianDistrictService.js";
+import { assertTechnicianActivationPrerequisites } from "../Services/technicianApprovalService.js";
 
 /* =========================================================================
    A & B: DISTRICT / OPERATIONAL CITY MANAGEMENT
@@ -1447,26 +1448,34 @@ export const updateTechnicianVerification = async (req, res) => {
     const tech = await TechnicianProfile.findById(id);
     if (!tech) return res.status(404).json({ success: false, message: "Technician profile not found" });
 
-    if (action === "APPROVE") tech.workStatus = "approved";
-    else if (action === "REJECT") tech.workStatus = "rejected";
-    else if (action === "SUSPEND") tech.workStatus = "suspended";
-    else if (action === "REACTIVATE") tech.workStatus = "approved";
-    else return res.status(400).json({ success: false, message: "Invalid action. Allowed: APPROVE, REJECT, SUSPEND, REACTIVATE" });
-
-    if (tech.workStatus === "approved") {
+    if (action === "APPROVE" || action === "REACTIVATE") {
       try {
+        await assertTechnicianActivationPrerequisites(tech._id);
         await ensureApprovedDistrictZones({
           technicianId: tech._id,
           adminUserId: req.user?.userId,
           reason: reason || `Technician verification ${action}`,
         });
-      } catch (districtErr) {
-        return res.status(districtErr.statusCode || 400).json({
+      } catch (approvalErr) {
+        return res.status(approvalErr.statusCode || 400).json({
           success: false,
-          message: districtErr.message,
-          code: districtErr.code || "DISTRICT_ZONE_REQUIRED",
+          message: approvalErr.message,
+          code: approvalErr.code || "TECHNICIAN_APPROVAL_FAILED",
         });
       }
+
+      tech.workStatus = "approved";
+      tech.approvedAt = new Date();
+    } else if (action === "REJECT") {
+      tech.workStatus = "suspended";
+      tech.availability = tech.availability || {};
+      tech.availability.isOnline = false;
+    } else if (action === "SUSPEND") {
+      tech.workStatus = "suspended";
+      tech.availability = tech.availability || {};
+      tech.availability.isOnline = false;
+    } else {
+      return res.status(400).json({ success: false, message: "Invalid action. Allowed: APPROVE, REJECT, SUSPEND, REACTIVATE" });
     }
 
     await tech.save();

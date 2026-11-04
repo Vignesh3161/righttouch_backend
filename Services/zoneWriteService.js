@@ -79,9 +79,9 @@ export const recordPolygonVersion = async (
 };
 
 /**
- * Containment (zone inside parent district) + overlap (vs other ACTIVE zones
- * in the district) placement checks. Returns { ok:true } or
- * { ok:false, code, message } for a 400/409 response.
+ * Parent-district containment placement check. Zone-to-zone overlap inside a
+ * district is intentionally allowed; only districts are overlap-validated.
+ * Returns { ok:true } or { ok:false, code, message } for a 400/404 response.
  */
 export const assertZonePlacement = async ({ sanitizedPolygon, districtId, excludeZoneId = null }) => {
   const district = await OperationalCity.findById(districtId).lean();
@@ -100,21 +100,6 @@ export const assertZonePlacement = async ({ sanitizedPolygon, districtId, exclud
     }
   }
 
-  // Reservation policy: geography is checked against ALL zones in the
-  // district (active and inactive) so a retired zone still reserves its
-  // area; reactivating or rebuilding over it would otherwise collide.
-  const existingZones = await CityZone.find({ operationalCityId: districtId }).lean();
-  for (const ez of existingZones) {
-    if (excludeZoneId && String(ez._id) === String(excludeZoneId)) continue;
-    if (ez.polygon && checkZoneOverlap(sanitizedPolygon, ez.polygon)) {
-      return {
-        ok: false,
-        status: 409,
-        code: "ZONE_OVERLAP_DETECTED",
-        message: `Zone polygon overlaps geographically with existing ${ez.active === false ? "inactive " : ""}zone "${ez.name || "Zone"}" in the same district.`,
-      };
-    }
-  }
   return {
     ok: true,
     district,

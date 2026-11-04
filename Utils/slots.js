@@ -257,7 +257,7 @@ export const validateScheduledAtUtc = (
 /**
  * Full slot payload for GET /booking/slots.
  */
-export const getBookingSchedulePayload = (now = new Date(), tz = BUSINESS_TIMEZONE) => {
+export const getBookingSchedulePayload = (now = new Date(), tz = BUSINESS_TIMEZONE, availability = null) => {
   const instantArrival = new Date(now.getTime() + 30 * 60 * 1000);
   return {
     instant: {
@@ -272,6 +272,7 @@ export const getBookingSchedulePayload = (now = new Date(), tz = BUSINESS_TIMEZO
       days: generateScheduleDays(now, tz),
       timeSlots: generateTimeSlots(),
       timezone: tz,
+      availability: availability || null,
     },
   };
 };
