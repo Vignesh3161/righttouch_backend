@@ -82,10 +82,13 @@ export const processRow = async (row) => {
   const { bookingId, technicianId, kind, broadcastId, version, payload } = row;
   const traceId = payload?.traceId || `trc_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   try {
+    let bookingAutoCancelAt = null;
     // 🛡 Pre-send booking status check: if booking was cancelled, accepted, or expired
     // while this outbox row was pending/inflight, skip notification entirely.
     if (bookingId) {
-      const booking = await ServiceBooking.findById(bookingId).select("status").lean();
+      const booking = await ServiceBooking.findById(bookingId)
+        .select("status bookingType dispatchEligibleAt autoCancelAt")
+        .lean();
       if (!booking) {
         await updateClaimedRow(row, {
           $set: { status: "done", completedAt: new Date(), lastError: "booking_missing" },
@@ -101,9 +104,30 @@ export const processRow = async (row) => {
         console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_status_${bookingStatus}`);
         return;
       }
+      bookingAutoCancelAt = booking.autoCancelAt || null;
+      if (bookingAutoCancelAt &&
+          new Date(bookingAutoCancelAt).getTime() <= Date.now()) {
+        await updateClaimedRow(row, {
+          $set: { status: "done", completedAt: new Date(), lastError: "booking_auto_cancelled" },
+        });
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=booking_auto_cancelled`);
+        return;
+      }
+      if (booking.dispatchEligibleAt &&
+          new Date(booking.dispatchEligibleAt).getTime() > Date.now()) {
+        await updateClaimedRow(row, {
+          $set: {
+            status: "pending",
+            claimedAt: null,
+            nextAttemptAt: new Date(booking.dispatchEligibleAt),
+          },
+        });
+        console.log(`📭 [TRACE] ${traceId} DISPATCH_DEFERRED bookingId=${bookingId} tech=${technicianId} until=${booking.dispatchEligibleAt}`);
+        return;
+      }
     }
 
-    const broadcast = broadcastId
+    let broadcast = broadcastId
       ? { _id: broadcastId, version: version ?? 1 }
       : null;
     // H25: the offer itself must still be live (sent + version-current).
@@ -112,7 +136,7 @@ export const processRow = async (row) => {
     // accept path would only 409. Stale rows complete as stale (no retry).
     if (broadcastId) {
       const live = await JobBroadcast.findById(broadcastId)
-        .select("status version expiresAt")
+        .select("status version expiresAt lastPushedAt lastPushedVersion")
         .lean();
       const stale =
         !live ||
@@ -126,8 +150,37 @@ export const processRow = async (row) => {
         console.log(`📭 [TRACE] ${traceId} DISPATCH_SKIPPED bookingId=${bookingId} tech=${technicianId} reason=stale_broadcast`);
         return;
       }
+      broadcast = {
+        ...broadcast,
+        lastPushedAt: live.lastPushedAt || null,
+        lastPushedVersion: live.lastPushedVersion ?? null,
+      };
     }
-    const result = await notifyTechnicianOfNewJob(ioRef, technicianId.toString(), payload, broadcast);
+    const result = await notifyTechnicianOfNewJob(
+      ioRef,
+      technicianId.toString(),
+      payload,
+      broadcast,
+      { autoCancelAt: bookingAutoCancelAt }
+    );
+
+    if (result?.deferUntil) {
+      const deferUntil = new Date(result.deferUntil);
+      const nextAttemptAt = Number.isFinite(deferUntil.getTime()) && deferUntil > new Date()
+        ? deferUntil
+        : new Date(Date.now() + 5 * 60 * 1000);
+      await updateClaimedRow(row, {
+        $set: {
+          status: "pending",
+          claimedAt: null,
+          nextAttemptAt,
+          lastError: result.reason || "deferred",
+        },
+      });
+      recordDispatch("deferred");
+      console.log(`🌙 [TRACE] ${traceId} DISPATCH_DEFERRED bookingId=${bookingId} tech=${technicianId} until=${nextAttemptAt.toISOString()} reason=${result.reason}`);
+      return;
+    }
 
     if (result?.skipped) {
       // Duplicate or ineligible — nothing to deliver, don't burn retries.

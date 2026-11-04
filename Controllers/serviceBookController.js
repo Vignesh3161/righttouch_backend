@@ -31,9 +31,17 @@ import {
   buildServiceBookingDoc,
   createBookingAndOutbox,
   broadcastCreatedBooking,
+  computeAutoCancelAt,
 } from "../Utils/bookingService.js";
+import { writeAuditLog } from "../Utils/audit.js";
 import { getBookingSchedulePayload } from "../Utils/slots.js";
+import {
+  computeDispatchEligibleAt,
+  RESCHEDULE_CUTOFF_MINUTES,
+  SCHEDULED_REDISPATCH_WINDOW_MINUTES,
+} from "../Utils/schedulingConfig.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { getSlotAvailability } from "../Services/slotAvailabilityService.js";
 import { containsRegex } from "../Utils/safeQuery.js";
 import { getReacceptPenaltyPercent } from "./adminSettingsController.js";
 import {
@@ -62,23 +70,30 @@ export const fireBookingCompletedSideEffects = async (booking, technicianProfile
     console.error("settleBookingEarningsIfEligible error:", settleErr.message);
   }
 
-  // Notify customer — service is complete, payment is now due
+  // Notify customer — service is complete (payment was captured before OTP).
   if (booking.customerId) {
     try {
-      const { sendPushNotification } = await import("../Utils/sendNotification.js");
-      await sendPushNotification(booking.customerId.toString(), {
+      const { sendAppNotification } = await import("../Services/unifiedNotificationService.js");
+      await sendAppNotification({
+        userId: booking.customerId.toString(),
+        recipientType: "customer",
+        type: "BOOKING_COMPLETED",
         title: "Service Completed",
-        body: "Your service is complete. Please complete the payment for your booking.",
-        data: { bookingId: booking._id.toString(), type: "BOOKING_COMPLETED" },
-      }, { recipientType: "customer" });
+        message: "Your service is complete. Thank you!",
+        bookingId: booking._id,
+        metadata: { socketEvent: "booking:completed", stage: "service_completed" },
+        priority: "high",
+        category: "booking",
+        io,
+      });
     } catch (notifyErr) {
       console.error("notifyCustomerCompleted error:", notifyErr.message);
     }
     if (io) {
       io.to(`customer_${booking.customerId}`).emit("booking_completed", {
         bookingId: booking._id,
-        message: "Service completed — payment is now due",
-        type: "PAYMENT_DUE",
+        message: "Service completed successfully",
+        type: "BOOKING_COMPLETED",
       });
     }
   }
@@ -328,6 +343,12 @@ export const createBooking = async (req, res) => {
       gstAmount: paiseToRupees(snapshot.gstAmountPaise),
       tipAmount: paiseToRupees(snapshot.tipAmountPaise),
       scheduledAt: finalScheduledAt,
+      estimatedDurationMinutes: service.durationMinutes || 60,
+      dispatchEligibleAt: computeDispatchEligibleAt(
+        bookingType === "scheduled" ? "schedule" : "instant",
+        finalScheduledAt,
+        now
+      ),
       status: initialStatus,
       radius: radiusInput ?? 500,
       faultProblem: typeof req.body?.faultProblem === "string" ? req.body.faultProblem.trim() : null,
@@ -526,13 +547,285 @@ export const storeBookingSchedule = async (req, res) => {
 
 
 
+/* ================= RESCHEDULE (UNASSIGNED SCHEDULED BOOKING) ================= */
+export const rescheduleBooking = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const { id } = req.params;
+    const { scheduledDate, scheduledTime, reason } = req.body || {};
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id", result: {} });
+    }
+
+    const booking = await ServiceBooking.findOne({
+      _id: id,
+      customerId: req.user.userId,
+    });
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found", result: {} });
+    }
+
+    if (booking.bookingType !== "schedule" || !booking.scheduledAt) {
+      return res.status(400).json({
+        success: false,
+        message: "Only scheduled bookings can be rescheduled",
+        result: {},
+      });
+    }
+
+    if (booking.technicianId || !["pending", "broadcasted"].includes(normalizeBookingStatus(booking.status))) {
+      return res.status(409).json({
+        success: false,
+        message: "This booking is already assigned or closed. Please cancel and rebook.",
+        result: {},
+      });
+    }
+
+    const now = new Date();
+    const cutoffMs = RESCHEDULE_CUTOFF_MINUTES * 60 * 1000;
+    if (booking.scheduledAt.getTime() - now.getTime() < cutoffMs) {
+      return res.status(409).json({
+        success: false,
+        message: `Reschedules are closed within ${RESCHEDULE_CUTOFF_MINUTES} minutes of the appointment. Please cancel and rebook.`,
+        result: {},
+      });
+    }
+
+    const schedule = resolveScheduleInput(
+      { bookingType: "scheduled", scheduledDate, scheduledTime },
+      { now }
+    );
+    if (schedule.error) {
+      return res.status(400).json({ success: false, message: schedule.error, result: {} });
+    }
+
+    if (schedule.scheduledAt.getTime() === booking.scheduledAt.getTime()) {
+      return res.status(400).json({
+        success: false,
+        message: "New slot must be different from the current slot",
+        result: {},
+      });
+    }
+
+    const oldScheduledAt = booking.scheduledAt;
+    const newScheduledAt = schedule.scheduledAt;
+    const autoCancelAt = computeAutoCancelAt("schedule", newScheduledAt, now);
+    const dispatchEligibleAt = computeDispatchEligibleAt("schedule", newScheduledAt, now);
+    const rescheduleCount = (booking.rescheduleCount || 0) + 1;
+
+    await session.withTransaction(async () => {
+      const updated = await ServiceBooking.findOneAndUpdate(
+        {
+          _id: booking._id,
+          customerId: req.user.userId,
+          bookingType: "schedule",
+          status: { $in: ["pending", "broadcasted", "SEARCHING"] },
+          technicianId: null,
+          scheduledAt: oldScheduledAt,
+        },
+        {
+          $set: {
+            status: "pending",
+            scheduledAt: newScheduledAt,
+            timezone: schedule.timezone,
+            scheduledDateLocal: schedule.scheduledDateLocal,
+            scheduledTimeLocal: schedule.scheduledTimeLocal,
+            originalScheduledAt: booking.originalScheduledAt || oldScheduledAt,
+            rescheduleStatus: "accepted",
+            rescheduleRequestedAt: now,
+            rescheduleRequestedBy: "customer",
+            rescheduleReason: reason || null,
+            rescheduleRespondBy: null,
+            rescheduleCount,
+            autoCancelAt,
+            dispatchEligibleAt,
+            broadcastedAt: null,
+            broadcastStartedAt: now,
+            assignmentStatus: "unassigned",
+            lastRebroadcastAt: null,
+            enforcementAlertAt: null,
+            noShowAt: null,
+            matchingLeaseUntil: null,
+            matchingLeaseOwner: null,
+            "remindersSent.h24": false,
+            "remindersSent.h1": false,
+            "remindersSent.min15": false,
+            "remindersSent.enforceOTW": false,
+            "remindersSent.escalate25": false,
+            "remindersSent.escalate15": false,
+            "remindersSent.escalate10": false,
+          },
+          $inc: { version: 1 },
+        },
+        { new: true, session }
+      );
+
+      if (!updated) {
+        const error = new Error("Booking changed concurrently. Please refresh and retry.");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      await JobBroadcast.updateMany(
+        { bookingId: booking._id, status: { $in: ["sent", "expired", "rejected"] } },
+        {
+          $set: {
+            status: "expired",
+            expiredAt: now,
+            expiredReason: "rescheduled",
+            lastPushedAt: null,
+            lastPushedVersion: null,
+          },
+        },
+        { session }
+      );
+
+      await TechnicianBookingOffer.updateMany(
+        { bookingId: booking._id, decision: "offered" },
+        { $set: { decision: "superseded", respondedAt: now } },
+        { session }
+      );
+
+      await DispatchOutbox.updateMany(
+        { bookingId: booking._id, kind: "job_new", status: { $in: ["pending", "inflight"] } },
+        {
+          $set: {
+            status: "done",
+            completedAt: now,
+            lastError: "superseded_by_reschedule",
+          },
+        },
+        { session }
+      );
+
+      await writeAuditLog({
+        actor: req.user.userId,
+        actorRole: "Customer",
+        action: "BOOKING_RESCHEDULED",
+        targetType: "ServiceBooking",
+        targetId: booking._id,
+        before: { scheduledAt: oldScheduledAt },
+        after: { scheduledAt: newScheduledAt, rescheduleCount },
+        reason: reason || null,
+        session,
+      });
+    });
+
+    const updatedBooking = await ServiceBooking.findById(booking._id);
+
+    if (req.io) {
+      const payload = {
+        bookingId: updatedBooking._id,
+        scheduledAt: updatedBooking.scheduledAt,
+        scheduledDateLocal: updatedBooking.scheduledDateLocal,
+        scheduledTimeLocal: updatedBooking.scheduledTimeLocal,
+        timezone: updatedBooking.timezone,
+      };
+      req.io.to(`customer_${req.user.userId}`).emit("booking_rescheduled", payload);
+      req.io.to("admin_dashboard").emit("booking_rescheduled", payload);
+    }
+
+    matchAndBroadcastBooking(updatedBooking._id, req.io).catch((err) =>
+      console.error("Re-broadcast after reschedule failed:", err.message)
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Booking rescheduled successfully",
+      result: {
+        bookingId: updatedBooking._id,
+        scheduledAt: updatedBooking.scheduledAt,
+        scheduledDateLocal: updatedBooking.scheduledDateLocal,
+        scheduledTimeLocal: updatedBooking.scheduledTimeLocal,
+        timezone: updatedBooking.timezone,
+        rescheduleCount: updatedBooking.rescheduleCount,
+      },
+    });
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    console.error("rescheduleBooking Error:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+      result: {},
+    });
+  } finally {
+    session.endSession();
+  }
+};
+
 /* ================= GET BOOKING SCHEDULE ================= */
 export const getBookingSchedule = async (req, res) => {
   try {
+    const { serviceId, addressId } = req.query;
+    let availability = {
+      enabled: false,
+      reason: "service_required",
+    };
+
+    if (serviceId) {
+      if (!mongoose.Types.ObjectId.isValid(serviceId)) {
+        availability = { enabled: false, reason: "invalid_service_id" };
+      } else {
+        const service = await Service.findById(serviceId).select("isActive durationMinutes");
+        if (!service || !service.isActive) {
+          availability = { enabled: false, reason: "service_not_found" };
+        } else {
+          const latitude = toFiniteNumber(req.query.latitude ?? req.query.lat);
+          const longitude = toFiniteNumber(req.query.longitude ?? req.query.lng ?? req.query.lon);
+          let location = null;
+
+          if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+            location = { latitude, longitude };
+          } else if (addressId && req.user?.userId) {
+            try {
+              const resolved = await resolveUserLocation({
+                locationType: "saved",
+                addressId,
+                userId: req.user.userId,
+              });
+              if (resolved?.success) {
+                location = { latitude: resolved.latitude, longitude: resolved.longitude };
+              }
+            } catch {
+              location = null;
+            }
+          }
+
+          if (!location) {
+            availability = { enabled: false, reason: "location_required" };
+          } else {
+            const zoneCheck = await resolveServiceZoneAvailability({
+              service,
+              latitude: location.latitude,
+              longitude: location.longitude,
+            });
+            if (!zoneCheck.ok) {
+              availability = {
+                enabled: true,
+                available: false,
+                reason: zoneCheck.reason || "SERVICE_NOT_AVAILABLE",
+                days: {},
+              };
+            } else {
+              availability = await getSlotAvailability({
+                serviceId,
+                districtId: zoneCheck.districtId,
+                cityZoneId: zoneCheck.zoneId,
+                latitude: location.latitude,
+                longitude: location.longitude,
+              }) || { enabled: false, reason: "disabled" };
+            }
+          }
+        }
+      }
+    }
+
     return res.status(200).json({
       success: true,
       message: "Booking schedule options",
-      result: getBookingSchedulePayload(),
+      result: getBookingSchedulePayload(new Date(), undefined, availability),
     });
   } catch (error) {
     return res.status(500).json({
@@ -1428,6 +1721,7 @@ export const requestCompletionOtp = async (req, res) => {
     const result = await requestCompletionOtpService({
       bookingId: req.params.id,
       technicianProfileId: req.user?.technicianProfileId,
+      io: req.io,
     });
     return res.status(200).json({ success: true, message: "Completion verification requested.", result });
   } catch (error) {
@@ -1444,6 +1738,7 @@ export const resendCompletionOtp = async (req, res) => {
     const result = await resendCompletionOtpService({
       bookingId: req.params.id,
       technicianProfileId: req.user?.technicianProfileId,
+      io: req.io,
     });
     return res.status(200).json({ success: true, message: "Completion OTP resent.", result });
   } catch (error) {
@@ -1661,6 +1956,7 @@ export const cancelBooking = async (req, res) => {
           assignmentStatus: "released",
           autoCancelAt: null,
           completionPinnedAt: null,
+          completionOtpRequestedAt: null,
         },
         $inc: { version: 1 },
       },
@@ -1864,8 +2160,32 @@ export const technicianCancelBooking = async (req, res) => {
 
     // 6. Expire the old broadcasts and offers for this booking (in transaction)
     await JobBroadcast.updateMany(
-      { bookingId: id, status: { $in: ["sent", "accepted"] } },
-      { status: "expired" },
+      { bookingId: id, status: { $in: ["sent", "accepted", "expired"] } },
+      {
+        $set: {
+          status: "expired",
+          expiredAt: now,
+          expiredReason: "technician_cancelled",
+          lastPushedAt: null,
+          lastPushedVersion: null,
+        },
+      },
+      { session }
+    );
+    // The cancelling technician declined this job for re-dispatch purposes;
+    // keep them suppressed while the booking is re-broadcast.
+    await JobBroadcast.updateOne(
+      { bookingId: id, technicianId: techId },
+      {
+        $set: {
+          status: "rejected",
+          respondedAt: now,
+          expiredAt: null,
+          expiredReason: null,
+          lastPushedAt: null,
+          lastPushedVersion: null,
+        },
+      },
       { session }
     );
     await TechnicianBookingOffer.updateMany(
@@ -1885,12 +2205,25 @@ export const technicianCancelBooking = async (req, res) => {
       booking.technicianSnapshot = null;
       booking.assignedAt = null;
       booking.completionPinnedAt = null;
-      booking.autoCancelAt = new Date(booking.scheduledAt.getTime() - 5 * 60 * 60 * 1000);
-      if (booking.autoCancelAt <= now) booking.autoCancelAt = new Date(now.getTime() + 5 * 60 * 1000);
+      const redispatchWindowMs = SCHEDULED_REDISPATCH_WINDOW_MINUTES * 60 * 1000;
+      booking.autoCancelAt = new Date(Math.max(
+        now.getTime() + redispatchWindowMs,
+        booking.scheduledAt.getTime() - 5 * 60 * 60 * 1000
+      ));
+      booking.dispatchEligibleAt = now;
+      booking.lastRebroadcastAt = null;
+      booking.broadcastedAt = null;
+      booking.matchingLeaseUntil = null;
+      booking.matchingLeaseOwner = null;
       booking.cancelReason = null;
       booking.cancelledBy = null;
       booking.technicianPenalty = penaltyPaise / 100;
       booking.technicianRejectCount = (booking.technicianRejectCount || 0) + 1;
+      if (booking.remindersSent) {
+        for (const key of Object.keys(booking.remindersSent.toObject?.() || booking.remindersSent)) {
+          booking.remindersSent[key] = false;
+        }
+      }
       await booking.save({ session });
     } else {
       // Instant booking or past slot: cancel permanently
@@ -2180,6 +2513,7 @@ export const acceptCancelledJob = async (req, res) => {
           cancelReason: null,
           autoCancelAt: live.bookingType === "instant" ? new Date(now.getTime() + 30 * 60 * 1000) : null,
           completionPinnedAt: null,
+          completionOtpRequestedAt: null,
           ...(penaltyPaise > 0
             ? {
                 technicianPenaltyPaise: penaltyPaise,

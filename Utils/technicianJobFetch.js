@@ -3,8 +3,6 @@ import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
-import { haversineMeters } from "./feasibility.js";
-import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getGpsState } from "./locationConfig.js";
@@ -30,27 +28,37 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     // 2. Fetch current technician profile and state
     const technician = await TechnicianProfile.findById(technicianProfileId)
-        .select("location locationUpdatedAt availability workStatus profileComplete trainingCompleted primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds skills serviceRadiusKm")
+        .select("location locationUpdatedAt serviceBaseLocation availability notificationPreferences workStatus profileComplete trainingCompleted primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds enabledCityZoneIds skills serviceRadiusKm")
         .lean();
 
     if (!technician || technician.workStatus !== "approved" || !technician.availability?.isOnline) {
         return [];
     }
 
-    // 3. Location validity & freshness gate (<= 90s for fetch)
-    const techCoords = technician.location?.coordinates;
-    if (!Array.isArray(techCoords) || techCoords.length < 2 || !Number.isFinite(techCoords[0]) || !Number.isFinite(techCoords[1])) {
-        return [];
-    }
+    // 3. Location validity & freshness gate (<= 90s for fetch).
+    // A stable service base location is enough for scheduled offers; instant
+    // offers are still filtered per-booking by the eligibility engine.
+    const baseCoords = technician.serviceBaseLocation?.coordinates;
+    const hasBaseLocation = Array.isArray(baseCoords)
+        && baseCoords.length === 2
+        && Number.isFinite(baseCoords[0])
+        && Number.isFinite(baseCoords[1]);
+    if (!hasBaseLocation) {
+        const techCoords = technician.location?.coordinates;
+        if (!Array.isArray(techCoords) || techCoords.length < 2 || !Number.isFinite(techCoords[0]) || !Number.isFinite(techCoords[1])) {
+            console.log(`[fetchJobsInternal] Tech ${technicianProfileId} has invalid/missing GPS coordinates. Hiding jobs.`);
+            return [];
+        }
 
-    const gps = getGpsState(technician, "FETCH");
-    if (!gps.valid) {
-        console.log(`[fetchJobsInternal] Tech ${technicianProfileId} has invalid/missing GPS coordinates. Hiding jobs.`);
-        return [];
-    }
-    if (!gps.fresh) {
-        console.log(`[fetchJobsInternal] Tech ${technicianProfileId} GPS is stale or missing timestamp (${technician.locationUpdatedAt || "none"}, reason=${gps.reason}, age=${gps.ageSeconds}s, threshold=${gps.thresholdSeconds}s). Hiding jobs.`);
-        return [];
+        const gps = getGpsState(technician, "FETCH");
+        if (!gps.valid) {
+            console.log(`[fetchJobsInternal] Tech ${technicianProfileId} has invalid/missing GPS coordinates. Hiding jobs.`);
+            return [];
+        }
+        if (!gps.fresh) {
+            console.log(`[fetchJobsInternal] Tech ${technicianProfileId} GPS is stale or missing timestamp (${technician.locationUpdatedAt || "none"}, reason=${gps.reason}, age=${gps.ageSeconds}s, threshold=${gps.thresholdSeconds}s). Hiding jobs.`);
+            return [];
+        }
     }
 
     const kyc = await TechnicianKyc.findOne({ technicianId: techId })
@@ -90,6 +98,11 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
     for (const booking of bookings) {
         const bookingIdStr = String(booking._id);
 
+        if (booking.bookingType === "schedule" &&
+            technician.notificationPreferences?.scheduledOffersEnabled === false) {
+            continue;
+        }
+
         // Use unified eligibility check for fetch mode (same as broadcast)
         const eligibility = await evaluateTechnicianEligibility({
             technician,
@@ -111,7 +124,7 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
         // All checks passed -> Eligible for display in Jobs.jsx
         const distanceMeters = eligibility.details.distanceMeters;
-        const distanceKm = (distanceMeters / 1000).toFixed(1);
+        const distanceKm = distanceMeters != null ? (distanceMeters / 1000).toFixed(1) : null;
         const customerName = booking.addressSnapshot?.name ||
             (booking.customerId ? `${booking.customerId.fname || ''} ${booking.customerId.lname || ''}`.trim() : "Customer");
 
@@ -130,9 +143,9 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             pincode: booking.addressSnapshot?.pincode || "",
             latitude: booking.location?.coordinates?.[1] || null,
             longitude: booking.location?.coordinates?.[0] || null,
-            distanceStr: `${distanceKm} km`,
-            distanceKm: Number(distanceKm),
-            distanceMeters: Math.round(distanceMeters),
+            distanceStr: distanceKm != null ? `${distanceKm} km` : null,
+            distanceKm: distanceKm != null ? Number(distanceKm) : null,
+            distanceMeters: distanceMeters != null ? Math.round(distanceMeters) : null,
             jobRadiusKm: Number((eligibility.details.effectiveRadiusMeters / 1000).toFixed(1)),
             maxRadiusKm: Number((eligibility.details.effectiveRadiusMeters / 1000).toFixed(1)),
             maxAllowedMeters: eligibility.details.effectiveRadiusMeters,

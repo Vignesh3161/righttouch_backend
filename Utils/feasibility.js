@@ -16,9 +16,15 @@
  * baked in here because the technician's origin is only known at offer time.
  */
 
-const DEFAULT_CITY_SPEED_KMPH = 25; // city driving average for ETA estimates
-const DEFAULT_TRAVEL_BUFFER = 1.15; // +15% — deadline gate, not display ETA
-const DEFAULT_JOB_GRACE_MINUTES = 15;
+import {
+  FEASIBILITY_CITY_SPEED_KMPH,
+  FEASIBILITY_TRAVEL_BUFFER,
+  FEASIBILITY_GRACE_MINUTES,
+} from "./schedulingConfig.js";
+
+const DEFAULT_CITY_SPEED_KMPH = FEASIBILITY_CITY_SPEED_KMPH;
+const DEFAULT_TRAVEL_BUFFER = FEASIBILITY_TRAVEL_BUFFER;
+const DEFAULT_JOB_GRACE_MINUTES = FEASIBILITY_GRACE_MINUTES;
 
 /** Normalize a GeoJSON point [lng, lat], GeoJSON object, or {latitude, longitude} to {latitude, longitude}. */
 export const toLatLng = (loc) => {
@@ -178,5 +184,95 @@ export const canArriveBy = ({
     projectedArrival,
     slackMinutes: Math.round(slackMinutes * 10) / 10,
     reason: cursor <= deadline ? "feasible" : "arrives_late",
+  };
+};
+
+/**
+ * Scheduled-chain feasibility: can the technician serve the candidate
+ * appointment plus every already-accepted scheduled job without overlapping
+ * travel/service windows?
+ *
+ * Existing accepted appointments and the candidate are sorted by start time,
+ * then walked with the same travel model used for instant jobs. The grace
+ * window is the latest acceptable arrival at each appointment.
+ */
+export const scheduleChainFeasible = ({
+  technicianLocation,
+  candidateJob,
+  committedQueue = [],
+  activeJob = null,
+  travel = {},
+  graceMinutes = DEFAULT_JOB_GRACE_MINUTES,
+  now = new Date(),
+}) => {
+  const committed = [...committedQueue];
+  if (activeJob?._id && !committed.some((job) => String(job._id) === String(activeJob._id))) {
+    committed.push(activeJob);
+  }
+  const jobs = [...committed, candidateJob]
+    .filter((job) => job?.scheduledAt)
+    .sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
+
+  let cursor = new Date(now).getTime();
+  let location = technicianLocation;
+  const travelOpts = {
+    speedKmph: DEFAULT_CITY_SPEED_KMPH,
+    buffer: DEFAULT_TRAVEL_BUFFER,
+    ...travel,
+  };
+
+  // An active instant job occupies the technician before any future slot.
+  if (activeJob?.bookingType === "instant" && activeJob.location) {
+    const activeTravelMin = estimateTravelMinutes(location, activeJob.location, travelOpts);
+    if (activeTravelMin != null) {
+      cursor += activeTravelMin * 60 * 1000;
+      const activeDuration = Number(activeJob.estimatedDurationMinutes);
+      cursor += (Number.isFinite(activeDuration) && activeDuration > 0 ? activeDuration : 60) * 60 * 1000;
+      location = activeJob.location;
+    }
+  }
+
+  const nowMs = new Date(now).getTime();
+  for (const job of jobs) {
+    const travelMin = estimateTravelMinutes(location, job.location, travelOpts);
+    if (travelMin == null) {
+      return { feasible: false, projectedArrival: null, slackMinutes: null, reason: "missing_location" };
+    }
+    const start = new Date(job.scheduledAt).getTime();
+    if (!Number.isFinite(start)) continue;
+
+    const duration = Number(job.estimatedDurationMinutes);
+    const durationMs = (Number.isFinite(duration) && duration > 0 ? duration : 60) * 60 * 1000;
+
+    // Jobs already in progress (or past their slot) are committed work: they
+    // occupy the technician from now for their remaining duration. Applying
+    // the arrival deadline to them would incorrectly reject every new offer.
+    if (start <= nowMs) {
+      cursor += travelMin * 60 * 1000 + durationMs;
+      location = job.location;
+      continue;
+    }
+
+    const earliestArrival = cursor + travelMin * 60 * 1000;
+    const latestArrival = start + graceMinutes * 60 * 1000;
+    if (earliestArrival > latestArrival) {
+      return {
+        feasible: false,
+        projectedArrival: new Date(earliestArrival),
+        slackMinutes: Math.round(((latestArrival - earliestArrival) / 60000) * 10) / 10,
+        reason: "schedule_travel_conflict",
+      };
+    }
+
+    const serviceStart = Math.max(earliestArrival, start);
+    cursor = serviceStart + durationMs;
+    location = job.location;
+  }
+
+  return {
+    feasible: true,
+    projectedArrival: new Date(cursor),
+    slackMinutes: null,
+    reason: "schedule_chain_feasible",
   };
 };

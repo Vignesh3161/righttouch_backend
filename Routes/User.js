@@ -75,6 +75,7 @@ import {
   getBookings,
   getBookingSchedule,
   storeBookingSchedule,
+  rescheduleBooking,
   getCustomerBookings,
   cancelBooking,
   getCancellationReasons,
@@ -307,6 +308,7 @@ router.delete("/service/:id/polygon", Auth, removeServicePolygon);
 router.get("/service/booking", Auth, getBookings);
 router.get("/booking/slots", getBookingSchedule);
 router.post("/booking/schedule", Auth, storeBookingSchedule);
+router.put("/booking/reschedule/:id", Auth, rescheduleBooking);
 router.put("/booking/cancel/:id", Auth, cancelBooking);
 router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);

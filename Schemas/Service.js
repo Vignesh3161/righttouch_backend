@@ -157,6 +157,15 @@ const serviceSchema = new mongoose.Schema(
       type: String, // "60–90 mins"
     },
 
+    // Numeric duration used by scheduling, slot availability, and travel
+    // feasibility checks. `duration` remains the customer-facing label.
+    durationMinutes: {
+      type: Number,
+      default: 60,
+      min: 15,
+      max: 480,
+    },
+
     siteVisitRequired: {
       type: Boolean,
       default: false,

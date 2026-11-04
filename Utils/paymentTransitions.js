@@ -368,6 +368,22 @@ export const markPaymentSucceeded = async (
       source,
     });
 
+    // Service completion is pay-before-OTP: the payment success is what
+    // releases the completion OTP SMS. Keep this best-effort so a delivery
+    // outage never turns a captured payment into an error response.
+    if ((result.payment.itemType || "service") === "service" && !result.manualReview) {
+      try {
+        const { issueCompletionOtpForPaidBooking } = await import(
+          "../Services/completionVerificationService.js"
+        );
+        await issueCompletionOtpForPaidBooking({ bookingId: result.payment.bookingId });
+      } catch (otpErr) {
+        console.error(
+          `[PaymentTransition] completion OTP issuance failed for booking ${result.payment.bookingId}:`,
+          otpErr.message
+        );
+      }
+    }
   }
 
   return result;

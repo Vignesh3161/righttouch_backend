@@ -64,10 +64,9 @@ scripts/
 Scripts/
 test/
 
-# Project documentation, operational scripts, and tests are tracked
+# Project documentation and operational scripts are tracked
 !docs/
 !scripts/
-!test/
 config/firebase-credentials.json
 *Account.json
 serverAccount.json

@@ -12,10 +12,10 @@ import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
 import { findNearbyTechnicians } from "./findNearbyTechnicians.js";
 import { emitJobsChanged } from "./sendNotification.js";
-import { canArriveBy, computeLatestArrival, haversineMeters } from "./feasibility.js";
+import { canArriveBy, computeLatestArrival, haversineMeters, scheduleChainFeasible } from "./feasibility.js";
 import { geoSearch } from "./technicianGeo.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
-import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
+import { evaluateTechnicianEligibility, getAllowedDistrictIds, getAllowedZoneIds, hasDistrictPermission, hasZonePermission, checkCurrentDistrictMatch, checkCurrentZoneMatch, calculateDistanceMeters, getEffectiveRadiusMeters, getTechnicianOrigin, MAX_PREFILTER_RADIUS_M } from "../Services/technicianEligibilityService.js";
 import { STALENESS_SECONDS, stalenessCutoff, getGpsState } from "./locationConfig.js";
 import { recordMetric, recordHistogram, METRIC_KEYS } from "./broadcastMetrics.js";
 import {
@@ -26,6 +26,12 @@ import {
 import { offerPurgeAt } from "./broadcastRetention.js";
 import { mergeTechnicianCandidateIds } from "./technicianCandidatePool.js";
 import { buildJobDispatchPayload } from "./jobPayload.js";
+import {
+  SCHEDULED_CANDIDATE_CAP,
+  REOFFER_DECLINED_AFTER_MINUTES,
+  isDispatchWindowOpen,
+} from "./schedulingConfig.js";
+import { startOfBusinessDayUtc } from "./slots.js";
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -297,35 +303,60 @@ export const upsertTechnicianOffers = async ({
 export const loadCommittedQueues = async (techIds) => {
   const map = new Map();
   techIds.forEach((id) =>
-    map.set(String(id), { activeJob: null, schedules: [] })
+    map.set(String(id), { activeJob: null, schedules: [], instantJobs: [] })
   );
   if (!techIds.length) return map;
 
-  const [activeJobs, schedules] = await Promise.all([
+  const [activeJobs, schedules, instantJobs] = await Promise.all([
     ServiceBooking.find({
       technicianId: { $in: techIds },
       status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
     })
-      .select("technicianId scheduledAt location bookingType")
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
       .lean(),
     ServiceBooking.find({
       technicianId: { $in: techIds },
       bookingType: "schedule",
-      status: { $in: ["accepted"] },
+      status: { $in: ["accepted", "ACCEPTED"] },
       scheduledAt: { $gt: new Date() },
     })
-      .select("technicianId scheduledAt location")
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
       .sort({ scheduledAt: 1 })
+      .lean(),
+    ServiceBooking.find({
+      technicianId: { $in: techIds },
+      bookingType: "instant",
+      status: { $in: ["accepted", "ACCEPTED", "on_the_way", "reached", "in_progress"] },
+    })
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
       .lean(),
   ]);
 
   for (const job of activeJobs) {
     const entry = map.get(String(job.technicianId));
-    if (entry) entry.activeJob = job;
+    if (!entry) continue;
+    if (job.bookingType === "instant") {
+      // An in-flight instant job is the technician's current position and
+      // must not be hidden by a later-sorted scheduled appointment.
+      entry.activeJob = job;
+    } else if (!entry.schedules.some((s) => String(s._id) === String(job._id))) {
+      entry.schedules.push(job);
+    }
   }
   for (const s of schedules) {
     const entry = map.get(String(s.technicianId));
-    if (entry) entry.schedules.push(s);
+    if (entry && !entry.schedules.some((existing) => String(existing._id) === String(s._id))) {
+      entry.schedules.push(s);
+    }
+  }
+  for (const entry of map.values()) {
+    entry.schedules.sort(
+      (a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
+    );
+  }
+  for (const job of instantJobs) {
+    const entry = map.get(String(job.technicianId));
+    if (entry) entry.instantJobs.push(job);
   }
   return map;
 };
@@ -337,8 +368,8 @@ export const nextScheduledFromQueue = (queue) =>
 /**
  * Feasibility filter for a candidate job against one technician's committed
  * queue. Instant jobs: forward-pass against the next scheduled appointment.
- * Scheduled jobs: no travel math (fixed future slot) — always feasible here;
- * precise overlap conflicts are rejected at accept time.
+ * Scheduled jobs: duration-aware travel chain across every accepted
+ * appointment (plus any active instant job).
  *
  * Returns { feasible, reason, projectedArrival, slackMinutes }.
  */
@@ -354,7 +385,12 @@ export const evaluateJobFeasibility = ({
     return { feasible: true, reason: "no_deadline", projectedArrival: null, slackMinutes: null };
   }
   if (isScheduled) {
-    return { feasible: true, reason: "schedule_appointment", projectedArrival: null, slackMinutes: null };
+    return scheduleChainFeasible({
+      technicianLocation: techLocation,
+      candidateJob,
+      committedQueue: queue?.schedules || [],
+      activeJob: queue?.activeJob || null,
+    });
   }
 
   return canArriveBy({
@@ -458,6 +494,8 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       serviceId: { $in: technicianServiceIds },
       technicianId: null,
       status: { $in: ["pending", "broadcasted"] },
+      // Scheduled jobs stay dormant until their dispatch lead window opens.
+      dispatchEligibleAt: { $not: { $gt: new Date() } },
       location: {
         $nearSphere: {
           $geometry: { type: "Point", coordinates: [lng, lat] },
@@ -507,6 +545,23 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
     let newlyBroadcastedCount = 0;
     const offerRows = [];
 
+    // Scheduled offer cap is shared with matchAndBroadcastBooking; this
+    // technician-triggered path must not stack extra offers on top.
+    let scheduledOfferCount = 0;
+    let scheduledMaxOffers = Infinity;
+    let scheduledOfferBookingIds = new Set();
+    if (eligibleBookings.some((b) => b.bookingType === "schedule")) {
+      const prefs = tech.notificationPreferences || {};
+      scheduledMaxOffers = prefs.maxActiveScheduledOffers ?? 5;
+      const activeOffers = await JobBroadcast.find({
+        technicianId: tech._id,
+        status: "sent",
+        expiresAt: { $gt: new Date() },
+      }).select("bookingId").lean();
+      scheduledOfferBookingIds = new Set(activeOffers.map((o) => String(o.bookingId)));
+      scheduledOfferCount = scheduledOfferBookingIds.size;
+    }
+
     // 📤 Batch-load service docs once (no N+1 inside the per-booking loop)
     const serviceIds = [...new Set(eligibleBookings.map((b) => String(b.serviceId)).filter(Boolean))];
     const services = serviceIds.length
@@ -523,6 +578,9 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       const leaseClaimed = await ServiceBooking.findOneAndUpdate(
         {
           _id: booking._id,
+          status: { $in: ["pending", "broadcasted"] },
+          technicianId: null,
+          scheduledAt: booking.scheduledAt || null,
           $or: [{ matchingLeaseUntil: null }, { matchingLeaseUntil: { $lte: new Date() } }],
         },
         { $set: { matchingLeaseUntil: new Date(Date.now() + LOC_MATCH_LEASE_TTL_MS), matchingLeaseOwner: bookingTraceId } },
@@ -539,8 +597,25 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           continue;
         }
 
+        if (booking.bookingType === "schedule" &&
+            tech.notificationPreferences?.scheduledOffersEnabled === false) {
+          continue;
+        }
+
+        if (booking.bookingType !== "schedule" &&
+            (techQueue?.instantJobs?.length || 0) > 0) {
+          continue;
+        }
+
+        if (booking.bookingType === "schedule" &&
+            !scheduledOfferBookingIds.has(String(booking._id)) &&
+            scheduledOfferCount >= scheduledMaxOffers) {
+          continue;
+        }
+
+        const techOrigin = getTechnicianOrigin(tech, booking.bookingType)?.location || null;
         const distanceMeters = haversineMeters(
-          { latitude: lat, longitude: lng },
+          techOrigin || { latitude: lat, longitude: lng },
           {
             latitude: booking.location?.coordinates?.[1],
             longitude: booking.location?.coordinates?.[0],
@@ -579,12 +654,22 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
         }
 
         const feasibility = evaluateJobFeasibility({
-          techLocation: tech.location,
+          techLocation: techOrigin,
           candidateJob: booking,
           queue: techQueue,
         });
         if (!feasibility.feasible) {
           console.log(`⏱ Skipped job ${booking._id} for tech ${tech._id} — ${feasibility.reason} (arrives ${feasibility.projectedArrival})`);
+          continue;
+        }
+
+        const stillOpen = await ServiceBooking.exists({
+          _id: booking._id,
+          status: { $in: ["pending", "broadcasted"] },
+          technicianId: null,
+          scheduledAt: booking.scheduledAt || null,
+        });
+        if (!stillOpen) {
           continue;
         }
 
@@ -624,6 +709,11 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
 
         if (broadcast) {
           newlyBroadcastedCount++;
+          if (booking.bookingType === "schedule" &&
+              !scheduledOfferBookingIds.has(String(booking._id))) {
+            scheduledOfferBookingIds.add(String(booking._id));
+            scheduledOfferCount += 1;
+          }
 
           const service = serviceById.get(String(booking.serviceId));
           const bm = new Map([[String(tech._id), { _id: broadcast._id, version: broadcast.version }]]);
@@ -706,40 +796,54 @@ export const findEligibleTechniciansForService = async ({
   enableGeo = true,
   limit = 50,
   session,
+  bookingType = "instant",
+  cityZoneId = null,
 } = {}) => {
   const serviceObjectId = new mongoose.Types.ObjectId(serviceId);
   const serviceIdString = String(serviceId);
+  const isScheduled = bookingType === "schedule";
 
-  // ⚡ 1. Efficiently query busy technicians (indexed distinct query on active bookings)
-  let activeTechIdsQuery = ServiceBooking.find({
-    technicianId: { $ne: null },
-    $or: [
-      { status: { $in: ["on_the_way", "reached", "in_progress"] } },
-      { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
-    ],
-  }).distinct("technicianId");
+  // ⚡ 1. Efficiently query busy technicians (indexed distinct query on active bookings).
+  // Scheduled offers are future work and are not hidden by an instant job.
+  let activeTechIds = [];
+  if (!isScheduled) {
+    let activeTechIdsQuery = ServiceBooking.find({
+      technicianId: { $ne: null },
+      $or: [
+        { status: { $in: ["on_the_way", "reached", "in_progress"] } },
+        { status: { $in: ["accepted", "ACCEPTED"] }, bookingType: "instant" },
+      ],
+    }).distinct("technicianId");
 
-  const activeTechIds = session
-    ? await activeTechIdsQuery.session(session)
-    : await activeTechIdsQuery;
+    activeTechIds = session
+      ? await activeTechIdsQuery.session(session)
+      : await activeTechIdsQuery;
+  }
 
   // ⚡ 2. Build targeted candidate query using compound indexes on TechnicianProfile
   const baseQuery = {
     workStatus: "approved",
     profileComplete: true,
     trainingCompleted: true,
-    "availability.isOnline": true,
     $or: [
       { "skills.serviceId": serviceObjectId },
       { "skills.serviceId": serviceIdString },
     ],
   };
 
+  // Instant dispatch requires a live, online, recently-pinged technician.
+  // Scheduled dispatch is based on the approved service area + base location.
+  if (!isScheduled) {
+    baseQuery["availability.isOnline"] = true;
+  } else {
+    baseQuery["notificationPreferences.scheduledOffersEnabled"] = { $ne: false };
+  }
+
   if (activeTechIds && activeTechIds.length > 0) {
     baseQuery._id = { $nin: activeTechIds };
   }
 
-  if (STALENESS_SECONDS > 0) {
+  if (!isScheduled && STALENESS_SECONDS > 0) {
     baseQuery.locationUpdatedAt = { $gte: stalenessCutoff() };
   }
 
@@ -748,8 +852,10 @@ export const findEligibleTechniciansForService = async ({
     if (!techIds?.length) return [];
     let kycQuery = TechnicianKyc.find({
       technicianId: { $in: techIds },
-      bankVerified: true,
-      $or: [{ verificationStatus: "approved" }, { kycVerified: true }],
+      $and: [
+        { $or: [{ verificationStatus: "approved" }, { kycVerified: true }] },
+        { $or: [{ bankVerified: true }, { bankVerificationStatus: "approved" }] },
+      ],
     }).select("technicianId").lean();
     if (session) kycQuery = kycQuery.session(session);
     const approvedDocs = await kycQuery;
@@ -786,13 +892,52 @@ export const findEligibleTechniciansForService = async ({
     const jobDistrictObjId = new mongoose.Types.ObjectId(jobDistrictId);
     baseQuery.$and = baseQuery.$and || [];
     baseQuery.$and.push({
-      $or: [
-        { primaryDistrictId: jobDistrictObjId },
-        { primaryCityId: jobDistrictObjId },
-        { enabledDistrictIds: jobDistrictObjId },
-        { allowedCityIds: jobDistrictObjId },
-      ],
+      $or: isScheduled
+        ? [
+            { enabledDistrictIds: jobDistrictObjId },
+            { allowedCityIds: jobDistrictObjId },
+          ]
+        : [
+            { primaryDistrictId: jobDistrictObjId },
+            { primaryCityId: jobDistrictObjId },
+            { enabledDistrictIds: jobDistrictObjId },
+            { allowedCityIds: jobDistrictObjId },
+          ],
     });
+  }
+
+  if (isScheduled) {
+    if (cityZoneId) {
+      baseQuery.$and = baseQuery.$and || [];
+      baseQuery.$and.push({ enabledCityZoneIds: new mongoose.Types.ObjectId(cityZoneId) });
+    }
+
+    const candidateTarget = Math.min(limit, SCHEDULED_CANDIDATE_CAP);
+    const scanLimit = Math.min(500, Math.max(candidateTarget * 10, candidateTarget));
+    let scheduledQuery = TechnicianProfile.find(baseQuery)
+      .select("_id serviceBaseLocation location")
+      .limit(scanLimit);
+    if (session) scheduledQuery = scheduledQuery.session(session);
+    const scheduledCandidates = await scheduledQuery.lean();
+
+    let candidates = scheduledCandidates.map((technician) => {
+      const origin = getTechnicianOrigin(technician, "schedule")?.location || null;
+      const distanceMeters = hasCoords && origin
+        ? haversineMeters(origin, { latitude: lat, longitude: lng })
+        : null;
+      return { id: technician._id, distanceMeters };
+    });
+
+    if (hasCoords) {
+      candidates = candidates
+        .filter((candidate) =>
+          candidate.distanceMeters != null && candidate.distanceMeters <= MAX_PREFILTER_RADIUS_M
+        )
+        .sort((a, b) => a.distanceMeters - b.distanceMeters);
+    }
+
+    const verifiedIds = await filterByApprovedKyc(candidates.map((candidate) => candidate.id));
+    return verifiedIds.slice(0, candidateTarget).map((id) => String(id));
   }
 
   if (enableGeo && hasCoords) {
@@ -964,6 +1109,18 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       };
     }
 
+    // Scheduled offers only enter dispatch inside their lead window. The
+    // re-broadcast cron retries pending bookings once the window opens.
+    if (!isDispatchWindowOpen(booking)) {
+      return {
+        success: true,
+        count: 0,
+        outcome: "DISPATCH_NOT_DUE",
+        retryable: false,
+        message: "Scheduled dispatch window has not opened yet",
+      };
+    }
+
     const service = await Service.findById(booking.serviceId);
     if (!service) {
       console.error(`❌ matchAndBroadcastBooking: Service ${booking.serviceId} not found`);
@@ -1035,15 +1192,20 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     // 1. Find Technicians (prefilter at platform-max ceiling; the
     // per-technician effective radius gates authoritatively below).
+    const isScheduledBooking = booking.bookingType === "schedule";
+    const bookingAddress = {
+      ...(booking.addressSnapshot || {}),
+      latitude: booking.addressSnapshot?.latitude ?? booking.location?.coordinates?.[1],
+      longitude: booking.addressSnapshot?.longitude ?? booking.location?.coordinates?.[0],
+    };
     const eligibleTechnicians = await findEligibleTechniciansForService({
       serviceId: booking.serviceId,
-      address: booking.addressSnapshot || {
-        latitude: booking.location?.coordinates[1],
-        longitude: booking.location?.coordinates[0]
-      },
+      address: bookingAddress,
       radiusMeters: MAX_PREFILTER_RADIUS_M,
-      enableGeo: true,
-      limit: MATCH_CANDIDATE_LIMIT,
+      enableGeo: !isScheduledBooking,
+      limit: isScheduledBooking ? SCHEDULED_CANDIDATE_CAP : MATCH_CANDIDATE_LIMIT,
+      bookingType: booking.bookingType,
+      cityZoneId: booking.cityZoneId,
     });
 
     await extendMatchLease("prefilter");
@@ -1161,10 +1323,28 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     await extendMatchLease("zone");
 
+    // Declined offers stay suppressed for the booking (default) so a
+    // re-broadcast cannot spam technicians who already said no.
+    if (isScheduledBooking) {
+      const rejectedFilter = { bookingId: booking._id, status: "rejected" };
+      if (REOFFER_DECLINED_AFTER_MINUTES > 0) {
+        rejectedFilter.respondedAt = {
+          $gte: new Date(Date.now() - REOFFER_DECLINED_AFTER_MINUTES * 60 * 1000),
+        };
+      }
+      const rejected = await JobBroadcast.find(rejectedFilter)
+        .select("technicianId")
+        .lean();
+      if (rejected.length) {
+        const rejectedSet = new Set(rejected.map((r) => String(r.technicianId)));
+        technicianIds = technicianIds.filter((id) => !rejectedSet.has(String(id)));
+      }
+    }
+
     // Load full profiles and queues for candidates
     const [techProfiles, queueMap, kycDocs] = await Promise.all([
       TechnicianProfile.find({ _id: { $in: technicianIds } })
-        .select("_id userId location locationUpdatedAt workStatus profileComplete trainingCompleted availability skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
+        .select("_id userId location serviceBaseLocation locationUpdatedAt workStatus profileComplete trainingCompleted availability notificationPreferences skills primaryDistrictId primaryCityId enabledDistrictIds allowedCityIds cityZoneId enabledCityZoneIds serviceRadiusKm")
         .lean(),
       loadCommittedQueues(technicianIds),
       TechnicianKyc.find({ technicianId: { $in: technicianIds } })
@@ -1176,7 +1356,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // Build userId map for correct room targeting
     const techUserIds = new Map(techProfiles.map((t) => [String(t._id), String(t.userId)]));
 
-    const offerRows = [];
+    let offerRows = [];
     const validCandidateIds = [];
     const candidateReasons = {};
     const bumpReason = (reason) => {
@@ -1189,8 +1369,12 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       technicianIds,
       MATCH_EVAL_CONCURRENCY,
       async (techId) => {
-        const techProfile = profileById.get(techId);
-        if (!techProfile || !techProfile.location?.coordinates) {
+        const techProfile = profileById.get(String(techId));
+        const hasOrigin = Boolean(
+          techProfile?.serviceBaseLocation?.coordinates ||
+          techProfile?.location?.coordinates
+        );
+        if (!techProfile || (!hasOrigin && !isScheduledBooking)) {
           bumpReason("MISSING_LOCATION");
           console.log(`REJECT TECHNICIAN`, JSON.stringify({
             technicianId: techId,
@@ -1220,9 +1404,9 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         recordMetric(METRIC_KEYS.TECHS_ELIGIBLE);
 
         const feasibility = evaluateJobFeasibility({
-          techLocation: techProfile.location,
+          techLocation: getTechnicianOrigin(techProfile, booking.bookingType)?.location || null,
           candidateJob: booking,
-          queue: queueMap.get(techId),
+          queue: queueMap.get(String(techId)),
         });
 
         if (!feasibility.feasible) {
@@ -1235,7 +1419,6 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
           return null;
         }
-        recordMetric(METRIC_KEYS.TECHS_FILTERED_FEASIBILITY);
 
         return { techId, eligibility, feasibility };
       }
@@ -1254,9 +1437,58 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     technicianIds = validCandidateIds;
 
+    // Per-technician scheduled caps: active offers and accepted jobs today.
+    if (isScheduledBooking && technicianIds.length) {
+      const now = new Date();
+      const targetDay = booking.scheduledAt ? new Date(booking.scheduledAt) : now;
+      const dayStart = startOfBusinessDayUtc(targetDay);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+      const [activeOfferCounts, dailyCounts] = await Promise.all([
+        JobBroadcast.aggregate([
+          {
+            $match: {
+              technicianId: { $in: technicianIds.map((id) => new mongoose.Types.ObjectId(id)) },
+              bookingId: { $ne: booking._id },
+              status: "sent",
+              expiresAt: { $gt: now },
+            },
+          },
+          { $group: { _id: "$technicianId", count: { $sum: 1 } } },
+        ]),
+        ServiceBooking.aggregate([
+          {
+            $match: {
+              technicianId: { $in: technicianIds.map((id) => new mongoose.Types.ObjectId(id)) },
+              bookingType: "schedule",
+              status: {
+                $in: ["accepted", "ACCEPTED", "on_the_way", "reached", "in_progress", "completed"],
+              },
+              scheduledAt: { $gte: dayStart, $lt: dayEnd },
+            },
+          },
+          { $group: { _id: "$technicianId", count: { $sum: 1 } } },
+        ]),
+      ]);
+      const activeOfferMap = new Map(activeOfferCounts.map((r) => [String(r._id), r.count]));
+      const dailyMap = new Map(dailyCounts.map((r) => [String(r._id), r.count]));
+      const offerById = new Map(offerRows.map((o) => [String(o.technicianId), o]));
+      const cappedIds = technicianIds.filter((id) => {
+        const prefs = profileById.get(String(id))?.notificationPreferences || {};
+        const maxOffers = prefs.maxActiveScheduledOffers ?? 5;
+        const maxDaily = prefs.maxScheduledJobsPerDay ?? 8;
+        return (activeOfferMap.get(String(id)) || 0) < maxOffers
+          && (dailyMap.get(String(id)) || 0) < maxDaily;
+      });
+      if (cappedIds.length !== technicianIds.length) {
+        console.log(`📊 [TRACE] ${trc} SCHEDULED_CAPS bookingId=${bookingId} dropped=${technicianIds.length - cappedIds.length}`);
+      }
+      technicianIds = cappedIds;
+      offerRows = cappedIds.map((id) => offerById.get(String(id))).filter(Boolean);
+    }
+
     console.log(`📊 [TRACE] ${trc} CANDIDATE_FUNNEL bookingId=${bookingId}`, JSON.stringify({
       candidates: evaluations.length,
-      eligible: validCandidateIds.length,
+      eligible: technicianIds.length,
       reasons: candidateReasons,
     }));
 
@@ -1264,13 +1496,23 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
 
     if (technicianIds.length === 0) {
       console.log(`⏱ [TRACE] ${trc} NO_FEASIBLE_TECHS bookingId=${bookingId}`);
-      await supersedeStaleOffers({
-        bookingId: booking._id,
-        keepTechnicianIds: [],
-        reason: "rebroadcast_no_candidates",
-      }).catch((err) =>
-        console.warn(`[TRACE] ${trc} supersede offers failed: ${err.message}`)
-      );
+      // Only the worker that still owns the lease for the same slot may
+      // expire offers; a concurrent reschedule/re-broadcast owns the newer
+      // generation and must not be clobbered by this stale scan.
+      const stillCurrent = await ServiceBooking.exists({
+        _id: booking._id,
+        matchingLeaseOwner: trc,
+        scheduledAt: booking.scheduledAt || null,
+      });
+      if (stillCurrent) {
+        await supersedeStaleOffers({
+          bookingId: booking._id,
+          keepTechnicianIds: [],
+          reason: "rebroadcast_no_candidates",
+        }).catch((err) =>
+          console.warn(`[TRACE] ${trc} supersede offers failed: ${err.message}`)
+        );
+      }
       return {
         success: true,
         count: 0,
@@ -1300,6 +1542,8 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       serviceType: service.serviceType,
       description: service.description,
       duration: service.duration,
+      durationMinutes: service.durationMinutes ?? booking.estimatedDurationMinutes ?? 60,
+      bookingType: booking.bookingType,
       customerName: booking.addressSnapshot?.name || "Customer",
       baseAmount: booking.baseAmount,
       address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
@@ -1323,6 +1567,8 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
             _id: booking._id,
             status: { $in: ["pending", "broadcasted"] },
             technicianId: null,
+            matchingLeaseOwner: trc,
+            scheduledAt: booking.scheduledAt || null,
           },
           {
             $set: { status: "broadcasted", broadcastedAt: new Date(), assignmentStatus: "broadcasted" },
@@ -1474,7 +1720,10 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     console.log(`🚀 [TRACE] ${trc} MATCH_SUCCESS bookingId=${bookingId} techCount=${technicianIds.length}`);
     technicianIds.forEach((tid, i) => {
       const offer = offerRows.find(o => String(o.technicianId) === String(tid));
-      console.log(`   [${i + 1}] Tech ${tid} -> Distance: ${offer ? `${(offer.distanceAtOffer / 1000).toFixed(2)} km (${Math.round(offer.distanceAtOffer)}m)` : "within 10km"}`);
+      const distanceLabel = offer?.distanceAtOffer != null
+        ? `${(offer.distanceAtOffer / 1000).toFixed(2)} km (${Math.round(offer.distanceAtOffer)}m)`
+        : "within service area";
+      console.log(`   [${i + 1}] Tech ${tid} -> Distance: ${distanceLabel}`);
     });
     console.log(`======================================================================\n`);
     return {

@@ -13,6 +13,7 @@ import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendRemind
 import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
 import { expireRewards, recoverMissedRewards, expireRedemptionReservations } from "../Services/rewardService.js";
 import { normalizeBookingStatus } from "./bookingStatus.js";
+import { SCHEDULED_REDISPATCH_WINDOW_MINUTES } from "./schedulingConfig.js";
 import { hasActiveCompletionChallenge, closeActiveChallengesForBooking } from "./completionOtp.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
@@ -117,7 +118,7 @@ const notifyCustomer = async (booking, message, io) => {
 };
 
 /** Release an assigned technician (atomic, idempotent) and record history. */
-const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
+const releaseTechnicianAssignment = async (bookingId, releaseReason, { autoCancelAt = null } = {}) => {
   const now = new Date();
   const booking = await ServiceBooking.findOneAndUpdate(
     {
@@ -130,8 +131,9 @@ const releaseTechnicianAssignment = async (bookingId, releaseReason) => {
         technicianId: null,
         status: "pending",
         assignmentStatus: "unassigned",
-        autoCancelAt: new Date(now.getTime() + 5 * 60 * 1000),
+        autoCancelAt: autoCancelAt || new Date(now.getTime() + 5 * 60 * 1000),
         completionPinnedAt: null,
+        completionOtpRequestedAt: null,
       },
       $inc: { version: 1 },
     },
@@ -172,7 +174,15 @@ const expireBroadcastsForBooking = async (io, bookingId, reason, expiresAt = new
   try {
     await JobBroadcast.updateMany(
       { bookingId },
-      { $set: { status: "expired" } }
+      {
+        $set: {
+          status: "expired",
+          expiredAt: new Date(),
+          expiredReason: reason,
+          lastPushedAt: null,
+          lastPushedVersion: null,
+        },
+      }
     );
     await TechnicianBookingOffer.updateMany(
       { bookingId, decision: "offered" },
@@ -247,6 +257,7 @@ export const initBookingCrons = (io) => {
                           cancellationStatus: "system_cancelled",
                           assignmentStatus: "released",
                           completionPinnedAt: null,
+                          completionOtpRequestedAt: null,
                         },
                         $inc: { version: 1 },
                       }
@@ -293,6 +304,8 @@ export const initBookingCrons = (io) => {
                 status: { $in: ["pending", "broadcasted"] },
                 technicianId: null,
                 autoCancelAt: { $gt: now },
+                // Legacy rows have no dispatchEligibleAt and remain eligible.
+                dispatchEligibleAt: { $not: { $gt: now } },
                 $or: [
                   { lastRebroadcastAt: { $exists: false } },
                   { lastRebroadcastAt: { $lt: tenMinsAgo } },
@@ -387,6 +400,7 @@ export const initBookingCrons = (io) => {
                               assignmentStatus: "released",
                               autoCancelAt: null,
                               completionPinnedAt: null,
+                              completionOtpRequestedAt: null,
                             },
                             $inc: { version: 1 },
                           }
@@ -422,6 +436,7 @@ export const initBookingCrons = (io) => {
                           assignmentStatus: "unassigned",
                           autoCancelAt: new Date(now.getTime() + 5 * 60 * 1000),
                           completionPinnedAt: null,
+                          completionOtpRequestedAt: null,
                         },
                         $push: {
                           assignmentAttempts: {
@@ -565,7 +580,16 @@ export const initBookingCrons = (io) => {
                                 console.log(`[Cron:Enforcement] Holding ${b._id}: completion OTP in progress`);
                                 continue;
                             }
-                            const released = await releaseTechnicianAssignment(b._id, "schedule_travel_no_show");
+                            const redispatchWindowMs = SCHEDULED_REDISPATCH_WINDOW_MINUTES * 60 * 1000;
+                            const releaseAutoCancelAt = new Date(Math.max(
+                              now.getTime() + redispatchWindowMs,
+                              fresh.scheduledAt
+                                ? new Date(fresh.scheduledAt).getTime() - 5 * 60 * 60 * 1000
+                                : 0
+                            ));
+                            const released = await releaseTechnicianAssignment(b._id, "schedule_travel_no_show", {
+                              autoCancelAt: releaseAutoCancelAt,
+                            });
                             if (released) {
                                 await expireBroadcastsForBooking(io, b._id, "schedule_travel_no_show");
                                 await matchAndBroadcastBooking(b._id, io);

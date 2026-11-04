@@ -1,19 +1,20 @@
 /**
  * ✅ SERVICE COMPLETION VERIFICATION (Checkpoint C).
  *
- * Customer-confirmed job completion: the technician requests a 4-digit OTP,
- * the customer receives it by SMS, the technician submits it, and the
- * booking flips to `completed` ONLY inside the same transaction that
+ * Customer-confirmed job completion: the technician requests completion,
+ * the customer receives a payment-due notification, pays online, and only
+ * then receives the 4-digit OTP by SMS. The technician submits the OTP and
+ * the booking flips to `completed` ONLY inside the same transaction that
  * consumes the challenge.
  *
  * Boundaries (deliberate):
  *  - This service moves NO money. After commit, the caller runs the
  *    EXISTING completion side effects (settleBookingEarningsIfEligible +
- *    notifications) exactly as updateBookingStatus does today.
+ *    notifications).
  *  - Attempt counting happens OUTSIDE the transaction (one HTTP attempt =
  *    one count); transaction retries only wrap consume+flip, so a retry
  *    can never double-count an incorrect attempt.
- *  - SMS is sent AFTER the challenge commit (provider calls never run
+ *  - SMS is sent only AFTER payment succeeds (provider calls never run
  *    inside a MongoDB transaction). Crash gap documented in
  *    Utils/sendCompletionSms.js; resend re-drives delivery.
  */
@@ -21,6 +22,7 @@ import mongoose from "mongoose";
 
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import ServiceCompletionChallenge from "../Schemas/ServiceCompletionChallenge.js";
+import Payment from "../Schemas/Payment.js";
 import User from "../Schemas/User.js";
 import Report from "../Schemas/Report.js";
 import { canTransition, normalizeBookingStatus } from "../Utils/bookingStatus.js";
@@ -38,6 +40,7 @@ import {
   recordCompletionAttempt,
   registerCompletionResend,
   rollbackCompletionResend,
+  prepareCompletionChallengeDelivery,
   markChallengeDelivering,
   consumeCompletionChallenge,
   closeCompletionChallenge,
@@ -47,6 +50,9 @@ import { sendCompletionSms, validateCompletionSmsConfig } from "../Utils/sendCom
 import { writeAuditLog } from "../Utils/audit.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
+import { isSuccessfulServicePayment } from "../Utils/servicePaymentEligibility.js";
+import { sendAppNotification } from "./unifiedNotificationService.js";
+import { SOCKET_EVENTS } from "../Utils/socketConstants.js";
 
 const fail = (statusCode, code, message) => {
   const err = otpError(code, message);
@@ -96,6 +102,66 @@ const isValidDeliveryPhone = (phone) =>
 const loadCustomerPhone = async (customerId) => {
   const customer = await User.findById(customerId).select("mobileNumber").lean();
   return String(customer?.mobileNumber || "").replace(/\D/g, "");
+};
+
+const isFreeServicePayment = (payment) => {
+  if (!payment) return false;
+  if (String(payment.provider || "").toLowerCase() === "free") return true;
+  return Number(payment.totalAmountPaise || 0) === 0;
+};
+
+/**
+ * A paid service booking only counts when there is a successful authoritaive
+ * payment row. Offline/cash rows never satisfy completion, and free bookings
+ * are the explicit exception.
+ */
+const loadSuccessfulServicePayment = async (booking) => {
+  if (!booking || booking.paymentStatus !== "paid") return null;
+  const payment = await Payment.findOne({
+    bookingId: booking._id,
+    status: "success",
+  }).lean();
+  if (!payment) return null;
+  if (payment.itemType && payment.itemType !== "service") return null;
+  if (isFreeServicePayment(payment)) return payment;
+  return isSuccessfulServicePayment(payment) ? payment : null;
+};
+
+const assertServicePaymentSatisfied = async (booking) => {
+  const payment = await loadSuccessfulServicePayment(booking);
+  if (!payment) {
+    throw fail(
+      409,
+      OTP_ERRORS.PAYMENT_REQUIRED,
+      "Payment is required before completion OTP verification"
+    );
+  }
+  return payment;
+};
+
+const notifyCompletionPaymentDue = async ({ booking, notifier = sendAppNotification, io = null }) => {
+  if (!booking?.customerId) return;
+  try {
+    await notifier({
+      userId: String(booking.customerId),
+      recipientType: "customer",
+      type: "PAYMENT_DUE",
+      title: "Payment due for service completion",
+      message:
+        "Your technician has completed the work. Complete the payment to receive your completion OTP.",
+      bookingId: booking._id,
+      metadata: {
+        socketEvent: SOCKET_EVENTS.PAYMENT_STATUS,
+        stage: "completion_otp_requested",
+        paymentStatus: booking.paymentStatus || "pending",
+      },
+      priority: "high",
+      category: "payment",
+      io,
+    });
+  } catch (err) {
+    console.error("[completionOtp] payment-due notification failed:", err.message);
+  }
 };
 
 const providerFailureDetails = (err) => ({
@@ -292,15 +358,6 @@ const assertCompletionEligible = async (booking) => {
     err.details = { bookingStatus: "completed", requiresCompletionOtp: false };
     throw err;
   }
-  if (booking.paymentStatus === "paid") {
-    const err = fail(409, OTP_ERRORS.CONSUMED, "Payment already recorded — completion OTP is not required");
-    err.details = {
-      bookingStatus,
-      paymentStatus: "paid",
-      requiresCompletionOtp: false,
-    };
-    throw err;
-  }
   if (!canTransition(bookingStatus, "completed")) {
     throw fail(409, OTP_ERRORS.NOT_PENDING, `Booking in status "${booking.status}" cannot be completed`);
   }
@@ -365,22 +422,24 @@ const activeChallengeFor = (bookingId) =>
   });
 
 /**
- * Request a completion OTP.
+ * Request completion verification.
  *
- * - An expired challenge is closed and replaced.
- * - An active challenge inside the send cooldown returns 429 with
- *   `retryAfterSeconds`; it never reports success without sending an SMS.
- * - After the cooldown the SAME challenge is re-driven with a new generation
- *   (old code dies), respecting the resend budget for `pending` challenges and
- *   ignoring it for `pending_delivery` crash recovery.
- * - Concurrent creation races collide on the partial unique index — the loser
- *   loads and returns the winner instead of creating a second OTP.
+ * The first request is a payment prompt: it pins the booking, stamps
+ * `completionOtpRequestedAt`, persists a notification and emits the socket
+ * event. No OTP challenge/SMS exists until the online payment succeeds.
  */
-export const requestCompletionOtp = async ({ bookingId, technicianProfileId, smsSender = sendCompletionSms }) => {
+export const requestCompletionOtp = async ({
+  bookingId,
+  technicianProfileId,
+  smsSender = sendCompletionSms,
+  notifier = sendAppNotification,
+  io = null,
+}) => {
   const booking = await loadBookingOrFail(bookingId);
   await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
+  // Fail before creating a payment obligation the system cannot fulfil.
   assertSmsDeliveryConfigured();
   assertOtpHashingConfigured();
 
@@ -392,9 +451,77 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
   const now = new Date();
   await pinBookingForCompletion(booking, technicianProfileId, now);
 
+  const marked = await ServiceBooking.findOneAndUpdate(
+    { _id: booking._id, completionOtpRequestedAt: null },
+    { $set: { completionOtpRequestedAt: now } },
+    { new: true }
+  );
+  const fresh = marked || (await ServiceBooking.findById(booking._id).lean());
+  if (!fresh) throw fail(404, OTP_ERRORS.NOT_FOUND, "Booking not found");
+
+  const payment = await loadSuccessfulServicePayment(fresh);
+  if (!payment) {
+    if (marked) {
+      await notifyCompletionPaymentDue({ booking: fresh, notifier, io });
+    }
+    return {
+      bookingId: String(fresh._id),
+      paymentRequired: true,
+      paymentStatus: fresh.paymentStatus || "pending",
+      verificationStatus: "awaiting_payment",
+      completionOtpRequestedAt: fresh.completionOtpRequestedAt,
+    };
+  }
+
+  return issueCompletionOtpForPaidBooking({
+    bookingId: fresh._id,
+    smsSender,
+    notifier,
+    io,
+  });
+};
+
+/**
+ * Issue/deliver the completion OTP after a successful online payment.
+ * Idempotent: an already-delivered challenge is reused; a challenge stuck in
+ * `pending_delivery` is rotated and re-driven. The marker is also backfilled
+ * for legacy paid bookings.
+ */
+export const issueCompletionOtpForPaidBooking = async ({
+  bookingId,
+  smsSender = sendCompletionSms,
+  notifier = sendAppNotification,
+  io = null,
+}) => {
+  const booking = await loadBookingOrFail(bookingId);
+  if (normalizeBookingStatus(booking.status) === "completed") {
+    return {
+      bookingId: String(booking._id),
+      verificationStatus: "verified",
+      requiresCompletionOtp: false,
+      alreadyCompleted: true,
+    };
+  }
+  await assertCompletionEligible(booking);
+  await assertServicePaymentSatisfied(booking);
+  if (!booking.technicianId) {
+    throw fail(409, OTP_ERRORS.NOT_PENDING, "Booking is no longer assigned to a technician");
+  }
+  assertSmsDeliveryConfigured();
+  assertOtpHashingConfigured();
+
+  const phone = await loadCustomerPhone(booking.customerId);
+  if (!isValidDeliveryPhone(phone)) {
+    throw fail(409, OTP_ERRORS.NOT_PENDING, "Customer has no verified phone number for OTP delivery");
+  }
+
+  const now = new Date();
+  await ServiceBooking.updateOne(
+    { _id: booking._id, completionOtpRequestedAt: null },
+    { $set: { completionOtpRequestedAt: now } }
+  );
+
   let challenge = await activeChallengeFor(booking._id);
-  // Safety net for pre-deploy releases that left a challenge behind: an OTP
-  // issued to a previous assignee must never block the current technician.
   if (challenge && toId(challenge.technicianId) !== toId(booking.technicianId)) {
     await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
     challenge = null;
@@ -403,82 +530,81 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
     await closeCompletionChallenge(challenge._id, { to: "expired", now });
     challenge = null;
   }
+  if (challenge && challenge.status === "pending") {
+    return { bookingId: String(booking._id), ...publicChallengeState(challenge), alreadyActive: true };
+  }
+
+  let generation = 1;
+  let expiresAt = new Date(now.getTime() + OTP_TTL_MS);
+  let otp = generateCompletionOtp();
 
   if (challenge) {
-    const remainingMs = completionOtpCooldownRemainingMs(challenge, now);
-    if (remainingMs > 0) throw rateLimited(remainingMs);
-
-    const otp = generateCompletionOtp();
-    const generation = challenge.generation + 1;
-    const moved = await registerCompletionResend(challenge._id, {
+    generation = challenge.generation + 1;
+    const moved = await prepareCompletionChallengeDelivery(challenge._id, {
       expectedGeneration: challenge.generation,
       otpHash: hashCompletionOtp({ bookingId: booking._id, generation, otp }),
-      expiresAt: new Date(now.getTime() + OTP_TTL_MS),
-      ignoreResendBudget: challenge.status === "pending_delivery",
+      expiresAt,
     });
     if (!moved) {
       const fresh = await activeChallengeFor(booking._id);
       if (!fresh) {
-        throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — fetch status and retry");
+        throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — retry the OTP request");
       }
-      const freshRemainingMs = completionOtpCooldownRemainingMs(fresh, new Date());
-      if (freshRemainingMs > 0) throw rateLimited(freshRemainingMs);
-      throw fail(429, OTP_ERRORS.RESEND_EXCEEDED, "Resend limit reached — contact support");
+      return { bookingId: String(booking._id), ...publicChallengeState(fresh), alreadyActive: true };
     }
-
-    const delivering = await deliverChallengeOtp({
-      booking,
-      challenge: moved,
-      phone,
-      otp,
-      generation,
-      smsSender,
-      operation: "request_redrive",
-      onFailure: () => rollbackCompletionResend(challenge._id, { expectedGeneration: generation }),
-    });
-    return { bookingId: String(booking._id), ...publicChallengeState(delivering || moved) };
+    challenge = moved;
+  } else {
+    try {
+      challenge = await ServiceCompletionChallenge.create({
+        bookingId: booking._id,
+        technicianId: booking.technicianId,
+        customerId: booking.customerId,
+        otpHash: hashCompletionOtp({ bookingId: booking._id, generation, otp }),
+        generation,
+        status: "pending_delivery",
+        expiresAt,
+        lastSentAt: now,
+      });
+    } catch (e) {
+      if (e?.code !== 11000) throw e;
+      challenge = await activeChallengeFor(booking._id);
+      if (!challenge) {
+        throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — retry the OTP request");
+      }
+      return { bookingId: String(booking._id), ...publicChallengeState(challenge), alreadyActive: true };
+    }
   }
 
-  const otp = generateCompletionOtp();
-  const expiresAt = new Date(now.getTime() + OTP_TTL_MS);
-  try {
-    challenge = await ServiceCompletionChallenge.create({
-      bookingId: booking._id,
-      technicianId: booking.technicianId,
-      customerId: booking.customerId,
-      otpHash: hashCompletionOtp({ bookingId: booking._id, generation: 1, otp }),
-      generation: 1,
-      status: "pending_delivery",
-      expiresAt,
-      lastSentAt: now,
-    });
-  } catch (e) {
-    if (e?.code !== 11000) throw e;
-    // Lost the creation race — return the winner's public state.
-    challenge = await activeChallengeFor(booking._id);
-    if (!challenge) {
-      throw fail(409, OTP_ERRORS.SUPERSEDED, "Challenge changed — fetch status and retry");
-    }
-    const remainingMs = completionOtpCooldownRemainingMs(challenge, new Date());
-    return {
-      bookingId: String(booking._id),
-      ...publicChallengeState(challenge),
-      alreadyActive: true,
-      retryAfterSeconds: Math.ceil(remainingMs / 1000),
-    };
-  }
-
-  // Delivery AFTER commit (never inside a transaction).
   const delivering = await deliverChallengeOtp({
     booking,
     challenge,
     phone,
     otp,
-    generation: 1,
+    generation,
     smsSender,
-    operation: "request",
+    operation: "payment_success",
   });
-  return { bookingId: String(booking._id), ...publicChallengeState(delivering || challenge) };
+  const result = { bookingId: String(booking._id), ...publicChallengeState(delivering || challenge) };
+
+  // Best-effort: confirm to the customer that the paid OTP is on its way.
+  try {
+    await notifier({
+      userId: String(booking.customerId),
+      recipientType: "customer",
+      type: "COMPLETION_OTP_SENT",
+      title: "Completion OTP sent",
+      message: "Payment received. Use the OTP sent to your registered mobile to finish the service.",
+      bookingId: booking._id,
+      metadata: { socketEvent: SOCKET_EVENTS.PAYMENT_SUCCESS, stage: "completion_otp_sent" },
+      priority: "high",
+      category: "payment",
+      io,
+    });
+  } catch (err) {
+    console.error("[completionOtp] payment-success notification failed:", err.message);
+  }
+
+  return result;
 };
 
 /**
@@ -486,18 +612,25 @@ export const requestCompletionOtp = async ({ bookingId, technicianProfileId, sms
  * bounded by OTP_MAX_RESENDS. Crash recovery: a challenge stuck in
  * pending_delivery is re-driven here, never revived at an old generation.
  */
-export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsSender = sendCompletionSms }) => {
+export const resendCompletionOtp = async ({
+  bookingId,
+  technicianProfileId,
+  smsSender = sendCompletionSms,
+  notifier = sendAppNotification,
+  io = null,
+}) => {
   const booking = await loadBookingOrFail(bookingId);
   await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
+  await assertServicePaymentSatisfied(booking);
   assertSmsDeliveryConfigured();
   assertOtpHashingConfigured();
 
   const now = new Date();
   const challenge = await activeChallengeFor(booking._id);
   if (!challenge) {
-    throw fail(409, OTP_ERRORS.NOT_FOUND, "No active verification — request a new OTP first");
+    return issueCompletionOtpForPaidBooking({ bookingId: booking._id, smsSender, notifier, io });
   }
   if (toId(challenge.technicianId) !== toId(booking.technicianId)) {
     await closeCompletionChallenge(challenge._id, { to: "cancelled", now });
@@ -555,14 +688,17 @@ export const resendCompletionOtp = async ({ bookingId, technicianProfileId, smsS
  * effects (settlement + notifications, run by the caller as today).
  */
 export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp }) => {
-  if (!OTP_PATTERN.test(String(otp || ""))) {
-    throw fail(400, OTP_ERRORS.INVALID, "Invalid OTP format");
-  }
   const now = new Date();
   const booking = await loadBookingOrFail(bookingId);
   await assertCompletionAccess(booking, technicianProfileId);
   await assertTechnicianCanComplete(technicianProfileId);
   await assertCompletionEligible(booking);
+  // Payment is checked before OTP format so an unpaid verification always
+  // reports PAYMENT_REQUIRED (the customer has no OTP yet in this flow).
+  await assertServicePaymentSatisfied(booking);
+  if (!OTP_PATTERN.test(String(otp || ""))) {
+    throw fail(400, OTP_ERRORS.INVALID, "Invalid OTP format");
+  }
   assertOtpHashingConfigured();
 
   const challenge = await ServiceCompletionChallenge.findOne({
@@ -677,23 +813,31 @@ export const verifyCompletionOtp = async ({ bookingId, technicianProfileId, otp 
 export const buildCompletionStatus = (booking, challenge = null) => {
   const bookingStatus = normalizeBookingStatus(booking.status);
   const paymentStatus = booking.paymentStatus || "pending";
+  const otpRequested = Boolean(booking.completionOtpRequestedAt);
   if (bookingStatus === "completed") {
     return {
       bookingId: String(booking._id),
       bookingStatus: "completed",
       paymentStatus,
+      paymentConfirmed: paymentStatus === "paid",
+      otpRequested,
+      paymentDue: false,
       verificationStatus: "verified",
       requiresCompletionOtp: false,
       completedAt: booking.completedAt || null,
     };
   }
-  const requiresCompletionOtp =
-    paymentStatus !== "paid" && canTransition(bookingStatus, "completed");
+  const eligible = canTransition(bookingStatus, "completed");
+  const paymentDue = eligible && otpRequested && paymentStatus !== "paid";
   return {
     bookingId: String(booking._id),
     bookingStatus,
     paymentStatus,
-    requiresCompletionOtp,
+    paymentConfirmed: paymentStatus === "paid",
+    otpRequested,
+    paymentDue,
+    completionOtpRequestedAt: booking.completionOtpRequestedAt || null,
+    requiresCompletionOtp: eligible && paymentStatus === "paid",
     ...publicChallengeState(challenge),
   };
 };

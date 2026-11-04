@@ -9,10 +9,10 @@ import { fetchTechnicianJobsInternal } from "../Utils/technicianJobFetch.js";
 import { ensureTechnician } from "../Utils/ensureTechnician.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import { evaluateJobFeasibility, loadCommittedQueues } from "../Utils/technicianMatching.js";
-import { canArriveBy, computeLatestArrival, estimateTravelMinutes } from "../Utils/feasibility.js";
+import { scheduleChainFeasible } from "../Utils/feasibility.js";
 import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
-import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { checkTechnicianEligibility, getTechnicianOrigin } from "../Services/technicianEligibilityService.js";
 import { auditPurgeAt, offerPurgeAt } from "../Utils/broadcastRetention.js";
 
 const DISPATCH_LOCK_MS = 10000;
@@ -313,7 +313,7 @@ export const respondToJob = async (req, res) => {
 
     // ⏱ Candidate booking snapshot (Phase-A advisory read).
     const candidate = await ServiceBooking.findById(id)
-      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
+      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
     if (!candidate) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
@@ -364,121 +364,52 @@ export const respondToJob = async (req, res) => {
     //   schedule candidate                        → window overlap check
     const [techQueueMap, techProfileForCheck] = await Promise.all([
       loadCommittedQueues([technicianProfileId]),
-      TechnicianProfile.findById(technicianProfileId).select("location"),
+      TechnicianProfile.findById(technicianProfileId).select("location serviceBaseLocation"),
     ]);
     const techQueue = techQueueMap.get(String(technicianProfileId));
 
     if (candidate.bookingType === "schedule") {
-      // Schedule-vs-schedule: run forward-pass travel chain (not just ±30min overlap)
-      // to ensure the technician can physically travel between slots.
-      const candidateSlot = new Date(candidate.scheduledAt).getTime();
+      // Schedule-vs-schedule: shared travel-chain check against every accepted
+      // appointment (duration-aware, uses service base location when present).
       const existingSchedules = (techQueue?.schedules || []).filter(
         (s) => String(s._id) !== String(id)
       );
+      const techLocation = getTechnicianOrigin(techProfileForCheck, "schedule")?.location || null;
 
-      if (existingSchedules.length > 0 && techProfileForCheck?.location) {
-        // Sort existing schedules by slot time
-        const sorted = [...existingSchedules].sort(
-          (a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
-        );
-
-        // Build committed queue: all existing accepted schedules
-        const committedQueue = sorted.map((s) => ({
-          location: s.location,
-          scheduledAt: s.scheduledAt,
-          estimatedDurationMinutes: 60, // default service duration
-        }));
-
-        // Check if tech can arrive at candidate after the preceding schedule
-        // and still make the following schedule
-        const candidateDeadline = computeLatestArrival(candidate.scheduledAt);
-        const techLocation = techProfileForCheck.location;
-
-        // Find the schedule that comes just before the candidate slot
-        const preceding = sorted.filter(
-          (s) => new Date(s.scheduledAt).getTime() < candidateSlot
-        );
-        const following = sorted.filter(
-          (s) => new Date(s.scheduledAt).getTime() > candidateSlot
-        );
-
-        // Feasibility: can the tech arrive at candidate by its deadline?
-        // Build a chain: [preceding schedules] -> candidate -> [following schedules]
-        const chainQueue = [...preceding.map((s) => ({
-          location: s.location,
-          scheduledAt: s.scheduledAt,
-          estimatedDurationMinutes: 60,
-        })), {
-          location: candidate.location,
-          scheduledAt: candidate.scheduledAt,
-          estimatedDurationMinutes: 60,
-        }];
-
-        // Check travel from tech to first stop, then through the chain
-        let cursor = Date.now();
-        let lastLocation = techLocation;
-
-        for (const stop of chainQueue) {
-          const travelMin = estimateTravelMinutes(lastLocation, stop.location);
-          if (travelMin == null) continue;
-          cursor += travelMin * 60 * 1000;
-
-          // Must arrive before the slot (with grace)
-          const deadline = computeLatestArrival(stop.scheduledAt);
-          if (deadline && cursor > deadline.getTime()) {
-            return res.status(409).json({
-              success: false,
-              message: "This time slot conflicts with an appointment you already accepted.",
-            });
-          }
-
-          // Move cursor past the job duration
-          cursor += (stop.estimatedDurationMinutes || 60) * 60 * 1000;
-          lastLocation = stop.location;
-        }
-
-        // Also check that after the candidate, tech can reach following schedules
-        if (following.length > 0) {
-          for (const stop of following) {
-            const travelMin = estimateTravelMinutes(lastLocation, stop.location);
-            if (travelMin == null) continue;
-            cursor += travelMin * 60 * 1000;
-
-            const deadline = computeLatestArrival(stop.scheduledAt);
-            if (deadline && cursor > deadline.getTime()) {
-              return res.status(409).json({
-                success: false,
-                message: "Accepting this job would make you late for a later appointment.",
-              });
-            }
-            cursor += (stop.estimatedDurationMinutes || 60) * 60 * 1000;
-            lastLocation = stop.location;
-          }
+      if (existingSchedules.length > 0 || techLocation) {
+        const feasibility = scheduleChainFeasible({
+          technicianLocation: techLocation,
+          candidateJob: candidate,
+          committedQueue: existingSchedules,
+          activeJob: techQueue?.activeJob || null,
+        });
+        if (!feasibility.feasible) {
+          return res.status(409).json({
+            success: false,
+            message: feasibility.reason === "schedule_travel_conflict"
+              ? "This time slot conflicts with an appointment you already accepted."
+              : "This time slot cannot be reached in time.",
+            result: {
+              projectedArrival: feasibility.projectedArrival,
+              slackMinutes: feasibility.slackMinutes,
+              reason: feasibility.reason,
+            },
+          });
         }
       }
     } else {
-      // Check for ANY instant jobs in technician's queue (not just scheduled)
-      // Race condition fix: another instant job could have been accepted between broadcast and accept
-      const allInstantJobs = (techQueue?.schedules || []).filter(s => s.bookingType === "instant");
-      if (allInstantJobs.length > 0 && techProfileForCheck?.location) {
-        // Check feasibility against all instant jobs
-        for (const instantJob of allInstantJobs) {
-          const feasibility = evaluateJobFeasibility({
-            techLocation: techProfileForCheck.location,
-            candidateJob: candidate,
-            queue: { activeJob: null, schedules: [instantJob] },
-          });
-          if (!feasibility.feasible) {
-            return res.status(409).json({
-              success: false,
-              message: "This job would make you late for another instant job you accepted.",
-              result: {
-                projectedArrival: feasibility.projectedArrival,
-                slackMinutes: feasibility.slackMinutes,
-              },
-            });
-          }
-        }
+      // Instant jobs are immediate and cannot overlap. Another instant job
+      // could have been accepted between broadcast and accept; reject the
+      // second claim rather than double-booking the technician.
+      const allInstantJobs = techQueue?.instantJobs || [];
+      if (allInstantJobs.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: "You already have an active instant job. Finish it before accepting another.",
+          result: {
+            activeInstantJobIds: allInstantJobs.map((job) => String(job._id)),
+          },
+        });
       }
 
       const feasibility = evaluateJobFeasibility({
@@ -531,7 +462,7 @@ export const respondToJob = async (req, res) => {
 
       const live = await ServiceBooking.findById(id)
         .session(session)
-        .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId");
+        .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
       if (!live) {
         await session.abortTransaction();
         return res.status(404).json({ success: false, message: "Booking not found" });
@@ -656,6 +587,7 @@ export const respondToJob = async (req, res) => {
       assignedAt: new Date(),
       technicianSnapshot,
       completionPinnedAt: null,
+      completionOtpRequestedAt: null,
       $push: {
         assignmentAttempts: {
           technicianId: technicianProfileId,
