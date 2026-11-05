@@ -1,5 +1,6 @@
 import { createQuoteRequest, updateQuoteRequest, getCustomerRequests, getCustomerRequestById, cancelQuoteRequest, getAdminRequests, getAdminRequestById, assignRequest, updateRequestStatus } from "../Services/productQuoteRequestService.js";
 import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
+import { emitProductQuoteRequestChanged } from "../Utils/productRealtime.js";
 
 const ok = (res, code, message, result) => res.status(code).json({ success: true, message, result: result || {} });
 const fail = (res, code, message, result) => res.status(code).json({ success: false, message, result: result || {} });
@@ -98,6 +99,12 @@ export const adminDeleteQuoteRequestController = async (req, res) => {
       return fail(res, 409, "Cannot delete a quote request with active or accepted quotations", { code: "QUOTE_REQUEST_DELETE_BLOCKED" });
     }
     await ProductQuoteRequest.findByIdAndDelete(req.params.id);
+    emitProductQuoteRequestChanged({
+      action: "deleted",
+      requestId: request._id,
+      requestNumber: request.requestNumber,
+      status: "deleted",
+    });
     return ok(res, 200, "Quote request deleted", request);
   } catch (err) {
     return failErr(res, err);

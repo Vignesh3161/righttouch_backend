@@ -14,6 +14,10 @@ import { assertQuotationTransition, assertQuoteRequestTransition, canTransitionQ
 import { generateQuotationNumber } from "../Utils/quotationNumber.js";
 import { enqueueDeliveries } from "./quotationDeliveryService.js";
 import { writeAuditLog } from "../Utils/audit.js";
+import {
+  emitProductQuoteRequestChanged,
+  emitProductQuotationChanged,
+} from "../Utils/productRealtime.js";
 
 const loadRequest = async (quoteRequestId) => {
   if (!mongoose.Types.ObjectId.isValid(quoteRequestId)) {
@@ -224,6 +228,21 @@ export const createQuotationDraft = async ({ adminId, body = {} }) => {
     after: { quotationNumber: quotation.quotationNumber, totalAmountPaise, requestId: quoteRequestId },
   });
 
+  emitProductQuotationChanged({
+    action: "created",
+    quotationId: quotation._id,
+    quotationNumber: quotation.quotationNumber,
+    requestId: quotation.quoteRequestId,
+    status: quotation.status,
+    totalAmountPaise,
+  });
+  emitProductQuoteRequestChanged({
+    action: "quotation_prepared",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
+  });
+
   return quotation;
 };
 
@@ -347,6 +366,15 @@ export const updateQuotationDraft = async ({ adminId, quotationId, body = {} }) 
     after: { totalAmountPaise, revision: quotation.revision },
   });
 
+  emitProductQuotationChanged({
+    action: "updated",
+    quotationId: quotation._id,
+    quotationNumber: quotation.quotationNumber,
+    requestId: quotation.quoteRequestId,
+    status: quotation.status,
+    totalAmountPaise,
+  });
+
   return quotation;
 };
 
@@ -416,6 +444,20 @@ export const sendQuotation = async ({ adminId, quotationId }) => {
     metadata: { requestId: quotation.quoteRequestId },
   });
 
+  emitProductQuotationChanged({
+    action: "sent",
+    quotationId: quotation._id,
+    quotationNumber: quotation.quotationNumber,
+    requestId: quotation.quoteRequestId,
+    status: quotation.status,
+    totalAmountPaise: quotation.financialSnapshot?.totalAmountPaise || 0,
+  });
+  emitProductQuoteRequestChanged({
+    action: "quotation_sent",
+    requestId: quotation.quoteRequestId,
+    status: "quotation_sent",
+  });
+
   return quotation;
 };
 
@@ -439,6 +481,13 @@ export const resendQuotation = async ({ adminId, quotationId }) => {
     notificationType: "QUOTATION_SENT",
     title: "Your quotation is ready",
     body: `Quotation ${quotation.quotationNumber} for ₹${(quotation.financialSnapshot.totalAmountPaise / 100).toFixed(2)} is ready.`,
+  });
+  emitProductQuotationChanged({
+    action: "resent",
+    quotationId: quotation._id,
+    quotationNumber: quotation.quotationNumber,
+    requestId: quotation.quoteRequestId,
+    status: quotation.status,
   });
   return quotation;
 };
@@ -571,6 +620,16 @@ export const reviseQuotation = async ({ adminId, quotationId, body = {} }) => {
     targetId: quotation._id,
     after: { supersedes: existing._id, revision, totalAmountPaise },
   });
+
+  emitProductQuotationChanged({
+    action: "revised",
+    quotationId: quotation._id,
+    quotationNumber: quotation.quotationNumber,
+    requestId: quotation.quoteRequestId,
+    supersedes: existing._id,
+    status: quotation.status,
+    totalAmountPaise,
+  });
   return quotation;
 };
 
@@ -677,6 +736,18 @@ export const expireQuotations = async () => {
 
   if (result.modifiedCount > 0) {
     console.log(`[Quotation] expired ${result.modifiedCount} quotation(s)`);
+    emitProductQuotationChanged({
+      action: "expired",
+      modifiedCount: result.modifiedCount,
+      requestIds,
+    });
+    requestIds.forEach((requestId) => {
+      emitProductQuoteRequestChanged({
+        action: "expired",
+        requestId,
+        status: "expired",
+      });
+    });
   }
   return result.modifiedCount;
 };

@@ -3,6 +3,7 @@ import ProductBooking from "../Schemas/ProductBooking.js";
 import Product from "../Schemas/Product.js";
 import { buildProductFinancialSnapshot, validateProductAmountAgainstCatalog } from "../Utils/productPricing.js";
 import { buildPaymentDetailsSummary } from "../Utils/paymentReadModel.js";
+import { emitProductBookingChanged } from "../Utils/productRealtime.js";
 
 const ensureAdminOrOwner = (req) => {
   const role = (req.user?.role || "").toLowerCase();
@@ -279,6 +280,15 @@ export const productBookingCancel = async (req, res) => {
     booking.status = "cancelled";
     await booking.save();
 
+    emitProductBookingChanged({
+      action: "cancelled",
+      bookingId: booking._id,
+      quotationId: booking.quotationId,
+      requestId: booking.quoteRequestId,
+      status: booking.status,
+      paymentStatus: booking.paymentStatus,
+    });
+
     res.status(200).json({
       success: true,
       message: "Your booking has been cancelled successfully",
@@ -332,6 +342,14 @@ export const adminCancelProductBooking = async (req, res) => {
 
     booking.status = "cancelled";
     await booking.save();
+    emitProductBookingChanged({
+      action: "cancelled",
+      bookingId: booking._id,
+      quotationId: booking.quotationId,
+      requestId: booking.quoteRequestId,
+      status: booking.status,
+      paymentStatus: booking.paymentStatus,
+    });
     return res.status(200).json({
       success: true,
       message: "Product booking cancelled",
@@ -399,6 +417,15 @@ export const adminCompleteProductBooking = async (req, res) => {
 
     booking.status = "completed";
     await booking.save();
+
+    emitProductBookingChanged({
+      action: "completed",
+      bookingId: booking._id,
+      quotationId: booking.quotationId,
+      requestId: booking.quoteRequestId,
+      status: booking.status,
+      paymentStatus: booking.paymentStatus,
+    });
 
     res.status(200).json({
       success: true,

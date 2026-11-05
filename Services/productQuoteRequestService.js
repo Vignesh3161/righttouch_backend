@@ -14,6 +14,7 @@ import { assertQuoteRequestTransition } from "../Utils/quotationStateMachine.js"
 import { writeAuditLog } from "../Utils/audit.js";
 import { broadcastAdminUnreadCounts } from "../Controllers/adminNotificationController.js";
 import { getIo } from "../Utils/ioAccess.js";
+import { emitProductQuoteRequestChanged } from "../Utils/productRealtime.js";
 
 const newRequestNumber = async () => {
   // Retry a few times in the astronomically-unlikely event of a collision.
@@ -132,6 +133,12 @@ export const createQuoteRequest = async ({ customerId, body = {} }) => {
       existingActive.status = "under_review";
       existingActive.version = (existingActive.version || 0) + 1;
       await existingActive.save();
+      emitProductQuoteRequestChanged({
+        action: "reopened",
+        requestId: existingActive._id,
+        requestNumber: existingActive.requestNumber,
+        status: existingActive.status,
+      });
     }
     return existingActive;
   }
@@ -172,6 +179,12 @@ export const createQuoteRequest = async ({ customerId, body = {} }) => {
 
   // Broadcast real-time admin unread notification badge update
   broadcastAdminUnreadCounts(getIo());
+  emitProductQuoteRequestChanged({
+    action: "created",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
+  });
 
   return request;
 };
@@ -306,6 +319,13 @@ export const updateQuoteRequest = async ({ customerId, id, body = {} }) => {
     metadata: { changedFields },
   });
 
+  emitProductQuoteRequestChanged({
+    action: "updated",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
+  });
+
   return request;
 };
 
@@ -362,6 +382,13 @@ export const cancelQuoteRequest = async ({ customerId, id }) => {
     targetId: request._id,
     before: { status: "quote_requested" },
     after: { status: "cancelled" },
+  });
+
+  emitProductQuoteRequestChanged({
+    action: "cancelled",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
   });
   return request;
 };
@@ -437,6 +464,14 @@ export const assignRequest = async ({ id, adminId }) => {
     after: { assignedAdminId: adminId, status: request.status, assignedAt: request.assignedAt },
     metadata: isReassign ? { reassignedFrom: previousAdminId } : undefined,
   });
+
+  emitProductQuoteRequestChanged({
+    action: "assigned",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
+    assignedAdminId: request.assignedAdminId,
+  });
   return request;
 };
 
@@ -461,6 +496,13 @@ export const updateRequestStatus = async ({ id, status, adminId }) => {
     targetId: request._id,
     before: { status: before },
     after: { status },
+  });
+
+  emitProductQuoteRequestChanged({
+    action: "status_updated",
+    requestId: request._id,
+    requestNumber: request.requestNumber,
+    status: request.status,
   });
   return request;
 };

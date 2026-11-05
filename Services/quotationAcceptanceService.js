@@ -17,6 +17,11 @@ import ProductBooking from "../Schemas/ProductBooking.js";
 import { convertQuotationSnapshot } from "./quotationPricingService.js";
 import { enqueueDeliveries } from "./quotationDeliveryService.js";
 import { writeAuditLog } from "../Utils/audit.js";
+import {
+  emitProductBookingChanged,
+  emitProductQuotationChanged,
+  emitProductQuoteRequestChanged,
+} from "../Utils/productRealtime.js";
 
 class ConflictError extends Error {
   constructor(message) {
@@ -231,6 +236,30 @@ export const acceptQuotation = async ({ quotationId, customerId, acceptedItemIds
     },
   });
 
+  const booking = bookings[0];
+  emitProductQuotationChanged({
+    action: "accepted",
+    quotationId,
+    requestId: booking?.quoteRequestId,
+    status: "accepted",
+  });
+  emitProductQuoteRequestChanged({
+    action: "accepted",
+    requestId: booking?.quoteRequestId,
+    status: "accepted",
+  });
+  bookings.forEach((b) => {
+    emitProductBookingChanged({
+      action: "created",
+      bookingId: b._id,
+      quotationId: b.quotationId,
+      requestId: b.quoteRequestId,
+      status: b.status,
+      paymentStatus: b.paymentStatus,
+      totalAmountPaise: b.amountPaise,
+    });
+  });
+
   return { booking: bookings[0], bookings, paymentGroupId: null };
 };
 
@@ -275,6 +304,18 @@ export const rejectQuotation = async ({ quotationId, customerId, reason }) => {
     targetType: "Quotation",
     targetId: quotationId,
     after: { reason: quotation?.rejectedReason },
+  });
+
+  emitProductQuotationChanged({
+    action: "rejected",
+    quotationId,
+    requestId: quotation?.quoteRequestId,
+    status: "rejected",
+  });
+  emitProductQuoteRequestChanged({
+    action: "quotation_rejected",
+    requestId: quotation?.quoteRequestId,
+    status: "under_review",
   });
   return quotation;
 };
