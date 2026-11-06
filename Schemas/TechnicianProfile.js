@@ -224,11 +224,11 @@ const technicianProfileSchema = new mongoose.Schema(
     // directly (verified + fingerprinted at mark-paid time).
 
     /* ──────────────────────────────────────────────────────────────
-       💸 AUTO-PAYOUT SETTINGS (per-technician overrides)
+       💸 PAYOUT SETTINGS (per-technician overrides)
        Effective value = tech override ?? global config (GlobalSetting /
-       env). Auto-payout fires when availableBalancePaise >= threshold;
-       it pays out balance − minimumMaintenancePaise, keeping the
-       maintenance floor in the wallet.
+       env). Payouts are manual-only, so the execution flags are legacy;
+       minimumMaintenancePaise still enforces the floor that must remain
+       in the wallet when a withdrawal is requested.
     ────────────────────────────────────────────────────────────── */
     payoutSettings: {
       autoPayoutEnabled: { type: Boolean, default: true },

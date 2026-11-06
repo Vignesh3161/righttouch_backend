@@ -11,7 +11,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import User from "../Schemas/User.js";
 import DistrictPermissionHistory from "../Schemas/DistrictPermissionHistory.js";
 import PolygonVersion from "../Schemas/PolygonVersion.js";
-import { validateAndSanitizePolygon } from "../Utils/geoValidation.js";
+import { validateAndSanitizePolygon, checkZoneOverlap } from "../Utils/geoValidation.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { resolveServiceAvailability } from "../Services/serviceAvailabilityService.js";
 import { haversineMeters } from "../Utils/feasibility.js";
@@ -949,8 +949,9 @@ export const rollbackPolygonVersion = async (req, res) => {
  * Read-only pre-write validation for admin-drawn polygons (GeoJSON tool).
  * Body: { polygon, districtId?, excludeZoneId? }
  * - Always runs the canonical geometry validator.
- * - With districtId: also checks district containment + overlap against
- *   sibling zones (excluding excludeZoneId), using the same rules as create.
+ * - With districtId: requires full parent-district containment.
+ * - Sibling-zone overlap is reported for visibility but is ALLOWED inside the
+ *   same district (zones can be service-specific coverage areas).
  * Never writes. Admin/Owner only (router guard).
  */
 export const validatePolygonPreview = async (req, res) => {
@@ -985,27 +986,44 @@ export const validatePolygonPreview = async (req, res) => {
       if (placement.status === 404) {
         return res.status(404).json({ success: false, message: placement.message, code: placement.code });
       }
-      const containmentInfo = placement.containment || { fullyContained: true, reason: null };
+      const containmentInfo = placement.containment || { fullyContained: false, reason: null };
       result.containment = {
         checked: true,
-        // Render-compatible keys (both spellings). Partial boundary
-        // overshoot is allowed as long as the zone still overlaps the
-        // parent district, so only isFullyContained reflects containment.
-        isFullyContained: containmentInfo.fullyContained,
-        isContained: placement.ok,
+        isFullyContained: containmentInfo.fullyContained === true,
+        isContained: placement.ok === true && containmentInfo.fullyContained === true,
         message: containmentInfo.fullyContained
           ? "Polygon completely contained within district limits."
-          : "Polygon extends outside the district boundary but overlaps the district; creation is allowed.",
+          : "Polygon must be fully contained inside the parent district boundary.",
         reason: containmentInfo.fullyContained ? null : containmentInfo.reason,
       };
-      const overlap = !placement.ok && placement.code === "ZONE_OVERLAP_DETECTED";
+
+      const siblingFilter = {
+        operationalCityId: districtId,
+        active: { $ne: false },
+      };
+      if (excludeZoneId) siblingFilter._id = { $ne: excludeZoneId };
+      const siblings = await CityZone.find(siblingFilter)
+        .select("_id name zoneCode polygon")
+        .lean();
+      const overlappingZones = siblings
+        .filter((zone) => zone.polygon && checkZoneOverlap(validation.sanitizedPolygon, zone.polygon))
+        .map((zone) => ({
+          id: String(zone._id),
+          name: zone.name || zone.zoneCode || "Zone",
+          zoneCode: zone.zoneCode || "",
+        }));
       result.overlap = {
         checked: true,
-        hasOverlap: overlap,
-        overlappingZone: overlap ? placement.message : null,
-        message: overlap ? placement.message : "No overlap with sibling zones detected.",
+        allowed: true,
+        hasOverlap: overlappingZones.length > 0,
+        overlappingZones,
+        overlappingZone: overlappingZones.map((zone) => zone.name).join(", ") || null,
+        message:
+          overlappingZones.length > 0
+            ? `Overlaps ${overlappingZones.map((zone) => `"${zone.name}"`).join(", ")}. Zone-to-zone overlap is allowed inside the same district.`
+            : "No overlap with sibling zones detected.",
       };
-      result.isValid = placement.ok;
+      result.isValid = placement.ok === true;
       if (!placement.ok) result.errors = [...validation.errors, placement.message];
     }
 

@@ -17,7 +17,7 @@
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import BookingOutbox from "../Schemas/BookingOutbox.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
-import { resolveDistrictAndZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
+import { resolveServiceZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
 import { resolveCommissionSnapshot } from "./commission.js";
 import { paiseToRupees } from "./money.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
@@ -51,24 +51,28 @@ export const resolveServiceZoneAvailability = async ({
       reason: "LOCATION_REQUIRED",
     };
   }
-  // Joint resolution: zone lookup is scoped to the district polygon, so a
-  // zone whose operationalCityId disagrees with the geo district (stale
-  // parent link / zone sticking outside its district) cannot silently pass.
-  const { district, zone } = await resolveDistrictAndZoneFromCoordinates(
-    latitude,
-    longitude,
-    { session, includeInactiveZone: true }
+  // Overlapping zones are allowed. Resolve the zone by the requested service
+  // so a point covered by multiple service-specific zones does not get an
+  // arbitrary first-zone answer.
+  const resolved = await resolveServiceZoneFromCoordinates(
+    service?._id,
+    latNum,
+    lngNum,
+    { session }
   );
-  if (zone && zone.active === false) {
+
+  if (resolved.error) {
     return {
       ok: false,
-      zoneId: zone?._id || null,
-      districtId: district?._id || zone?.operationalCityId || null,
+      zoneId: resolved.zone?._id || null,
+      districtId: resolved.district?._id || null,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
-      reason: "ZONE_INACTIVE",
+      reason: resolved.reason || resolved.error,
     };
   }
+
+  const { district, zone } = resolved;
   // FINAL RULE: address must resolve to BOTH District AND Zone.
   // No zone polygon → block (no district fallback for booking).
   if (!zone?._id || !district?._id) {
@@ -94,27 +98,25 @@ export const resolveServiceZoneAvailability = async ({
       reason: "ZONE_DISTRICT_MISMATCH",
     };
   }
-  const districtId = district._id;
 
-  const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
-  const avail = await resolveServiceAvailability({
-    serviceId: service?._id,
-    districtId,
-    cityZoneId: zone?._id || null,
-  });
-
-  if (!avail.available) {
+  const avail = resolved.availability;
+  if (!avail?.available) {
     return {
       ok: false,
       zoneId: zone?._id || null,
-      districtId,
+      districtId: district._id,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
-      reason: avail.reason,
+      reason: avail?.reason || "SERVICE_NOT_AVAILABLE",
     };
   }
 
-  return { ok: true, zoneId: zone?._id || null, districtId };
+  return {
+    ok: true,
+    zoneId: zone._id,
+    districtId: district._id,
+    matchingZoneIds: (resolved.matchingZones || [zone]).map((entry) => entry._id),
+  };
 };
 
 /**

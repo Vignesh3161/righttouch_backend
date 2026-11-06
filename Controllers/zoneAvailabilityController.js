@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import CityZone from "../Schemas/CityZone.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
-import { resolveZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
+import { resolveDistrictAndZoneFromCoordinates, resolveServiceZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
 import { internalError } from "../Utils/safeQuery.js";
 import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 
@@ -25,13 +25,29 @@ export const resolveCustomerZone = async (req, res) => {
 
     // Include inactive zones so a deactivated zone is detected and reported
     // as unavailable instead of "no zone found".
-    const { zone, error } = await resolveZoneFromCoordinates(lat, lng, { includeInactive: true });
+    const { district, zone: resolvedZone, error } = await resolveDistrictAndZoneFromCoordinates(
+      lat,
+      lng,
+      { includeInactiveZone: true }
+    );
 
     if (error) {
       return res.status(400).json({ success: false, message: error, result: {} });
     }
 
-    if (!zone) {
+    const pointGeo = {
+      $geoIntersects: {
+        $geometry: { type: "Point", coordinates: [lng, lat] },
+      },
+    };
+    const zones = district
+      ? await CityZone.find({
+          operationalCityId: district._id,
+          polygon: pointGeo,
+        }).lean()
+      : [];
+
+    if (!zones.length) {
       return res.status(200).json({
         success: true,
         message: "No service zone found for this location",
@@ -39,38 +55,66 @@ export const resolveCustomerZone = async (req, res) => {
       });
     }
 
-    // Single source of truth: unified resolver per service (honours
-    // Service.isActive, Zone.active, ZoneServiceMapping, district status
-    // and ServiceAvailability ZONE/DISTRICT overrides). Raw
-    // ZoneServiceMapping-only listing would ignore DISABLED overrides.
-    const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
-    const mappings = await ZoneServiceMapping.find({
-      zoneId: zone._id,
-      active: true,
-    })
-      .populate({ path: "serviceId", select: "_id serviceName serviceType isActive" })
-      .lean();
-    const availableServices = [];
-    for (const m of mappings) {
-      if (!m.serviceId || m.serviceId.isActive === false) continue;
-      const avail = await resolveServiceAvailability({
-        serviceId: m.serviceId._id,
-        districtId: zone.operationalCityId,
-        cityZoneId: zone._id,
+    const activeZones = zones.filter((zone) => zone.active !== false);
+    if (!activeZones.length) {
+      const inactiveZone = resolvedZone || zones[0];
+      return res.status(200).json({
+        success: true,
+        message: "Zone resolved",
+        result: {
+          zone: {
+            _id: inactiveZone._id,
+            name: inactiveZone.name,
+            zoneCode: inactiveZone.zoneCode,
+            operationalCityId: inactiveZone.operationalCityId,
+            active: false,
+          },
+          availableServices: [],
+        },
       });
-      if (avail.available) availableServices.push(m.serviceId);
     }
+
+    // Overlapping zones are allowed. A customer point may sit inside several
+    // service-specific zones, so return the union of services available in
+    // any active matching zone.
+    const snapshot = await getAvailabilitySnapshot({
+      districtIds: [district._id],
+      zoneIds: activeZones.map((zone) => zone._id),
+    });
+    const serviceIds = new Set();
+    for (const zone of activeZones) {
+      for (const service of snapshot.services || []) {
+        if (service.isActive === false) continue;
+        const evaluation = snapshot.evaluate(service._id, district._id, zone._id);
+        if (evaluation.available) serviceIds.add(String(service._id));
+      }
+    }
+
+    const availableServices = serviceIds.size
+      ? await Service.find({ _id: { $in: [...serviceIds] }, isActive: true })
+          .select("_id serviceName serviceType isActive")
+          .lean()
+      : [];
+    const primaryZone = activeZones
+      .slice()
+      .sort((a, b) => String(a._id).localeCompare(String(b._id)))[0];
 
     return res.status(200).json({
       success: true,
       message: "Zone resolved",
       result: {
         zone: {
+          _id: primaryZone._id,
+          name: primaryZone.name,
+          zoneCode: primaryZone.zoneCode,
+          operationalCityId: primaryZone.operationalCityId,
+        },
+        zones: activeZones.map((zone) => ({
           _id: zone._id,
           name: zone.name,
           zoneCode: zone.zoneCode,
           operationalCityId: zone.operationalCityId,
-        },
+        })),
         availableServices,
       },
     });
@@ -101,20 +145,27 @@ export const checkServiceAvailability = async (req, res) => {
       });
     }
 
-    const { zone } = await resolveZoneFromCoordinates(lat, lng, { includeInactive: true });
+    const resolved = await resolveServiceZoneFromCoordinates(serviceId, lat, lng);
+    const zone = resolved.zone;
 
-    if (zone && zone.active === false) {
+    if (resolved.reason === "ZONE_INACTIVE") {
       return res.status(200).json({
         success: true,
         result: {
           available: false,
           reason: "zone_inactive",
           message: "Service unavailable in this area",
+          zone: zone ? { _id: zone._id, name: zone.name } : undefined,
         },
       });
     }
 
-    if (!zone) {
+    if (
+      !zone ||
+      resolved.reason === "ZONE_REQUIRED" ||
+      resolved.reason === "DISTRICT_REQUIRED" ||
+      resolved.reason === "NO_ACTIVE_DISTRICT"
+    ) {
       return res.status(200).json({
         success: true,
         result: {
@@ -125,25 +176,16 @@ export const checkServiceAvailability = async (req, res) => {
       });
     }
 
-    // Single source of truth: unified resolver honours Service.isActive,
-    // Service.zoneRestricted, ZoneServiceMapping, zone active flag,
-    // district status and ServiceAvailability overrides.
-    const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
-    const avail = await resolveServiceAvailability({
-      serviceId,
-      districtId: zone.operationalCityId,
-      cityZoneId: zone._id,
-    });
-
-    if (!avail.available) {
+    const avail = resolved.availability;
+    if (resolved.error || !avail?.available) {
       return res.status(200).json({
         success: true,
         result: {
           available: false,
-          reason: avail.reason === "ZONE_SERVICE_NOT_MAPPED" ? "service_not_in_zone" : avail.reason?.toLowerCase() || "service_unavailable",
+          reason: avail?.reason === "ZONE_SERVICE_NOT_MAPPED" ? "service_not_in_zone" : avail?.reason?.toLowerCase() || "service_unavailable",
           message: "This service is not available in your zone",
           zone: { _id: zone._id, name: zone.name },
-          availabilityMetadata: avail,
+          availabilityMetadata: avail || null,
         },
       });
     }
@@ -154,6 +196,11 @@ export const checkServiceAvailability = async (req, res) => {
         available: true,
         zone: { _id: zone._id, name: zone.name, zoneCode: zone.zoneCode },
         availabilityMetadata: avail,
+        matchingZones: (resolved.matchingZones || [zone]).map((entry) => ({
+          _id: entry._id,
+          name: entry.name,
+          zoneCode: entry.zoneCode,
+        })),
       },
     });
   } catch (err) {

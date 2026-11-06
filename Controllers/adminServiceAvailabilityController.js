@@ -635,6 +635,14 @@ export const getServiceZoneDetail = async (req, res) => {
           isMapped: evaluation.mappingExists,
           isMappingActive: evaluation.mappingActive,
           status, // "ENABLED" or "DISABLED"
+          effectiveStatus: status,
+          globalServiceActive: service.isActive !== false,
+          districtDefaultStatus: evaluation.districtDefaultStatus,
+          source: evaluation.reason,
+          scope: evaluation.scope,
+          overrideScope: evaluation.overrideScope,
+          overrideStatus: evaluation.overrideStatus,
+          pricingMultiplier: evaluation.pricingMultiplier,
         };
       });
 
@@ -655,6 +663,8 @@ export const getServiceZoneDetail = async (req, res) => {
         active: dist.active,
         isJobEnabled: dist.isJobEnabled,
         isDistrictEnabled,
+        districtDefaultStatus: districtEval.status,
+        districtDefaultReason: districtEval.reason,
         activeZonesCount,
         inactiveZonesCount,
         zones: formattedZones,
