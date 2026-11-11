@@ -58,12 +58,23 @@ export const getTechnicianDistricts = async (req, res) => {
     const orphanedPermissions = permissions.filter((p) => !p.districtId);
     const activePermissions = permissions.filter((p) => p.districtId);
 
+    const primaryDistrictId = profile.primaryCityId?._id || profile.primaryCityId || null;
+    const primaryDistrictPermission = primaryDistrictId
+      ? activePermissions.find(
+          (p) =>
+            p.districtId &&
+            String(p.districtId._id || p.districtId) === String(primaryDistrictId)
+        ) || null
+      : null;
+
     return res.status(200).json({
       success: true,
       message: "Technician district permissions fetched",
       result: {
         technicianId,
         primaryDistrict: profile.primaryCityId || null,
+        primaryDistrictHasPermission: Boolean(primaryDistrictPermission?.isEnabled),
+        primaryDistrictPermission,
         additionalPermissions: activePermissions,
         orphanedPermissions,
         allowedDistrictIds: await technicianDistrictService.getAllowedDistrictsForTechnician(profile),

@@ -166,8 +166,11 @@ export const setAutoPayoutConfig = async (updates = {}, actor = null) => {
 
 
 /**
- * Resolve a technician's EFFECTIVE payout settings: per-tech override
- * ?? global config. Pure — easily testable.
+ * Resolve a technician's EFFECTIVE payout settings.
+ *
+ * The global payout policy is authoritative for the maintenance floor. The
+ * legacy per-technician minimumMaintenancePaise field is retained for stored
+ * compatibility but must not silently override a global policy of 0.
  */
 export const resolveTechPayoutSettings = (tech = {}, config = {}) => {
   const perTech = tech.payoutSettings || {};
@@ -178,7 +181,7 @@ export const resolveTechPayoutSettings = (tech = {}, config = {}) => {
       perTech.autoPayoutThresholdPaise ?? config.autoPayoutThresholdPaise ?? DEFAULT_AUTO_PAYOUT_THRESHOLD_PAISE
     ),
     minimumMaintenancePaise: toPaise(
-      perTech.minimumMaintenancePaise ?? config.minimumMaintenancePaise ?? DEFAULT_MINIMUM_MAINTENANCE_PAISE
+      config.minimumMaintenancePaise ?? perTech.minimumMaintenancePaise ?? DEFAULT_MINIMUM_MAINTENANCE_PAISE
     ),
     preferredPayoutMode: perTech.preferredPayoutMode || "UPI",
   };

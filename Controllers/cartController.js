@@ -16,6 +16,8 @@ import {
   resolveScheduleInput,
   buildServiceBookingDoc,
   createBookingAndOutbox,
+  resolveBookingIdempotencyKey,
+  isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import {
   validateScheduledAtUtc,
@@ -41,6 +43,38 @@ const normalizeAddressId = (v) => {
     if (typeof v !== "string") return null;
     const trimmed = v.trim();
     return trimmed === "" || trimmed === "null" || trimmed === "undefined" ? null : trimmed;
+};
+
+const buildCheckoutReplay = async (res, bookings) => {
+    const services = await Service.find({ _id: { $in: bookings.map((b) => b.serviceId) } })
+        .select("serviceName")
+        .lean();
+    const serviceNameById = new Map(services.map((s) => [String(s._id), s.serviceName]));
+    const serviceBookings = bookings.map((b) => ({
+        bookingId: b._id,
+        serviceId: b.serviceId,
+        serviceName: serviceNameById.get(String(b.serviceId)) || null,
+        quantity: 1,
+        baseAmount: b.baseAmount,
+        status: b.status,
+    }));
+    const totalAmountPaise = bookings.reduce(
+        (sum, b) => sum + toPaise(b.financialSnapshot?.totalAmountPaise),
+        0
+    );
+    const firstId = serviceBookings[0]?.bookingId;
+    return res.status(200).json({
+        success: true,
+        message: "Service booking confirmed successfully",
+        result: {
+            serviceBookings,
+            totalAmountPaise,
+            totalAmount: totalAmountPaise / 100,
+            _id: firstId,
+            bookingId: firstId,
+            deduped: true,
+        },
+    });
 };
 
 const getErrorMessage = (error) => {
@@ -755,6 +789,7 @@ export const removeFromCartUnrestricted = async (req, res) => {
 export const checkout = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
+    const checkoutKeys = [];
 
     try {
         ensureCustomer(req);
@@ -1022,6 +1057,42 @@ export const checkout = async (req, res) => {
             });
         }
 
+        for (const cartItem of validServiceItems) {
+            checkoutKeys.push(
+                resolveBookingIdempotencyKey({
+                    req,
+                    scope: "cart-checkout",
+                    customerId: String(customerId),
+                    suffix: String(cartItem._id),
+                    fingerprint: {
+                        serviceId: String(cartItem.itemId),
+                        bookingType: cartItem.scheduledDate || cartItem.scheduledAt ? "schedule" : "instant",
+                        scheduledAt: cartItem.scheduledAt ? new Date(cartItem.scheduledAt).toISOString() : null,
+                        scheduledDate: cartItem.scheduledDate || null,
+                        scheduledTime: cartItem.scheduledTime || null,
+                        quantity: cartItem.quantity || 1,
+                        tipAmount: Math.max(toFiniteNumber(cartItem?.tipAmount) || 0, 0),
+                        addressId: resolvedLocation.addressId ? String(resolvedLocation.addressId) : null,
+                        latitude: resolvedLocation.latitude,
+                        longitude: resolvedLocation.longitude,
+                    },
+                })
+            );
+        }
+
+        const existingBookings = await ServiceBooking.find({
+            idempotencyKey: { $in: checkoutKeys },
+        }).session(session);
+        const existingByKey = new Map(
+            existingBookings.map((booking) => [booking.idempotencyKey, booking])
+        );
+
+        if (existingBookings.length === checkoutKeys.length) {
+            await Cart.deleteMany({ customerId }).session(session);
+            await session.commitTransaction();
+            return buildCheckoutReplay(res, existingBookings);
+        }
+
         const bookingResults = {
             address: {
                 _id: addressSnapshot._id,
@@ -1042,7 +1113,9 @@ export const checkout = async (req, res) => {
         const serviceBroadcastTasks = [];
 
         // Create Service Bookings
-        for (const cartItem of validServiceItems) {
+        for (let index = 0; index < validServiceItems.length; index += 1) {
+            const cartItem = validServiceItems[index];
+            const idempotencyKey = checkoutKeys[index];
             const service = await Service.findById(cartItem.itemId).session(session);
 
             if (!service || !service.isActive) {
@@ -1116,6 +1189,22 @@ export const checkout = async (req, res) => {
                 });
             }
 
+            const existingBooking = existingByKey.get(idempotencyKey);
+            if (existingBooking) {
+                bookingResults.serviceBookings.push({
+                    bookingId: existingBooking._id,
+                    serviceId: cartItem.itemId,
+                    serviceName: service.serviceName,
+                    quantity: cartItem.quantity,
+                    baseAmount: existingBooking.baseAmount,
+                    status: existingBooking.status,
+                });
+                bookingResults.totalAmountPaise += toPaise(existingBooking.financialSnapshot?.totalAmountPaise);
+                continue;
+            }
+
+            doc.idempotencyKey = idempotencyKey;
+
             const { booking } = await createBookingAndOutbox({ doc, session });
 
             // Always broadcast immediately for both Instant and Scheduled in new flow
@@ -1168,10 +1257,28 @@ export const checkout = async (req, res) => {
     } catch (error) {
         await session.abortTransaction();
         console.error("Checkout error:", error);
-        const statusCode = error.code === 11000 ? 400 : (error?.statusCode || 500);
+
+        if (isDuplicateKeyError(error) && checkoutKeys.length > 0) {
+            const existing = await ServiceBooking.find({
+                idempotencyKey: { $in: checkoutKeys },
+            }).lean();
+            if (existing.length === checkoutKeys.length) {
+                return buildCheckoutReplay(res, existing);
+            }
+        }
+
+        const isWriteConflict =
+            error?.code === 112 ||
+            /WriteConflict|TransientTransactionError/i.test(String(error?.message || ""));
+        const statusCode =
+            isDuplicateKeyError(error) || isWriteConflict
+                ? 409
+                : (error?.statusCode || 500);
         res.status(statusCode).json({
             success: false,
-            message: "Checkout failed",
+            message: isWriteConflict
+                ? "Checkout already in progress. Please retry."
+                : "Checkout failed",
             result: { reason: getErrorMessage(error) },
         });
     } finally {

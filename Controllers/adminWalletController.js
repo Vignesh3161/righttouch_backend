@@ -1978,10 +1978,14 @@ export const adminManualPayoutToTechnician = async (req, res) => {
       return res.status(404).json({ success: false, message: "Technician not found" });
     }
 
-    // Same amount discipline as technician-initiated requests: global
-    // min/max limits plus the maintenance floor that must stay in the wallet.
+    // Admin-direct payouts follow the same global payout policy as
+    // technician-requested withdrawals. The per-technician maintenance
+    // override is legacy and must not override the global floor.
     const autoConfig = await getAutoPayoutConfig();
-    const minWithdrawalPaise = Math.max(0, toPaise(autoConfig.minWithdrawalAmountPaise ?? 10000));
+    const minWithdrawalPaise = Math.max(
+      0,
+      toPaise(autoConfig.minWithdrawalAmountPaise ?? 0)
+    );
     if (amountPaiseNum < minWithdrawalPaise) {
       return res.status(400).json({
         success: false,
@@ -1995,14 +1999,19 @@ export const adminManualPayoutToTechnician = async (req, res) => {
         message: `Amount exceeds the maximum withdrawal limit of ₹${paiseToRupees(maxWithdrawalPaise).toFixed(2)} per request.`,
       });
     }
-    const payoutSettings = resolveTechPayoutSettings(tech.toObject ? tech.toObject() : tech, autoConfig);
-    const maintenanceFloorPaise = Math.max(0, toPaise(payoutSettings.minimumMaintenancePaise ?? 10000));
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(autoConfig.minimumMaintenancePaise ?? 0)
+    );
     const availablePaise = toPaise(tech.availableBalancePaise ?? 0);
     const maxWithdrawablePaise = Math.max(0, availablePaise - maintenanceFloorPaise);
     if (amountPaiseNum > maxWithdrawablePaise) {
       return res.status(400).json({
         success: false,
-        message: `Amount exceeds the withdrawable balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)} (maintenance floor ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain).`,
+        message:
+          maintenanceFloorPaise > 0
+            ? `Amount exceeds the withdrawable balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)} (maintenance floor ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain).`
+            : `Amount exceeds the available balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)}.`,
       });
     }
 
@@ -2489,8 +2498,17 @@ export const getTechnicianWalletOverview = async (req, res) => {
     ]);
 
     const settings = resolveTechPayoutSettings(tech, autoConfig);
-    const maintenanceFloorPaise = Math.max(0, toPaise(settings.minimumMaintenancePaise ?? 10000));
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(autoConfig.minimumMaintenancePaise ?? 0)
+    );
+    const minimumWithdrawalAmountPaise = Math.max(
+      0,
+      toPaise(autoConfig.minWithdrawalAmountPaise ?? 0)
+    );
+    const maximumWithdrawalAmountPaise = toPaise(autoConfig.maxWithdrawalAmountPaise);
     const availablePaise = toPaise(tech.availableBalancePaise ?? 0);
+    const maxWithdrawablePaise = Math.max(0, availablePaise - maintenanceFloorPaise);
 
     return res.json({
       success: true,
@@ -2522,7 +2540,12 @@ export const getTechnicianWalletOverview = async (req, res) => {
         },
         payoutSettings: settings,
         maintenanceFloorPaise,
-        maxWithdrawablePaise: Math.max(0, availablePaise - maintenanceFloorPaise),
+        minimumWithdrawalAmountPaise,
+        minimumWithdrawalAmount: paiseToRupees(minimumWithdrawalAmountPaise),
+        maximumWithdrawalAmountPaise,
+        maximumWithdrawalAmount: paiseToRupees(maximumWithdrawalAmountPaise),
+        maxWithdrawablePaise,
+        adminDirectMaxWithdrawablePaise: maxWithdrawablePaise,
         activeWithdrawal: activeWithdrawal || null,
         recentWithdrawals,
         recentTransactions,

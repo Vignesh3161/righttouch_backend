@@ -689,16 +689,23 @@ export const requestWithdrawal = async (req, res) => {
       }
     }
 
-    // Resolve maintenance floor
+    // Resolve the global maintenance floor. A configured floor of 0 is valid
+    // and must not fall back to the legacy ₹100 default.
     const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
-    const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise || 10000;
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(payoutSettings.minimumMaintenancePaise ?? 0)
+    );
     const availableBalancePaise = tech.availableBalancePaise ?? toPaise(tech.walletBalance ?? 0);
     const maxPayoutPaise = Math.max(0, availableBalancePaise - maintenanceFloorPaise);
 
     if (amountPaiseNum > maxPayoutPaise) {
       return res.status(400).json({
         success: false,
-        message: `Requested amount ₹${amountRupees.toFixed(2)} exceeds maximum withdrawable balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}. Maintenance floor of ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain in wallet.`
+        message:
+          maintenanceFloorPaise > 0
+            ? `Requested amount ₹${amountRupees.toFixed(2)} exceeds maximum withdrawable balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}. Maintenance floor of ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain in wallet.`
+            : `Requested amount ₹${amountRupees.toFixed(2)} exceeds the available balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}.`,
       });
     }
 

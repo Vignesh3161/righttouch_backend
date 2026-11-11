@@ -53,14 +53,8 @@ export const getTechnicianZonePermissions = async (req, res) => {
 
     const enabledDistrictMap = new Map();
 
-    // Include primary district if present
-    if (primaryDistrictObj?._id) {
-      enabledDistrictMap.set(String(primaryDistrictObj._id), {
-        id: String(primaryDistrictObj._id),
-        name: primaryDistrictObj.name || primaryDistrictObj.city,
-        isPrimary: true,
-      });
-    }
+    // Primary district is registration metadata only; it is included below
+    // only when an enabled permission row / derived grant array backs it.
 
     // Include enabledDistrictIds / allowedCityIds array entries
     const profileDistricts = [...(tech.enabledDistrictIds || []), ...(tech.allowedCityIds || [])];
@@ -80,7 +74,7 @@ export const getTechnicianZonePermissions = async (req, res) => {
         enabledDistrictMap.set(String(perm.districtId._id), {
           id: String(perm.districtId._id),
           name: perm.districtId.name || perm.districtId.city,
-          isPrimary: perm.permissionType === "PRIMARY",
+          isPrimary: String(perm.districtId._id) === String(primaryDistrictObj?._id),
         });
       }
     }

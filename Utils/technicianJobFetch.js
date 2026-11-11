@@ -6,6 +6,7 @@ import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getGpsState } from "./locationConfig.js";
+import { bookingDeadlineFilter } from "./bookingStatus.js";
 
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
@@ -84,6 +85,8 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
         _id: { $in: bookingIds },
         status: { $in: ["pending", "broadcasted"] },
         technicianId: null,
+        dispatchEligibleAt: { $not: { $gt: new Date() } },
+        ...bookingDeadlineFilter(),
     })
         .populate([
             { path: "serviceId", populate: { path: "categoryId" } },

@@ -211,9 +211,8 @@ export const syncAllowedCityIds = async (technicianProfileId) => {
 
 /**
  * Returns explicitly enabled district permission IDs for a technician.
- * The primary district is auto-seeded as a PRIMARY permission row, but it is
- * never returned from profile metadata alone. Permission rows are the only
- * authorization source.
+ * The primary district is registration metadata only and is never auto-seeded;
+ * permission rows are the only authorization source.
  */
 export const getAllowedDistrictsForTechnician = async (techProfile) => {
   if (!techProfile) return [];
@@ -250,14 +249,6 @@ export const getAllowedDistrictsForTechnician = async (techProfile) => {
         { $set: { primaryCityId: primaryId, primaryDistrictId: primaryId } }
       ).catch(() => {});
     }
-  }
-
-  if (primaryId) {
-    await TechnicianDistrictPermission.updateOne(
-      { technicianId: profileDoc._id, districtId: primaryId },
-      { $setOnInsert: { permissionType: "PRIMARY", isEnabled: true, enabledAt: new Date() } },
-      { upsert: true }
-    ).catch(() => {});
   }
 
   const permissions = await TechnicianDistrictPermission.find({
@@ -318,10 +309,6 @@ export const addDistrictPermission = async ({ technicianId, districtId, adminUse
     fail("DISTRICT_JOBS_DISABLED", "District job assignment is currently disabled");
   }
 
-  if (profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    fail("ALREADY_PRIMARY_DISTRICT", "District is already technician's primary district");
-  }
-
   // Advisory duplicate signal (preserves the existing 400 contract for
   // sequential duplicates). True races resolve idempotently in the txn.
   const dupe = await TechnicianDistrictPermission.findOne({ technicianId, districtId, isEnabled: true })
@@ -376,9 +363,9 @@ export const addDistrictPermission = async ({ technicianId, districtId, adminUse
 };
 
 /**
- * Approval gate: an approved technician must have at least one working zone.
- * Ensures the primary/adopted district permission row exists and inherits all
- * active zones. Safe to call repeatedly (idempotent).
+ * Approval gate: an approved technician must have a registered district with
+ * at least one active zone. Sets primary district metadata only — coverage is
+ * granted exclusively by explicit permission rows. Safe to call repeatedly.
  */
 export const ensureApprovedDistrictZones = async ({
   technicianId,
@@ -471,26 +458,6 @@ export const ensureApprovedDistrictZones = async ({
     fail("NO_ACTIVE_ZONES", "Cannot approve: technician's district has no active zones");
   }
 
-  // Promote legacy profile arrays to real permission rows instead of silently
-  // revoking access when derived arrays are recomputed from rows.
-  const legacyDistrictIds = [
-    ...(profile.enabledDistrictIds || []),
-    ...(profile.allowedCityIds || []),
-  ]
-    .map((id) => String(id?._id || id))
-    .filter((id) => id && id !== String(districtId));
-  const legacyGrants = [];
-  for (const legacyId of [...new Set(legacyDistrictIds)]) {
-    if (!mongoose.Types.ObjectId.isValid(legacyId)) continue;
-    const legacyDistrict = await OperationalCity.findById(legacyId).select("active isJobEnabled").lean();
-    if (!legacyDistrict || legacyDistrict.active === false || legacyDistrict.isJobEnabled === false) continue;
-    const zoneCount = await CityZone.countDocuments({
-      operationalCityId: legacyId,
-      active: { $ne: false },
-    });
-    if (zoneCount > 0) legacyGrants.push(legacyId);
-  }
-
   try {
     await withZoneWriteTransaction(async (session) => {
       const opts = session ? { session } : {};
@@ -499,72 +466,20 @@ export const ensureApprovedDistrictZones = async ({
         { $set: { primaryDistrictId: districtId, primaryCityId: districtId } },
         opts
       );
-      let existingQuery = TechnicianDistrictPermission.findOne({
-        technicianId,
-        districtId,
-      }).select("_id isEnabled");
-      if (session) existingQuery = existingQuery.session(session);
-      const existing = await existingQuery.lean();
-      await TechnicianDistrictPermission.updateMany(
-        { technicianId, permissionType: "PRIMARY", districtId: { $ne: districtId } },
-        { $set: { permissionType: "ADDITIONAL" } },
-        opts
-      );
-      await TechnicianDistrictPermission.updateOne(
-        { technicianId, districtId },
-        {
-          $setOnInsert: { technicianId, districtId },
-          $set: {
-            permissionType: "PRIMARY",
-            isEnabled: true,
-            enabledBy: adminUserId || null,
-            enabledAt: new Date(),
-            disabledBy: null,
-            disabledAt: null,
-          },
-        },
-        { ...opts, upsert: true }
-      );
-      for (const legacyId of legacyGrants) {
-        await TechnicianDistrictPermission.updateOne(
-          { technicianId, districtId: legacyId },
-          {
-            $setOnInsert: { technicianId, districtId: legacyId, permissionType: "ADDITIONAL" },
-            $set: {
-              isEnabled: true,
-              enabledBy: adminUserId || null,
-              enabledAt: new Date(),
-              disabledBy: null,
-              disabledAt: null,
-            },
-          },
-          { ...opts, upsert: true }
-        );
-      }
       await resyncDerivedArrays(technicianId, session);
-      await syncDistrictZones({
-        technicianId,
-        districtId,
-        enabled: true,
-        adminUserId,
-        reason: reason || "Technician approved",
-        session,
-      });
-      for (const legacyId of legacyGrants) {
+
+      const grantedDistrictIds = [
+        ...new Set(permissionRows.map((row) => String(row.districtId)).filter(Boolean)),
+      ];
+      for (const grantedDistrictId of grantedDistrictIds) {
         await syncDistrictZones({
           technicianId,
-          districtId: legacyId,
+          districtId: grantedDistrictId,
           enabled: true,
           adminUserId,
-          reason: reason || "Legacy district grant migrated",
+          reason: reason || "Technician approved",
           session,
         });
-      }
-      if (existing && !existing.isEnabled) {
-        await writePermissionHistory(
-          { technicianId, districtId, kind: "enable", adminUserId, reason: reason || "Technician approved" },
-          session
-        );
       }
     });
   } catch (err) {
@@ -594,10 +509,6 @@ export const toggleDistrictPermission = async ({ technicianId, districtId, isEna
   const profile = await TechnicianProfile.findById(technicianId);
   if (!profile) {
     fail("TECHNICIAN_NOT_FOUND", "Technician not found", 404);
-  }
-
-  if (profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    fail("PRIMARY_DISTRICT_PROTECTED", "Cannot disable technician's primary district permission via additional permissions");
   }
 
   if (isEnabled) {
@@ -669,12 +580,6 @@ export const removeDistrictPermission = async ({ technicianId, districtId, admin
   const profile = await TechnicianProfile.findById(technicianId);
   if (!profile) {
     fail("TECHNICIAN_NOT_FOUND", "Technician not found", 404);
-  }
-  if (profile.primaryCityId && String(profile.primaryCityId) === String(districtId)) {
-    fail("PRIMARY_DISTRICT_PROTECTED", "Cannot remove primary district permission");
-  }
-  if (profile.primaryDistrictId && String(profile.primaryDistrictId) === String(districtId)) {
-    fail("PRIMARY_DISTRICT_PROTECTED", "Cannot remove primary district permission");
   }
 
   try {

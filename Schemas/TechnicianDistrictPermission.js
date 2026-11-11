@@ -3,6 +3,8 @@ import mongoose from "mongoose";
 /**
  * 🗺 TECHNICIAN DISTRICT PERMISSION
  * Stores explicit per-technician district authorization.
+ * permissionType PRIMARY is legacy (no longer created); every new grant is
+ * ADDITIONAL and can be disabled or revoked by an admin.
  */
 const technicianDistrictPermissionSchema = new mongoose.Schema(
   {

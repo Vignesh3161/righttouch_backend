@@ -14,6 +14,7 @@ import Service from "../Schemas/Service.js";
 import Category from "../Schemas/Category.js";
 import { checkTechnicianEligibility, getTechnicianOrigin } from "../Services/technicianEligibilityService.js";
 import { auditPurgeAt, offerPurgeAt } from "../Utils/broadcastRetention.js";
+import { bookingDeadlineFilter } from "../Utils/bookingStatus.js";
 
 const DISPATCH_LOCK_MS = 10000;
 
@@ -611,6 +612,7 @@ export const respondToJob = async (req, res) => {
       status: { $in: ["pending", "broadcasted"] },
       technicianId: null,
       activeBroadcastVersion: observedActiveBroadcastVersion,
+      ...bookingDeadlineFilter(),
     };
     booking = await ServiceBooking.findOneAndUpdate(
       claimFilter,

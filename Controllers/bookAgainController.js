@@ -12,6 +12,10 @@ import {
   buildServiceBookingDoc,
   createBookingAndOutbox,
   broadcastCreatedBooking,
+  resolveBookingIdempotencyKey,
+  findBookingByIdempotencyKey,
+  findBookingByIdempotencyKeyWithRetry,
+  isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { validateScheduledAtUtc } from "../Utils/slots.js";
 
@@ -20,6 +24,24 @@ const toFiniteNumber = (val) => {
   const num = Number(val);
   return Number.isFinite(num) ? num : null;
 };
+
+const sendRebookReplay = (res, booking, previousBooking, latestBaseAmount) =>
+  res.status(200).json({
+    success: true,
+    message: "Booking already recreated",
+    result: {
+      newBooking: booking,
+      previousBookingId: previousBooking._id,
+      broadcastCount: 0,
+      addressLabel: booking?.addressSnapshot?.label ?? null,
+      deduped: true,
+      pricingSummary: {
+        originalBaseAmount: previousBooking.baseAmount,
+        newBaseAmount: latestBaseAmount,
+        priceChanged: previousBooking.baseAmount !== latestBaseAmount,
+      },
+    },
+  });
 
 /**
  * @route   GET /api/user/booking/completed-services
@@ -472,6 +494,31 @@ export const rebookService = async (req, res) => {
       });
     }
 
+    const idempotencyKey = resolveBookingIdempotencyKey({
+      req,
+      scope: "booking-rebook",
+      customerId: String(customerId),
+      fingerprint: {
+        previousBookingId: String(previousBookingId),
+        serviceId: String(service._id),
+        bookingType: schedule.bookingType,
+        scheduledAt: schedule.scheduledAt ? schedule.scheduledAt.toISOString() : null,
+        addressId: resolvedLocation.addressId ? String(resolvedLocation.addressId) : null,
+        latitude: resolvedLocation.latitude,
+        longitude: resolvedLocation.longitude,
+        faultProblem: faultProblemInput || null,
+        tipAmount: toFiniteNumber(req.body?.tipAmount) || 0,
+        radius: radiusInput,
+      },
+    });
+    if (idempotencyKey) {
+      const existing = await findBookingByIdempotencyKey(idempotencyKey);
+      if (existing) {
+        return sendRebookReplay(res, existing, previousBooking, latestBaseAmount);
+      }
+      doc.idempotencyKey = idempotencyKey;
+    }
+
     const session = await mongoose.startSession();
     let newBooking;
     try {
@@ -481,6 +528,24 @@ export const rebookService = async (req, res) => {
       await session.commitTransaction();
     } catch (txError) {
       await session.abortTransaction();
+      const txMessage = String(txError?.message || "");
+      const retryableConflict =
+        txError?.code === 112 ||
+        txError?.errorLabels?.includes("TransientTransactionError") ||
+        /WriteConflict|TransientTransactionError/i.test(txMessage);
+      if (idempotencyKey && (isDuplicateKeyError(txError) || retryableConflict)) {
+        const existing = await findBookingByIdempotencyKeyWithRetry(idempotencyKey);
+        if (existing) {
+          return sendRebookReplay(res, existing, previousBooking, latestBaseAmount);
+        }
+        if (retryableConflict) {
+          return res.status(409).json({
+            success: false,
+            message: "Booking creation is already in progress. Please retry.",
+            reason: "duplicate_booking_request",
+          });
+        }
+      }
       throw txError;
     } finally {
       session.endSession();
@@ -515,7 +580,7 @@ export const rebookService = async (req, res) => {
     });
   } catch (error) {
     console.error("❌ rebookService Error:", error);
-    return res.status(500).json({
+    return res.status(error?.statusCode || 500).json({
       success: false,
       message: error.message || "Failed to rebook service",
       result: { error: error.message },

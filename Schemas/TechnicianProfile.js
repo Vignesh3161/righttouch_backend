@@ -224,11 +224,11 @@ const technicianProfileSchema = new mongoose.Schema(
     // directly (verified + fingerprinted at mark-paid time).
 
     /* ──────────────────────────────────────────────────────────────
-       💸 PAYOUT SETTINGS (per-technician overrides)
-       Effective value = tech override ?? global config (GlobalSetting /
-       env). Payouts are manual-only, so the execution flags are legacy;
-       minimumMaintenancePaise still enforces the floor that must remain
-       in the wallet when a withdrawal is requested.
+       💸 PAYOUT SETTINGS (legacy per-technician overrides)
+       The global payout policy (GlobalSetting / env) is authoritative for
+       withdrawal limits and the maintenance floor. minimumMaintenancePaise
+       is retained for stored compatibility only; it no longer overrides the
+       global floor.
     ────────────────────────────────────────────────────────────── */
     payoutSettings: {
       autoPayoutEnabled: { type: Boolean, default: true },

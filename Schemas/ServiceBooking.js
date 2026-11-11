@@ -531,6 +531,21 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    cancelledAt: {
+      type: Date,
+      default: null,
+    },
+
+    reacceptEligible: {
+      type: Boolean,
+      default: undefined,
+    },
+
+    idempotencyKey: {
+      type: String,
+      default: null,
+    },
+
     cancellationFee: {
       type: Number,
       default: 0,
@@ -723,6 +738,15 @@ serviceBookingSchema.index({ bookingType: 1, status: 1, dispatchEligibleAt: 1 })
 
 // Worker lease / expiry hot path
 serviceBookingSchema.index({ leaseUntil: 1, status: 1 });
+
+// Request-level booking idempotency (explicit or short-window fingerprint keys)
+serviceBookingSchema.index(
+  { idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { idempotencyKey: { $type: "string" } },
+  }
+);
 
 // Completed-unpaid payment-reminder sweep hot path
 serviceBookingSchema.index({ status: 1, paymentStatus: 1, completedAt: 1 });

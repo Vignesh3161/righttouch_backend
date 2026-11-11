@@ -12,9 +12,9 @@ import { toBookingCancelledDTO } from "./socketDTO.js";
 import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendReminder.js";
 import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
 import { expireRewards, recoverMissedRewards, expireRedemptionReservations } from "../Services/rewardService.js";
-import { normalizeBookingStatus } from "./bookingStatus.js";
 import { SCHEDULED_REDISPATCH_WINDOW_MINUTES } from "./schedulingConfig.js";
 import { hasActiveCompletionChallenge, closeActiveChallengesForBooking } from "./completionOtp.js";
+import { expireUnassignedBooking } from "./bookingExpiry.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
 const MAX_RELEASES_BEFORE_CANCEL = 2; // instant OTW-timeout policy
@@ -227,41 +227,16 @@ export const initBookingCrons = (io) => {
                 technicianId: null,
             }).select("_id").limit(100);
 
+            const owner = `expiry-worker:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+
             for (const { _id } of expiredJobs) {
-                const claimed = await claimLease(_id, "expiry-worker");
+                const claimed = await claimLease(_id, owner);
                 if (!claimed) continue;
 
                 try {
-                    // RECHECK — the booking may have been accepted between the
-                    // query and the lease claim. Never expire an accepted job.
-                    const fresh = await ServiceBooking.findById(_id)
-                      .select("status technicianId autoCancelAt bookingType cancelReason")
-                      .lean();
-                    if (
-                      !fresh ||
-                      fresh.technicianId !== null ||
-                      !["pending", "broadcasted"].includes(normalizeBookingStatus(fresh.status)) ||
-                      !fresh.autoCancelAt ||
-                      fresh.autoCancelAt > now
-                    ) {
-                      continue;
-                    }
+                    const expired = await expireUnassignedBooking(_id, owner, now);
+                    if (!expired) continue;
 
-                    await ServiceBooking.updateOne(
-                      { _id },
-                      {
-                        $set: {
-                          status: "expired",
-                          cancelReason: "no_technician_accept",
-                          cancelledBy: "system",
-                          cancellationStatus: "system_cancelled",
-                          assignmentStatus: "released",
-                          completionPinnedAt: null,
-                          completionOtpRequestedAt: null,
-                        },
-                        $inc: { version: 1 },
-                      }
-                    );
                     await closeActiveChallengesForBooking(_id, { to: "expired", now }).catch((err) => {
                       console.error(`[Cron:Expiry] Challenge cleanup failed for ${_id}:`, err.message);
                     });
@@ -271,13 +246,13 @@ export const initBookingCrons = (io) => {
                     // (jobs_changed + job:expired).
                     await expireBroadcastsForBooking(io, _id, "no_technician_accept", now);
 
-                    const message = fresh.bookingType === "instant"
+                    const message = expired.bookingType === "instant"
                         ? "We couldn't find a technician for your immediate booking. It has expired. Please try again later."
                         : "No technician accepted your scheduled booking 5 hours before the start. It has been cancelled automatically.";
-                    await notifyCustomer(claimed, message, io);
-                    console.log(`[Cron:Expiry] Auto-cancelled ${fresh.bookingType} job ${_id}`);
+                    await notifyCustomer(expired, message, io);
+                    console.log(`[Cron:Expiry] Auto-cancelled ${expired.bookingType} job ${_id}`);
                 } finally {
-                    await releaseLease(_id, "expiry-worker");
+                    await releaseLease(_id, owner);
                 }
             }
         } catch (err) {
@@ -395,7 +370,9 @@ export const initBookingCrons = (io) => {
                               status: "cancelled",
                               cancelReason: "technician_no_action",
                               cancelledBy: "system",
+                              cancelledAt: now,
                               cancellationStatus: "system_cancelled",
+                              reacceptEligible: false,
                               technicianId: null,
                               assignmentStatus: "released",
                               autoCancelAt: null,
