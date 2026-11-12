@@ -61,6 +61,7 @@ import {
   applyPaymentRewardDiscount,
   releaseRedemptionForPayment,
 } from "../Services/rewardService.js";
+import { emitProductBookingChanged } from "../Utils/productRealtime.js";
 
 /* ================= HELPERS ================= */
 
@@ -1387,6 +1388,19 @@ export const recordAdminOfflinePayment = async (req, res) => {
     });
 
     await notifyPaymentSucceeded(req, payment);
+
+    if (itemType === "product") {
+      emitProductBookingChanged({
+        action: "paid",
+        bookingId: booking._id,
+        quotationId: booking.quotationId,
+        requestId: booking.quoteRequestId,
+        status: booking.status,
+        paymentStatus: "paid",
+        paymentMode: modeLower,
+        totalAmountPaise: targetPaise,
+      });
+    }
 
     return ok(res, 200, `Offline payment recorded successfully via ${modeLower.toUpperCase()}`, {
       paymentId: payment._id,

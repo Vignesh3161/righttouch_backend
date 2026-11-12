@@ -55,6 +55,20 @@ export const isCanonicalBookingStatus = (status) =>
 export const isTerminalBookingStatus = (status) =>
   ["completed", "expired", "cancelled"].includes(normalizeBookingStatus(status));
 
+export const bookingDeadlineFilter = (now = new Date()) => ({
+  $or: [
+    { autoCancelAt: null },
+    { autoCancelAt: { $exists: false } },
+    { autoCancelAt: { $gt: now } },
+  ],
+});
+
+export const isBookingPastAutoCancel = (booking, now = new Date()) => {
+  if (!booking?.autoCancelAt) return false;
+  const deadline = new Date(booking.autoCancelAt).getTime();
+  return Number.isFinite(deadline) && deadline <= now.getTime();
+};
+
 /**
  * Explicit transition table (normalized).
  * Maps current status → set of allowed next statuses.

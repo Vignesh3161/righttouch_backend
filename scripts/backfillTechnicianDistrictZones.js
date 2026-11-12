@@ -40,6 +40,10 @@ const parseArgs = (argv) => {
 const usage = () => {
   console.log(`Usage: node scripts/backfillTechnicianDistrictZones.js [options]
 
+Repairs missing primary-district registration metadata for approved
+technicians. It never auto-grants district or zone coverage — admins grant
+that explicitly from the technician permissions screen.
+
 Options:
   --apply                 Apply changes. Without this flag the script is a dry run.
   --limit=N               Maximum approved technicians to scan (default 500, max 5000).

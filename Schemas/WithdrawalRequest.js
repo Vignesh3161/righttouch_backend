@@ -61,8 +61,9 @@ const withdrawalRequestSchema = new mongoose.Schema(
       default: "technician_request",
     },
 
-    // requiresApproval is true only for technician_request origin.
-    // admin_direct and auto are pre-approved / pre-processed.
+    // true only for high-value admin_direct payouts that must be confirmed by
+    // a second admin. Technician requests and low-value admin payouts are
+    // approved through the regular approve/mark-paid flow.
     requiresApproval: {
       type: Boolean,
       default: false,
@@ -93,9 +94,9 @@ const withdrawalRequestSchema = new mongoose.Schema(
       },
     },
 
-    // Auto-payout fields — set only for origin === "auto". Auto requests are
-    // created pre-approved (no admin step) and processed by the same
-    // Razorpay X outbox engine as manual ones.
+    // Legacy auto-payout fields — only present on historical origin === "auto"
+    // records from the removed RazorpayX integration. Automatic execution is
+    // permanently disabled; all new payouts are manual NEFT/IMPS/UPI/RTGS.
     autoApproved: {
       type: Boolean,
       default: false,

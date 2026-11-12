@@ -14,6 +14,8 @@ import { postPayoutLedgerEntry, postLedgerEntry } from "../Utils/ledger.js";
 import { sendPushNotification } from "../Utils/sendNotification.js";
 import { SOCKET_ROOMS, SOCKET_EVENTS } from "../Utils/socketConstants.js";
 import {
+  AUTO_PAYOUT_EXECUTION_ENABLED,
+  DEFAULT_DUAL_APPROVAL_THRESHOLD_PAISE,
   getAutoPayoutConfig,
   setAutoPayoutConfig,
   resolveTechPayoutSettings,
@@ -535,7 +537,7 @@ export const getAllWithdrawalRequests = async (req, res) => {
       WithdrawalRequest.find(query)
         .populate({
           path: "technicianId",
-          select: "walletBalance availableBalancePaise bankDetails decryptedBankDetails kycDetails isBankVerified status workStatus bankName accountNumber accountHolderName ifscCode branchName upiId payoutBlocked payoutBlockedReason",
+          select: "walletBalance availableBalancePaise status workStatus payoutBlocked payoutBlockedReason",
           populate: { path: "userId", select: "fname lname mobileNumber email" }
         })
         .sort({ createdAt: -1 })
@@ -567,7 +569,7 @@ export const exportWithdrawalRequests = async (req, res) => {
     const withdrawals = await WithdrawalRequest.find(query)
       .populate({
         path: "technicianId",
-        select: "userId bankDetails",
+        select: "userId",
         populate: { path: "userId", select: "fname lname mobileNumber email" },
       })
       .sort({ createdAt: -1 })
@@ -1683,11 +1685,11 @@ export const getAutoPayoutSummary = async (req, res) => {
 
     const [totalAutoPayouts, todayAutoPayouts, pendingAutoPayouts, paidAgg, todayPaidAgg, totalAutoAmountAgg] =
       await Promise.all([
-        WithdrawalRequest.countDocuments({ type: "auto" }),
-        WithdrawalRequest.countDocuments({ type: "auto", createdAt: { $gte: today } }),
-        WithdrawalRequest.countDocuments({ type: "auto", status: { $in: inFlightStatuses } }),
+        WithdrawalRequest.countDocuments({ origin: "auto" }),
+        WithdrawalRequest.countDocuments({ origin: "auto", createdAt: { $gte: today } }),
+        WithdrawalRequest.countDocuments({ origin: "auto", status: { $in: inFlightStatuses } }),
         WithdrawalRequest.aggregate([
-          { $match: { type: "auto", status: "paid" } },
+          { $match: { origin: "auto", status: "paid" } },
           {
             $group: {
               _id: null,
@@ -1696,7 +1698,7 @@ export const getAutoPayoutSummary = async (req, res) => {
           },
         ]),
         WithdrawalRequest.aggregate([
-          { $match: { type: "auto", status: "paid", createdAt: { $gte: today } } },
+          { $match: { origin: "auto", status: "paid", createdAt: { $gte: today } } },
           {
             $group: {
               _id: null,
@@ -1705,7 +1707,7 @@ export const getAutoPayoutSummary = async (req, res) => {
           },
         ]),
         WithdrawalRequest.aggregate([
-          { $match: { type: "auto", status: { $in: ["paid", ...inFlightStatuses] } } },
+          { $match: { origin: "auto", status: { $in: ["paid", ...inFlightStatuses] } } },
           {
             $group: {
               _id: null,
@@ -1724,6 +1726,13 @@ export const getAutoPayoutSummary = async (req, res) => {
     res.json({
       success: true,
       result: {
+        // Statistics cover legacy `origin: "auto"` records only; execution is
+        // permanently disabled in manual-NEFT mode.
+        manualOnly: true,
+        deprecated: true,
+        deprecationMessage:
+          "Automatic payouts are permanently disabled. Statistics only cover legacy origin=\"auto\" records; use the manual payout queue for new payouts.",
+        autoPayoutExecutionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
         totalAutoPayouts,
         todayAutoPayouts,
         pendingAutoPayouts,
@@ -1760,6 +1769,7 @@ export const getAutoPayoutSettings = async (req, res) => {
     res.json({
       success: true,
       result: {
+        autoPayoutExecutionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
         autoPayoutEnabled: config.autoPayoutEnabled,
         autoPayoutThreshold: paiseToRupees(config.autoPayoutThresholdPaise),
         autoPayoutThresholdPaise: config.autoPayoutThresholdPaise,
@@ -1768,9 +1778,17 @@ export const getAutoPayoutSettings = async (req, res) => {
         autoPayoutCronExpression: config.autoPayoutCronExpression,
         minWithdrawalAmount: paiseToRupees(config.minWithdrawalAmountPaise),
         minWithdrawalAmountPaise: config.minWithdrawalAmountPaise,
+        maxWithdrawalAmount: paiseToRupees(config.maxWithdrawalAmountPaise),
+        maxWithdrawalAmountPaise: config.maxWithdrawalAmountPaise,
         withdrawalCooldownDays: config.withdrawalCooldownDays,
         dualApprovalThreshold: paiseToRupees(config.dualApprovalThresholdPaise),
         dualApprovalThresholdPaise: config.dualApprovalThresholdPaise,
+        deprecatedAutoPayoutFields: [
+          "autoPayoutEnabled",
+          "autoPayoutThreshold",
+          "autoPayoutThresholdPaise",
+          "autoPayoutCronExpression",
+        ],
       },
     });
   } catch (error) {
@@ -1780,7 +1798,7 @@ export const getAutoPayoutSettings = async (req, res) => {
 
 /**
  * @desc  Update global auto-payout configuration.
- *        Body: { enabled?, threshold?, minimumMaintenance?, autoPayoutCronExpression?, minWithdrawalAmount?, withdrawalCooldownDays?, dualApprovalThreshold? }
+ *        Body: { enabled?, threshold?, minimumMaintenance?, autoPayoutCronExpression?, minWithdrawalAmount?, maxWithdrawalAmount?, withdrawalCooldownDays?, dualApprovalThreshold? }
  *        Values persist in GlobalSetting and take effect live.
  */
 export const updateAutoPayoutSettings = async (req, res) => {
@@ -1793,6 +1811,7 @@ export const updateAutoPayoutSettings = async (req, res) => {
       minimumMaintenance,
       autoPayoutCronExpression,
       minWithdrawalAmount,
+      maxWithdrawalAmount,
       withdrawalCooldownDays,
       dualApprovalThreshold,
     } = req.body || {};
@@ -1826,7 +1845,26 @@ export const updateAutoPayoutSettings = async (req, res) => {
       if (!Number.isFinite(minPaise) || minPaise < 0) {
         return res.status(400).json({ success: false, message: "minWithdrawalAmount must be >= 0" });
       }
+      const maxPaise = toPaise(
+        (updates.maxWithdrawalAmountPaise ?? (await getAutoPayoutConfig()).maxWithdrawalAmountPaise)
+      );
+      if (maxPaise != null && minPaise > maxPaise) {
+        return res.status(400).json({ success: false, message: "minWithdrawalAmount must be <= maxWithdrawalAmount" });
+      }
       updates.minWithdrawalAmountPaise = minPaise;
+    }
+    if (maxWithdrawalAmount !== undefined) {
+      const maxPaise = toPaise(maxWithdrawalAmount * 100);
+      if (!Number.isFinite(maxPaise) || maxPaise < 10000) {
+        return res.status(400).json({ success: false, message: "maxWithdrawalAmount must be at least ₹100" });
+      }
+      const minPaise = toPaise(
+        (updates.minWithdrawalAmountPaise ?? (await getAutoPayoutConfig()).minWithdrawalAmountPaise)
+      );
+      if (minPaise != null && maxPaise < minPaise) {
+        return res.status(400).json({ success: false, message: "maxWithdrawalAmount must be >= minWithdrawalAmount" });
+      }
+      updates.maxWithdrawalAmountPaise = maxPaise;
     }
     if (withdrawalCooldownDays !== undefined) {
       const days = Number(withdrawalCooldownDays);
@@ -1859,6 +1897,7 @@ export const updateAutoPayoutSettings = async (req, res) => {
       success: true,
       message: "Payout settings updated successfully",
       result: {
+        autoPayoutExecutionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
         autoPayoutEnabled: config.autoPayoutEnabled,
         autoPayoutThreshold: paiseToRupees(config.autoPayoutThresholdPaise),
         autoPayoutThresholdPaise: config.autoPayoutThresholdPaise,
@@ -1867,9 +1906,17 @@ export const updateAutoPayoutSettings = async (req, res) => {
         autoPayoutCronExpression: config.autoPayoutCronExpression,
         minWithdrawalAmount: paiseToRupees(config.minWithdrawalAmountPaise),
         minWithdrawalAmountPaise: config.minWithdrawalAmountPaise,
+        maxWithdrawalAmount: paiseToRupees(config.maxWithdrawalAmountPaise),
+        maxWithdrawalAmountPaise: config.maxWithdrawalAmountPaise,
         withdrawalCooldownDays: config.withdrawalCooldownDays,
         dualApprovalThreshold: paiseToRupees(config.dualApprovalThresholdPaise),
         dualApprovalThresholdPaise: config.dualApprovalThresholdPaise,
+        deprecatedAutoPayoutFields: [
+          "autoPayoutEnabled",
+          "autoPayoutThreshold",
+          "autoPayoutThresholdPaise",
+          "autoPayoutCronExpression",
+        ],
       },
     });
   } catch (error) {
@@ -1884,18 +1931,22 @@ export const updateAutoPayoutSettings = async (req, res) => {
  * status `requested` with `requiresApproval:true` and must be confirmed by a
  * second admin via `approveAdminManualPayout`.
  *
- * The threshold lives in GlobalSetting (key
- * `payout.adminManualDualApprovalPaise`) so it is tunable without a deploy.
+ * The threshold lives in GlobalSetting under the same canonical key written
+ * by the admin settings endpoint (`payout.dualApprovalThresholdPaise`), so
+ * the configured value actually controls manual payouts. The pre-unification
+ * key (`payout.adminManualDualApprovalPaise`) is still read as a fallback for
+ * deployments that set it directly.
  * Default: ₹10,000 (1,000,000 paise).
  */
 const getAdminManualDualApprovalPaise = async () => {
-  const doc = await GlobalSetting.findOne({
-    key: "payout.adminManualDualApprovalPaise",
-  }).lean();
-  const v = doc?.value;
-  if (v == null) return 1000000; // default ₹10,000
+  const [canonical, legacy] = await Promise.all([
+    GlobalSetting.findOne({ key: "payout.dualApprovalThresholdPaise" }).lean(),
+    GlobalSetting.findOne({ key: "payout.adminManualDualApprovalPaise" }).lean(),
+  ]);
+  const v = canonical?.value ?? legacy?.value;
+  if (v == null) return DEFAULT_DUAL_APPROVAL_THRESHOLD_PAISE;
   const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? toPaise(n) : 1000000;
+  return Number.isFinite(n) && n >= 0 ? toPaise(n) : DEFAULT_DUAL_APPROVAL_THRESHOLD_PAISE;
 };
 
 export const adminManualPayoutToTechnician = async (req, res) => {
@@ -1927,34 +1978,40 @@ export const adminManualPayoutToTechnician = async (req, res) => {
       return res.status(404).json({ success: false, message: "Technician not found" });
     }
 
-    // Same amount discipline as technician-initiated requests: global
-    // min/max limits plus the maintenance floor that must stay in the wallet.
+    // Admin-direct payouts follow the same global payout policy as
+    // technician-requested withdrawals. The per-technician maintenance
+    // override is legacy and must not override the global floor.
     const autoConfig = await getAutoPayoutConfig();
-    const minWithdrawalPaise = Math.max(0, toPaise(autoConfig.minWithdrawalAmountPaise ?? 10000));
+    const minWithdrawalPaise = Math.max(
+      0,
+      toPaise(autoConfig.minWithdrawalAmountPaise ?? 0)
+    );
     if (amountPaiseNum < minWithdrawalPaise) {
       return res.status(400).json({
         success: false,
         message: `Amount is below the minimum withdrawal of ₹${paiseToRupees(minWithdrawalPaise).toFixed(2)}.`,
       });
     }
-    const maxWithdrawalRupees = Number(process.env.MAX_WITHDRAWAL_AMOUNT);
-    const maxWithdrawalPaise = Number.isFinite(maxWithdrawalRupees) && maxWithdrawalRupees > 0
-      ? Math.round(maxWithdrawalRupees * 100)
-      : 50000 * 100;
+    const maxWithdrawalPaise = toPaise(autoConfig.maxWithdrawalAmountPaise);
     if (amountPaiseNum > maxWithdrawalPaise) {
       return res.status(400).json({
         success: false,
         message: `Amount exceeds the maximum withdrawal limit of ₹${paiseToRupees(maxWithdrawalPaise).toFixed(2)} per request.`,
       });
     }
-    const payoutSettings = resolveTechPayoutSettings(tech.toObject ? tech.toObject() : tech, autoConfig);
-    const maintenanceFloorPaise = Math.max(0, toPaise(payoutSettings.minimumMaintenancePaise ?? 10000));
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(autoConfig.minimumMaintenancePaise ?? 0)
+    );
     const availablePaise = toPaise(tech.availableBalancePaise ?? 0);
     const maxWithdrawablePaise = Math.max(0, availablePaise - maintenanceFloorPaise);
     if (amountPaiseNum > maxWithdrawablePaise) {
       return res.status(400).json({
         success: false,
-        message: `Amount exceeds the withdrawable balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)} (maintenance floor ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain).`,
+        message:
+          maintenanceFloorPaise > 0
+            ? `Amount exceeds the withdrawable balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)} (maintenance floor ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain).`
+            : `Amount exceeds the available balance of ₹${paiseToRupees(maxWithdrawablePaise).toFixed(2)}.`,
       });
     }
 
@@ -2290,7 +2347,7 @@ export const getWithdrawalDetails = async (req, res) => {
     const withdrawal = await WithdrawalRequest.findById(id)
       .populate({
         path: "technicianId",
-        select: "userId bankDetails kycDetails isBankVerified status payoutBlocked payoutBlockedReason",
+        select: "userId status payoutBlocked payoutBlockedReason",
         populate: { path: "userId", select: "fname lname mobileNumber email" },
       })
       .lean();
@@ -2441,8 +2498,17 @@ export const getTechnicianWalletOverview = async (req, res) => {
     ]);
 
     const settings = resolveTechPayoutSettings(tech, autoConfig);
-    const maintenanceFloorPaise = Math.max(0, toPaise(settings.minimumMaintenancePaise ?? 10000));
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(autoConfig.minimumMaintenancePaise ?? 0)
+    );
+    const minimumWithdrawalAmountPaise = Math.max(
+      0,
+      toPaise(autoConfig.minWithdrawalAmountPaise ?? 0)
+    );
+    const maximumWithdrawalAmountPaise = toPaise(autoConfig.maxWithdrawalAmountPaise);
     const availablePaise = toPaise(tech.availableBalancePaise ?? 0);
+    const maxWithdrawablePaise = Math.max(0, availablePaise - maintenanceFloorPaise);
 
     return res.json({
       success: true,
@@ -2474,7 +2540,12 @@ export const getTechnicianWalletOverview = async (req, res) => {
         },
         payoutSettings: settings,
         maintenanceFloorPaise,
-        maxWithdrawablePaise: Math.max(0, availablePaise - maintenanceFloorPaise),
+        minimumWithdrawalAmountPaise,
+        minimumWithdrawalAmount: paiseToRupees(minimumWithdrawalAmountPaise),
+        maximumWithdrawalAmountPaise,
+        maximumWithdrawalAmount: paiseToRupees(maximumWithdrawalAmountPaise),
+        maxWithdrawablePaise,
+        adminDirectMaxWithdrawablePaise: maxWithdrawablePaise,
         activeWithdrawal: activeWithdrawal || null,
         recentWithdrawals,
         recentTransactions,

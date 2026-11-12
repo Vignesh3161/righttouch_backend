@@ -14,15 +14,16 @@
  *   - Broadcast only after commit (inline fast path + outbox retry)
  */
 
+import crypto from "crypto";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import BookingOutbox from "../Schemas/BookingOutbox.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
-import { resolveDistrictAndZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
+import { resolveServiceZoneFromCoordinates } from "./resolveZoneFromCoordinates.js";
 import { resolveCommissionSnapshot } from "./commission.js";
 import { paiseToRupees } from "./money.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
 import { validateSlot, BUSINESS_TIMEZONE, localDateInBusinessTimezone, formatInBusinessTimezone } from "./slots.js";
-import { normalizeBookingStatus } from "./bookingStatus.js";
+import { isBookingPastAutoCancel, normalizeBookingStatus } from "./bookingStatus.js";
 import { computeDispatchEligibleAt } from "./schedulingConfig.js";
 
 /**
@@ -51,24 +52,28 @@ export const resolveServiceZoneAvailability = async ({
       reason: "LOCATION_REQUIRED",
     };
   }
-  // Joint resolution: zone lookup is scoped to the district polygon, so a
-  // zone whose operationalCityId disagrees with the geo district (stale
-  // parent link / zone sticking outside its district) cannot silently pass.
-  const { district, zone } = await resolveDistrictAndZoneFromCoordinates(
-    latitude,
-    longitude,
-    { session, includeInactiveZone: true }
+  // Overlapping zones are allowed. Resolve the zone by the requested service
+  // so a point covered by multiple service-specific zones does not get an
+  // arbitrary first-zone answer.
+  const resolved = await resolveServiceZoneFromCoordinates(
+    service?._id,
+    latNum,
+    lngNum,
+    { session }
   );
-  if (zone && zone.active === false) {
+
+  if (resolved.error) {
     return {
       ok: false,
-      zoneId: zone?._id || null,
-      districtId: district?._id || zone?.operationalCityId || null,
+      zoneId: resolved.zone?._id || null,
+      districtId: resolved.district?._id || null,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
-      reason: "ZONE_INACTIVE",
+      reason: resolved.reason || resolved.error,
     };
   }
+
+  const { district, zone } = resolved;
   // FINAL RULE: address must resolve to BOTH District AND Zone.
   // No zone polygon → block (no district fallback for booking).
   if (!zone?._id || !district?._id) {
@@ -94,27 +99,25 @@ export const resolveServiceZoneAvailability = async ({
       reason: "ZONE_DISTRICT_MISMATCH",
     };
   }
-  const districtId = district._id;
 
-  const { resolveServiceAvailability } = await import("../Services/serviceAvailabilityService.js");
-  const avail = await resolveServiceAvailability({
-    serviceId: service?._id,
-    districtId,
-    cityZoneId: zone?._id || null,
-  });
-
-  if (!avail.available) {
+  const avail = resolved.availability;
+  if (!avail?.available) {
     return {
       ok: false,
       zoneId: zone?._id || null,
-      districtId,
+      districtId: district._id,
       error: FRIENDLY,
       code: "SERVICE_NOT_AVAILABLE",
-      reason: avail.reason,
+      reason: avail?.reason || "SERVICE_NOT_AVAILABLE",
     };
   }
 
-  return { ok: true, zoneId: zone?._id || null, districtId };
+  return {
+    ok: true,
+    zoneId: zone._id,
+    districtId: district._id,
+    matchingZoneIds: (resolved.matchingZones || [zone]).map((entry) => entry._id),
+  };
 };
 
 /**
@@ -262,6 +265,79 @@ export const buildServiceBookingDoc = async ({
   return doc;
 };
 
+const AUTO_IDEMPOTENCY_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.BOOKING_IDEMPOTENCY_WINDOW_SECONDS) || 30
+) * 1000;
+
+export const resolveBookingIdempotencyKey = ({
+  req,
+  scope,
+  customerId,
+  suffix = null,
+  fingerprint = null,
+  windowMs = AUTO_IDEMPOTENCY_WINDOW_MS,
+} = {}) => {
+  if (!scope || !customerId) return null;
+
+  const suffixPart = suffix ? `:${suffix}` : "";
+  const rawKey =
+    req?.get?.("Idempotency-Key") ??
+    req?.headers?.["idempotency-key"] ??
+    req?.body?.idempotencyKey ??
+    null;
+
+  if (rawKey !== null && rawKey !== undefined && String(rawKey).trim()) {
+    const key = String(rawKey).trim();
+    if (key.length > 180) {
+      throw Object.assign(
+        new Error("Idempotency-Key must be 180 characters or fewer"),
+        { statusCode: 400 }
+      );
+    }
+    return `${scope}:${customerId}:${key}${suffixPart}`;
+  }
+
+  if (!fingerprint) return null;
+  const hash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(fingerprint))
+    .digest("hex")
+    .slice(0, 32);
+  const bucket = Math.floor(Date.now() / windowMs);
+  return `${scope}:${customerId}:auto:${hash}${suffixPart}:${bucket}`;
+};
+
+export const findBookingByIdempotencyKey = async (idempotencyKey, session = null) => {
+  if (!idempotencyKey) return null;
+  let query = ServiceBooking.findOne({ idempotencyKey });
+  if (session) query = query.session(session);
+  return query;
+};
+
+export const findBookingByIdempotencyKeyWithRetry = async (
+  idempotencyKey,
+  { attempts = 4, delayMs = 50 } = {}
+) => {
+  if (!idempotencyKey) return null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const booking = await findBookingByIdempotencyKey(idempotencyKey);
+    if (booking) return booking;
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return null;
+};
+
+export const isDuplicateKeyError = (error) =>
+  Boolean(
+    error &&
+      (error.code === 11000 ||
+        error.code === 11001 ||
+        /E11000/.test(String(error.message || "")))
+  );
+
 /**
  * Insert the booking + BOOKING_CREATED outbox row in the caller's transaction.
  * Caller owns commit/abort.
@@ -330,7 +406,7 @@ export const markBookingOutboxDone = async (bookingId) => {
  */
 export const processBookingCreatedOutbox = async (booking) => {
   const current = await ServiceBooking.findById(booking.aggregateId)
-    .select("status activeBroadcastVersion technicianId")
+    .select("status activeBroadcastVersion technicianId autoCancelAt")
     .lean();
 
   if (!current) {
@@ -343,6 +419,10 @@ export const processBookingCreatedOutbox = async (booking) => {
   }
   if (!["pending", "broadcasted"].includes(status)) {
     return { status: "done", reason: `not_dispatchable_${status}` };
+  }
+
+  if (isBookingPastAutoCancel(current)) {
+    return { status: "done", reason: "auto_cancel_deadline_passed" };
   }
 
   if ((current.activeBroadcastVersion || 0) > 0) {

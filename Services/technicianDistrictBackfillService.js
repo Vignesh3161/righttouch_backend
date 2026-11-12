@@ -5,33 +5,28 @@ const idString = (value) => {
 
 export const getBackfillDistrictId = (profile) => {
   if (!profile) return null;
-  const direct = idString(profile.primaryDistrictId || profile.primaryCityId);
-  if (direct) return direct;
-  const legacy = [
-    ...(profile.enabledDistrictIds || []),
-    ...(profile.allowedCityIds || []),
-  ].map(idString).find(Boolean);
-  return legacy || null;
+  return idString(profile.primaryDistrictId || profile.primaryCityId);
 };
 
+/**
+ * Backfill only repairs missing primary-district registration metadata.
+ * District/zone coverage is never auto-granted here — admins grant it
+ * explicitly through TechnicianDistrictPermission rows.
+ */
 export const inspectBackfillCandidate = ({
   profile,
   district = null,
   activeZoneCount = 0,
-  enabledPermissionCount = 0,
   zoneDistrictId = null,
 }) => {
-  const districtId = getBackfillDistrictId(profile) || idString(zoneDistrictId);
-  const hasDistrictCache = (profile?.enabledDistrictIds || []).length > 0;
-  const hasZoneCache = (profile?.enabledCityZoneIds || []).length > 0;
-  const hasPermissionRows = enabledPermissionCount > 0;
-  const needed = !hasDistrictCache || !hasZoneCache || !hasPermissionRows;
+  const primaryDistrictId = getBackfillDistrictId(profile);
+  const districtId = primaryDistrictId || idString(zoneDistrictId);
 
-  if (!needed) {
+  if (primaryDistrictId) {
     return {
       needed: false,
       eligible: true,
-      reason: "PERMISSIONS_PRESENT",
+      reason: "PRIMARY_METADATA_PRESENT",
       districtId,
     };
   }
@@ -84,7 +79,7 @@ export const inspectBackfillCandidate = ({
   return {
     needed: true,
     eligible: true,
-    reason: "MISSING_PERMISSIONS",
+    reason: "MISSING_PRIMARY_METADATA",
     districtId,
   };
 };

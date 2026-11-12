@@ -59,6 +59,11 @@ export const SOCKET_EVENTS = {
     NEW_BOOKING: "new_booking",
     ADMIN_UNREAD_COUNTS_UPDATED: "admin:unread_counts_updated",
 
+    // 🛒 Product quote → quotation → booking flow (admin dashboard)
+    PRODUCT_QUOTE_REQUEST_CHANGED: "product_quote_request:changed",
+    PRODUCT_QUOTATION_CHANGED: "product_quotation:changed",
+    PRODUCT_BOOKING_CHANGED: "product_booking:changed",
+
     // 🔐 Session Control & Permissions
     SESSION_REVOKED: "session:revoked",
     SESSION_REPLACED: "session:replaced",

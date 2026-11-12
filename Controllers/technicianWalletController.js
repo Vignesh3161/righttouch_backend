@@ -7,13 +7,15 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { toPaise, rupeesToPaise, paiseToRupees } from "../Utils/money.js";
 import {
+  AUTO_PAYOUT_EXECUTION_ENABLED,
+  DEFAULT_MAX_WITHDRAWAL_AMOUNT_PAISE,
   getAutoPayoutConfig,
   resolveTechPayoutSettings,
   computeAutoPayoutForTech,
 } from "../Utils/autoPayout.js";
 import { hasActivePayoutBlock } from "../Utils/complaintFreeze.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
-import { fingerprintBankDetails } from "../Utils/kycPrivacy.js";
+import { fingerprintBankDetails, maskAccount } from "../Utils/kycPrivacy.js";
 import { SOCKET_ROOMS } from "../Utils/socketConstants.js";
 import { atomicWalletDebit } from "../Utils/walletDebit.js";
 import { getIo } from "../Utils/ioAccess.js";
@@ -25,14 +27,23 @@ const toMoney = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-const getConfig = () => {
-  const envMinWithdrawal = toMoney(process.env.MIN_WITHDRAWAL_AMOUNT);
-  const minWithdrawal =
-    envMinWithdrawal != null && envMinWithdrawal > 0 ? envMinWithdrawal : 100;
-  const cooldownDays = toMoney(process.env.WITHDRAWAL_COOLDOWN_DAYS) ?? 0;
+/**
+ * Derive the withdrawal limits from the SAME resolved global config used by
+ * admin payouts (GlobalSetting -> env -> defaults). This keeps technician
+ * requests and admin direct payouts on one set of min/max/cooldown rules.
+ */
+const buildWithdrawalConfig = (autoConfig = {}) => {
+  const minWithdrawalPaise = toPaise(autoConfig.minWithdrawalAmountPaise ?? 10000);
+  const maxWithdrawalPaise = toPaise(
+    autoConfig.maxWithdrawalAmountPaise ?? DEFAULT_MAX_WITHDRAWAL_AMOUNT_PAISE
+  );
+  const cooldownDays = Number(autoConfig.withdrawalCooldownDays ?? 0);
   return {
-    minWithdrawal,
-    cooldownMs: Math.max(0, cooldownDays) * 24 * 60 * 60 * 1000,
+    minWithdrawal: paiseToRupees(minWithdrawalPaise),
+    minWithdrawalPaise,
+    maxWithdrawal: paiseToRupees(maxWithdrawalPaise),
+    maxWithdrawalPaise,
+    cooldownMs: Math.max(0, Number.isFinite(cooldownDays) ? cooldownDays : 0) * 24 * 60 * 60 * 1000,
   };
 };
 
@@ -306,15 +317,18 @@ export const getTechnicianWallet = async (req, res) => {
 
     // 💸 Auto-payout context — effective settings, in-flight auto payout and
     // the next-run estimate (or how much more must be earned to trigger).
-    const [autoConfig, pendingAuto] = await Promise.all([
+    const [autoConfig, pendingAuto, kycForDisplay] = await Promise.all([
       getAutoPayoutConfig(),
       WithdrawalRequest.findOne({
         technicianId: tech._id,
-        type: "auto",
+        origin: "auto",
         status: { $in: ["pending", "requested", "approved", "processing"] },
       })
         .select("amountPaise status autoApprovedAt autoApprovedReason")
         .sort({ createdAt: -1 })
+        .lean(),
+      TechnicianKyc.findOne({ technicianId: tech._id })
+        .select("bankDetails encryptedDek")
         .lean(),
     ]);
     const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
@@ -330,16 +344,27 @@ export const getTechnicianWallet = async (req, res) => {
     const currentAvailablePaise = tech?.availableBalancePaise ?? toPaise(tech?.walletBalance ?? 0);
     const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise;
     const availableToWithdrawPaise = Math.max(0, currentAvailablePaise - maintenanceFloorPaise);
-    const config = getConfig();
+    const config = buildWithdrawalConfig(autoConfig);
 
+    // Show the SAME bank/UPI account that payout validation reads (KYC store),
+    // not the legacy profile mirror, so the technician never sees a stale
+    // destination different from the account the admin will pay.
     let payoutDestination = null;
-    if (tech.bankDetails) {
-      if (tech.bankDetails.accountNumber) {
-        const acc = String(tech.bankDetails.accountNumber);
-        payoutDestination = `Bank Account (****${acc.slice(-4)})`;
-      } else if (tech.bankDetails.upiId) {
-        payoutDestination = `UPI (${tech.bankDetails.upiId})`;
+    try {
+      if (kycForDisplay) {
+        const displayDek = await getDekForKycDoc(kycForDisplay);
+        const displayBank = decryptBankDetails(kycForDisplay.bankDetails, displayDek) || {};
+        if (displayBank.accountNumber) {
+          const acc = String(displayBank.accountNumber);
+          payoutDestination = `Bank Account (****${acc.slice(-4)})`;
+        } else if (displayBank.upiId) {
+          const upi = String(displayBank.upiId);
+          const at = upi.lastIndexOf("@");
+          payoutDestination = at > 0 ? `UPI (***${upi.slice(at)})` : `UPI (${maskAccount(upi)})`;
+        }
       }
+    } catch (displayErr) {
+      console.warn("[getTechnicianWallet] bank display unavailable:", displayErr.message);
     }
 
     res.json({
@@ -368,8 +393,21 @@ export const getTechnicianWallet = async (req, res) => {
         : null,
       payoutLimits: {
         minWithdrawal: config.minWithdrawal,
-        maxWithdrawal: toMoney(process.env.MAX_WITHDRAWAL_AMOUNT) || 50000,
+        minWithdrawalPaise: config.minWithdrawalPaise,
+        maxWithdrawal: config.maxWithdrawal,
+        maxWithdrawalPaise: config.maxWithdrawalPaise,
+        cooldownDays: Math.round(config.cooldownMs / (24 * 60 * 60 * 1000)),
+        source: "GlobalSetting (payout.*) with env/default fallback",
       },
+      autoPayoutExecutionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
+      deprecatedAutoPayoutFields: [
+        "payoutSettings.autoPayoutEnabled",
+        "payoutSettings.autoPayoutThreshold",
+        "payoutSettings.autoPayoutThresholdPaise",
+        "pendingAutoPayout",
+        "pendingAutoPayoutPaise",
+        "nextAutoPayoutEstimate",
+      ],
       totalEarnings,
       totalJobEarnings,
       totalTips,
@@ -394,18 +432,22 @@ export const getTechnicianWallet = async (req, res) => {
       nextAutoPayoutEstimate: autoEstimate.eligible
         ? {
             eligible: true,
+            executionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
             amount: paiseToRupees(autoEstimate.amountPaise),
             amountPaise: autoEstimate.amountPaise,
             message: "You are eligible for auto-payout",
           }
         : {
             eligible: false,
+            executionEnabled: AUTO_PAYOUT_EXECUTION_ENABLED,
             remainingToThreshold: paiseToRupees(autoEstimate.remainingToThresholdPaise),
             remainingToThresholdPaise: autoEstimate.remainingToThresholdPaise,
             message:
-              autoEstimate.reason === "auto_payout_disabled"
-                ? "Auto-payout is disabled for your account"
-                : `Earn ₹${paiseToRupees(autoEstimate.remainingToThresholdPaise).toFixed(2)} more to trigger auto-payout`,
+              autoEstimate.reason === "auto_payout_execution_disabled"
+                ? "Auto-payout execution is disabled. Submit a withdrawal request and an admin will transfer it manually."
+                : autoEstimate.reason === "auto_payout_disabled"
+                  ? "Auto-payout is disabled for your account"
+                  : `Earn ₹${paiseToRupees(autoEstimate.remainingToThresholdPaise).toFixed(2)} more to trigger auto-payout`,
           },
     });
   } catch (error) {
@@ -541,7 +583,8 @@ export const requestWithdrawal = async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const { amount, amountRupees: bodyAmountRupees, withdrawalAmount, amountPaise, clientIdempotencyKey } = req.body || {};
-    const config = getConfig(); // Get config
+    const autoConfig = await getAutoPayoutConfig();
+    const config = buildWithdrawalConfig(autoConfig);
 
     const rawRupees = bodyAmountRupees ?? amount ?? withdrawalAmount;
     let amountPaiseNum = null;
@@ -565,11 +608,10 @@ export const requestWithdrawal = async (req, res) => {
       });
     }
 
-    const maxWithdrawalRupees = toMoney(process.env.MAX_WITHDRAWAL_AMOUNT) || 50000;
-    if (amountRupees > maxWithdrawalRupees) {
+    if (amountRupees > config.maxWithdrawal) {
       return res.status(400).json({
         success: false,
-        message: `Maximum withdrawal limit per request is ₹${maxWithdrawalRupees}`
+        message: `Maximum withdrawal limit per request is ₹${config.maxWithdrawal}`
       });
     }
 
@@ -647,17 +689,23 @@ export const requestWithdrawal = async (req, res) => {
       }
     }
 
-    // Resolve maintenance floor
-    const autoConfig = await getAutoPayoutConfig();
+    // Resolve the global maintenance floor. A configured floor of 0 is valid
+    // and must not fall back to the legacy ₹100 default.
     const payoutSettings = resolveTechPayoutSettings(tech, autoConfig);
-    const maintenanceFloorPaise = payoutSettings.minimumMaintenancePaise || 10000;
+    const maintenanceFloorPaise = Math.max(
+      0,
+      toPaise(payoutSettings.minimumMaintenancePaise ?? 0)
+    );
     const availableBalancePaise = tech.availableBalancePaise ?? toPaise(tech.walletBalance ?? 0);
     const maxPayoutPaise = Math.max(0, availableBalancePaise - maintenanceFloorPaise);
 
     if (amountPaiseNum > maxPayoutPaise) {
       return res.status(400).json({
         success: false,
-        message: `Requested amount ₹${amountRupees.toFixed(2)} exceeds maximum withdrawable balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}. Maintenance floor of ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain in wallet.`
+        message:
+          maintenanceFloorPaise > 0
+            ? `Requested amount ₹${amountRupees.toFixed(2)} exceeds maximum withdrawable balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}. Maintenance floor of ₹${paiseToRupees(maintenanceFloorPaise).toFixed(2)} must remain in wallet.`
+            : `Requested amount ₹${amountRupees.toFixed(2)} exceeds the available balance of ₹${paiseToRupees(maxPayoutPaise).toFixed(2)}.`,
       });
     }
 
@@ -1064,7 +1112,7 @@ export const getWithdrawalReceipt = async (req, res) => {
     const withdrawal = await WithdrawalRequest.findOne(query)
       .populate({
         path: "technicianId",
-        select: "userId bankDetails",
+        select: "userId",
         populate: { path: "userId", select: "fname lname mobileNumber email" },
       })
       .lean();

@@ -16,13 +16,21 @@ import { toPaise } from "./money.js";
  *
  * No function in this module creates withdrawals, reserves balances, or
  * calls any provider.
+ *
+ * AUTO_PAYOUT_EXECUTION_ENABLED is the single source of truth for whether an
+ * automatic payout can actually run. It is permanently false in manual-only
+ * mode; wallet/admin UIs must use this flag instead of inferring eligibility
+ * from balances alone.
  */
 
 /* ── Defaults & env fallbacks ── */
+export const AUTO_PAYOUT_EXECUTION_ENABLED = false;
 export const DEFAULT_AUTO_PAYOUT_ENABLED = true;
 export const DEFAULT_AUTO_PAYOUT_THRESHOLD_PAISE = 500000; // ₹5,000
 export const DEFAULT_MINIMUM_MAINTENANCE_PAISE = 10000; // ₹100
 export const MIN_AUTO_PAYOUT_PAISE = 10000; // ₹100 — never auto-pay below this
+export const DEFAULT_DUAL_APPROVAL_THRESHOLD_PAISE = 1000000; // ₹10,000
+export const DEFAULT_MAX_WITHDRAWAL_AMOUNT_PAISE = 5000000; // ₹50,000
 
 // Keys stored in GlobalSetting (singleton key-value store)
 const KEY_ENABLED = "payout.autoEnabled";
@@ -30,6 +38,7 @@ const KEY_THRESHOLD = "payout.autoThresholdPaise";
 const KEY_MAINTENANCE = "payout.minimumMaintenancePaise";
 const KEY_CRON = "payout.autoPayoutCronExpression";
 const KEY_MIN_WITHDRAWAL = "payout.minWithdrawalAmountPaise";
+const KEY_MAX_WITHDRAWAL = "payout.maxWithdrawalAmountPaise";
 const KEY_COOLDOWN = "payout.withdrawalCooldownDays";
 const KEY_DUAL_APPROVAL = "payout.dualApprovalThresholdPaise";
 
@@ -55,6 +64,7 @@ export const getAutoPayoutConfig = async () => {
     maintenanceDoc,
     cronDoc,
     minWithdrawalDoc,
+    maxWithdrawalDoc,
     cooldownDoc,
     dualApprovalDoc,
   ] = await Promise.all([
@@ -63,6 +73,7 @@ export const getAutoPayoutConfig = async () => {
     GlobalSetting.findOne({ key: KEY_MAINTENANCE }).lean(),
     GlobalSetting.findOne({ key: KEY_CRON }).lean(),
     GlobalSetting.findOne({ key: KEY_MIN_WITHDRAWAL }).lean(),
+    GlobalSetting.findOne({ key: KEY_MAX_WITHDRAWAL }).lean(),
     GlobalSetting.findOne({ key: KEY_COOLDOWN }).lean(),
     GlobalSetting.findOne({ key: KEY_DUAL_APPROVAL }).lean(),
   ]);
@@ -92,13 +103,18 @@ export const getAutoPayoutConfig = async () => {
       envRupeesToPaise("MIN_WITHDRAWAL_AMOUNT", 10000) // ₹100 fallback
   );
 
+  const maxWithdrawalAmountPaise = toPaise(
+    maxWithdrawalDoc?.value ??
+      envRupeesToPaise("MAX_WITHDRAWAL_AMOUNT", DEFAULT_MAX_WITHDRAWAL_AMOUNT_PAISE)
+  );
+
   const withdrawalCooldownDays = Number(
     cooldownDoc?.value ?? (toMoney(process.env.WITHDRAWAL_COOLDOWN_DAYS) ?? 0)
   );
 
   const dualApprovalThresholdPaise = toPaise(
     dualApprovalDoc?.value ??
-      envRupeesToPaise("DUAL_APPROVAL_THRESHOLD_INR", 5000000) // ₹50,000 fallback
+      envRupeesToPaise("DUAL_APPROVAL_THRESHOLD_INR", DEFAULT_DUAL_APPROVAL_THRESHOLD_PAISE)
   );
 
   return {
@@ -107,6 +123,7 @@ export const getAutoPayoutConfig = async () => {
     minimumMaintenancePaise,
     autoPayoutCronExpression,
     minWithdrawalAmountPaise,
+    maxWithdrawalAmountPaise,
     withdrawalCooldownDays,
     dualApprovalThresholdPaise,
   };
@@ -114,7 +131,7 @@ export const getAutoPayoutConfig = async () => {
 
 /**
  * Persist global auto-payout config into GlobalSetting (live, no restart).
- * @param {{autoPayoutEnabled?: boolean, autoPayoutThresholdPaise?: number, minimumMaintenancePaise?: number, autoPayoutCronExpression?: string, minWithdrawalAmountPaise?: number, withdrawalCooldownDays?: number, dualApprovalThresholdPaise?: number}} updates
+ * @param {{autoPayoutEnabled?: boolean, autoPayoutThresholdPaise?: number, minimumMaintenancePaise?: number, autoPayoutCronExpression?: string, minWithdrawalAmountPaise?: number, maxWithdrawalAmountPaise?: number, withdrawalCooldownDays?: number, dualApprovalThresholdPaise?: number}} updates
  * @param {{userId?: string, role?: string}} [actor] — admin who changed it
  */
 export const setAutoPayoutConfig = async (updates = {}, actor = null) => {
@@ -124,6 +141,7 @@ export const setAutoPayoutConfig = async (updates = {}, actor = null) => {
     [KEY_MAINTENANCE, updates.minimumMaintenancePaise],
     [KEY_CRON, updates.autoPayoutCronExpression],
     [KEY_MIN_WITHDRAWAL, updates.minWithdrawalAmountPaise],
+    [KEY_MAX_WITHDRAWAL, updates.maxWithdrawalAmountPaise],
     [KEY_COOLDOWN, updates.withdrawalCooldownDays],
     [KEY_DUAL_APPROVAL, updates.dualApprovalThresholdPaise],
   ].filter(([, value]) => value !== undefined);
@@ -148,8 +166,11 @@ export const setAutoPayoutConfig = async (updates = {}, actor = null) => {
 
 
 /**
- * Resolve a technician's EFFECTIVE payout settings: per-tech override
- * ?? global config. Pure — easily testable.
+ * Resolve a technician's EFFECTIVE payout settings.
+ *
+ * The global payout policy is authoritative for the maintenance floor. The
+ * legacy per-technician minimumMaintenancePaise field is retained for stored
+ * compatibility but must not silently override a global policy of 0.
  */
 export const resolveTechPayoutSettings = (tech = {}, config = {}) => {
   const perTech = tech.payoutSettings || {};
@@ -160,7 +181,7 @@ export const resolveTechPayoutSettings = (tech = {}, config = {}) => {
       perTech.autoPayoutThresholdPaise ?? config.autoPayoutThresholdPaise ?? DEFAULT_AUTO_PAYOUT_THRESHOLD_PAISE
     ),
     minimumMaintenancePaise: toPaise(
-      perTech.minimumMaintenancePaise ?? config.minimumMaintenancePaise ?? DEFAULT_MINIMUM_MAINTENANCE_PAISE
+      config.minimumMaintenancePaise ?? perTech.minimumMaintenancePaise ?? DEFAULT_MINIMUM_MAINTENANCE_PAISE
     ),
     preferredPayoutMode: perTech.preferredPayoutMode || "UPI",
   };
@@ -178,6 +199,19 @@ export const resolveTechPayoutSettings = (tech = {}, config = {}) => {
 export const computeAutoPayoutForTech = (tech = {}, config = {}) => {
   const settings = resolveTechPayoutSettings(tech, config);
   const balancePaise = toPaise(tech.availableBalancePaise ?? 0);
+
+  // Manual-only mode: never advertise an automatic payout that cannot run.
+  if (!AUTO_PAYOUT_EXECUTION_ENABLED) {
+    return {
+      eligible: false,
+      reason: "auto_payout_execution_disabled",
+      amountPaise: 0,
+      remainingToThresholdPaise: 0,
+      executionEnabled: false,
+      deprecated: true,
+      settings,
+    };
+  }
 
   if (!settings.autoPayoutEnabled) {
     return {

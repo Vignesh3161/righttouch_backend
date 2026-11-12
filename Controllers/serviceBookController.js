@@ -10,7 +10,7 @@ import Address from "../Schemas/Address.js";
 import mongoose from "mongoose";
 import { broadcastJobToTechnicians } from "../Utils/sendNotification.js";
 import { notifyCustomerJobAccepted } from "../Utils/sendNotification.js";
-import { broadcastPendingJobsToTechnician, findEligibleTechniciansForService } from "../Utils/technicianMatching.js";
+import { broadcastPendingJobsToTechnician, findEligibleTechniciansForService, loadCommittedQueues, evaluateJobFeasibility } from "../Utils/technicianMatching.js";
 import { findNearbyTechnicians } from "../Utils/findNearbyTechnicians.js";
 import { settleBookingEarningsIfEligible } from "../Utils/settlement.js";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
@@ -32,6 +32,10 @@ import {
   createBookingAndOutbox,
   broadcastCreatedBooking,
   computeAutoCancelAt,
+  resolveBookingIdempotencyKey,
+  findBookingByIdempotencyKey,
+  findBookingByIdempotencyKeyWithRetry,
+  isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { getBookingSchedulePayload } from "../Utils/slots.js";
@@ -40,7 +44,7 @@ import {
   RESCHEDULE_CUTOFF_MINUTES,
   SCHEDULED_REDISPATCH_WINDOW_MINUTES,
 } from "../Utils/schedulingConfig.js";
-import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
+import { checkTechnicianEligibility, getTechnicianOrigin } from "../Services/technicianEligibilityService.js";
 import { getSlotAvailability } from "../Services/slotAvailabilityService.js";
 import { containsRegex } from "../Utils/safeQuery.js";
 import { getReacceptPenaltyPercent } from "./adminSettingsController.js";
@@ -52,6 +56,36 @@ import {
   completionAccessError,
 } from "../Services/completionVerificationService.js";
 import { closeActiveChallengesForBooking } from "../Utils/completionOtp.js";
+import { evaluateReacceptEligibility } from "../Utils/bookingReaccept.js";
+
+const DISPATCH_LOCK_MS = 10000;
+
+const REACCEPT_REJECT_MESSAGES = {
+  not_cancelled: "Only cancelled jobs can be re-accepted",
+  not_technician_cancelled: "Only jobs cancelled by you can be re-accepted",
+  reaccept_disabled: "This cancellation is not eligible for re-acceptance",
+  reaccept_window_expired: "The re-accept window has expired",
+  scheduled_time_passed: "This scheduled slot has already passed",
+  missing_cancellation_time: "The cancellation time is unavailable",
+  missing_scheduled_at: "This scheduled booking has no valid slot",
+};
+
+const sendScheduleReplay = (res, booking) =>
+  res.status(200).json({
+    success: true,
+    message: "Booking already created",
+    result: {
+      bookingId: booking._id,
+      bookingType: booking.bookingType === "schedule" ? "scheduled" : "instant",
+      status: booking.status,
+      scheduledAt: booking.scheduledAt,
+      scheduledDateLocal: booking.scheduledDateLocal,
+      scheduledTimeLocal: booking.scheduledTimeLocal,
+      timezone: booking.timezone,
+      broadcastCount: 0,
+      deduped: true,
+    },
+  });
 
 /**
  * Post-commit completion side effects — the EXISTING completion behavior,
@@ -496,6 +530,28 @@ export const storeBookingSchedule = async (req, res) => {
       });
     }
 
+    const idempotencyKey = resolveBookingIdempotencyKey({
+      req,
+      scope: "booking-schedule",
+      customerId: String(req.user.userId),
+      fingerprint: {
+        serviceId: String(serviceId),
+        bookingType: schedule.bookingType,
+        scheduledAt: schedule.scheduledAt ? schedule.scheduledAt.toISOString() : null,
+        addressId: addressId ? String(addressId) : null,
+        locationType: locationType || null,
+        latitude: resolvedLocation.latitude,
+        longitude: resolvedLocation.longitude,
+        faultProblem: faultProblem || null,
+        tipAmount: toFiniteNumber(req.body?.tipAmount) || 0,
+      },
+    });
+    if (idempotencyKey) {
+      const existing = await findBookingByIdempotencyKey(idempotencyKey);
+      if (existing) return sendScheduleReplay(res, existing);
+      doc.idempotencyKey = idempotencyKey;
+    }
+
     // ─── Booking + outbox in one transaction ──────────────────────────────
     const session = await mongoose.startSession();
     try {
@@ -531,13 +587,29 @@ export const storeBookingSchedule = async (req, res) => {
       });
     } catch (txError) {
       await session.abortTransaction();
+      const txMessage = String(txError?.message || "");
+      const retryableConflict =
+        txError?.code === 112 ||
+        txError?.errorLabels?.includes("TransientTransactionError") ||
+        /WriteConflict|TransientTransactionError/i.test(txMessage);
+      if (idempotencyKey && (isDuplicateKeyError(txError) || retryableConflict)) {
+        const existing = await findBookingByIdempotencyKeyWithRetry(idempotencyKey);
+        if (existing) return sendScheduleReplay(res, existing);
+        if (retryableConflict) {
+          return res.status(409).json({
+            success: false,
+            message: "Booking creation is already in progress. Please retry.",
+            reason: "duplicate_booking_request",
+          });
+        }
+      }
       throw txError;
     } finally {
       session.endSession();
     }
 
   } catch (error) {
-    return res.status(500).json({
+    return res.status(error?.statusCode || 500).json({
       success: false,
       message: error.message,
       result: { error: error.message },
@@ -1946,6 +2018,8 @@ export const cancelBooking = async (req, res) => {
         $set: {
           status: "cancelled",
           cancelledBy: "customer",
+          cancelledAt: now,
+          reacceptEligible: false,
           cancelReason: reason || "customer_cancel",
           cancellationStatus: "customer_cancelled",
           cancellationFee: fee,
@@ -2217,6 +2291,9 @@ export const technicianCancelBooking = async (req, res) => {
       booking.matchingLeaseOwner = null;
       booking.cancelReason = null;
       booking.cancelledBy = null;
+      booking.cancelledAt = null;
+      booking.cancellationStatus = "active";
+      booking.reacceptEligible = false;
       booking.technicianPenalty = penaltyPaise / 100;
       booking.technicianRejectCount = (booking.technicianRejectCount || 0) + 1;
       if (booking.remindersSent) {
@@ -2229,6 +2306,8 @@ export const technicianCancelBooking = async (req, res) => {
       // Instant booking or past slot: cancel permanently
       booking.status = "cancelled";
       booking.cancelledBy = "technician";
+      booking.cancelledAt = now;
+      booking.reacceptEligible = true;
       booking.cancelReason = reason || "technician_cancel";
       booking.technicianPenalty = penaltyPaise / 100;
       booking.assignmentStatus = "released";
@@ -2302,6 +2381,8 @@ export const acceptCancelledJob = async (req, res) => {
   // Phase B deterministically lose; only changes inside the short window
   // remain invisible (documented consistency boundary).
   let session = null;
+  let reacceptLockAt = null;
+  let reacceptLockTechId = null;
   try {
     const { id } = req.params;
     // H18: client-supplied penalty flags are never trusted (see header).
@@ -2318,6 +2399,28 @@ export const acceptCancelledJob = async (req, res) => {
       return res.status(403).json({ success: false, message: activation.message });
     }
 
+    const dispatchLockAt = new Date(Date.now() + DISPATCH_LOCK_MS);
+    const dispatchLock = await TechnicianProfile.findOneAndUpdate(
+      {
+        _id: techId,
+        $or: [
+          { dispatchLockUntil: null },
+          { dispatchLockUntil: { $lte: new Date() } },
+        ],
+      },
+      { $set: { dispatchLockUntil: dispatchLockAt } },
+      { new: true, select: "_id" }
+    );
+    if (!dispatchLock) {
+      return res.status(409).json({
+        success: false,
+        message: "Another dispatch action is in progress. Please retry.",
+        reason: "dispatch_lock_busy",
+      });
+    }
+    reacceptLockAt = dispatchLockAt;
+    reacceptLockTechId = techId;
+
     const booking = await ServiceBooking.findById(id)
       .populate("customerId", "fname lname mobileNumber email")
       .populate({ path: "serviceId", populate: { path: "categoryId" } });
@@ -2331,6 +2434,16 @@ export const acceptCancelledJob = async (req, res) => {
     }
     if (booking.technicianId?.toString() !== techId?.toString()) {
       return res.status(403).json({ success: false, message: "This job was not assigned to you" });
+    }
+
+    const reacceptPolicy = evaluateReacceptEligibility({ booking });
+    if (!reacceptPolicy.eligible) {
+      return res.status(reacceptPolicy.reason === "not_cancelled" ? 400 : 409).json({
+        success: false,
+        message: REACCEPT_REJECT_MESSAGES[reacceptPolicy.reason] || "This job cannot be re-accepted",
+        code: "REACCEPT_NOT_ALLOWED",
+        reason: reacceptPolicy.reason,
+      });
     }
 
     // ⚔️ One active job at a time — same guard as a fresh accept.
@@ -2368,6 +2481,25 @@ export const acceptCancelledJob = async (req, res) => {
       });
     }
 
+    const [queueMap, techProfileForCheck] = await Promise.all([
+      loadCommittedQueues([techId]),
+      TechnicianProfile.findById(techId).select("location serviceBaseLocation").lean(),
+    ]);
+    const feasibility = evaluateJobFeasibility({
+      techLocation: getTechnicianOrigin(techProfileForCheck, booking.bookingType)?.location || null,
+      candidateJob: booking,
+      queue: queueMap.get(String(techId)),
+    });
+    if (!feasibility.feasible) {
+      return res.status(409).json({
+        success: false,
+        message: "This job no longer fits your schedule.",
+        code: "JOB_NOT_FEASIBLE",
+        reason: feasibility.reason,
+        result: { feasibility },
+      });
+    }
+
     // B-09 deterministic test hook (inert in production): runs after the
     // advisory checks and BEFORE the claim transaction opens.
     await globalThis.__b09OnEligible?.();
@@ -2390,6 +2522,18 @@ export const acceptCancelledJob = async (req, res) => {
       await session.abortTransaction();
       return res.status(403).json({ success: false, message: "This job was not assigned to you" });
     }
+
+    const liveReacceptPolicy = evaluateReacceptEligibility({ booking: live });
+    if (!liveReacceptPolicy.eligible) {
+      await session.abortTransaction();
+      return res.status(liveReacceptPolicy.reason === "not_cancelled" ? 400 : 409).json({
+        success: false,
+        message: REACCEPT_REJECT_MESSAGES[liveReacceptPolicy.reason] || "This job cannot be re-accepted",
+        code: "REACCEPT_NOT_ALLOWED",
+        reason: liveReacceptPolicy.reason,
+      });
+    }
+
     const liveActiveJob = await ServiceBooking.findOne({
       technicianId: techId,
       $or: [
@@ -2511,7 +2655,10 @@ export const acceptCancelledJob = async (req, res) => {
           cancellationStatus: "active",
           cancelledBy: null,
           cancelReason: null,
-          autoCancelAt: live.bookingType === "instant" ? new Date(now.getTime() + 30 * 60 * 1000) : null,
+          reacceptEligible: false,
+          autoCancelAt: live.bookingType === "instant"
+            ? new Date(now.getTime() + 30 * 60 * 1000)
+            : computeAutoCancelAt("schedule", live.scheduledAt, now),
           completionPinnedAt: null,
           completionOtpRequestedAt: null,
           ...(penaltyPaise > 0
@@ -2610,6 +2757,16 @@ export const acceptCancelledJob = async (req, res) => {
     }
     return res.status(500).json({ success: false, message: error.message });
   } finally {
+    if (reacceptLockAt && reacceptLockTechId) {
+      try {
+        await TechnicianProfile.updateOne(
+          { _id: reacceptLockTechId, dispatchLockUntil: reacceptLockAt },
+          { $set: { dispatchLockUntil: new Date() } }
+        );
+      } catch {
+        /* lock expires on its own */
+      }
+    }
     try {
       session?.endSession();
     } catch {

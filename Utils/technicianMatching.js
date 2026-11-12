@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
-import { normalizeBookingStatus } from "./bookingStatus.js";
+import { bookingDeadlineFilter, isBookingPastAutoCancel, normalizeBookingStatus } from "./bookingStatus.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
 import DispatchOutbox from "../Schemas/DispatchOutbox.js";
@@ -496,6 +496,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
       status: { $in: ["pending", "broadcasted"] },
       // Scheduled jobs stay dormant until their dispatch lead window opens.
       dispatchEligibleAt: { $not: { $gt: new Date() } },
+      ...bookingDeadlineFilter(),
       location: {
         $nearSphere: {
           $geometry: { type: "Point", coordinates: [lng, lat] },
@@ -892,17 +893,10 @@ export const findEligibleTechniciansForService = async ({
     const jobDistrictObjId = new mongoose.Types.ObjectId(jobDistrictId);
     baseQuery.$and = baseQuery.$and || [];
     baseQuery.$and.push({
-      $or: isScheduled
-        ? [
-            { enabledDistrictIds: jobDistrictObjId },
-            { allowedCityIds: jobDistrictObjId },
-          ]
-        : [
-            { primaryDistrictId: jobDistrictObjId },
-            { primaryCityId: jobDistrictObjId },
-            { enabledDistrictIds: jobDistrictObjId },
-            { allowedCityIds: jobDistrictObjId },
-          ],
+      $or: [
+        { enabledDistrictIds: jobDistrictObjId },
+        { allowedCityIds: jobDistrictObjId },
+      ],
     });
   }
 
@@ -1106,6 +1100,16 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
         outcome: "BOOKING_NOT_DISPATCHABLE",
         retryable: false,
         message: `Booking status is ${booking.status}`,
+      };
+    }
+
+    if (isBookingPastAutoCancel(booking)) {
+      return {
+        success: false,
+        count: 0,
+        outcome: "BOOKING_EXPIRED",
+        retryable: false,
+        message: "Booking auto-cancel deadline has passed",
       };
     }
 

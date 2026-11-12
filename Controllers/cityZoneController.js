@@ -202,16 +202,18 @@ export const createCityZone = async (req, res) => {
           },
           session
         );
+        let grantedCount = 0;
         if (created.active !== false) {
-          await grantZoneToDistrictTechnicians({
+          const grantResult = await grantZoneToDistrictTechnicians({
             zoneId: created._id,
             districtId: operationalCityId,
             adminUserId: actorId,
             reason: "Auto-granted on zone creation",
             session,
           });
+          grantedCount = grantResult.granted;
         }
-        return { created, seeded };
+        return { created, seeded, granted: grantedCount };
       });
       zone = out.result.created;
       seeded = out.result.seeded;
@@ -331,7 +333,9 @@ export const updateCityZone = async (req, res) => {
     }
 
     const actorId = req.user?.userId || req.user?._id || null;
-    const { result: out } = await withZoneWriteTransaction(async (session) => {
+    const {
+      result: { updated: zone },
+    } = await withZoneWriteTransaction(async (session) => {
       const opts = { new: true, runValidators: true, ...(session ? { session } : {}) };
       const updated = await CityZone.findByIdAndUpdate(id, update, opts);
       if (sanitizedPolygon) {
@@ -348,6 +352,10 @@ export const updateCityZone = async (req, res) => {
       }
       return { updated };
     });
+
+    if (!zone) {
+      return res.status(404).json({ success: false, message: "City zone not found", result: {} });
+    }
 
     if (existing.active === false && zone.active === true) {
       await grantZoneToDistrictTechnicians({

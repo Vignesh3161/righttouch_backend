@@ -79,8 +79,12 @@ export const recordPolygonVersion = async (
 };
 
 /**
- * Parent-district containment placement check. Zone-to-zone overlap inside a
- * district is intentionally allowed; only districts are overlap-validated.
+ * Parent-district containment placement check.
+ *
+ * A micro-zone MUST be fully contained by its parent district. Zone-to-zone
+ * overlap inside the same district is intentionally allowed because zones can
+ * represent service-specific coverage areas.
+ *
  * Returns { ok:true } or { ok:false, code, message } for a 400/404 response.
  */
 export const assertZonePlacement = async ({ sanitizedPolygon, districtId, excludeZoneId = null }) => {
@@ -90,12 +94,18 @@ export const assertZonePlacement = async ({ sanitizedPolygon, districtId, exclud
   let containment = null;
   if (district.polygon) {
     containment = validateZoneInsideDistrict(sanitizedPolygon, district.polygon);
-    if (!containment.valid && !checkZoneOverlap(sanitizedPolygon, district.polygon)) {
+    if (!containment.valid) {
       return {
         ok: false,
         status: 400,
         code: "ZONE_OUTSIDE_PARENT_DISTRICT",
-        message: "Sub-zone polygon does not overlap the parent Operational District boundary.",
+        message:
+          "Sub-zone polygon must be fully contained inside the parent Operational District boundary. " +
+          (containment.reason ? `Reason: ${containment.reason}` : "Move or resize the boundary so no part extends outside the district."),
+        containment: {
+          fullyContained: false,
+          reason: containment.reason || null,
+        },
       };
     }
   }
@@ -104,8 +114,8 @@ export const assertZonePlacement = async ({ sanitizedPolygon, districtId, exclud
     ok: true,
     district,
     containment: {
-      fullyContained: containment ? containment.valid : true,
-      reason: containment?.valid ? null : containment?.reason || null,
+      fullyContained: true,
+      reason: null,
     },
   };
 };
