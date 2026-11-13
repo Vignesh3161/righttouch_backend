@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import TechnicianSlot from "../Schemas/TechnicianSlot.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
@@ -78,15 +79,43 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     if (!broadcasts.length) return [];
 
+    const now = new Date();
+    const activeSlots = await TechnicianSlot.find({
+        technicianId: techId,
+        active: true,
+        slotEndAt: { $gt: now },
+    }).select("slotKey slotStartAt slotEndAt role bookingId").lean();
+    const committedSlotKeys = new Set(activeSlots.map((slot) => String(slot.slotKey)));
+    const currentSlot = activeSlots.find(
+        (slot) => new Date(slot.slotStartAt) <= now && new Date(slot.slotEndAt) > now
+    );
+    const backupBookingIds = new Set(
+        activeSlots
+            .filter((slot) => slot.role === "backup" && slot.bookingId)
+            .map((slot) => String(slot.bookingId))
+    );
+
     const bookingIds = broadcasts.map(b => b.bookingId);
 
     // 5. Query candidate unassigned bookings
     const bookings = await ServiceBooking.find({
         _id: { $in: bookingIds },
-        status: { $in: ["pending", "broadcasted"] },
-        technicianId: null,
-        dispatchEligibleAt: { $not: { $gt: new Date() } },
-        ...bookingDeadlineFilter(),
+        $and: [
+            {
+                $or: [
+                    {
+                        status: { $in: ["pending", "broadcasted"] },
+                        technicianId: null,
+                        dispatchEligibleAt: { $not: { $gt: new Date() } },
+                    },
+                    {
+                        _id: { $in: [...backupBookingIds].map((id) => new mongoose.Types.ObjectId(id)) },
+                        status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
+                    },
+                ],
+            },
+            bookingDeadlineFilter(),
+        ],
     })
         .populate([
             { path: "serviceId", populate: { path: "categoryId" } },
@@ -100,16 +129,25 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     for (const booking of bookings) {
         const bookingIdStr = String(booking._id);
+        const isBackupOffer = backupBookingIds.has(bookingIdStr);
 
         if (booking.bookingType === "schedule" &&
             technician.notificationPreferences?.scheduledOffersEnabled === false) {
             continue;
         }
 
+        if (!isBackupOffer && booking.bookingType === "schedule" && booking.slotKey &&
+            committedSlotKeys.has(String(booking.slotKey))) {
+            continue;
+        }
+        if (booking.bookingType === "instant" && currentSlot) {
+            continue;
+        }
+
         // Use unified eligibility check for fetch mode (same as broadcast)
         const eligibility = await evaluateTechnicianEligibility({
             technician,
-            booking,
+            booking: isBackupOffer ? { ...booking, technicianId: null } : booking,
             mode: "BROADCAST",
             context: { technicianKyc: kyc },
         });
@@ -159,7 +197,11 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             createdAt: booking.createdAt,
             broadcastedAt: booking.broadcastedAt,
             version: broadcastRow?.version || 1,
-            expiresAt: broadcastRow?.expiresAt || null
+            expiresAt: broadcastRow?.expiresAt || null,
+            isBackupOffer,
+            bookingStatus: booking.status,
+            slotKey: booking.slotKey || null,
+            slotLabel: booking.slotLabel || null,
         });
     }
 

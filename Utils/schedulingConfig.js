@@ -18,9 +18,52 @@ const envBool = (name, fallback) => {
   return ["1", "true", "yes", "on"].includes(String(raw).toLowerCase());
 };
 
-export const SCHEDULED_DISPATCH_LEAD_HOURS = Math.max(
+// Scheduled dispatch is immediate at booking. The legacy lead-hours override
+// is intentionally not read; assertScheduleSlotBootConfig() rejects a nonzero
+// env value in production so a deployment cannot silently restore a 24h delay.
+export const SCHEDULED_DISPATCH_LEAD_HOURS = 0;
+
+export const SCHEDULE_SLOT_MODEL = String(process.env.SCHEDULE_SLOT_MODEL || "four_slot").toLowerCase();
+export const SLOT_TRAVEL_BUFFER_MINUTES = Math.max(
   0,
-  envNumber("SCHEDULED_DISPATCH_LEAD_HOURS", 24)
+  Math.floor(envNumber("SLOT_TRAVEL_BUFFER_MINUTES", 30))
+);
+export const INSTANT_SLOT_BUFFER_MINUTES = Math.max(
+  0,
+  Math.floor(envNumber("INSTANT_SLOT_BUFFER_MINUTES", 15))
+);
+export const REPLACEMENT_SEARCH_MINUTES = Math.max(
+  5,
+  Math.floor(envNumber("REPLACEMENT_SEARCH_MINUTES", 35))
+);
+export const CUSTOMER_NO_SHOW_WAIT_MINUTES = Math.max(
+  1,
+  Math.floor(envNumber("CUSTOMER_NO_SHOW_WAIT_MINUTES", 15))
+);
+export const CUSTOMER_NO_SHOW_RESPONSE_MINUTES = Math.max(
+  1,
+  Math.floor(envNumber("CUSTOMER_NO_SHOW_RESPONSE_MINUTES", 10))
+);
+export const CUSTOMER_NO_SHOW_GEOFENCE_METERS = Math.max(
+  10,
+  Math.floor(envNumber("CUSTOMER_NO_SHOW_GEOFENCE_METERS", 100))
+);
+export const CUSTOMER_NO_SHOW_COMPENSATION_ENABLED = envBool("CUSTOMER_NO_SHOW_COMPENSATION_ENABLED", false);
+export const CUSTOMER_NO_SHOW_COMPENSATION_PERCENT = Math.min(
+  100,
+  Math.max(0, envNumber("CUSTOMER_NO_SHOW_COMPENSATION_PERCENT", 50))
+);
+export const CUSTOMER_NO_SHOW_MIN_COMPENSATION_PAISE = Math.max(
+  0,
+  Math.floor(envNumber("CUSTOMER_NO_SHOW_MIN_COMPENSATION_PAISE", 10000))
+);
+export const MAX_SCHEDULED_JOBS_PER_DAY_DEFAULT = Math.max(
+  1,
+  Math.min(4, Math.floor(envNumber("MAX_SCHEDULED_JOBS_PER_DAY_DEFAULT", 3)))
+);
+export const MAX_RESCHEDULES_PER_BOOKING = Math.max(
+  0,
+  Math.floor(envNumber("MAX_RESCHEDULES_PER_BOOKING", 2))
 );
 
 export const SCHEDULED_PUSH_COOLDOWN_MINUTES = Math.max(
@@ -113,10 +156,9 @@ export const computeDispatchEligibleAt = (
   scheduledAt,
   now = new Date()
 ) => {
-  if (bookingType !== "schedule" || !scheduledAt) return now;
-  const leadMs = SCHEDULED_DISPATCH_LEAD_HOURS * 60 * 60 * 1000;
-  const eligibleAt = new Date(new Date(scheduledAt).getTime() - leadMs);
-  return eligibleAt.getTime() > now.getTime() ? eligibleAt : now;
+  // Immediate dispatch for scheduled bookings. Kept as a function so callers
+  // do not need to change shape; the field remains for legacy rows.
+  return now;
 };
 
 export const isDispatchWindowOpen = (booking, now = new Date()) => {
@@ -124,4 +166,42 @@ export const isDispatchWindowOpen = (booking, now = new Date()) => {
   if (!booking?.dispatchEligibleAt) return true;
   const eligibleAt = new Date(booking.dispatchEligibleAt).getTime();
   return !Number.isFinite(eligibleAt) || eligibleAt <= now.getTime();
+};
+
+/**
+ * Boot-time guard for the four-slot model.
+ * - SCHEDULE_SLOT_MODEL must be legacy or four_slot.
+ * - A nonzero legacy SCHEDULED_DISPATCH_LEAD_HOURS is rejected: scheduled
+ *   dispatch is immediate, and silently restoring a lead would hide offers.
+ * - four_slot requires transactions; production refuses to start otherwise.
+ */
+export const assertScheduleSlotBootConfig = ({ transactionSupported = true } = {}) => {
+  if (!["legacy", "four_slot"].includes(SCHEDULE_SLOT_MODEL)) {
+    throw new Error(
+      `SCHEDULE_SLOT_MODEL must be "legacy" or "four_slot" (got "${SCHEDULE_SLOT_MODEL}")`
+    );
+  }
+
+  const legacyLead = Number(process.env.SCHEDULED_DISPATCH_LEAD_HOURS);
+  if (Number.isFinite(legacyLead) && legacyLead > 0) {
+    const message =
+      "SCHEDULED_DISPATCH_LEAD_HOURS is no longer supported; scheduled dispatch is immediate. Remove the env var.";
+    if (process.env.NODE_ENV === "production") {
+      console.error(`❌ ${message} Refusing to start.`);
+      process.exit(1);
+    }
+    console.warn(`⚠️ ${message}`);
+  }
+
+  if (SCHEDULE_SLOT_MODEL === "four_slot" && !transactionSupported) {
+    const message =
+      "SCHEDULE_SLOT_MODEL=four_slot requires MongoDB transactions (replica set).";
+    if (process.env.NODE_ENV === "production") {
+      console.error(`❌ ${message} Refusing to start.`);
+      process.exit(1);
+    }
+    console.warn(`⚠️ ${message} Continuing in non-production.`);
+  }
+
+  return { model: SCHEDULE_SLOT_MODEL, transactionSupported };
 };

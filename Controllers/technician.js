@@ -1914,6 +1914,22 @@ export const updateTechnicianStatus = async (req, res) => {
 
     await technician.save();
 
+    if (
+      workStatus === "suspended" ||
+      workStatus === "deleted" ||
+      trainingCompleted === false
+    ) {
+      const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+      await releaseFutureScheduledSlotsForTechnician({
+        technicianId,
+        reason: `work_status:${workStatus || "training_revoked"}`,
+        actor: req.user?.userId,
+        io: req.io,
+      }).catch((releaseErr) =>
+        console.error("Scheduled slot release after status change failed:", releaseErr.message)
+      );
+    }
+
     // 🔐 Session invalidation (Socket Analysis B1.5): a suspended/deleted
     // technician's connected sockets must be revoked NOW — their JWT claims
     // are frozen until re-auth, so only a forced disconnect stops alerts.
@@ -2030,6 +2046,17 @@ export const deleteTechnician = async (req, res) => {
     await technician.deleteOne({ session });
 
     await session.commitTransaction();
+
+    const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+    await releaseFutureScheduledSlotsForTechnician({
+      technicianId: id,
+      reason: "technician_deleted",
+      actor: req.user?.userId,
+      io: req.io,
+    }).catch((releaseErr) =>
+      console.error("Scheduled slot release after delete failed:", releaseErr.message)
+    );
+
     console.log(`🗑️ Deleted technician ${id} (Profile: Hard, User: Soft/Anonymized)`);
 
     return res.status(200).json({

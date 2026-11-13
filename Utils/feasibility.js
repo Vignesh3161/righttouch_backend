@@ -209,6 +209,22 @@ export const scheduleChainFeasible = ({
   if (activeJob?._id && !committed.some((job) => String(job._id) === String(activeJob._id))) {
     committed.push(activeJob);
   }
+  // Four-slot rule: a technician can hold at most one scheduled job per slot.
+  const candidateSlotKey = candidateJob?.slotKey || null;
+  if (candidateSlotKey) {
+    const conflict = committed.find(
+      (job) => job?.slotKey && String(job.slotKey) === String(candidateSlotKey)
+    );
+    if (conflict) {
+      return {
+        feasible: false,
+        projectedArrival: null,
+        slackMinutes: null,
+        reason: "slot_conflict",
+      };
+    }
+  }
+
   const jobs = [...committed, candidateJob]
     .filter((job) => job?.scheduledAt)
     .sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());

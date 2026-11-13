@@ -55,18 +55,13 @@ node_modules/.cache/
 .vercel
 .env*.local
 
-# lock file
-package-lock.json
 
-postman/
+postman/*
+!postman/postmancollection/
+!postman/postmancollection/**
 
-scripts/
-Scripts/
-test/
 
 # Project documentation and operational scripts are tracked
-!docs/
-!scripts/
 config/firebase-credentials.json
 *Account.json
 serverAccount.json

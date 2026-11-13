@@ -62,6 +62,7 @@ import adminSkillRequestRoutes from "./Routes/adminSkillRequestRoutes.js";
 import adminZoneGeofenceRoutes from "./Routes/adminZoneGeofenceRoutes.js";
 import adminRefundsRoutes from "./Routes/adminRefunds.js";
 import adminQuotationRoutes from "./Routes/adminQuotationRoutes.js";
+import telephonyRoutes from "./Routes/telephony.js";
 
 // Technician Route Imports
 import TechnicianRoutes from "./Routes/technician.js";
@@ -442,6 +443,7 @@ import { releaseExpiredHolds } from "./Utils/complaintFreeze.js";
 import { getRefundPolicy } from "./Utils/refundPolicy.js";
 import { validateSecrets } from "./Utils/secretValidation.js";
 import { enforceTransactionSupport } from "./Utils/mongoTransactions.js";
+import { assertScheduleSlotBootConfig } from "./Utils/schedulingConfig.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -689,6 +691,7 @@ App.use("/api/technician", TechnicianRoutes);
 App.use("/api/technician", technicianWalletRoutes);
 App.use("/api/technician", technicianFinanceRoutes);
 App.use("/api/technician", technicianRefundsRoutes);
+App.use("/api/telephony", telephonyRoutes);
 App.use("/api/technician/notifications", Auth, isTechnician, notificationRoutes);
 App.use("/api/technician/permissions", Auth, makePermissionRouter("Technician"));
 App.use("/api/technician/device-token", Auth, makeDeviceRouter("Technician"));
@@ -791,7 +794,8 @@ const startServer = async () => {
 
     // 3a. Financial mutations require multi-document transactions — fail
     // closed in production on standalone topologies (warn in dev/test).
-    await enforceTransactionSupport();
+    const transactionSupported = await enforceTransactionSupport();
+    assertScheduleSlotBootConfig({ transactionSupported });
 
     // 3b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
     await initRedisAdapter(io);

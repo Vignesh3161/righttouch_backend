@@ -11,6 +11,7 @@
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
     "backfill:service-base-location": "node scripts/backfillServiceBaseLocation.js",
     "backfill:product-booking-keys": "node scripts/backfillProductBookingKeys.js",
+    "backfill:scheduled-slots": "node scripts/backfillScheduledSlots.js",
     "migrate:product-carts": "node scripts/migrateProductCartToQuoteRequests.js",
     "generate-postman": "node postman/generate_canonical_collections.js && node postman/generate_payout_collection.js"
   },

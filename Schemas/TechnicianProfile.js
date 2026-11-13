@@ -182,7 +182,7 @@ const technicianProfileSchema = new mongoose.Schema(
       quietHoursStart: { type: Number, default: 22, min: 0, max: 23 },
       quietHoursEnd: { type: Number, default: 8, min: 0, max: 23 },
       maxActiveScheduledOffers: { type: Number, default: 5, min: 1, max: 50 },
-      maxScheduledJobsPerDay: { type: Number, default: 8, min: 1, max: 50 },
+      maxScheduledJobsPerDay: { type: Number, default: 3, min: 1, max: 50 },
     },
 
     // 📱 FCM push tokens (multi-device). Registered on app login/foreground;
@@ -275,6 +275,13 @@ const technicianProfileSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+
+    // Reliability counters used by dropout/no-show policy.
+    dropoutStrikeCount: { type: Number, default: 0, min: 0 },
+    lastDropoutAt: { type: Date, default: null },
+    customerNoShowReportCount: { type: Number, default: 0, min: 0 },
+    customerNoShowConfirmedCount: { type: Number, default: 0, min: 0 },
+    reliabilityReviewRequired: { type: Boolean, default: false, index: true },
 
     // Last time matching calculations were performed (for rate limiting)
     lastMatchingAt: {

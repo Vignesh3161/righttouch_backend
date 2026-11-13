@@ -10,7 +10,6 @@ import {
   resolveScheduleInput,
   resolveServiceZoneAvailability,
   buildServiceBookingDoc,
-  createBookingAndOutbox,
   broadcastCreatedBooking,
   resolveBookingIdempotencyKey,
   findBookingByIdempotencyKey,
@@ -18,6 +17,7 @@ import {
   isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { validateScheduledAtUtc } from "../Utils/slots.js";
+import { prepareScheduledBooking } from "../Services/slotCapacityService.js";
 
 const toFiniteNumber = (val) => {
   if (val === null || val === undefined || val === "") return null;
@@ -521,13 +521,22 @@ export const rebookService = async (req, res) => {
 
     const session = await mongoose.startSession();
     let newBooking;
+    let preparedBooking = null;
     try {
       session.startTransaction();
-      const created = await createBookingAndOutbox({ doc, session });
-      newBooking = created.booking;
+      preparedBooking = await prepareScheduledBooking({
+        doc,
+        session,
+        latitude: resolvedLocation.latitude,
+        longitude: resolvedLocation.longitude,
+      });
+      newBooking = preparedBooking.booking;
       await session.commitTransaction();
     } catch (txError) {
       await session.abortTransaction();
+      if (preparedBooking?.releaseCapacity) {
+        await preparedBooking.releaseCapacity().catch(() => {});
+      }
       const txMessage = String(txError?.message || "");
       const retryableConflict =
         txError?.code === 112 ||

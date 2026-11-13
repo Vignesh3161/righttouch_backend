@@ -1498,6 +1498,18 @@ export const updateTechnicianVerification = async (req, res) => {
 
     await tech.save();
 
+    if (action === "REJECT" || action === "SUSPEND") {
+      const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+      await releaseFutureScheduledSlotsForTechnician({
+        technicianId: id,
+        reason: `verification_${String(action).toLowerCase()}`,
+        actor: req.user?.userId,
+        io: req.app?.get("io") || req.io,
+      }).catch((releaseErr) =>
+        console.error("Scheduled slot release after verification change failed:", releaseErr.message)
+      );
+    }
+
     try {
       const io = req.app?.get("io") || req.io;
       if (io) {

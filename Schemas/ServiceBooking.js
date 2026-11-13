@@ -143,6 +143,20 @@ const serviceBookingSchema = new mongoose.Schema(
       index: true,
     },
 
+    // 🧱 FOUR-SLOT SCHEDULE MODEL
+    // Slot fields are derived from scheduledAt by the shared slot engine.
+    // Legacy 30-minute bookings map to the containing 3-hour slot.
+    slotKey: { type: String, default: null, index: true },
+    slotValue: { type: String, default: null },
+    slotLabel: { type: String, default: null },
+    slotStartAt: { type: Date, default: null, index: true },
+    slotEndAt: { type: Date, default: null },
+    cartGroupId: { type: String, default: null, index: true },
+
+    // Set when the customer must be shown "Awaiting technician" instead of
+    // any confirmation language while a scheduled booking is unassigned.
+    customerStatusLabel: { type: String, default: null },
+
     // Numeric estimate copied from Service.durationMinutes at booking time.
     estimatedDurationMinutes: {
       type: Number,
@@ -151,10 +165,9 @@ const serviceBookingSchema = new mongoose.Schema(
       max: 480,
     },
 
-    // Earliest instant at which scheduled dispatch should begin. Instant
-    // bookings use createdAt/now; scheduled bookings use
-    // scheduledAt - SCHEDULED_DISPATCH_LEAD_HOURS. Null/absent on legacy
-    // bookings means "eligible now".
+    // Earliest instant at which scheduled dispatch should begin. Four-slot
+    // bookings dispatch immediately; the field remains for legacy rows and
+    // for the outbox worker's eligibility check.
     dispatchEligibleAt: {
       type: Date,
       default: null,
@@ -636,6 +649,69 @@ const serviceBookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // 🚦 EXECUTION TIMESTAMPS — needed for slot overrun and no-show logic.
+    onTheWayAt: { type: Date, default: null },
+    reachedAt: { type: Date, default: null },
+    inProgressAt: { type: Date, default: null, index: true },
+
+    // ⏱ LATE COMPLETION / BACKUP-FIRST REPLACEMENT
+    lateCompletionAtRisk: { type: Boolean, default: false, index: true },
+    lateCompletionDetectedAt: { type: Date, default: null },
+    originalTechnicianId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TechnicianProfile",
+      default: null,
+    },
+    replacementTechnicianId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TechnicianProfile",
+      default: null,
+    },
+    backupTechnicianId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TechnicianProfile",
+      default: null,
+      index: true,
+    },
+    backupTechnicianSlotId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TechnicianSlot",
+      default: null,
+    },
+
+    // 🙅 CUSTOMER NO-SHOW CLAIM (technician-side, admin-reviewed)
+    customerNoShowStatus: {
+      type: String,
+      enum: ["none", "reported", "awaiting_customer", "confirmed", "rejected"],
+      default: "none",
+      index: true,
+    },
+    customerNoShowReportedAt: { type: Date, default: null },
+    customerNoShowResponseDeadline: { type: Date, default: null },
+    customerNoShowCallAttempts: [
+      {
+        callLogId: { type: String, required: true },
+        provider: { type: String, default: null },
+        attemptedAt: { type: Date, default: Date.now },
+        durationSeconds: { type: Number, default: 0 },
+      },
+    ],
+    customerNoShowConfirmedAt: { type: Date, default: null },
+    customerNoShowCompensationPaise: { type: Number, default: 0, min: 0 },
+    customerNoShowCompensationStatus: {
+      type: String,
+      enum: ["none", "recorded", "approved", "paid", "rejected"],
+      default: "none",
+    },
+    customerNoShowCompensationApprovedAt: { type: Date, default: null },
+    customerNoShowCompensationApprovedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    customerNoShowCompensationPaidAt: { type: Date, default: null },
+    customerNoShowReviewNote: { type: String, default: null },
+
     // 🔔 REMINDER FLAGS (prevent duplicate cron reminders)
     remindersSent: {
       h24: { type: Boolean, default: false },
@@ -735,6 +811,10 @@ serviceBookingSchema.index({ status: 1, "remindersSent.min15": 1, scheduledAt: 1
 serviceBookingSchema.index({ status: 1, technicianId: 1, autoCancelAt: 1 });
 serviceBookingSchema.index({ bookingType: 1, status: 1, scheduledAt: 1, technicianId: 1 });
 serviceBookingSchema.index({ bookingType: 1, status: 1, dispatchEligibleAt: 1 });
+serviceBookingSchema.index({ slotKey: 1, status: 1 });
+serviceBookingSchema.index({ technicianId: 1, slotKey: 1, status: 1 });
+serviceBookingSchema.index({ slotStartAt: 1, status: 1 });
+serviceBookingSchema.index({ lateCompletionAtRisk: 1, status: 1 });
 
 // Worker lease / expiry hot path
 serviceBookingSchema.index({ leaseUntil: 1, status: 1 });

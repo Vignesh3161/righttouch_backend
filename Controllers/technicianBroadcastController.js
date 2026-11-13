@@ -4,7 +4,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
 import User from "../Schemas/User.js";
-import { notifyCustomerJobAccepted, notifyJobTaken, emitJobsChanged } from "../Utils/sendNotification.js";
+import { notifyCustomerJobAccepted, notifyJobTaken, emitJobsChanged, notifyTechnicianWithFallback } from "../Utils/sendNotification.js";
 import { fetchTechnicianJobsInternal } from "../Utils/technicianJobFetch.js";
 import { ensureTechnician } from "../Utils/ensureTechnician.js";
 import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
@@ -15,6 +15,10 @@ import Category from "../Schemas/Category.js";
 import { checkTechnicianEligibility, getTechnicianOrigin } from "../Services/technicianEligibilityService.js";
 import { auditPurgeAt, offerPurgeAt } from "../Utils/broadcastRetention.js";
 import { bookingDeadlineFilter } from "../Utils/bookingStatus.js";
+import TechnicianSlot from "../Schemas/TechnicianSlot.js";
+import { confirmScheduledSlot, confirmSlotCapacity } from "../Services/slotCapacityService.js";
+import { getSlotForTime, startOfBusinessDayUtc } from "../Utils/slots.js";
+import { promoteBackup } from "../Services/lateCompletionService.js";
 
 const DISPATCH_LOCK_MS = 10000;
 
@@ -314,13 +318,25 @@ export const respondToJob = async (req, res) => {
 
     // ⏱ Candidate booking snapshot (Phase-A advisory read).
     const candidate = await ServiceBooking.findById(id)
-      .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
+      .select("bookingType scheduledAt slotKey slotValue slotLabel slotStartAt slotEndAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
     if (!candidate) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
     const observedActiveBroadcastVersion = Number.isFinite(candidate.activeBroadcastVersion)
       ? candidate.activeBroadcastVersion
       : 0;
+
+    // Late-completion backup offer: the booking still has the original
+    // technician assigned, so the normal unassigned claim cannot apply.
+    const backupSlot = candidate.technicianId
+      ? await TechnicianSlot.findOne({
+          bookingId: id,
+          technicianId: technicianProfileId,
+          role: "backup",
+          active: true,
+        }).lean()
+      : null;
+    const isBackupAccept = Boolean(backupSlot);
 
     // 🎯 VERSION VALIDATION (advisory) — reject stale broadcast versions.
     // The authoritative version gate runs inside the Phase-B transaction.
@@ -338,7 +354,9 @@ export const respondToJob = async (req, res) => {
     // inside the Phase-B transaction on a fresh snapshot.
     const eligibility = await checkTechnicianEligibility({
       technician: technicianProfileId,
-      booking: candidate,
+      booking: isBackupAccept
+        ? { ...(candidate.toObject ? candidate.toObject() : candidate), technicianId: null }
+        : candidate,
     });
 
     if (!eligibility.eligible) {
@@ -352,7 +370,7 @@ export const respondToJob = async (req, res) => {
 
     // ⏱ The claim must reference an active unassigned booking (advisory —
     // re-verified on live state inside Phase B).
-    if (candidate.technicianId || !["pending", "broadcasted"].includes(candidate.status)) {
+    if (!isBackupAccept && (candidate.technicianId || !["pending", "broadcasted"].includes(candidate.status))) {
       return res.status(409).json({
         success: false,
         message: "Too late! Booking already taken or closed.",
@@ -365,11 +383,53 @@ export const respondToJob = async (req, res) => {
     //   schedule candidate                        → window overlap check
     const [techQueueMap, techProfileForCheck] = await Promise.all([
       loadCommittedQueues([technicianProfileId]),
-      TechnicianProfile.findById(technicianProfileId).select("location serviceBaseLocation"),
+      TechnicianProfile.findById(technicianProfileId).select("location serviceBaseLocation notificationPreferences"),
     ]);
     const techQueue = techQueueMap.get(String(technicianProfileId));
 
     if (candidate.bookingType === "schedule") {
+      const candidateSlot = candidate.slotKey
+        ? { slotKey: candidate.slotKey }
+        : getSlotForTime(candidate.scheduledAt);
+      if (!candidateSlot?.slotKey) {
+        return res.status(409).json({
+          success: false,
+          message: "This scheduled booking has no valid slot. Please refresh and try again.",
+          reason: "slot_missing",
+        });
+      }
+      const activeSlotConflict = (techQueue?.slots || []).find(
+        (slot) =>
+          String(slot.slotKey) === String(candidateSlot.slotKey) &&
+          (!backupSlot || String(slot._id) !== String(backupSlot._id))
+      );
+      if (activeSlotConflict) {
+        return res.status(409).json({
+          success: false,
+          message: "You already have a scheduled job in this slot.",
+          reason: "slot_conflict",
+        });
+      }
+
+      const targetDay = candidate.scheduledAt ? new Date(candidate.scheduledAt) : new Date();
+      const dayStart = startOfBusinessDayUtc(targetDay);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+      const scheduledToday = await TechnicianSlot.countDocuments({
+        technicianId: technicianProfileId,
+        active: true,
+        slotStartAt: { $gte: dayStart, $lt: dayEnd },
+        ...(backupSlot ? { _id: { $ne: backupSlot._id } } : {}),
+      });
+      const maxDaily =
+        techProfileForCheck?.notificationPreferences?.maxScheduledJobsPerDay ?? 3;
+      if (scheduledToday >= maxDaily) {
+        return res.status(409).json({
+          success: false,
+          message: `You have reached your daily scheduled job limit (${maxDaily}).`,
+          reason: "daily_scheduled_cap",
+        });
+      }
+
       // Schedule-vs-schedule: shared travel-chain check against every accepted
       // appointment (duration-aware, uses service base location when present).
       const existingSchedules = (techQueue?.schedules || []).filter(
@@ -463,12 +523,32 @@ export const respondToJob = async (req, res) => {
 
       const live = await ServiceBooking.findById(id)
         .session(session)
-        .select("bookingType scheduledAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
+        .select("bookingType scheduledAt slotKey slotValue slotLabel slotStartAt slotEndAt location status autoCancelAt activeBroadcastVersion assignmentAttempts serviceId districtId cityZoneId technicianId estimatedDurationMinutes");
       if (!live) {
         await session.abortTransaction();
         return res.status(404).json({ success: false, message: "Booking not found" });
       }
-      if (live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
+      if (isBackupAccept) {
+        const backupLive = await TechnicianSlot.findOne({
+          _id: backupSlot._id,
+          bookingId: id,
+          technicianId: technicianProfileId,
+          role: "backup",
+          active: true,
+        }).session(session).lean();
+        if (
+          !backupLive ||
+          !live.technicianId ||
+          !["accepted", "on_the_way", "reached", "in_progress"].includes(live.status)
+        ) {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "This backup offer is no longer available.",
+            reason: "backup_offer_expired",
+          });
+        }
+      } else if (live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
         await session.abortTransaction();
         return res.status(409).json({
           success: false,
@@ -515,7 +595,9 @@ export const respondToJob = async (req, res) => {
 
       const recheck = await checkTechnicianEligibility({
         technician: technicianProfileId,
-        booking: live,
+        booking: isBackupAccept
+          ? { ...(live.toObject ? live.toObject() : live), technicianId: null }
+          : live,
       });
       if (!recheck.eligible) {
         await session.abortTransaction();
@@ -578,6 +660,19 @@ export const respondToJob = async (req, res) => {
 
       const liveAttemptCount = Array.isArray(live.assignmentAttempts) ? live.assignmentAttempts.length : 0;
 
+    let slotHoldForConfirm = null;
+    if (isBackupAccept) {
+      await promoteBackup({
+        booking: live,
+        backupTechnicianId: technicianProfileId,
+        technicianSnapshot,
+        session,
+      });
+      booking = await ServiceBooking.findById(id)
+        .session(session)
+        .populate("customerId")
+        .populate({ path: "serviceId", populate: { path: "categoryId" } });
+    } else {
     // 🎯 ATOMIC CLAIM — the broadcast flip above already pinned the offered
     // version; this claim pins the unassigned booking. A miss means a
     // concurrent winner: conflict, no partial state changes (all in-txn).
@@ -604,8 +699,33 @@ export const respondToJob = async (req, res) => {
     if (live.bookingType === "instant") {
       // Instant: technician must click On The Way within 30 minutes.
       acceptUpdate.autoCancelAt = new Date(Date.now() + 30 * 60 * 1000);
+    } else {
+      // Scheduled: normalize legacy rows onto a modern slot and reserve it.
+      const slot = live.slotKey
+        ? {
+            slotKey: live.slotKey,
+            slotValue: live.slotValue,
+            slotLabel: live.slotLabel,
+            slotStartAt: live.slotStartAt,
+            slotEndAt: live.slotEndAt,
+          }
+        : getSlotForTime(live.scheduledAt);
+      if (!slot?.slotKey) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: "This scheduled booking has no valid slot. Please refresh and try again.",
+          reason: "slot_missing",
+        });
+      }
+      acceptUpdate.slotKey = slot.slotKey;
+      acceptUpdate.slotValue = slot.slotValue || null;
+      acceptUpdate.slotLabel = slot.slotLabel || null;
+      acceptUpdate.slotStartAt = slot.slotStartAt || null;
+      acceptUpdate.slotEndAt = slot.slotEndAt || null;
+      acceptUpdate.customerStatusLabel = null;
+      acceptUpdate.dispatchEligibleAt = null;
     }
-    // Schedule: keep the slot-driven lifecycle (reminders, escalation).
 
     const claimFilter = {
       _id: id,
@@ -626,6 +746,60 @@ export const respondToJob = async (req, res) => {
     if (!booking) {
       await session.abortTransaction();
       return res.status(409).json({ success: false, message: "Too late! Booking already taken" });
+    }
+
+    if (live.bookingType === "schedule") {
+      try {
+        const confirmed = await confirmScheduledSlot({
+          bookingId: id,
+          technicianId: technicianProfileId,
+          session,
+          adjustCapacity: false,
+        });
+        slotHoldForConfirm = confirmed.hold;
+      } catch (slotError) {
+        if (slotError.code === "SLOT_HOLD_MISSING") {
+          // Legacy booking created before the hold model: reserve the slot
+          // directly; the unique index still enforces one job per slot.
+          try {
+            await TechnicianSlot.create(
+              [
+                {
+                  technicianId: technicianProfileId,
+                  bookingId: id,
+                  slotKey: live.slotKey || getSlotForTime(live.scheduledAt)?.slotKey,
+                  slotStartAt: live.slotStartAt || getSlotForTime(live.scheduledAt)?.slotStartAt,
+                  slotEndAt: live.slotEndAt || getSlotForTime(live.scheduledAt)?.slotEndAt,
+                  role: "primary",
+                  active: true,
+                  source: "booking",
+                },
+              ],
+              { session }
+            );
+          } catch (legacySlotError) {
+            if (legacySlotError?.code === 11000) {
+              await session.abortTransaction();
+              return res.status(409).json({
+                success: false,
+                message: "You already have a scheduled job in this slot.",
+                reason: "slot_conflict",
+              });
+            }
+            throw legacySlotError;
+          }
+        } else if (slotError.code === "SLOT_BUSY") {
+          await session.abortTransaction();
+          return res.status(409).json({
+            success: false,
+            message: "You already have a scheduled job in this slot.",
+            reason: "slot_conflict",
+          });
+        } else {
+          throw slotError;
+        }
+      }
+    }
     }
 
     const otherBroadcasts = await JobBroadcast.find({
@@ -665,6 +839,10 @@ export const respondToJob = async (req, res) => {
     );
 
     await session.commitTransaction();
+
+    if (slotHoldForConfirm?.capacityKeys?.length) {
+      await confirmSlotCapacity(slotHoldForConfirm.capacityKeys);
+    }
     } catch (claimErr) {
       // B-09: a write/commit conflict here means a concurrent winner,
       // re-broadcast, or revocation-touching commit landed first. All writes
@@ -713,6 +891,24 @@ export const respondToJob = async (req, res) => {
         message: retryable ? "Too late! Booking already taken or updated. Please retry." : "Failed to accept job",
         ...(retryable ? { reason: "claim_conflict" } : {}),
       });
+    }
+
+    if (isBackupAccept && booking.originalTechnicianId) {
+      await notifyTechnicianWithFallback(
+        req.io,
+        booking.originalTechnicianId,
+        {
+          event: "booking:backup_replaced",
+          data: {
+            bookingId: booking._id,
+            message: "A backup technician has taken over your late-running job.",
+          },
+          pushTitle: "Job reassigned",
+          pushBody: "A backup technician has taken over your late-running scheduled job.",
+        },
+        false
+      ).catch(() => {});
+      emitJobsChanged(req.io, booking.originalTechnicianId);
     }
 
     if (req.io) {

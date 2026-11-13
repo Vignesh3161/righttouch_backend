@@ -29,6 +29,7 @@ import {
 } from "../Controllers/technician.js";
 import { technicianLogin, verifyTechnicianOtp } from "../Controllers/User.js";
 import { respondToJob, getMyJobs } from "../Controllers/technicianBroadcastController.js";
+import { initiateBookingCall } from "../Controllers/callLogController.js";
 import {
   submitTechnicianKyc,
   submitTechnicianBankDetails,
@@ -44,7 +45,7 @@ import {
   deleteOrphanedKyc,
   deleteAllOrphanedKyc,
 } from "../Controllers/technicianKycController.js";
-import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob, requestCompletionOtp, resendCompletionOtp, verifyCompletionOtp, getCompletionStatus } from "../Controllers/serviceBookController.js";
+import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob, requestCompletionOtp, resendCompletionOtp, verifyCompletionOtp, getCompletionStatus, reportCustomerNoShow } from "../Controllers/serviceBookController.js";
 import { createWalletTransaction, getWalletTransactions, requestWithdrawal, getMyWithdrawalRequests, cancelMyWithdrawal } from "../Controllers/technicianWalletController.js";
 import { getMyZone, getServicesInMyZone } from "../Controllers/zoneAvailabilityController.js";
 import { technicianListMyComplaints, technicianGetComplaintDetail, technicianRespondToComplaint } from "../Controllers/complaintController.js";
@@ -267,6 +268,8 @@ const completionOtpLimiter = rateLimit({
 router.post("/booking/:id/completion-otp", Auth, isTechnician, completionOtpLimiter, requestCompletionOtp);
 router.post("/booking/:id/completion-otp/resend", Auth, isTechnician, completionOtpLimiter, resendCompletionOtp);
 router.post("/booking/:id/verify-completion-otp", Auth, isTechnician, completionOtpLimiter, verifyCompletionOtp);
+router.post("/booking/:id/customer-no-show", Auth, isTechnician, reportCustomerNoShow);
+router.post("/booking/:id/masked-call", Auth, isTechnician, initiateBookingCall);
 router.get("/booking/:id/completion-status", Auth, isTechnician, getCompletionStatus);
 router.post(
   "/jobs/:id/work-images",
