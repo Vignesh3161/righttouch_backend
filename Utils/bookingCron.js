@@ -12,9 +12,16 @@ import { toBookingCancelledDTO } from "./socketDTO.js";
 import { sendScheduledReminder, notifyCustomerOfRebroadcast } from "./sendReminder.js";
 import { runPaymentReminderSweep } from "./completedPaymentReminder.js";
 import { expireRewards, recoverMissedRewards, expireRedemptionReservations } from "../Services/rewardService.js";
-import { SCHEDULED_REDISPATCH_WINDOW_MINUTES } from "./schedulingConfig.js";
+import {
+  SCHEDULED_REDISPATCH_WINDOW_MINUTES,
+  CUSTOMER_NO_SHOW_COMPENSATION_ENABLED,
+  CUSTOMER_NO_SHOW_COMPENSATION_PERCENT,
+  CUSTOMER_NO_SHOW_MIN_COMPENSATION_PAISE,
+} from "./schedulingConfig.js";
 import { hasActiveCompletionChallenge, closeActiveChallengesForBooking } from "./completionOtp.js";
-import { expireUnassignedBooking } from "./bookingExpiry.js";
+import { expireUnassignedBooking, resolveExpiryCancelReason } from "./bookingExpiry.js";
+import { releaseScheduledSlot, expireStaleSlotHolds, reconcileSlotCapacity, cleanupZeroCapacityRows } from "../Services/slotCapacityService.js";
+import { runLateCompletionWatchdog } from "../Services/lateCompletionService.js";
 
 const LEASE_TTL_MS = 2 * 60 * 1000; // worker claim TTL (crash recovery)
 const MAX_RELEASES_BEFORE_CANCEL = 2; // instant OTW-timeout policy
@@ -225,16 +232,18 @@ export const initBookingCrons = (io) => {
                 status: { $in: ["pending", "broadcasted"] },
                 autoCancelAt: { $lte: now },
                 technicianId: null,
-            }).select("_id").limit(100);
+            }).select("_id assignmentAttempts").limit(100);
 
             const owner = `expiry-worker:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
 
-            for (const { _id } of expiredJobs) {
+            for (const job of expiredJobs) {
+                const { _id } = job;
+                const cancelReason = resolveExpiryCancelReason(job);
                 const claimed = await claimLease(_id, owner);
                 if (!claimed) continue;
 
                 try {
-                    const expired = await expireUnassignedBooking(_id, owner, now);
+                    const expired = await expireUnassignedBooking(_id, owner, now, { cancelReason });
                     if (!expired) continue;
 
                     await closeActiveChallengesForBooking(_id, { to: "expired", now }).catch((err) => {
@@ -244,11 +253,26 @@ export const initBookingCrons = (io) => {
                     // Batch: expire all broadcasts + offers for this booking,
                     // bump cursors, and tell live techs the offer died
                     // (jobs_changed + job:expired).
-                    await expireBroadcastsForBooking(io, _id, "no_technician_accept", now);
+                    await expireBroadcastsForBooking(io, _id, cancelReason, now);
+                    await releaseScheduledSlot({
+                      bookingId: _id,
+                      reason: "booking_expired",
+                      expired: true,
+                    }).catch((releaseErr) => {
+                      console.error(`[Cron:Expiry] Slot release failed for ${_id}:`, releaseErr.message);
+                    });
 
-                    const message = expired.bookingType === "instant"
-                        ? "We couldn't find a technician for your immediate booking. It has expired. Please try again later."
+                    const hadPriorAssignment = cancelReason === "technician_no_action";
+                    let message;
+                    if (expired.bookingType === "instant") {
+                      message = hadPriorAssignment
+                        ? "Your assigned technician was released and we couldn't find a replacement in time. Your booking has expired. Please try again."
+                        : "We couldn't find a technician for your immediate booking. It has expired. Please try again later.";
+                    } else {
+                      message = hadPriorAssignment
+                        ? "Your assigned technician was released and no replacement accepted before the booking expired. Please book again."
                         : "No technician accepted your scheduled booking 5 hours before the start. It has been cancelled automatically.";
+                    }
                     await notifyCustomer(expired, message, io);
                     console.log(`[Cron:Expiry] Auto-cancelled ${expired.bookingType} job ${_id}`);
                 } finally {
@@ -522,7 +546,7 @@ export const initBookingCrons = (io) => {
                     if (!claimed) continue;
                     try {
                         const fresh = await ServiceBooking.findById(b._id)
-                          .select("status scheduledAt remindersSent technicianId")
+                          .select("status scheduledAt remindersSent technicianId lateCompletionAtRisk backupTechnicianId")
                           .lean();
                         if (!fresh || fresh.status !== "accepted" || fresh.technicianId == null ||
                             fresh.remindersSent?.[stage.flag]) {
@@ -555,6 +579,20 @@ export const initBookingCrons = (io) => {
                             // completion; re-checked next minute if the code expires.
                             if (await hasActiveCompletionChallenge(b._id, now)) {
                                 console.log(`[Cron:Enforcement] Holding ${b._id}: completion OTP in progress`);
+                                continue;
+                            }
+                            // Backup-first late completion: never blind-release the
+                            // original technician while their current job is at risk
+                            // and no backup has accepted.
+                            if (fresh.lateCompletionAtRisk && !fresh.backupTechnicianId) {
+                                if (io) {
+                                    io.to("admin_dashboard").emit("booking_at_risk", {
+                                        bookingId: b._id,
+                                        technicianId: fresh.technicianId,
+                                        scheduledAt: fresh.scheduledAt,
+                                        type: "LATE_COMPLETION_KEEP_ORIGINAL",
+                                    });
+                                }
                                 continue;
                             }
                             const redispatchWindowMs = SCHEDULED_REDISPATCH_WINDOW_MINUTES * 60 * 1000;
@@ -639,6 +677,79 @@ export const initBookingCrons = (io) => {
             }
         } catch (err) {
             console.error("[Cron:Reminders Error]", err);
+        }
+    });
+
+    /**
+     * ─── CRON 6: LATE COMPLETION / BACKUP-FIRST REPLACEMENT (Every 5 min) ──
+     * If an in-progress scheduled job is projected to overrun the next slot
+     * minus the 35-minute buffer, mark it at risk and offer a backup. The
+     * original technician remains assigned until the backup accepts.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("*/5 * * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            await runLateCompletionWatchdog({ io });
+        } catch (err) {
+            console.error("[Cron:LateCompletion Error]", err);
+        }
+    });
+
+    /**
+     * ─── CRON 8: SLOT HOLD EXPIRY + CAPACITY RECONCILER (Every 5 min) ─────
+     * Expires holds whose booking never got accepted and recomputes the
+     * approximate counters from authoritative rows. Counter drift is bounded
+     * by this sweep; TechnicianSlot's unique index is still the hard guard.
+     * ──────────────────────────────────────────────────────────────────────
+     */
+    cron.schedule("*/5 * * * *", async () => {
+        try {
+            if (!dbReady()) return;
+            const expiredBookingIds = await expireStaleSlotHolds({ limit: 100 });
+            for (const bookingId of expiredBookingIds) {
+                await ServiceBooking.updateOne(
+                    { _id: bookingId, status: { $in: ["pending", "broadcasted"] }, technicianId: null },
+                    { $set: { status: "expired", cancelReason: "slot_hold_expired" }, $inc: { version: 1 } }
+                ).catch(() => {});
+            }
+            await reconcileSlotCapacity({ limit: 100 });
+            await cleanupZeroCapacityRows();
+
+            // Auto-confirm customer no-show claims whose response window expired.
+            const dueNoShows = await ServiceBooking.find({
+                customerNoShowStatus: "awaiting_customer",
+                customerNoShowResponseDeadline: { $ne: null, $lte: new Date() },
+            }).select("_id technicianId financialSnapshot").limit(50);
+            for (const claim of dueNoShows) {
+                const techAmountPaise = Number(claim.financialSnapshot?.technicianAmountPaise) || 0;
+                const totalPaise = Number(claim.financialSnapshot?.totalAmountPaise) || 0;
+                const raw = Math.round(techAmountPaise * (CUSTOMER_NO_SHOW_COMPENSATION_PERCENT / 100));
+                const compensationPaise = CUSTOMER_NO_SHOW_COMPENSATION_ENABLED
+                    ? Math.min(totalPaise > 0 ? totalPaise : raw, Math.max(CUSTOMER_NO_SHOW_MIN_COMPENSATION_PAISE, raw))
+                    : 0;
+                const result = await ServiceBooking.updateOne(
+                    { _id: claim._id, customerNoShowStatus: "awaiting_customer" },
+                    {
+                        $set: {
+                            customerNoShowStatus: "confirmed",
+                            customerNoShowConfirmedAt: new Date(),
+                            customerNoShowCompensationPaise: compensationPaise,
+                            customerNoShowCompensationStatus: compensationPaise > 0 ? "recorded" : "none",
+                        },
+                        $inc: { version: 1 },
+                    }
+                );
+                if (result.modifiedCount > 0 && claim.technicianId) {
+                    const { default: TechnicianProfile } = await import("../Schemas/TechnicianProfile.js");
+                    await TechnicianProfile.updateOne(
+                        { _id: claim.technicianId },
+                        { $inc: { customerNoShowConfirmedCount: 1 } }
+                    ).catch(() => {});
+                }
+            }
+        } catch (err) {
+            console.error("[Cron:SlotMaintenance Error]", err);
         }
     });
 

@@ -891,6 +891,17 @@ export const verifyTechnicianKyc = async (req, res) => {
       if (suspension.modifiedCount > 0 && technicianProfile) {
         technicianProfile = { ...technicianProfile, workStatus: "suspended" };
       }
+      if (status === "rejected") {
+        const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+        await releaseFutureScheduledSlotsForTechnician({
+          technicianId,
+          reason: "kyc_rejected",
+          actor: req.user?.userId,
+          io: req.io,
+        }).catch((releaseErr) =>
+          console.error("Scheduled slot release after KYC rejection failed:", releaseErr.message)
+        );
+      }
     }
 
     const kycObj = await maskKycPii(kyc.toObject());
@@ -995,6 +1006,18 @@ export const verifyBankDetails = async (req, res) => {
     kyc.bankDetailsFingerprint = verified ? fingerprintBankDetails(plainBank) : null;
 
     await kyc.save();
+
+    if (!verified) {
+      const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+      await releaseFutureScheduledSlotsForTechnician({
+        technicianId,
+        reason: "bank_rejected",
+        actor: req.user?.userId,
+        io: req.io,
+      }).catch((releaseErr) =>
+        console.error("Scheduled slot release after bank rejection failed:", releaseErr.message)
+      );
+    }
 
     // 🔏 Audit the bank verification decision
     await writeAuditLog({

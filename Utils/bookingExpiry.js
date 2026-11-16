@@ -1,6 +1,21 @@
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 
-export const expireUnassignedBooking = async (bookingId, owner, now = new Date()) => {
+export const resolveExpiryCancelReason = (booking) => {
+  const attempts = Array.isArray(booking?.assignmentAttempts)
+    ? booking.assignmentAttempts
+    : [];
+  const hadAssignment = attempts.some((attempt) =>
+    ["assigned", "released"].includes(attempt?.status)
+  );
+  return hadAssignment ? "technician_no_action" : "no_technician_accept";
+};
+
+export const expireUnassignedBooking = async (
+  bookingId,
+  owner,
+  now = new Date(),
+  { cancelReason = "no_technician_accept" } = {}
+) => {
   if (!owner || typeof owner !== "string" || !owner.trim()) {
     throw Object.assign(new Error("expireUnassignedBooking requires a non-empty owner"), { statusCode: 400 });
   }
@@ -16,7 +31,7 @@ export const expireUnassignedBooking = async (bookingId, owner, now = new Date()
     {
       $set: {
         status: "expired",
-        cancelReason: "no_technician_accept",
+        cancelReason,
         cancelledBy: "system",
         cancelledAt: now,
         cancellationStatus: "system_cancelled",

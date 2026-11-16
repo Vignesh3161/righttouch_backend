@@ -123,6 +123,17 @@ const ProductBookingSchema = new mongoose.Schema(
       default: 0,
     },
 
+    paymentRequestedAt: {
+      type: Date,
+      default: null,
+    },
+
+    paymentRequestedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
     status: {
       type: String,
       enum: ["active", "completed", "cancelled"],

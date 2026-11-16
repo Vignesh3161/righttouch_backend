@@ -25,7 +25,7 @@ export const isSuccessfulServicePayment = (payment) => {
   const provider = String(payment.provider || "").toLowerCase();
   const mode = String(payment.mode || "").toLowerCase();
   if (provider !== "razorpay") return false;
-  if (["offline", "cash", "bank_transfer", "upi_direct", "cheque", "other"].includes(mode)) {
+  if (["offline", "cash", "bank_transfer", "upi_direct", "cheque", "card", "other"].includes(mode)) {
     return false;
   }
   return true;

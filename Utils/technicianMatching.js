@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import TechnicianSlot from "../Schemas/TechnicianSlot.js";
 import { bookingDeadlineFilter, isBookingPastAutoCancel, normalizeBookingStatus } from "./bookingStatus.js";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import TechnicianBookingOffer from "../Schemas/TechnicianBookingOffer.js";
@@ -25,11 +26,13 @@ import {
 } from "./dispatchQueue.js";
 import { offerPurgeAt } from "./broadcastRetention.js";
 import { mergeTechnicianCandidateIds } from "./technicianCandidatePool.js";
-import { buildJobDispatchPayload } from "./jobPayload.js";
+import { buildJobDispatchPayload, buildJobScheduleFields, resolveBookingJobLocation } from "./jobPayload.js";
 import {
   SCHEDULED_CANDIDATE_CAP,
   REOFFER_DECLINED_AFTER_MINUTES,
   isDispatchWindowOpen,
+  INSTANT_SLOT_BUFFER_MINUTES,
+  MAX_SCHEDULED_JOBS_PER_DAY_DEFAULT,
 } from "./schedulingConfig.js";
 import { startOfBusinessDayUtc } from "./slots.js";
 
@@ -303,16 +306,16 @@ export const upsertTechnicianOffers = async ({
 export const loadCommittedQueues = async (techIds) => {
   const map = new Map();
   techIds.forEach((id) =>
-    map.set(String(id), { activeJob: null, schedules: [], instantJobs: [] })
+    map.set(String(id), { activeJob: null, schedules: [], instantJobs: [], slots: [] })
   );
   if (!techIds.length) return map;
 
-  const [activeJobs, schedules, instantJobs] = await Promise.all([
+  const [activeJobs, schedules, instantJobs, technicianSlots] = await Promise.all([
     ServiceBooking.find({
       technicianId: { $in: techIds },
       status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
     })
-      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes slotKey slotStartAt slotEndAt")
       .lean(),
     ServiceBooking.find({
       technicianId: { $in: techIds },
@@ -320,7 +323,7 @@ export const loadCommittedQueues = async (techIds) => {
       status: { $in: ["accepted", "ACCEPTED"] },
       scheduledAt: { $gt: new Date() },
     })
-      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes slotKey slotStartAt slotEndAt")
       .sort({ scheduledAt: 1 })
       .lean(),
     ServiceBooking.find({
@@ -328,7 +331,14 @@ export const loadCommittedQueues = async (techIds) => {
       bookingType: "instant",
       status: { $in: ["accepted", "ACCEPTED", "on_the_way", "reached", "in_progress"] },
     })
-      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes")
+      .select("technicianId scheduledAt location bookingType estimatedDurationMinutes slotKey slotStartAt slotEndAt")
+      .lean(),
+    TechnicianSlot.find({
+      technicianId: { $in: techIds },
+      active: true,
+      slotEndAt: { $gt: new Date() },
+    })
+      .select("technicianId bookingId slotKey slotStartAt slotEndAt role")
       .lean(),
   ]);
 
@@ -358,6 +368,15 @@ export const loadCommittedQueues = async (techIds) => {
     const entry = map.get(String(job.technicianId));
     if (entry) entry.instantJobs.push(job);
   }
+  for (const slot of technicianSlots) {
+    const entry = map.get(String(slot.technicianId));
+    if (entry) entry.slots.push(slot);
+  }
+  for (const entry of map.values()) {
+    entry.slots.sort(
+      (a, b) => new Date(a.slotStartAt).getTime() - new Date(b.slotStartAt).getTime()
+    );
+  }
   return map;
 };
 
@@ -379,18 +398,70 @@ export const evaluateJobFeasibility = ({
   queue,
 }) => {
   const nextSched = nextScheduledFromQueue(queue);
-
+  const slots = queue?.slots || [];
   const isScheduled = candidateJob?.bookingType === "schedule";
-  if (!isScheduled && !nextSched) {
-    return { feasible: true, reason: "no_deadline", projectedArrival: null, slackMinutes: null };
-  }
+
   if (isScheduled) {
+    if (candidateJob?.slotKey) {
+      const conflict = slots.find(
+        (slot) => String(slot.slotKey) === String(candidateJob.slotKey)
+      );
+      if (conflict) {
+        return {
+          feasible: false,
+          reason: "slot_conflict",
+          projectedArrival: null,
+          slackMinutes: null,
+        };
+      }
+    }
     return scheduleChainFeasible({
       technicianLocation: techLocation,
       candidateJob,
       committedQueue: queue?.schedules || [],
       activeJob: queue?.activeJob || null,
     });
+  }
+
+  // Instant work must finish before the next committed scheduled slot,
+  // leaving a travel/cleanup buffer. A currently-running slot blocks instantly.
+  const now = Date.now();
+  const nextSlot = slots.find((slot) => new Date(slot.slotStartAt).getTime() > now);
+  const currentSlot = slots.find(
+    (slot) =>
+      new Date(slot.slotStartAt).getTime() <= now &&
+      new Date(slot.slotEndAt).getTime() > now
+  );
+  if (currentSlot) {
+    return {
+      feasible: false,
+      reason: "slot_blocked",
+      projectedArrival: null,
+      slackMinutes: null,
+    };
+  }
+  if (nextSlot) {
+    const deadline =
+      new Date(nextSlot.slotStartAt).getTime() - INSTANT_SLOT_BUFFER_MINUTES * 60 * 1000;
+    if (deadline <= now) {
+      return {
+        feasible: false,
+        reason: "slot_blocked",
+        projectedArrival: null,
+        slackMinutes: null,
+      };
+    }
+    return canArriveBy({
+      technicianLocation: techLocation,
+      committedQueue: [],
+      candidateJob,
+      targetLocation: techLocation,
+      requiredArrivalTime: new Date(deadline),
+    });
+  }
+
+  if (!nextSched) {
+    return { feasible: true, reason: "no_deadline", projectedArrival: null, slackMinutes: null };
   }
 
   return canArriveBy({
@@ -717,6 +788,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           }
 
           const service = serviceById.get(String(booking.serviceId));
+          const jobLocation = resolveBookingJobLocation(booking);
           const bm = new Map([[String(tech._id), { _id: broadcast._id, version: broadcast.version }]]);
           await enqueueJobNewNotifications({
             bookingId: booking._id,
@@ -728,13 +800,17 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
               serviceType: service?.serviceType,
               description: service?.description,
               duration: service?.duration,
-              customerName: booking.addressSnapshot?.name || "Customer",
+              ...buildJobScheduleFields(booking),
+              customerName: jobLocation.customerName,
+              customerMobile: jobLocation.customerMobile,
               baseAmount: booking.baseAmount,
-              address: booking.address,
-              scheduledAt: booking.scheduledAt,
+              address: jobLocation.address,
+              city: jobLocation.city,
+              state: jobLocation.state,
+              pincode: jobLocation.pincode,
             }, {
-              latitude: booking.location?.coordinates?.[1],
-              longitude: booking.location?.coordinates?.[0],
+              latitude: jobLocation.latitude,
+              longitude: jobLocation.longitude,
               distanceMeters,
               effectiveRadiusMeters: techEffectiveRadiusM,
             }),
@@ -1345,6 +1421,38 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       }
     }
 
+    // Hard slot guard: never offer a scheduled slot to a technician who
+    // already holds it, and never offer instant work during a committed slot.
+    if (technicianIds.length) {
+      const slotQuery = {
+        technicianId: { $in: technicianIds.map((id) => new mongoose.Types.ObjectId(id)) },
+        active: true,
+      };
+      if (isScheduledBooking && booking.slotKey) {
+        slotQuery.slotKey = booking.slotKey;
+      } else {
+        const now = new Date();
+        slotQuery.slotStartAt = { $lte: now };
+        slotQuery.slotEndAt = { $gt: now };
+      }
+      const busySlotTechIds = await TechnicianSlot.find(slotQuery)
+        .distinct("technicianId");
+      if (busySlotTechIds.length) {
+        const busy = new Set(busySlotTechIds.map(String));
+        technicianIds = technicianIds.filter((id) => !busy.has(String(id)));
+        if (!technicianIds.length) {
+          return {
+            success: true,
+            count: 0,
+            outcome: "NO_ELIGIBLE_TECHNICIANS",
+            retryable: false,
+            stage: "slot_conflict",
+            message: "All matching technicians already hold this slot",
+          };
+        }
+      }
+    }
+
     // Load full profiles and queues for candidates
     const [techProfiles, queueMap, kycDocs] = await Promise.all([
       TechnicianProfile.find({ _id: { $in: technicianIds } })
@@ -1459,15 +1567,12 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
           },
           { $group: { _id: "$technicianId", count: { $sum: 1 } } },
         ]),
-        ServiceBooking.aggregate([
+        TechnicianSlot.aggregate([
           {
             $match: {
               technicianId: { $in: technicianIds.map((id) => new mongoose.Types.ObjectId(id)) },
-              bookingType: "schedule",
-              status: {
-                $in: ["accepted", "ACCEPTED", "on_the_way", "reached", "in_progress", "completed"],
-              },
-              scheduledAt: { $gte: dayStart, $lt: dayEnd },
+              active: true,
+              slotStartAt: { $gte: dayStart, $lt: dayEnd },
             },
           },
           { $group: { _id: "$technicianId", count: { $sum: 1 } } },
@@ -1479,7 +1584,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       const cappedIds = technicianIds.filter((id) => {
         const prefs = profileById.get(String(id))?.notificationPreferences || {};
         const maxOffers = prefs.maxActiveScheduledOffers ?? 5;
-        const maxDaily = prefs.maxScheduledJobsPerDay ?? 8;
+        const maxDaily = prefs.maxScheduledJobsPerDay ?? MAX_SCHEDULED_JOBS_PER_DAY_DEFAULT;
         return (activeOfferMap.get(String(id)) || 0) < maxOffers
           && (dailyMap.get(String(id)) || 0) < maxDaily;
       });
@@ -1539,6 +1644,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // All in a single transaction for atomicity.
     // NOTE: jobDataPayload is constructed BEFORE the transaction so the
     // DispatchOutbox rows inside the transaction can reference it (B-01 TDZ fix).
+    const jobLocation = resolveBookingJobLocation(booking);
     const jobDataPayload = buildJobDispatchPayload({
       bookingId: booking._id,
       serviceId: service._id,
@@ -1547,11 +1653,15 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       description: service.description,
       duration: service.duration,
       durationMinutes: service.durationMinutes ?? booking.estimatedDurationMinutes ?? 60,
-      bookingType: booking.bookingType,
-      customerName: booking.addressSnapshot?.name || "Customer",
+      ...buildJobScheduleFields(booking),
+      customerName: jobLocation.customerName,
+      customerMobile: jobLocation.customerMobile,
       baseAmount: booking.baseAmount,
-      address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
-      scheduledAt: booking.scheduledAt,
+      address: jobLocation.address,
+      city: jobLocation.city,
+      state: jobLocation.state,
+      pincode: jobLocation.pincode,
+      customerStatusLabel: booking.customerStatusLabel || null,
     }, { latitude, longitude });
     const session = await mongoose.startSession();
     let broadcastMap = new Map();

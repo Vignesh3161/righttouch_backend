@@ -25,6 +25,7 @@ import { matchAndBroadcastBooking } from "./technicianMatching.js";
 import { validateSlot, BUSINESS_TIMEZONE, localDateInBusinessTimezone, formatInBusinessTimezone } from "./slots.js";
 import { isBookingPastAutoCancel, normalizeBookingStatus } from "./bookingStatus.js";
 import { computeDispatchEligibleAt } from "./schedulingConfig.js";
+import { assertServiceFitsSlot } from "../Services/slotAvailabilityService.js";
 
 /**
  * Validate that a service may be booked from the given zone.
@@ -129,12 +130,22 @@ export const resolveServiceZoneAvailability = async ({
  *             scheduledTimeLocal: string|null, error?: string }}
  */
 export const resolveScheduleInput = (body, { now = new Date() } = {}) => {
-  const bookingType = body?.bookingType === "scheduled" ? "schedule" : "instant";
+  const requestedType = String(body?.bookingType || "").toLowerCase();
+  const hasScheduleInput = Boolean(body?.scheduledDate && body?.scheduledTime);
+  const bookingType =
+    requestedType === "schedule" || requestedType === "scheduled" || hasScheduleInput
+      ? "schedule"
+      : "instant";
 
   if (bookingType === "instant") {
     return {
       bookingType,
       scheduledAt: null,
+      slotKey: null,
+      slotValue: null,
+      slotLabel: null,
+      slotStartAt: null,
+      slotEndAt: null,
       timezone: null,
       scheduledDateLocal: null,
       scheduledTimeLocal: null,
@@ -151,7 +162,12 @@ export const resolveScheduleInput = (body, { now = new Date() } = {}) => {
   const local = formatInBusinessTimezone(validation.scheduledAt);
   return {
     bookingType,
-    scheduledAt: validation.scheduledAt,
+    scheduledAt: validation.slot?.slotStartAt || validation.scheduledAt,
+    slotKey: validation.slot?.slotKey || null,
+    slotValue: validation.slot?.slotValue || scheduledTime,
+    slotLabel: validation.slot?.slotLabel || null,
+    slotStartAt: validation.slot?.slotStartAt || validation.scheduledAt,
+    slotEndAt: validation.slot?.slotEndAt || null,
     timezone: BUSINESS_TIMEZONE,
     scheduledDateLocal: localDateInBusinessTimezone(validation.scheduledAt),
     scheduledTimeLocal: `${local.hours}:${local.minutes}`,
@@ -214,6 +230,9 @@ export const buildServiceBookingDoc = async ({
 
   const bookingType = schedule.bookingType;
   const scheduledAt = schedule.scheduledAt || null;
+  if (bookingType === "schedule") {
+    assertServiceFitsSlot(service.durationMinutes || 60);
+  }
   const autoCancelAt = computeAutoCancelAt(bookingType, scheduledAt, now);
 
   const doc = {
@@ -225,11 +244,17 @@ export const buildServiceBookingDoc = async ({
     baseAmount,
     financialSnapshot: snapshot,
     scheduledAt,
+    slotKey: schedule.slotKey || null,
+    slotValue: schedule.slotValue || null,
+    slotLabel: schedule.slotLabel || null,
+    slotStartAt: schedule.slotStartAt || null,
+    slotEndAt: schedule.slotEndAt || null,
     estimatedDurationMinutes: service.durationMinutes || 60,
     dispatchEligibleAt: computeDispatchEligibleAt(bookingType, scheduledAt, now),
     timezone: schedule.timezone,
     scheduledDateLocal: schedule.scheduledDateLocal,
     scheduledTimeLocal: schedule.scheduledTimeLocal,
+    customerStatusLabel: bookingType === "schedule" ? "Awaiting technician" : null,
     faultProblem: faultProblem || null,
     locationType: resolvedLocation.locationType,
     addressSnapshot: resolvedLocation.addressSnapshot,

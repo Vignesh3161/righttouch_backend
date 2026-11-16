@@ -1,0 +1,1478 @@
+{
+	"info": {
+		"_postman_id": "6f1c9d2a-4b7e-4c8f-9a0d-2e3f4a5b6c7d",
+		"name": "RightTouch - Dispatch, Jobs & Socket Companion",
+		"description": "HTTP companion collection for RightTouch dispatch, scheduled bookings, technician job handling, base-location setup, completion/payment, and Socket.IO reference. Socket.IO itself is documented in postmancollection/docs/02-socket-notifications.md and docs/04-scheduled-booking-and-technician-jobs.md, and probed here with an Engine.IO handshake request.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:5000"
+		}
+	],
+	"item": [
+		{
+			"name": "00 - Authentication",
+			"item": [
+				{
+					"name": "Technician - Request Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"OTP requested\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Success response\", function () { pm.expect(body.success).to.eql(true); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{technicianMobile}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/login/technician",
+						"description": "Requests a technician login OTP. Put the SMS OTP into technicianLoginOtp, then run the verify request."
+					}
+				},
+				{
+					"name": "Technician - Verify Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Technician logged in\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Token returned\", function () { pm.expect(body.result.token).to.be.a(\"string\").and.not.empty; });",
+									"pm.environment.set(\"technicianToken\", body.result.token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{technicianMobile}}\",\n  \"otp\": \"{{technicianLoginOtp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/login/technician/verify-otp",
+						"description": "Verifies the technician OTP and stores the bearer token in technicianToken."
+					}
+				},
+				{
+					"name": "Customer - Request Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"OTP requested\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Success response\", function () { pm.expect(body.success).to.eql(true); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{customerMobile}}\",\n  \"role\": \"Customer\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login/customer",
+						"description": "Requests a customer login OTP. Put the SMS OTP into customerLoginOtp, then run the verify request."
+					}
+				},
+				{
+					"name": "Customer - Verify Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Customer logged in\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Token returned\", function () { pm.expect(body.result.token).to.be.a(\"string\").and.not.empty; });",
+									"pm.environment.set(\"customerToken\", body.result.token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{customerMobile}}\",\n  \"otp\": \"{{customerLoginOtp}}\",\n  \"role\": \"Customer\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login/customer/verify-otp",
+						"description": "Verifies the customer OTP and stores the bearer token in customerToken."
+					}
+				},
+				{
+					"name": "Admin - Password Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Admin logged in\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Token returned\", function () { pm.expect(body.result.token).to.be.a(\"string\").and.not.empty; });",
+									"pm.environment.set(\"adminToken\", body.result.token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{adminMobile}}\",\n  \"password\": \"{{adminPassword}}\",\n  \"role\": \"{{adminRole}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login",
+						"description": "Admin or Owner password login. Stores the bearer token in adminToken."
+					}
+				}
+			]
+		},
+		{
+			"name": "01 - Customer Create Booking",
+			"item": [
+				{
+					"name": "Customer - Create Instant Booking",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Booking created\", function () { pm.response.to.have.status(201); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Booking id returned\", function () { pm.expect(body.result.bookingId).to.be.a(\"string\").and.not.empty; });",
+									"pm.environment.set(\"bookingId\", String(body.result.bookingId));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"locationType\": \"gps\",\n  \"latitude\": {{latitude}},\n  \"longitude\": {{longitude}},\n  \"faultProblem\": \"Postman dispatch smoke test\",\n  \"bookingType\": \"instant\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/booking/schedule",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Creates an instant booking at the configured GPS point and captures bookingId. Run the technician location request first so the technician can be matched. Set serviceId to an active service."
+					}
+				}
+			]
+		},
+		{
+			"name": "02 - Technician Dispatch",
+			"item": [
+				{
+					"name": "Technician - Update Location",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Location accepted\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"latitude\": {{latitude}},\n  \"longitude\": {{longitude}}\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/location",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Updates the technician GPS position. Matching is rate-limited to once per 30 seconds per technician."
+					}
+				},
+				{
+					"name": "Technician - Go Online",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Technician online\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"availability\": {\n    \"isOnline\": true\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/updateTechnician",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Sets the technician online. Run Update Location first so a fresh GPS ping exists; the server returns 409 GPS_REQUIRED/GPS_STALE otherwise."
+					}
+				},
+				{
+					"name": "Technician - Register FCM Token",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"token\": \"{{firebaseToken}}\",\n  \"unregister\": false\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/fcm-token",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Optional. Registers a device push token for job alerts. Set firebaseToken first."
+					}
+				},
+				{
+					"name": "Technician - My Jobs",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Feed fetched\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const jobs = body.result || [];",
+									"pm.test(\"Result is an array\", function () { pm.expect(jobs).to.be.an(\"array\"); });",
+									"if (jobs.length) {",
+									"  pm.environment.set(\"bookingId\", String(jobs[0].bookingId));",
+									"  pm.environment.set(\"broadcastVersion\", String(jobs[0].version || 1));",
+									"}",
+									"pm.test(\"First job captured when present\", function () {",
+									"  if (jobs.length) { pm.expect(pm.environment.get(\"bookingId\")).to.be.a(\"string\").and.not.empty; }",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/job-broadcast/my-jobs",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Returns the live job feed. Captures the first bookingId and broadcast version for the accept/decline requests."
+					}
+				},
+				{
+					"name": "Technician - Accept Job",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Job accepted\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"action\": \"accepted\",\n  \"version\": {{broadcastVersion}}\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/job-broadcast/respond/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Accepts the current offer. A stale version returns 409 version_mismatch; refresh My Jobs and retry."
+					}
+				},
+				{
+					"name": "Technician - Decline Job",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Job declined\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"action\": \"declined\",\n  \"version\": {{broadcastVersion}},\n  \"reason\": \"not_available\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/job-broadcast/respond/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Declines the offer. Under notify_new mode, declining the last live offer triggers a best-effort immediate rematch."
+					}
+				},
+				{
+					"name": "Technician - Current Jobs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/jobs/current",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists current active jobs."
+					}
+				},
+				{
+					"name": "Technician - Job History",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/jobs/history",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists the technician job history."
+					}
+				}
+			]
+		},
+		{
+			"name": "03 - Completion OTP & Payment",
+			"item": [
+				{
+					"name": "Customer - Bookings",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/user/booking/getCustomerBookings",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists the customer bookings."
+					}
+				},
+				{
+					"name": "Technician - Booking Completion Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/booking/{{bookingId}}/completion-status",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Safe completion state for the assigned technician. Never returns the OTP or hash."
+					}
+				},
+				{
+					"name": "Technician - Request Completion OTP",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/booking/{{bookingId}}/completion-otp",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Requests completion verification and sets completionOtpRequestedAt, which makes the customer's online payment due. When unpaid it returns paymentRequired=true and sends a PAYMENT_DUE notification/socket with NO OTP SMS or challenge. After online payment succeeds the OTP SMS is sent automatically. The OTP is never returned in the response."
+					}
+				},
+				{
+					"name": "Customer - Booking Completion Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/user/booking/{{bookingId}}/completion-status",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Customer view: paymentDue=true after the technician requests the completion OTP and payment is unpaid; otpRequested=true once the marker is saved; requiresCompletionOtp=true after online payment until the technician verifies the OTP."
+					}
+				},
+				{
+					"name": "Customer - Payment Summary",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/user/payments/summary",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Payment summary for the authenticated customer. Pending payment rows count toward dueCount/amountDuePaise; the completion OTP marker alone does not create a due row."
+					}
+				},
+				{
+					"name": "Customer - Create Payment Order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/payments/{{bookingId}}/order",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Creates/reuses the Razorpay order. Service payment is available only after the technician requests the completion OTP: otherwise 400 PAYMENT_NOT_DUE. Online-only; already paid 409; manual review 409 UNDER_REVIEW."
+					}
+				},
+				{
+					"name": "Customer - Verify Payment",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"bookingId\": \"{{bookingId}}\",\n  \"razorpay_order_id\": \"{{razorpayOrderId}}\",\n  \"razorpay_payment_id\": \"{{razorpayPaymentId}}\",\n  \"razorpay_signature\": \"{{razorpaySignature}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/payment/verify",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Verifies the provider payment for this booking. Add razorpayOrderId, razorpayPaymentId, and razorpaySignature to the environment first. Online payment must succeed before technician OTP verification."
+					}
+				},
+				{
+					"name": "Technician - Resend Completion OTP (Optional)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/booking/{{bookingId}}/completion-otp/resend",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Optional after payment: rotates the OTP generation (old code dies); if no challenge exists it issues the first OTP. Before payment returns 409 PAYMENT_REQUIRED. Max 3 resends; 60s send cooldown."
+					}
+				},
+				{
+					"name": "Technician - Verify Completion OTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"otp\": \"{{completionOtp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/booking/{{bookingId}}/verify-completion-otp",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Verifies the customer OTP and completes the booking. Payment is checked before OTP format: requires booking.paymentStatus=paid and a successful Razorpay service payment, otherwise 409 PAYMENT_REQUIRED even with an empty code. Put the customer's SMS OTP in completionOtp."
+					}
+				}
+			],
+			"description": "Customer-confirmed completion + online payment (pay-before-OTP). Sequence: technician requests completion (payment due notification, no SMS yet) -> customer creates and verifies a Razorpay order (payment success sends the OTP SMS) -> technician verifies the OTP. Service completion requires an online Razorpay payment; cash/offline attempts cannot satisfy it, and verification/resend return 409 PAYMENT_REQUIRED until the online payment is captured."
+		},
+		{
+			"name": "04 - Admin Dispatch Ops",
+			"item": [
+				{
+					"name": "Admin - Queue Stats",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Stats fetched\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Queue result present\", function () { pm.expect(body.result).to.be.an(\"object\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/admin/dispatch/stats",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Queue counts, retry distribution, oldest pending age, stale inflight count, and delivery metrics."
+					}
+				},
+				{
+					"name": "Admin - Dispatch Health",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/admin/dispatch/health",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Redis availability and server timestamp."
+					}
+				},
+				{
+					"name": "Admin - Failed Rows",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Failed list fetched\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const items = body.result || [];",
+									"if (items.length) { pm.environment.set(\"outboxId\", String(items[0]._id)); }"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/admin/dispatch/failed?page=1&limit=25",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists failed dispatch rows and captures the first _id as outboxId."
+					}
+				},
+				{
+					"name": "Admin - Pending Rows",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/admin/dispatch/pending?status=all&page=1&limit=25",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists pending and inflight rows. Use status=pending for pending only."
+					}
+				},
+				{
+					"name": "Admin - Retry Row",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/dispatch/{{outboxId}}/retry",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Requeues one failed/pending row. Returns 409 when a live duplicate already exists."
+					}
+				},
+				{
+					"name": "Admin - Retry All Failed",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/dispatch/retry-failed",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Requeues up to 1000 failed rows, skipping any with a live duplicate."
+					}
+				},
+				{
+					"name": "Admin - Restart Worker",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/dispatch/worker/restart",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Restarts the in-process dispatch worker."
+					}
+				},
+				{
+					"name": "Admin - Stop Worker (maintenance only)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/dispatch/worker/stop",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Stops the dispatch worker. Only use during maintenance; restart it afterwards."
+					}
+				}
+			]
+		},
+		{
+			"name": "05 - Socket.IO Handshake Probe",
+			"item": [
+				{
+					"name": "Socket.IO - Engine.IO Handshake Probe",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Socket.IO endpoint reachable\", function () { pm.response.to.have.status(200); });",
+									"pm.test(\"Engine.IO handshake payload\", function () { pm.expect(pm.response.text()).to.match(/^0/); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/socket.io/?EIO=4&transport=polling&t={{$timestamp}}",
+						"description": "Reachability probe only. Postman cannot speak the Socket.IO protocol; connect with a Socket.IO client using auth.token. See docs/02-socket-notifications.md."
+					}
+				}
+			]
+		},
+		{
+			"name": "06 - Scheduled Booking & Base Location",
+			"item": [
+				{
+					"name": "Customer - Get Booking Slots (GPS)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&latitude={{latitude}}&longitude={{longitude}}",
+						"description": "Public slot options. Returns instant ETA, the next two business days, 09:00-20:30 slots, timezone, and availability. Captures scheduledDate/scheduledTime and a second slot for rescheduling."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Slots fetched\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const schedule = (body.result && body.result.schedule) || {};",
+									"const days = schedule.days || [];",
+									"const slots = schedule.timeSlots || [];",
+									"pm.test(\"Schedule options returned\", function () {",
+									"  pm.expect(days).to.be.an(\"array\").and.not.empty;",
+									"  pm.expect(slots).to.be.an(\"array\").and.not.empty;",
+									"});",
+									"if (days.length && slots.length) {",
+									"  pm.environment.set(\"scheduledDate\", days[0].fullDate);",
+									"  pm.environment.set(\"scheduledTime\", slots[0].value);",
+									"  pm.environment.set(\"rescheduleDate\", (days[1] || days[0]).fullDate);",
+									"  pm.environment.set(\"rescheduleTime\", slots[slots.length - 1].value);",
+									"}",
+									"pm.test(\"First available slot captured\", function () {",
+									"  pm.expect(pm.environment.get(\"scheduledDate\")).to.be.a(\"string\").and.not.empty;",
+									"  pm.expect(pm.environment.get(\"scheduledTime\")).to.be.a(\"string\").and.not.empty;",
+									"});"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Customer - Create Scheduled Booking",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/user/booking/schedule",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"faultProblem\": \"Postman scheduled booking smoke test\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Creates a scheduled booking. Captures bookingId and scheduledAt. Dispatch starts at dispatchEligibleAt (scheduledAt minus SCHEDULED_DISPATCH_LEAD_HOURS, default 24h)."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Scheduled booking created\", function () { pm.response.to.have.status(201); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Booking id returned\", function () { pm.expect(body.result.bookingId).to.be.a(\"string\").and.not.empty; });",
+									"pm.environment.set(\"bookingId\", String(body.result.bookingId));",
+									"pm.environment.set(\"scheduledAt\", body.result.scheduledAt || \"\");"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Customer - Reschedule Booking",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/user/booking/reschedule/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"scheduledDate\": \"{{rescheduleDate}}\",\n  \"scheduledTime\": \"{{rescheduleTime}}\",\n  \"reason\": \"Postman reschedule smoke test\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Reschedules an unassigned scheduled booking outside the reschedule cutoff. Emits booking_rescheduled to the customer room and admin_dashboard."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Booking rescheduled\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Customer - Cancel Booking",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/user/booking/cancel/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{customerToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"reason\": \"Postman cancellation smoke test\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Cancels a booking. Scheduled cancellations are free more than 3 hours before the slot; fees apply inside 3 hours and at the door."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Booking cancelled\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Technician - Get My Service Base Location",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/service-base-location/me",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Scheduled matching uses serviceBaseLocation as the travel origin; live GPS is a fallback."
+					}
+				},
+				{
+					"name": "Technician - Set My Service Base Location",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/service-base-location/me",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Self-service base location. Rejects coordinates outside the technician's approved districts."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Base location updated\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Technician - Accepted Scheduled Jobs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/jobs/accepted/scheduled",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Accepted scheduled jobs only. Use this to render the technician's upcoming schedule."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Accepted scheduled jobs fetched\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Technician - Cancel Assigned Job",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/booking/technician/cancel/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"reason\": \"technician_unavailable\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Cancels an assigned job and suppresses immediate re-offer to the cancelling technician."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Technician cancellation accepted\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Technician - Re-accept Cancelled Job",
+					"request": {
+						"method": "PUT",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/booking/reaccept/{{bookingId}}",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{technicianToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Re-accepts a job the technician previously cancelled; penalty policy is server-authoritative."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Cancelled job re-accepted\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Admin - Missing Base Locations",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/admin/service-base-location/missing?page=1&limit=50",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Lists approved technicians needing base-location review. Captures technicianId."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Missing base-location list fetched\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const techs = (body.result && body.result.technicians) || [];",
+									"if (techs.length) {",
+									"  pm.environment.set(\"technicianId\", String(techs[0].technicianId));",
+									"}"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Admin - Get Technician Base Location",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "{{baseUrl}}/api/technician/admin/technicians/{{technicianId}}/service-base-location",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Admin/Owner read of a technician base location."
+					}
+				},
+				{
+					"name": "Admin - Set Technician Base Location",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/admin/technicians/{{technicianId}}/service-base-location",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"verified\": true,\n  \"force\": false,\n  \"reason\": \"Postman scheduled dispatch setup\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Admin/Owner set/verify. District must be allowed unless force=true. Audit-logged."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Technician base location updated\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					]
+				}
+			],
+			"description": "Scheduled-booking smoke path: slots -> create scheduled -> feed/accept -> status updates -> reschedule/cancel guards -> base-location admin review."
+		}
+	]
+}

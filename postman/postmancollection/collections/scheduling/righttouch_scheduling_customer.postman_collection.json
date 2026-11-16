@@ -1,0 +1,794 @@
+{
+  "info": {
+    "name": "RightTouch - Scheduling (Customer)",
+    "description": "Customer-side four-slot scheduling flow: slot discovery, scheduled booking, reschedule, cancellation, no-show response, and socket reference.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "00 - Setup & Auth",
+      "item": [
+        {
+          "name": "Customer - Request Login OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"OTP requested\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.identifier !== undefined && r.identifier !== null) pm.collectionVariables.set(\"identifier\", String(r.identifier));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/login/customer",
+            "description": "Sends a customer login OTP.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifier\": \"{{customerMobile}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Verify Login OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Customer authenticated\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "const token = (j.result && j.result.token) || j.token;",
+                  "if (token) pm.collectionVariables.set('customerToken', token);",
+                  "pm.test('Customer token captured', function () { pm.expect(pm.collectionVariables.get('customerToken')).to.be.a('string').and.not.empty; });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/login/customer/verify-otp",
+            "description": "Verifies the customer OTP and stores customerToken.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifier\": \"{{customerMobile}}\",\n  \"otp\": \"{{customerOtp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "01 - Slot Discovery & Booking",
+      "item": [
+        {
+          "name": "Customer - Get Slots (GPS)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Slots fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "const schedule = (j.result && j.result.schedule) || {};",
+                  "const days = schedule.days || [];",
+                  "const slots = schedule.timeSlots || [];",
+                  "pm.test('Five days and four slots returned', function () { pm.expect(days.length).to.eql(5); pm.expect(slots.length).to.eql(4); });",
+                  "if (days[0]) pm.collectionVariables.set('scheduledDate', days[0].fullDate);",
+                  "if (slots[0]) pm.collectionVariables.set('scheduledTime', slots[0].value);",
+                  "if (days[1]) pm.collectionVariables.set('rescheduleDate', days[1].fullDate);",
+                  "if (slots[slots.length - 1]) pm.collectionVariables.set('rescheduleTime', slots[slots.length - 1].value);",
+                  "pm.test('First slot captured', function () { pm.expect(pm.collectionVariables.get('scheduledDate')).to.be.a('string').and.not.empty; pm.expect(pm.collectionVariables.get('scheduledTime')).to.be.a('string').and.not.empty; });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&latitude={{latitude}}&longitude={{longitude}}",
+            "description": "Public. Returns instant ETA plus five days (tomorrow + 4) and four 3-hour slots."
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Get Slots (Saved Address)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Saved-address slots fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&addressId={{addressId}}",
+            "description": "Saved-address variant. The address must belong to the authenticated customer."
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Create Scheduled Booking",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Scheduled booking created\", function () { pm.response.to.have.status(201); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.bookingId !== undefined && r.bookingId !== null) pm.collectionVariables.set(\"bookingId\", String(r.bookingId)); if (r.scheduledAt !== undefined && r.scheduledAt !== null) pm.collectionVariables.set(\"scheduledAt\", String(r.scheduledAt)); if (r.slotKey !== undefined && r.slotKey !== null) pm.collectionVariables.set(\"slotKey\", String(r.slotKey)); if (r.slotLabel !== undefined && r.slotLabel !== null) pm.collectionVariables.set(\"slotLabel\", String(r.slotLabel));",
+                  "pm.test('Booking id captured', function () { pm.expect(pm.collectionVariables.get('bookingId')).to.be.a('string').and.not.empty; });",
+                  "pm.test('Scheduled type returned', function () { pm.expect(pm.response.json().result.bookingType).to.eql('scheduled'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/schedule",
+            "description": "Creates a scheduled booking in a slot returned by GET /booking/slots. Dispatch starts immediately; the booking remains pending until a technician accepts.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"faultProblem\": \"Postman scheduling smoke test\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - List My Bookings",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Customer bookings fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); pm.test('Result is an array', function () { pm.expect(j.result).to.be.an('array'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/getCustomerBookings?bookingType=schedule&limit=20",
+            "description": "Returns the customer booking list with filters and pagination."
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Reschedule Booking",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Booking rescheduled\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.bookingId !== undefined && r.bookingId !== null) pm.collectionVariables.set(\"bookingId\", String(r.bookingId)); if (r.scheduledAt !== undefined && r.scheduledAt !== null) pm.collectionVariables.set(\"scheduledAt\", String(r.scheduledAt)); if (r.slotKey !== undefined && r.slotKey !== null) pm.collectionVariables.set(\"slotKey\", String(r.slotKey));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/reschedule/{{bookingId}}",
+            "description": "Only unassigned pending/broadcasted scheduled bookings; max 2 reschedules; blocked inside RESCHEDULE_CUTOFF_MINUTES.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scheduledDate\": \"{{rescheduleDate}}\",\n  \"scheduledTime\": \"{{rescheduleTime}}\",\n  \"reason\": \"Plan changed\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Set Cart Item Schedule",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Cart item scheduled\", function () { pm.expect([200,400]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/cart/set-schedule",
+            "description": "Schedules a service cart item using the same four-slot engine. Products are quotation-only.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"itemId\": \"{{cartItemId}}\",\n  \"bookingDate\": \"{{scheduledDate}}\",\n  \"timeSlot\": \"{{scheduledTime}}\",\n  \"faultProblem\": \"Cart scheduling smoke test\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Scheduled Cart Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Scheduled cart checkout handled\", function () { pm.expect([201,400]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/checkout",
+            "description": "Checks out scheduled cart items. Multiple items booked into one slot are rejected with MULTI_ITEM_SAME_SLOT_NOT_SUPPORTED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addressId\": \"{{addressId}}\",\n  \"scheduledAt\": \"{{scheduledAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "02 - Lifecycle & No-Show",
+      "item": [
+        {
+          "name": "Customer - Completion Status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Completion status fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/completion-status",
+            "description": "Safe completion status without OTP hashes."
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Respond To No-Show Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"No-show response accepted\", function () { pm.expect([\n  200,\n  409\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/respond",
+            "description": "Responds within the 10-minute window. available=true cancels the claim; available=false confirms it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"available\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Get Cancellation Reasons",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Reasons fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/reasons",
+            "description": "Returns the cancellation reason catalog."
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Cancel Booking",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Booking cancelled or already closed\", function () { pm.expect([\n  200,\n  400\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/cancel/{{bookingId}}",
+            "description": "Scheduled fees: free >3h, ₹50 2–3h, ₹100 <2h, ₹120 at door; free when the technician is late.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Change of plans\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Customer - Book Again (Scheduled)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Book-again handled\", function () { pm.expect([\n  201,\n  400\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/book-again",
+            "description": "Only completed + paid previous bookings. Uses the same slot engine and scheduled-slot reservation as a new booking.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"previousBookingId\": \"{{bookingId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "03 - Socket.IO Probe",
+      "item": [
+        {
+          "name": "Socket.IO - Engine.IO Handshake",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Socket.IO endpoint reachable\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/socket.io/?EIO=4&transport=polling&t={{$timestamp}}",
+            "description": "A 200 response beginning with 0 proves the Socket.IO endpoint is reachable. Event-level testing needs a Socket.IO client."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "90 - Guard Checks (optional)",
+      "item": [
+        {
+          "name": "Guard - Invalid Slot",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Invalid slot rejected\", function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/schedule",
+            "description": "Expected 400: time is outside the four bookable slots.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"23:45\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Guard - Reschedule Assigned Booking",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Assigned booking not reschedulable\", function () { pm.expect([\n  409\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{customerToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/reschedule/{{bookingId}}",
+            "description": "Expected 409 once the booking is assigned or closed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scheduledDate\": \"{{rescheduleDate}}\",\n  \"scheduledTime\": \"{{rescheduleTime}}\",\n  \"reason\": \"Guard check\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:7372"
+    },
+    {
+      "key": "customerMobile",
+      "value": "9000000000"
+    },
+    {
+      "key": "customerOtp",
+      "value": "1234"
+    },
+    {
+      "key": "customerToken",
+      "value": "PASTE_CUSTOMER_JWT_HERE"
+    },
+    {
+      "key": "serviceId",
+      "value": "507f1f77bcf86cd799439066"
+    },
+    {
+      "key": "addressId",
+      "value": "507f1f77bcf86cd799439033"
+    },
+    {
+      "key": "latitude",
+      "value": "12.9716"
+    },
+    {
+      "key": "longitude",
+      "value": "77.5946"
+    },
+    {
+      "key": "bookingId",
+      "value": ""
+    },
+    {
+      "key": "scheduledDate",
+      "value": ""
+    },
+    {
+      "key": "scheduledTime",
+      "value": ""
+    },
+    {
+      "key": "rescheduleDate",
+      "value": ""
+    },
+    {
+      "key": "rescheduleTime",
+      "value": ""
+    },
+    {
+      "key": "cartItemId",
+      "value": ""
+    },
+    {
+      "key": "scheduledAt",
+      "value": ""
+    }
+  ]
+}

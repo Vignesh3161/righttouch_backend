@@ -1,0 +1,783 @@
+{
+  "info": {
+    "name": "RightTouch - Scheduling (Admin)",
+    "description": "Admin/Owner scheduling operations: dispatch health, booking inspection, broadcast audit, base-location review, and customer no-show compensation review.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "00 - Setup & Auth",
+      "item": [
+        {
+          "name": "Admin - Owner Password Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Admin authenticated\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "const token = (j.result && j.result.token) || j.token;",
+                  "if (token) pm.collectionVariables.set('adminToken', token);",
+                  "pm.test('Admin token captured', function () { pm.expect(pm.collectionVariables.get('adminToken')).to.be.a('string').and.not.empty; });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/login/owner",
+            "description": "Admin/Owner password login. Stores adminToken.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifier\": \"{{ownerIdentifier}}\",\n  \"password\": \"{{ownerPassword}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "01 - Dispatch & Booking Ops",
+      "item": [
+        {
+          "name": "Admin - Dispatch Queue Stats",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Dispatch stats fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/dispatch/stats",
+            "description": "Dispatch and booking outbox counts, retry distribution, delivery metrics."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Dispatch Health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Dispatch health fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/dispatch/health",
+            "description": "Redis/worker reachability snapshot."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Failed Dispatch Rows",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Failed rows fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); const items = j.result || [];",
+                  "if (items.length) pm.collectionVariables.set('dispatchId', String(items[0]._id || ''));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/dispatch/failed?page=1&limit=25",
+            "description": "Failed dispatch rows. Captures the first dispatchId for retry."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Pending Dispatch Rows",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Pending rows fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/dispatch/pending?status=pending",
+            "description": "Pending/inflight rows; status=all returns both."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Retry Dispatch Row",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Dispatch row requeued\", function () { pm.expect([\n  200,\n  409\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/dispatch/{{dispatchId}}/retry",
+            "description": "Requeues one failed/pending row. Returns 409 when a live duplicate exists."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - List All Bookings",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Admin bookings fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); const bookings = (j.result && j.result.bookings) || [];",
+                  "if (bookings.length) pm.collectionVariables.set('bookingId', String(bookings[0]._id || ''));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/getAllBookings?limit=50",
+            "description": "Admin/Owner booking list. Captures the first bookingId."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Get Booking By Id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Booking detail fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/getBookingById/{{bookingId}}",
+            "description": "Full booking detail including slot, execution, no-show, and compensation fields."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Broadcast Audit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Broadcast audit fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/zone-geofence/jobs/{{bookingId}}/broadcast-audit",
+            "description": "Broadcast offers, versions, expiry, and responses for one booking."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Missing Technician Base Locations",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Missing base locations fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/technician/admin/service-base-location/missing?page=1&limit=50",
+            "description": "Approved technicians missing/unverified service base location."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Get Technician Base Location",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Technician base location fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/technician/admin/technicians/{{technicianId}}/service-base-location",
+            "description": "Read one technician's scheduled-matching origin."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Set Technician Base Location",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Technician base location saved\", function () { pm.expect([\n  200,\n  201\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/technician/admin/technicians/{{technicianId}}/service-base-location",
+            "description": "Set/verify a technician's base location. force=true overrides the approved-district restriction.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"verified\": true,\n  \"force\": false,\n  \"reason\": \"Postman scheduling check\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Zone Health Dashboard",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Zone health fetched\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/zone-geofence/zone-health-dashboard",
+            "description": "Zone and supply health used when scheduled slots are under-supplied."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "02 - No-Show Compensation",
+      "item": [
+        {
+          "name": "Admin - Approve No-Show Compensation",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Compensation approved\", function () { pm.expect([\n  200,\n  409\n]).to.include(pm.response.code); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.compensationStatus !== undefined && r.compensationStatus !== null) pm.collectionVariables.set(\"compensationStatus\", String(r.compensationStatus)); if (r.compensationPaise !== undefined && r.compensationPaise !== null) pm.collectionVariables.set(\"compensationPaise\", String(r.compensationPaise));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/compensation",
+            "description": "Only a confirmed no-show with a recorded amount. Posts a pending manual_adjustment liability.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve\",\n  \"note\": \"Approved in Postman\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Reject No-Show Compensation",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Compensation rejected\", function () { pm.expect([\n  200,\n  409\n]).to.include(pm.response.code); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.compensationStatus !== undefined && r.compensationStatus !== null) pm.collectionVariables.set(\"compensationStatus\", String(r.compensationStatus));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/compensation",
+            "description": "Rejects a recorded/approved compensation and marks the pending ledger entry as exception.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"reject\",\n  \"note\": \"Rejected in Postman\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Mark No-Show Compensation Paid",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Compensation marked paid\", function () { pm.expect([\n  200,\n  409\n]).to.include(pm.response.code); });",
+                  "const j = pm.response.json(); const r = j.result || {};if (r.compensationStatus !== undefined && r.compensationStatus !== null) pm.collectionVariables.set(\"compensationStatus\", String(r.compensationStatus)); if (r.paidAt !== undefined && r.paidAt !== null) pm.collectionVariables.set(\"paidAt\", String(r.paidAt));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/compensation",
+            "description": "Requires approved state. Flips the manual_adjustment ledger entry from pending to posted.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"mark_paid\",\n  \"note\": \"Paid in Postman\",\n  \"providerReference\": \"UTR-POSTMAN-001\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "03 - Socket.IO Probe",
+      "item": [
+        {
+          "name": "Socket.IO - Engine.IO Handshake",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Socket.IO endpoint reachable\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/socket.io/?EIO=4&transport=polling&t={{$timestamp}}",
+            "description": "Handshake probe only. Admin dashboard events require an authenticated Socket.IO client."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "90 - Guard Checks (optional)",
+      "item": [
+        {
+          "name": "Guard - Compensation Invalid Action",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Invalid compensation action rejected\", function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/compensation",
+            "description": "Expected 400 INVALID_ACTION.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"refund\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Guard - Compensation Before Confirmation",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Unconfirmed claim rejected\", function () { pm.expect([\n  409\n]).to.include(pm.response.code); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/user/booking/{{bookingId}}/customer-no-show/compensation",
+            "description": "Expected 409 NO_SHOW_NOT_CONFIRMED when the booking has no confirmed claim.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:7372"
+    },
+    {
+      "key": "ownerIdentifier",
+      "value": "9000000000"
+    },
+    {
+      "key": "ownerPassword",
+      "value": "Owner@12345"
+    },
+    {
+      "key": "adminToken",
+      "value": "PASTE_ADMIN_JWT_HERE"
+    },
+    {
+      "key": "serviceId",
+      "value": "507f1f77bcf86cd799439066"
+    },
+    {
+      "key": "technicianId",
+      "value": "507f1f77bcf86cd799439022"
+    },
+    {
+      "key": "bookingId",
+      "value": ""
+    },
+    {
+      "key": "dispatchId",
+      "value": ""
+    },
+    {
+      "key": "latitude",
+      "value": "12.9716"
+    },
+    {
+      "key": "longitude",
+      "value": "77.5946"
+    }
+  ]
+}

@@ -1,12 +1,14 @@
 import mongoose from "mongoose";
 import JobBroadcast from "../Schemas/TechnicianBroadcast.js";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
+import TechnicianSlot from "../Schemas/TechnicianSlot.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import TechnicianKyc from "../Schemas/TechnicianKYC.js";
 import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getGpsState } from "./locationConfig.js";
 import { bookingDeadlineFilter } from "./bookingStatus.js";
+import { buildJobScheduleFields, resolveBookingJobLocation } from "./jobPayload.js";
 
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
@@ -78,15 +80,43 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     if (!broadcasts.length) return [];
 
+    const now = new Date();
+    const activeSlots = await TechnicianSlot.find({
+        technicianId: techId,
+        active: true,
+        slotEndAt: { $gt: now },
+    }).select("slotKey slotStartAt slotEndAt role bookingId").lean();
+    const committedSlotKeys = new Set(activeSlots.map((slot) => String(slot.slotKey)));
+    const currentSlot = activeSlots.find(
+        (slot) => new Date(slot.slotStartAt) <= now && new Date(slot.slotEndAt) > now
+    );
+    const backupBookingIds = new Set(
+        activeSlots
+            .filter((slot) => slot.role === "backup" && slot.bookingId)
+            .map((slot) => String(slot.bookingId))
+    );
+
     const bookingIds = broadcasts.map(b => b.bookingId);
 
     // 5. Query candidate unassigned bookings
     const bookings = await ServiceBooking.find({
         _id: { $in: bookingIds },
-        status: { $in: ["pending", "broadcasted"] },
-        technicianId: null,
-        dispatchEligibleAt: { $not: { $gt: new Date() } },
-        ...bookingDeadlineFilter(),
+        $and: [
+            {
+                $or: [
+                    {
+                        status: { $in: ["pending", "broadcasted"] },
+                        technicianId: null,
+                        dispatchEligibleAt: { $not: { $gt: new Date() } },
+                    },
+                    {
+                        _id: { $in: [...backupBookingIds].map((id) => new mongoose.Types.ObjectId(id)) },
+                        status: { $in: ["accepted", "on_the_way", "reached", "in_progress"] },
+                    },
+                ],
+            },
+            bookingDeadlineFilter(),
+        ],
     })
         .populate([
             { path: "serviceId", populate: { path: "categoryId" } },
@@ -100,16 +130,25 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
 
     for (const booking of bookings) {
         const bookingIdStr = String(booking._id);
+        const isBackupOffer = backupBookingIds.has(bookingIdStr);
 
         if (booking.bookingType === "schedule" &&
             technician.notificationPreferences?.scheduledOffersEnabled === false) {
             continue;
         }
 
+        if (!isBackupOffer && booking.bookingType === "schedule" && booking.slotKey &&
+            committedSlotKeys.has(String(booking.slotKey))) {
+            continue;
+        }
+        if (booking.bookingType === "instant" && currentSlot) {
+            continue;
+        }
+
         // Use unified eligibility check for fetch mode (same as broadcast)
         const eligibility = await evaluateTechnicianEligibility({
             technician,
-            booking,
+            booking: isBackupOffer ? { ...booking, technicianId: null } : booking,
             mode: "BROADCAST",
             context: { technicianKyc: kyc },
         });
@@ -132,20 +171,23 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             (booking.customerId ? `${booking.customerId.fname || ''} ${booking.customerId.lname || ''}`.trim() : "Customer");
 
         const broadcastRow = broadcasts.find(br => String(br.bookingId) === bookingIdStr);
+        const jobLocation = resolveBookingJobLocation(booking);
 
         validJobs.push({
             bookingId: booking._id,
+            ...buildJobScheduleFields(booking),
             serviceName: booking.serviceId?.serviceName || "Service",
             serviceType: booking.serviceId?.serviceType || "General",
             description: booking.serviceId?.description || "",
             duration: booking.serviceId?.duration || "Flexible",
             customerName: customerName,
-            customerMobile: booking.customerId?.mobileNumber || "",
-            address: booking.addressSnapshot?.addressLine || booking.address || "Location unavailable",
-            city: booking.addressSnapshot?.city || "",
-            pincode: booking.addressSnapshot?.pincode || "",
-            latitude: booking.location?.coordinates?.[1] || null,
-            longitude: booking.location?.coordinates?.[0] || null,
+            customerMobile: booking.customerId?.mobileNumber || jobLocation.customerMobile || "",
+            address: jobLocation.address,
+            city: jobLocation.city,
+            state: jobLocation.state,
+            pincode: jobLocation.pincode,
+            latitude: jobLocation.latitude,
+            longitude: jobLocation.longitude,
             distanceStr: distanceKm != null ? `${distanceKm} km` : null,
             distanceKm: distanceKm != null ? Number(distanceKm) : null,
             distanceMeters: distanceMeters != null ? Math.round(distanceMeters) : null,
@@ -154,12 +196,13 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             maxAllowedMeters: eligibility.details.effectiveRadiusMeters,
             technicianAmount: booking.serviceId?.technicianAmount || booking.technicianAmount || 0,
             service: booking.serviceId || null,
-            scheduledAt: booking.scheduledAt,
             faultProblem: booking.faultProblem,
             createdAt: booking.createdAt,
             broadcastedAt: booking.broadcastedAt,
             version: broadcastRow?.version || 1,
-            expiresAt: broadcastRow?.expiresAt || null
+            expiresAt: broadcastRow?.expiresAt || null,
+            isBackupOffer,
+            bookingStatus: booking.status,
         });
     }
 

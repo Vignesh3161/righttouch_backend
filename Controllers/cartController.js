@@ -19,6 +19,7 @@ import {
   resolveBookingIdempotencyKey,
   isDuplicateKeyError,
 } from "../Utils/bookingService.js";
+import { prepareScheduledBooking } from "../Services/slotCapacityService.js";
 import {
   validateScheduledAtUtc,
   validateSlot,
@@ -26,6 +27,8 @@ import {
   BUSINESS_TIMEZONE,
   formatInBusinessTimezone,
   localDateInBusinessTimezone,
+  generateScheduleDays,
+  generateTimeSlots,
 } from "../Utils/slots.js";
 
 
@@ -527,60 +530,32 @@ const parseTimeString = (timeInput) => {
  */
 export const getCartScheduleSlots = async (req, res) => {
     try {
-        const now = new Date();
+        const days = generateScheduleDays();
+        const timeSlots = generateTimeSlots().map((slot) => ({
+            timeSlot: slot.label,
+            startTime: slot.value,
+            endTime: slot.endTime,
+            label: slot.label,
+        }));
 
-        const allowedDates = [];
-        for (let i = 1; i <= 2; i++) {
-            const d = new Date(now);
-            d.setDate(d.getDate() + i);
-            const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-            const month = d.toLocaleDateString("en-US", { month: "short" });
-            const fullDate = d.toISOString().split("T")[0];
-
-            allowedDates.push({
-                label: i === 1 ? "Tomorrow" : "Day after Tomorrow",
-                date: d.getDate(),
-                month,
-                dayName,
-                bookingDate: fullDate,
-            });
-        }
-
-        const timeSlots = [];
-        const startHour = 9;
-        const endHour = 20;
-
-        for (let h = startHour; h <= endHour; h++) {
-            const nextH = h + 1;
-
-            const formatHour = (hour) => {
-                const period = hour < 12 || hour === 24 ? "AM" : "PM";
-                const display = hour % 12 === 0 ? 12 : hour % 12;
-                return `${display < 10 ? "0" + display : display}:00 ${period}`;
-            };
-
-            const startLabel = formatHour(h);
-            const endLabel = formatHour(nextH);
-            const slotRange = `${startLabel} - ${endLabel}`;
-            const militaryTime = `${h < 10 ? "0" + h : h}:00`;
-
-            timeSlots.push({
-                timeSlot: slotRange,
-                startTime: militaryTime,
-                label: slotRange
-            });
-        }
+        const allowedDates = days.map((day) => ({
+            label: day.label,
+            date: day.date,
+            month: day.month,
+            dayName: day.dayName,
+            bookingDate: day.fullDate,
+        }));
 
         return res.status(200).json({
             success: true,
-            message: "Cart schedule slots retrieved successfully (Tomorrow and Day After Tomorrow only)",
+            message: "Cart schedule slots retrieved successfully (next five days)",
             result: {
                 allowedDates,
                 timeSlots,
                 samplePayloadFormat: {
                     itemId: "SAMPLE_ITEM_ID",
-                    bookingDate: allowedDates[0].bookingDate,
-                    timeSlot: timeSlots[0].timeSlot,
+                    bookingDate: allowedDates[0]?.bookingDate,
+                    timeSlot: timeSlots[0]?.label,
                     faultProblem: "Optional description of issue"
                 }
             }
@@ -790,6 +765,7 @@ export const checkout = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     const checkoutKeys = [];
+    let preparedBookings = [];
 
     try {
         ensureCustomer(req);
@@ -1057,6 +1033,30 @@ export const checkout = async (req, res) => {
             });
         }
 
+        // A client that asks for a scheduled checkout must have selected a
+        // valid per-item schedule first. Without this guard the request would
+        // silently create an instant booking (the bug surfaced on mobile).
+        const requestedBookingType = String(req.body?.bookingType || "").toLowerCase();
+        const requestedSchedule =
+            requestedBookingType === "schedule" ||
+            requestedBookingType === "scheduled" ||
+            (!requestedBookingType &&
+                Boolean(req.body?.scheduledDate || req.body?.scheduledTime || scheduledAt));
+        if (requestedSchedule) {
+            const hasItemSchedule = validServiceItems.some(
+                (item) => Boolean(item.scheduledAt || (item.scheduledDate && item.scheduledTime))
+            );
+            if (!hasItemSchedule) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    code: "SCHEDULE_SELECTION_REQUIRED",
+                    message: "Select a valid date and time for this service before scheduling checkout.",
+                    result: {},
+                });
+            }
+        }
+
         for (const cartItem of validServiceItems) {
             checkoutKeys.push(
                 resolveBookingIdempotencyKey({
@@ -1111,6 +1111,9 @@ export const checkout = async (req, res) => {
         };
 
         const serviceBroadcastTasks = [];
+        const scheduledSlotKeys = new Map();
+        preparedBookings = [];
+        const cartGroupId = `cart_${customerId}_${Date.now()}`;
 
         // Create Service Bookings
         for (let index = 0; index < validServiceItems.length; index += 1) {
@@ -1151,7 +1154,18 @@ export const checkout = async (req, res) => {
             } else if (cartItem.scheduledAt) {
                 const check = validateScheduledAtUtc(new Date(cartItem.scheduledAt), { now });
                 schedule = check.valid
-                    ? { bookingType: "schedule", scheduledAt: check.scheduledAt, timezone: check.timezone, scheduledDateLocal: check.scheduledDateLocal, scheduledTimeLocal: check.scheduledTimeLocal }
+                    ? {
+                        bookingType: "schedule",
+                        scheduledAt: check.normalizedScheduledAt || check.scheduledAt,
+                        slotKey: check.slot?.slotKey || null,
+                        slotValue: check.slot?.slotValue || null,
+                        slotLabel: check.slot?.slotLabel || null,
+                        slotStartAt: check.slot?.slotStartAt || null,
+                        slotEndAt: check.slot?.slotEndAt || null,
+                        timezone: check.timezone,
+                        scheduledDateLocal: check.scheduledDateLocal,
+                        scheduledTimeLocal: check.scheduledTimeLocal,
+                    }
                     : { bookingType: "schedule", error: check.error };
             } else {
                 schedule = { bookingType: "instant", scheduledAt: null, timezone: null, scheduledDateLocal: null, scheduledTimeLocal: null };
@@ -1164,6 +1178,19 @@ export const checkout = async (req, res) => {
                     message: schedule.error,
                     result: {},
                 });
+            }
+
+            if (schedule.bookingType === "schedule" && schedule.slotKey) {
+                if (scheduledSlotKeys.has(schedule.slotKey)) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        success: false,
+                        code: "MULTI_ITEM_SAME_SLOT_NOT_SUPPORTED",
+                        message: "Multiple cart services cannot be booked into the same slot yet. Please choose different slots.",
+                        result: { slotKey: schedule.slotKey },
+                    });
+                }
+                scheduledSlotKeys.set(schedule.slotKey, cartItem._id || cartItem.itemId);
             }
 
             // 💰 SERVER-SIDE SPLIT — canonical financial snapshot per cart item.
@@ -1204,8 +1231,23 @@ export const checkout = async (req, res) => {
             }
 
             doc.idempotencyKey = idempotencyKey;
+            doc.cartGroupId = cartGroupId;
 
-            const { booking } = await createBookingAndOutbox({ doc, session });
+            let booking;
+            if (doc.bookingType === "schedule") {
+                const prepared = await prepareScheduledBooking({
+                    doc,
+                    session,
+                    latitude: resolvedLocation.latitude,
+                    longitude: resolvedLocation.longitude,
+                    cartGroupId,
+                });
+                preparedBookings.push(prepared);
+                booking = prepared.booking;
+            } else {
+                const created = await createBookingAndOutbox({ doc, session });
+                booking = created.booking;
+            }
 
             // Always broadcast immediately for both Instant and Scheduled in new flow
             serviceBroadcastTasks.push({ bookingId: booking._id });
@@ -1239,7 +1281,10 @@ export const checkout = async (req, res) => {
             })();
         }
 
-        const responseMessage = "Service booking confirmed successfully";
+        const hasScheduled = bookingResults.serviceBookings.length > 0 && preparedBookings.length > 0;
+        const responseMessage = hasScheduled
+            ? "Booking placed. Scheduled services are awaiting technician confirmation."
+            : "Service booking confirmed successfully";
 
         const firstId = bookingResults.serviceBookings?.[0]?.bookingId;
 
@@ -1256,6 +1301,9 @@ export const checkout = async (req, res) => {
         });
     } catch (error) {
         await session.abortTransaction();
+        for (const prepared of preparedBookings || []) {
+            if (prepared?.releaseCapacity) await prepared.releaseCapacity();
+        }
         console.error("Checkout error:", error);
 
         if (isDuplicateKeyError(error) && checkoutKeys.length > 0) {

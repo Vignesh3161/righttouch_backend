@@ -48,6 +48,32 @@ export const parseOfflineRupees = (amount) => {
   }
   return paise;
 };
+
+export const OFFLINE_PAYMENT_MODES = [
+  "cash",
+  "bank_transfer",
+  "upi_direct",
+  "cheque",
+  "card",
+  "other",
+  "offline",
+];
+
+export const normalizeOfflinePaymentMode = (paymentMode) => {
+  const raw = String(paymentMode || "cash").trim().toLowerCase();
+  const aliases = {
+    upi: "upi_direct",
+    bank: "bank_transfer",
+    banktransfer: "bank_transfer",
+    pos: "card",
+    pos_card: "card",
+    debit_card: "card",
+    credit_card: "card",
+  };
+  const mode = aliases[raw] || raw;
+  return OFFLINE_PAYMENT_MODES.includes(mode) ? mode : null;
+};
+
 import {
   markPaymentSucceeded,
   markPaymentFailed,
@@ -176,7 +202,11 @@ const notifyPaymentSucceeded = async (req, payment) => {
         title: "Payment Successful",
         message: bodyText,
         bookingId: payment.bookingId,
-        metadata: { socketEvent: "payment_success", stage: "payment_success" },
+        metadata: {
+          socketEvent: "payment_success",
+          stage: "payment_success",
+          ...(payment.itemType === "product" ? { route: "/quotations?tab=3" } : {}),
+        },
         priority: "high",
         category: "payment",
         io,
@@ -1187,8 +1217,8 @@ export const retryPaymentSettlement = async (req, res) => {
 
 /* =====================================================
    7️⃣ RECORD ADMIN OFFLINE PAYMENT  (Admin/Owner)
-   Supports Cash, Bank Transfer, UPI Direct, Cheque, and
-   other manual payment modes for product & service bookings.
+   Product bookings only. Admin offline recording always settles the full
+   remaining balance; partial product payments are not supported.
 ===================================================== */
 
 export const recordAdminOfflinePayment = async (req, res) => {
@@ -1200,6 +1230,7 @@ export const recordAdminOfflinePayment = async (req, res) => {
       paymentMode = "cash",
       transactionReference = null,
       notes = "",
+      note = "",
       amount = null,
       receivedAt = null,
     } = req.body;
@@ -1208,37 +1239,27 @@ export const recordAdminOfflinePayment = async (req, res) => {
       return fail(res, 400, "Valid bookingId is required");
     }
 
-    const validModes = ["cash", "bank_transfer", "upi_direct", "cheque", "other", "offline"];
-    const modeLower = String(paymentMode).toLowerCase();
-    if (!validModes.includes(modeLower)) {
-      return fail(res, 400, `Invalid paymentMode. Must be one of: ${validModes.join(", ")}`);
+    const modeLower = normalizeOfflinePaymentMode(paymentMode);
+    if (!modeLower) {
+      return fail(res, 400, `Invalid paymentMode. Must be one of: ${OFFLINE_PAYMENT_MODES.join(", ")}`);
     }
 
-    let booking = await ProductBooking.findById(bookingId);
-    let itemType = "product";
+    const resolvedNotes = String(notes || note || "").trim();
+    const booking = await ProductBooking.findById(bookingId);
 
     if (!booking) {
-      booking = await ServiceBooking.findById(bookingId);
-      itemType = "service";
-    }
-
-    if (!booking) {
+      const serviceBooking = await ServiceBooking.findById(bookingId).select("_id").lean();
+      if (serviceBooking) {
+        return fail(res, 400, "Admin offline payments are available for product bookings only", {
+          code: "PRODUCT_PAYMENT_ONLY",
+        });
+      }
       return fail(res, 404, "Booking not found. Accept the product quotation to create a booking before recording payment.", {
         code: "PRODUCT_BOOKING_REQUIRED",
       });
     }
 
-    // Service completion uses the pay-before-OTP flow. Admin offline
-    // recording is only a legacy/post-completion fallback; it cannot satisfy
-    // the completion payment gate and is rejected before completion.
-    if (itemType === "service" && normalizeBookingStatus(booking.status) !== "completed") {
-      return fail(
-        res,
-        400,
-        `Payment allowed only after service completion (current status: ${booking.status})`
-      );
-    }
-    if (itemType === "product" && booking.status !== "active") {
+    if (booking.status !== "active") {
       return fail(res, 400, `Payment is not available for a ${booking.status} product booking`, {
         code: "PRODUCT_BOOKING_NOT_PAYABLE",
       });
@@ -1256,20 +1277,10 @@ export const recordAdminOfflinePayment = async (req, res) => {
       });
     }
 
-    // Determine target amount in paise.
-    // C6: explicit `amount` is RUPEES → rupeesToPaise exactly once. Snapshot
-    // fields are already paise → toPaise. An explicitly supplied amount is
-    // never silently ignored: invalid values fail closed with 400.
-    let targetPaise = 0;
-    if (amount != null && !(typeof amount === "string" && amount.trim() === "")) {
-      try {
-        targetPaise = parseOfflineRupees(amount);
-      } catch (e) {
-        return fail(res, e.statusCode || 400, e.message);
-      }
-    } else if (booking.financialSnapshot?.totalAmountPaise > 0) {
-      targetPaise = toPaise(booking.financialSnapshot.totalAmountPaise);
-    } else {
+    // Resolve the authoritative full balance from the booking snapshot. The
+    // explicit `amount` is in rupees and may only confirm that full balance.
+    let expectedPaise = toPaise(booking.financialSnapshot?.totalAmountPaise);
+    if (expectedPaise <= 0) {
       const rupees = toMoney(
         booking.totalAmount ??
         booking.amount ??
@@ -1281,15 +1292,34 @@ export const recordAdminOfflinePayment = async (req, res) => {
         if (rupees > MAX_OFFLINE_AMOUNT_RUPEES) {
           return fail(res, 400, `Invalid booking amount: exceeds maximum of ₹${MAX_OFFLINE_AMOUNT_RUPEES}`);
         }
-        targetPaise = rupeesToPaise(rupees);
+        expectedPaise = rupeesToPaise(rupees);
       }
     }
 
-    if (targetPaise <= 0) {
+    const alreadyPaidPaise = Math.max(0, Math.round(Number(booking.paidAmountPaise || 0)));
+    expectedPaise = Math.max(0, expectedPaise - alreadyPaidPaise);
+
+    if (expectedPaise <= 0) {
       return fail(res, 400, "Booking has no valid payable amount");
     }
 
-    // Auto-populate snapshot if missing
+    if (amount != null && !(typeof amount === "string" && amount.trim() === "")) {
+      let requestedPaise = 0;
+      try {
+        requestedPaise = parseOfflineRupees(amount);
+      } catch (e) {
+        return fail(res, e.statusCode || 400, e.message);
+      }
+      if (requestedPaise !== expectedPaise) {
+        return fail(res, 400, "Product payments must settle the full remaining balance", {
+          code: "PRODUCT_FULL_PAYMENT_REQUIRED",
+          amountPaise: expectedPaise,
+          amount: expectedPaise / 100,
+        });
+      }
+    }
+
+    const targetPaise = expectedPaise;
     let snapshot = booking.financialSnapshot;
     if (!snapshot || !snapshot.totalAmountPaise) {
       snapshot = {
@@ -1318,7 +1348,7 @@ export const recordAdminOfflinePayment = async (req, res) => {
     if (!payment) {
       payment = await Payment.create({
         bookingId: booking._id,
-        itemType,
+        itemType: "product",
         provider: "offline",
         mode: modeLower,
         currency: "INR",
@@ -1339,7 +1369,7 @@ export const recordAdminOfflinePayment = async (req, res) => {
           transactionReference: refId,
           receivedAt: receivedAt ? new Date(receivedAt) : new Date(),
           recordedBy: req.user.userId,
-          notes: notes || `Admin recorded offline payment (${modeLower})`,
+          notes: resolvedNotes || `Admin recorded offline payment (${modeLower})`,
         },
       });
     } else {
@@ -1350,7 +1380,7 @@ export const recordAdminOfflinePayment = async (req, res) => {
         transactionReference: refId,
         receivedAt: receivedAt ? new Date(receivedAt) : new Date(),
         recordedBy: req.user.userId,
-        notes: notes || `Admin recorded offline payment (${modeLower})`,
+        notes: resolvedNotes || `Admin recorded offline payment (${modeLower})`,
       };
       await payment.save();
     }
@@ -1360,7 +1390,7 @@ export const recordAdminOfflinePayment = async (req, res) => {
       providerPaymentId: refId,
       source: "admin_offline",
       actor,
-      reason: notes || `Admin recorded payment via ${modeLower.toUpperCase()}`,
+      reason: resolvedNotes || `Admin recorded payment via ${modeLower.toUpperCase()}`,
     });
 
     if (transition.manualReview) {
@@ -1379,33 +1409,31 @@ export const recordAdminOfflinePayment = async (req, res) => {
       targetId: payment._id,
       after: {
         bookingId: booking._id,
-        itemType,
+        itemType: "product",
         paymentMode: modeLower,
         amount: targetPaise / 100,
         transactionReference: refId,
       },
-      reason: notes || `Recorded ${modeLower} payment`,
+      reason: resolvedNotes || `Recorded ${modeLower} payment`,
     });
 
     await notifyPaymentSucceeded(req, payment);
 
-    if (itemType === "product") {
-      emitProductBookingChanged({
-        action: "paid",
-        bookingId: booking._id,
-        quotationId: booking.quotationId,
-        requestId: booking.quoteRequestId,
-        status: booking.status,
-        paymentStatus: "paid",
-        paymentMode: modeLower,
-        totalAmountPaise: targetPaise,
-      });
-    }
+    emitProductBookingChanged({
+      action: "paid",
+      bookingId: booking._id,
+      quotationId: booking.quotationId,
+      requestId: booking.quoteRequestId,
+      status: booking.status,
+      paymentStatus: "paid",
+      paymentMode: modeLower,
+      totalAmountPaise: targetPaise,
+    });
 
     return ok(res, 200, `Offline payment recorded successfully via ${modeLower.toUpperCase()}`, {
       paymentId: payment._id,
       bookingId: booking._id,
-      itemType,
+      itemType: "product",
       paymentMode: modeLower,
       transactionReference: refId,
       amount: targetPaise / 100,

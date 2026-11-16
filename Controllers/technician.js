@@ -1581,6 +1581,7 @@ export const getMyTechnician = async (req, res) => {
 /* ================= UPDATE TECHNICIAN ================= */
 export const updateTechnician = async (req, res) => {
   const session = await mongoose.startSession();
+  let availabilityAudit = null;
   try {
     const {
       user: userData,
@@ -1603,6 +1604,22 @@ export const updateTechnician = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized", result: {} });
     }
 
+    const locationInput = req.body?.location;
+    const latitudeInput = req.body?.latitude ?? locationInput?.latitude;
+    const longitudeInput = req.body?.longitude ?? locationInput?.longitude;
+    const hasGpsInput = latitudeInput !== undefined || longitudeInput !== undefined;
+    const gpsCoords = hasGpsInput
+      ? normalizeCoordinates(latitudeInput, longitudeInput)
+      : null;
+    if (hasGpsInput && !gpsCoords.valid) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_COORDINATES",
+        message: "Invalid coordinates",
+        result: {},
+      });
+    }
+
     if (experienceYears !== undefined && experienceYears > 15) {
       return res.status(400).json({ success: false, message: "Experience cannot exceed 15 years", result: {} });
     }
@@ -1621,6 +1638,23 @@ export const updateTechnician = async (req, res) => {
     if (!technician) {
       return res.status(404).json({ success: false, message: "Technician not found", result: {} });
     }
+    technician.availability = technician.availability || {};
+
+    const beforeAvailability = {
+      isOnline: technician.availability.isOnline === true,
+      offlineReason: technician.availability.offlineReason || null,
+      offlineAt: technician.availability.offlineAt || null,
+    };
+    const beforeLocation = {
+      latitude: technician.location?.coordinates?.[1] ?? null,
+      longitude: technician.location?.coordinates?.[0] ?? null,
+      locationUpdatedAt: technician.locationUpdatedAt || null,
+    };
+    availabilityAudit = {
+      beforeAvailability,
+      beforeLocation,
+      requestedOnline: availability?.isOnline === true,
+    };
 
     if (skills !== undefined && Array.isArray(skills) && skills.length > 0) {
       const skillServiceIds = skills.map((s) => new mongoose.Types.ObjectId(s.serviceId));
@@ -1648,6 +1682,16 @@ export const updateTechnician = async (req, res) => {
       if (specialization !== undefined) technician.specialization = specialization;
       if (skills !== undefined) technician.skills = skills;
 
+      // GPS supplied with the availability toggle is persisted atomically so
+      // the freshness gate below cannot race a separate /location request.
+      if (gpsCoords?.valid) {
+        technician.location = {
+          type: "Point",
+          coordinates: [gpsCoords.longitude, gpsCoords.latitude],
+        };
+        technician.locationUpdatedAt = new Date();
+      }
+
       // 2. Handle Online Status & Verification Logic
       // Training/work approval is Admin/Owner-only; self-update payloads that
       // include these fields are ignored rather than applied.
@@ -1673,9 +1717,12 @@ export const updateTechnician = async (req, res) => {
           }
 
           if (pendingRequirements.length > 0) {
-            throw new Error(
+            const error = new Error(
               `Cannot set online true. First complete: ${pendingRequirements.join(", ")}`
             );
+            error.code = "ONLINE_REQUIREMENTS_PENDING";
+            error.details = { pendingRequirements };
+            throw error;
           }
 
           if (technician.availability.isOnline !== true) {
@@ -1697,6 +1744,9 @@ export const updateTechnician = async (req, res) => {
         if (availability.isOnline) {
           technician.availability.offlineReason = null;
           technician.availability.offlineAt = null;
+        } else {
+          technician.availability.offlineReason = "manual";
+          technician.availability.offlineAt = new Date();
         }
       }
 
@@ -1737,6 +1787,35 @@ export const updateTechnician = async (req, res) => {
 
       await technician.save({ session });
     });
+
+    const availabilityChanged =
+      availability?.isOnline !== undefined &&
+      beforeAvailability.isOnline !== Boolean(availability.isOnline);
+    const afterGps = getGpsState(technician, "BROADCAST");
+    if (availabilityChanged) {
+      await writeAuditLog({
+        actor: userId,
+        actorRole: req.user?.role || "Technician",
+        action: availability.isOnline ? "TECHNICIAN_WENT_ONLINE" : "TECHNICIAN_WENT_OFFLINE",
+        targetType: "TechnicianProfile",
+        targetId: technicianProfileId,
+        before: beforeAvailability,
+        after: {
+          isOnline: technician.availability.isOnline === true,
+          offlineReason: technician.availability.offlineReason || null,
+          offlineAt: technician.availability.offlineAt || null,
+        },
+        reason: typeof req.body?.reason === "string" ? req.body.reason : null,
+        metadata: {
+          source: req.body?.source || "technician_app",
+          latitude: technician.location?.coordinates?.[1] ?? null,
+          longitude: technician.location?.coordinates?.[0] ?? null,
+          locationUpdatedAt: technician.locationUpdatedAt || null,
+          gps: afterGps,
+          coordinatesSupplied: Boolean(gpsCoords?.valid),
+        },
+      });
+    }
 
     // 5. Proactive Broadcast if technician went online; remove from GEO if offline
     let broadcastResult = null;
@@ -1820,11 +1899,33 @@ export const updateTechnician = async (req, res) => {
       message: "Technician profile updated successfully",
       result: updatedProfile,
       broadcast: broadcastResult,
+      gps: afterGps,
     });
 
   } catch (error) {
     if (res.headersSent) return;
     console.error("Update technician error:", error);
+    if (
+      availabilityAudit?.requestedOnline &&
+      ["GPS_REQUIRED", "GPS_STALE", "ONLINE_REQUIREMENTS_PENDING"].includes(error.code)
+    ) {
+      await writeAuditLog({
+        actor: req.user?.userId || null,
+        actorRole: req.user?.role || "Technician",
+        action: "TECHNICIAN_ONLINE_BLOCKED",
+        targetType: "TechnicianProfile",
+        targetId: req.user?.technicianProfileId || null,
+        before: availabilityAudit.beforeAvailability,
+        after: availabilityAudit.beforeAvailability,
+        reason: error.message,
+        metadata: {
+          code: error.code,
+          source: req.body?.source || "technician_app",
+          gps: error.details || null,
+          location: availabilityAudit.beforeLocation,
+        },
+      });
+    }
     return res.status(error.statusCode || 400).json({
       success: false,
       code: error.code,
@@ -1913,6 +2014,22 @@ export const updateTechnicianStatus = async (req, res) => {
     }
 
     await technician.save();
+
+    if (
+      workStatus === "suspended" ||
+      workStatus === "deleted" ||
+      trainingCompleted === false
+    ) {
+      const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+      await releaseFutureScheduledSlotsForTechnician({
+        technicianId,
+        reason: `work_status:${workStatus || "training_revoked"}`,
+        actor: req.user?.userId,
+        io: req.io,
+      }).catch((releaseErr) =>
+        console.error("Scheduled slot release after status change failed:", releaseErr.message)
+      );
+    }
 
     // 🔐 Session invalidation (Socket Analysis B1.5): a suspended/deleted
     // technician's connected sockets must be revoked NOW — their JWT claims
@@ -2030,6 +2147,17 @@ export const deleteTechnician = async (req, res) => {
     await technician.deleteOne({ session });
 
     await session.commitTransaction();
+
+    const { releaseFutureScheduledSlotsForTechnician } = await import("../Services/technicianSlotService.js");
+    await releaseFutureScheduledSlotsForTechnician({
+      technicianId: id,
+      reason: "technician_deleted",
+      actor: req.user?.userId,
+      io: req.io,
+    }).catch((releaseErr) =>
+      console.error("Scheduled slot release after delete failed:", releaseErr.message)
+    );
+
     console.log(`🗑️ Deleted technician ${id} (Profile: Hard, User: Soft/Anonymized)`);
 
     return res.status(200).json({

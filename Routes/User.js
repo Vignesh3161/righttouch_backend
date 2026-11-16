@@ -87,7 +87,9 @@ import {
   getCompletedServices,
   rebookService,
   getCompletionStatus,
+  respondToCustomerNoShow,
 } from "../Controllers/serviceBookController.js";
+import { reviewCustomerNoShowCompensation } from "../Controllers/customerNoShowAdminController.js";
 
 
 import {
@@ -306,7 +308,11 @@ router.delete("/service/:id/polygon", Auth, removeServicePolygon);
 
 /* ================= SERVICE BOOKING ================= */
 router.get("/service/booking", Auth, getBookings);
-router.get("/booking/slots", getBookingSchedule);
+const optionalAuth = (req, res, next) => {
+  if (!req.headers.authorization) return next();
+  return Auth(req, res, next);
+};
+router.get("/booking/slots", optionalAuth, getBookingSchedule);
 router.post("/booking/schedule", Auth, storeBookingSchedule);
 router.put("/booking/reschedule/:id", Auth, rescheduleBooking);
 router.put("/booking/cancel/:id", Auth, cancelBooking);
@@ -314,9 +320,11 @@ router.get("/booking/reasons", Auth, getCancellationReasons);
 router.get("/booking/getCustomerBookings", Auth, getCustomerBookings);
 // Safe completion-verification status only (no OTP/hash/phone ever).
 router.get("/booking/:id/completion-status", Auth, getCompletionStatus);
+router.post("/booking/:id/customer-no-show/respond", Auth, respondToCustomerNoShow);
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
 router.delete("/booking/:id", Auth, deleteServiceBooking);
 router.delete("/booking/admin/:id", Auth, authorizeRoles("Admin", "Owner"), deleteBookingAsAdmin);
+router.put("/booking/:id/customer-no-show/compensation", Auth, authorizeRoles("Admin", "Owner"), reviewCustomerNoShowCompensation);
 
 /* ================= BOOK AGAIN ================= */
 router.get("/booking/completed-services", Auth, getCompletedServices);

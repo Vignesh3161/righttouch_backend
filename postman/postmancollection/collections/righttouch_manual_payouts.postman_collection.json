@@ -1,0 +1,1634 @@
+{
+	"info": {
+		"_postman_id": "c4a7e2b1-9d3f-4a6c-8e5b-7f1d2c3a4b5e",
+		"name": "RightTouch - Manual Payouts (Admin & Technician)",
+		"description": "Focused cross-role collection for RightTouch manual payouts.\n\nFLOW\n- Technician request reserves the balance and emits withdrawal:requested to admin_dashboard.\n- Admin reviews, approves, transfers offline, then records UTR via mark-paid.\n- Admin direct payouts below the dual-approval threshold are created approved; at/above the threshold a different admin must approve.\n- Automatic payout execution is permanently disabled (AUTO_PAYOUT_EXECUTION_ENABLED=false).\n\nSETUP\n- Set technicianMobile/adminMobile/secondAdminMobile/ownerMobile and passwords in the environment.\n- Run folder 00 first; tokens and technicianId/withdrawalId are captured automatically.\n- Use a unique UTR per payout. The default utr value is a sample only.\n\nDOCS\n- postman/postmancollection/docs/05-manual-payouts.md\n- postman/postmancollection/docs/02-socket-notifications.md",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:5000"
+		}
+	],
+	"item": [
+		{
+			"name": "00 - Setup & Auth",
+			"description": "Run these first. Technician OTP login captures technicianToken and technicianId; admin, owner, and second-admin password logins capture the tokens used by later folders.",
+			"item": [
+				{
+					"name": "Technician - Request Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"OTP requested\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{technicianMobile}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/login/technician",
+						"description": "Requests a technician login OTP. Put the SMS OTP into technicianLoginOtp."
+					},
+					"response": []
+				},
+				{
+					"name": "Technician - Verify Login OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Success status\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const token = body?.result?.token || body?.result?.accessToken || body?.token || body?.data?.token;",
+									"pm.test(\"Token returned\", function () { pm.expect(token).to.be.a(\"string\").and.not.empty; });",
+									"if (token) pm.environment.set(\"technicianToken\", token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{technicianMobile}}\",\n  \"otp\": \"{{technicianLoginOtp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/login/technician/verify-otp",
+						"description": "Verifies the OTP and stores the bearer token in technicianToken."
+					},
+					"response": []
+				},
+				{
+					"name": "Technician - My Profile",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Profile loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const tech = body?.result?.technician || body?.result || body?.technician || body?.data || {};",
+									"const id = tech?._id || tech?.technicianId || body?.result?._id;",
+									"if (id) pm.environment.set(\"technicianId\", String(id));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/technician/me",
+						"description": "Captures technicianId for admin send-money, freeze, and wallet-overview requests."
+					},
+					"response": []
+				},
+				{
+					"name": "Admin - Password Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Success status\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const token = body?.result?.token || body?.result?.accessToken || body?.token || body?.data?.token;",
+									"pm.test(\"Token returned\", function () { pm.expect(token).to.be.a(\"string\").and.not.empty; });",
+									"if (token) pm.environment.set(\"adminToken\", token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{adminMobile}}\",\n  \"password\": \"{{adminPassword}}\",\n  \"role\": \"{{adminRole}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login",
+						"description": "Admin login. Stores adminToken."
+					},
+					"response": []
+				},
+				{
+					"name": "Owner - Password Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Success status\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const token = body?.result?.token || body?.result?.accessToken || body?.token || body?.data?.token;",
+									"pm.test(\"Token returned\", function () { pm.expect(token).to.be.a(\"string\").and.not.empty; });",
+									"if (token) pm.environment.set(\"ownerToken\", token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{ownerMobile}}\",\n  \"password\": \"{{ownerPassword}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login/owner",
+						"description": "Owner login for revert-paid only. Stores ownerToken."
+					},
+					"response": []
+				},
+				{
+					"name": "Second Admin - Password Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Success status\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const token = body?.result?.token || body?.result?.accessToken || body?.token || body?.data?.token;",
+									"pm.test(\"Token returned\", function () { pm.expect(token).to.be.a(\"string\").and.not.empty; });",
+									"if (token) pm.environment.set(\"secondAdminToken\", token);"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"identifier\": \"{{secondAdminMobile}}\",\n  \"password\": \"{{secondAdminPassword}}\",\n  \"role\": \"{{secondAdminRole}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/user/login",
+						"description": "Second admin login for high-value dual-approval payouts. The approver must differ from the initiating admin."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "01 - Payout Configuration",
+			"description": "Global payout limits, dual-approval threshold, and legacy auto-payout monitoring. Automatic execution is permanently disabled.",
+			"item": [
+				{
+					"name": "Get Admin Wallet Summary",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Not a 5xx\", function () { pm.response.code.to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet",
+						"description": "Wallet summary including manual payout counts/amounts, pending approvals, and bank-run SLA."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Payout Settings",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Settings loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Max withdrawal exposed\", function () { pm.expect(body?.result?.maxWithdrawalAmountPaise).to.be.a(\"number\"); });",
+									"pm.test(\"Auto execution disabled\", function () { pm.expect(body?.result?.autoPayoutExecutionEnabled).to.eql(false); });",
+									"pm.test(\"Deprecated auto fields listed\", function () { pm.expect(body?.result?.deprecatedAutoPayoutFields).to.be.an(\"array\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/settings/auto-payout",
+						"description": "Returns the effective GlobalSetting payout config. Min/max withdrawal, cooldown, and dual-approval threshold are used by manual payouts; auto-payout execution is always false."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Payout Settings",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Settings updated\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Max persisted\", function () { pm.expect(body?.result?.maxWithdrawalAmountPaise).to.be.a(\"number\"); });",
+									"pm.test(\"Manual-only remains enforced\", function () { pm.expect(body?.result?.autoPayoutExecutionEnabled).to.eql(false); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"minimumMaintenance\": 100,\n  \"minWithdrawalAmount\": 100,\n  \"maxWithdrawalAmount\": 50000,\n  \"withdrawalCooldownDays\": 1,\n  \"dualApprovalThreshold\": 10000\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/settings/auto-payout",
+						"description": "Sets the live GlobalSetting values. Rupee fields are converted to paise. maxWithdrawalAmount must be >= minWithdrawalAmount. Legacy auto fields (enabled/threshold/cron) are deprecated and omitted here."
+					},
+					"response": []
+				},
+				{
+					"name": "Legacy Auto Payout Summary (deprecated)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Summary loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Marked deprecated\", function () { pm.expect(body?.result?.deprecated).to.eql(true); });",
+									"pm.test(\"Manual only\", function () { pm.expect(body?.result?.manualOnly).to.eql(true); });",
+									"pm.test(\"Auto execution disabled\", function () { pm.expect(body?.result?.autoPayoutExecutionEnabled).to.eql(false); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/auto-payouts/summary",
+						"description": "Deprecated monitoring endpoint. Counts only legacy origin=auto records; no new auto payouts can be created."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Technician Wallet Overview",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Overview loaded\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/technician/{{technicianId}}",
+						"description": "Admin-side technician wallet: available/reserved balances, payout block, payout settings, and recent withdrawals."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "02 - Technician Withdrawal",
+			"description": "Technician wallet, withdrawal request, history, and receipt. A request reserves the balance immediately; admin approval and offline transfer follow.",
+			"item": [
+				{
+					"name": "Get My Wallet",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Wallet loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Manual-only mode\", function () { pm.expect(body?.autoPayoutExecutionEnabled).to.eql(false); });",
+									"pm.test(\"Max withdrawal exposed\", function () { pm.expect(body?.payoutLimits?.maxWithdrawalPaise).to.be.a(\"number\"); });",
+									"pm.test(\"Cooldown exposed\", function () { pm.expect(body?.payoutLimits?.cooldownDays).to.be.a(\"number\"); });",
+									"pm.test(\"Deprecated auto fields listed\", function () { pm.expect(body?.deprecatedAutoPayoutFields).to.be.an(\"array\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/wallet",
+						"description": "Wallet balance, KYC-backed payout destination, and payoutLimits resolved from GlobalSetting (payout.*) with env/default fallback. Auto-payout fields are deprecated and never execute."
+					},
+					"response": []
+				},
+				{
+					"name": "Request Withdrawal",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Withdrawal created\", function () { pm.response.to.have.status(201); });",
+									"const body = pm.response.json();",
+									"if (body?.result?.withdrawalId) pm.environment.set(\"withdrawalId\", String(body.result.withdrawalId));",
+									"pm.test(\"Request is pending admin review\", function () { pm.expect(body?.result?.status).to.eql(\"requested\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"amountPaise\": \"{{requestAmountPaise}}\",\n  \"clientIdempotencyKey\": \"wd-{{$timestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawal",
+						"description": "Creates a technician_request withdrawal and reserves the amount. Enforces GlobalSetting min/max, maintenance floor, verified KYC bank fingerprint, zero dues, no complaint hold, no active payout, and cooldown."
+					},
+					"response": []
+				},
+				{
+					"name": "My Withdrawal History",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"History loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const rows = body?.result || body?.data || [];",
+									"if (Array.isArray(rows) && rows[0]?._id) pm.environment.set(\"withdrawalId\", String(rows[0]._id));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawalhistory",
+						"description": "Lists the technician's withdrawal requests, newest first."
+					},
+					"response": []
+				},
+				{
+					"name": "My Withdrawal Receipt",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Receipt endpoint reachable\", function () { pm.expect([200, 422]).to.include(pm.response.code); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawal/{{withdrawalId}}/receipt",
+						"description": "Returns the official receipt only after the payout is paid; before that the API returns 422."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "03 - Admin Review & Release",
+			"description": "Admin review queue, approval, offline bank transfer recording, receipt, and exports. Bank data is intentionally absent from the list; the details endpoint is audited.",
+			"item": [
+				{
+					"name": "List Withdrawal Requests",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Queue loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const rows = body?.result || [];",
+									"if (rows[0]?._id) pm.environment.set(\"withdrawalId\", String(rows[0]._id));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawals?status=requested&page=1&limit=25&payoutType=technician_request",
+						"description": "Paginated withdrawal queue. Requested technician withdrawals need approval; approved withdrawals need the bank transfer plus mark-paid."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Withdrawal Details (audited bank view)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Details loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"if (body?.result?.withdrawalId) pm.environment.set(\"withdrawalId\", String(body.result.withdrawalId));",
+									"pm.test(\"Payout status exposed\", function () { pm.expect(body?.result?.status).to.be.a(\"string\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/details",
+						"description": "Returns decrypted bank/UPI details for the transfer and writes a BANK_DETAILS_VIEWED audit log. This is the only payout endpoint that exposes full bank data."
+					},
+					"response": []
+				},
+				{
+					"name": "Approve Withdrawal",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Withdrawal approved\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Status is approved\", function () { pm.expect(body?.result?.status).to.eql(\"approved\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"adminNote\": \"Approved for manual bank transfer\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/approve",
+						"description": "Approves a requested technician withdrawal. Optionally applies penalty/commission/other deductions; net payout must remain > 0."
+					},
+					"response": []
+				},
+				{
+					"name": "Mark Withdrawal Paid",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Marked paid\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"pm.test(\"Status is paid\", function () { pm.expect(body?.result?.status).to.eql(\"paid\"); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"utr\": \"{{utr}}\",\n  \"paymentMode\": \"IMPS\",\n  \"adminNote\": \"Offline bank/UPI transfer completed\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/mark-paid",
+						"description": "Records the offline transfer and moves approved -> paid. UTR is 8-30 uppercase alphanumerics and must be unique. Writes the technician_payout ledger entry, notification, socket event, and push."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Withdrawal Receipt",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Receipt loaded\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/receipt",
+						"description": "Admin copy of the paid payout receipt."
+					},
+					"response": []
+				},
+				{
+					"name": "Export Withdrawals CSV",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Export returned\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/export?status=paid",
+						"description": "Downloads withdrawal rows as CSV. Payout destination is the masked/recorded destination; full bank data is not included."
+					},
+					"response": []
+				},
+				{
+					"name": "Export Approved Bulk Payments",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Bulk export returned\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/bulk-payment-export?limit=500",
+						"description": "Exports approved payouts for the offline bank run with account holder, masked account (last 4), IFSC, and net amount."
+					},
+					"response": []
+				},
+				{
+					"name": "Revert Paid Withdrawal (Owner only)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Revert handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{ownerToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"reason\": \"Bank returned the transfer\",\n  \"bankReturnUtr\": \"{{utr}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/revert-paid",
+						"description": "Owner-only correction: paid -> failed, restores the gross amount to the technician wallet, and writes a compensating ledger entry. The original payout ledger row is never edited."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "04 - Admin Direct & Dual Approval",
+			"description": "Admin-initiated payouts. Below the configured threshold the payout is created as approved; at/above it is parked for a different admin to approve.",
+			"item": [
+				{
+					"name": "Send Manual Payout To Technician",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Payout request handled\", function () { pm.expect([200, 201]).to.include(pm.response.code); });",
+									"const body = pm.response.json();",
+									"if (body?.result?.withdrawalId) pm.environment.set(\"withdrawalId\", String(body.result.withdrawalId));",
+									"pm.test(\"Status is approved or awaiting second approval\", function () { pm.expect([\"approved\", \"requested\"]).to.include(body?.result?.status); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"amountPaise\": \"{{requestAmountPaise}}\",\n  \"reason\": \"Manual settlement\",\n  \"clientIdempotencyKey\": \"send-{{$timestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/technician/{{technicianId}}/send-money",
+						"description": "Creates an admin_direct payout with reserve-at-request. Uses the same min/max, maintenance floor, KYC fingerprint, dues, complaint, and active-payout guards."
+					},
+					"response": []
+				},
+				{
+					"name": "Send High-Value Payout (dual approval)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Dual request handled\", function () { pm.expect(pm.response.code).to.be.below(500); });",
+									"const body = pm.response.json();",
+									"if (body?.result?.withdrawalId) pm.environment.set(\"withdrawalId\", String(body.result.withdrawalId));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"amountPaise\": \"{{dualPayoutAmountPaise}}\",\n  \"reason\": \"High-value manual settlement requiring second approval\",\n  \"clientIdempotencyKey\": \"dual-{{$timestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/technician/{{technicianId}}/send-money",
+						"description": "Reference request for the dual-approval path. Requires sufficient technician balance; at/above dualApprovalThreshold it returns requested + needsSecondApproval."
+					},
+					"response": []
+				},
+				{
+					"name": "Approve Manual Payout (second admin)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Approval handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{secondAdminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/approve-manual-payout",
+						"description": "Second-admin approval for an admin_direct payout in requested status. The approver must not be the initiator."
+					},
+					"response": []
+				},
+				{
+					"name": "Resolve Manual Review Payout (legacy)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Resolution handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"decision\": \"complete\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/resolve-manual-review",
+						"description": "Legacy manual_review resolver: decision complete (force paid after bank confirmation) or revert (refund reserve)."
+					},
+					"response": []
+				},
+				{
+					"name": "Freeze Technician Payouts",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Freeze handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"freeze\": true,\n  \"reason\": \"{{freezeReason}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/technician/{{technicianId}}/freeze",
+						"description": "Places a Legal/Risk hold on all technician payouts. Reason is required."
+					},
+					"response": []
+				},
+				{
+					"name": "Unfreeze Technician Payouts",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Unfreeze handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"freeze\": false\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/technician/{{technicianId}}/freeze",
+						"description": "Clears the technician payout hold."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "05 - Notifications",
+			"description": "Persistent notification tray endpoints for Admin and Technician. Payout-specific socket events and current gaps are documented in docs/05-manual-payouts.md.",
+			"item": [
+				{
+					"name": "Admin - List Notifications",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Notifications loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const items = body?.data || body?.result?.items || body?.result || [];",
+									"const first = Array.isArray(items) ? items[0] : null;",
+									"const notificationId = first?._id || first?.id || first?.notificationId;",
+									"if (notificationId) pm.environment.set(\"notificationId\", String(notificationId));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/notifications?limit=20",
+						"description": "Admin notification tray."
+					},
+					"response": []
+				},
+				{
+					"name": "Admin - Unread Count",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Unread count loaded\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/notifications/unread-count",
+						"description": "Admin unread notification count."
+					},
+					"response": []
+				},
+				{
+					"name": "Admin - Mark Notification Read",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Mark-read handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/notifications/{{notificationId}}/read",
+						"description": "Marks one admin notification read."
+					},
+					"response": []
+				},
+				{
+					"name": "Technician - List Notifications",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Notifications loaded\", function () { pm.response.to.have.status(200); });",
+									"const body = pm.response.json();",
+									"const items = body?.data || body?.result?.items || body?.result || [];",
+									"const first = Array.isArray(items) ? items[0] : null;",
+									"const notificationId = first?._id || first?.id || first?.notificationId;",
+									"if (notificationId) pm.environment.set(\"notificationId\", String(notificationId));"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/notifications?limit=20",
+						"description": "Technician notification tray, including payout notifications."
+					},
+					"response": []
+				},
+				{
+					"name": "Technician - Unread Count",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Unread count loaded\", function () { pm.response.to.have.status(200); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/notifications/unread-count",
+						"description": "Technician unread notification count."
+					},
+					"response": []
+				},
+				{
+					"name": "Technician - Mark Notification Read",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Mark-read handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/notifications/{{notificationId}}/read",
+						"description": "Marks one technician notification read."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "06 - Socket.IO Probe",
+			"description": "Postman can only probe the Engine.IO handshake. Use a Socket.IO client with auth.token to observe payout events.",
+			"item": [
+				{
+					"name": "Socket.IO Handshake Probe",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Handshake reachable\", function () { pm.response.to.have.status(200); });",
+									"pm.test(\"Engine.IO open packet\", function () { pm.expect(String(pm.response.text()).startsWith(\"0\")).to.eql(true); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/socket.io/?EIO=4&transport=polling&t={{$timestamp}}",
+						"description": "A 200 response beginning with 0 proves the Socket.IO endpoint is reachable. This does not authenticate the socket."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "07 - Guard Cases",
+			"description": "Optional negative tests. Run after the main flow; duplicate/insufficient/invalid requests are expected to fail with 4xx responses.",
+			"item": [
+				{
+					"name": "Request Below Minimum",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Rejected\", function () { pm.expect([400, 409]).to.include(pm.response.code); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"amountPaise\": 1,\n  \"clientIdempotencyKey\": \"below-min-{{$timestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawal",
+						"description": "Expect 400 because the amount is below the GlobalSetting minimum."
+					},
+					"response": []
+				},
+				{
+					"name": "Request Above Maximum",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Rejected\", function () { pm.expect([400, 409]).to.include(pm.response.code); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"amountPaise\": 999999999,\n  \"clientIdempotencyKey\": \"above-max-{{$timestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawal",
+						"description": "Expect 400 because the amount exceeds the GlobalSetting maximum."
+					},
+					"response": []
+				},
+				{
+					"name": "Cancel My Withdrawal (pending/requested only)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Handled\", function () { pm.expect(pm.response.code).to.be.below(500); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/wallet/withdrawal/{{withdrawalId}}/cancel",
+						"description": "Cancels the current request and refunds the reserve. Returns 4xx if it is already approved/paid."
+					},
+					"response": []
+				},
+				{
+					"name": "Mark Paid With Duplicate UTR",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Handled\", function () { pm.expect([200, 400, 409]).to.include(pm.response.code); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{adminToken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"utr\": \"{{utr}}\",\n  \"paymentMode\": \"IMPS\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "{{baseUrl}}/api/admin/wallet/withdrawal/{{withdrawalId}}/mark-paid",
+						"description": "Idempotent replay: 200 if the same UTR is already recorded on this withdrawal, 409 if the withdrawal is paid with another UTR."
+					},
+					"response": []
+				}
+			]
+		}
+	]
+}
