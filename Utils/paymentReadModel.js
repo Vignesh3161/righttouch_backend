@@ -60,11 +60,12 @@ export const buildPaymentDetailsSummary = (payment) => {
   const provider = (payment.provider || "").toLowerCase();
   const ref = payment.providerPaymentId || payment.offlineDetails?.transactionReference || null;
 
-  if (provider === "offline" || ["cash", "bank_transfer", "upi_direct", "cheque", "other"].includes(mode)) {
+  if (provider === "offline" || ["cash", "bank_transfer", "upi_direct", "cheque", "card", "other"].includes(mode)) {
     const formattedMode =
       mode === "bank_transfer" ? "Bank Transfer" :
       mode === "upi_direct" ? "Direct UPI" :
       mode === "cheque" ? "Cheque" :
+      mode === "card" ? "Card / POS" :
       mode === "cash" ? "Cash" : "Offline Payment";
     return ref ? `Paid via ${formattedMode} (Ref: ${ref})` : `Paid via ${formattedMode}`;
   }

@@ -27,6 +27,7 @@ import {
   getProductBookingById,
   adminCompleteProductBooking,
   adminCancelProductBooking,
+  adminRequestProductPayment,
 } from "../Controllers/productBooking.js";
 import { recordAdminOfflinePayment } from "../Controllers/paymentController.js";
 
@@ -54,6 +55,7 @@ router.get("/product-bookings", Auth, adminOnly, getAllProductBooking);
 router.get("/product-bookings/:id", Auth, adminOnly, getProductBookingById);
 router.put("/product-bookings/:id/complete", Auth, adminOnly, adminCompleteProductBooking);
 router.post("/product-bookings/:id/cancel", Auth, adminOnly, adminCancelProductBooking);
+router.post("/product-bookings/:id/request-payment", Auth, adminOnly, adminRequestProductPayment);
 router.post("/product-bookings/:bookingId/manual-payment", Auth, adminOnly, recordAdminOfflinePayment);
 
 export default router;

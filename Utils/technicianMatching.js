@@ -26,7 +26,7 @@ import {
 } from "./dispatchQueue.js";
 import { offerPurgeAt } from "./broadcastRetention.js";
 import { mergeTechnicianCandidateIds } from "./technicianCandidatePool.js";
-import { buildJobDispatchPayload } from "./jobPayload.js";
+import { buildJobDispatchPayload, buildJobScheduleFields, resolveBookingJobLocation } from "./jobPayload.js";
 import {
   SCHEDULED_CANDIDATE_CAP,
   REOFFER_DECLINED_AFTER_MINUTES,
@@ -788,6 +788,7 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
           }
 
           const service = serviceById.get(String(booking.serviceId));
+          const jobLocation = resolveBookingJobLocation(booking);
           const bm = new Map([[String(tech._id), { _id: broadcast._id, version: broadcast.version }]]);
           await enqueueJobNewNotifications({
             bookingId: booking._id,
@@ -799,13 +800,17 @@ export const broadcastPendingJobsToTechnician = async (technicianProfileId, io, 
               serviceType: service?.serviceType,
               description: service?.description,
               duration: service?.duration,
-              customerName: booking.addressSnapshot?.name || "Customer",
+              ...buildJobScheduleFields(booking),
+              customerName: jobLocation.customerName,
+              customerMobile: jobLocation.customerMobile,
               baseAmount: booking.baseAmount,
-              address: booking.address,
-              scheduledAt: booking.scheduledAt,
+              address: jobLocation.address,
+              city: jobLocation.city,
+              state: jobLocation.state,
+              pincode: jobLocation.pincode,
             }, {
-              latitude: booking.location?.coordinates?.[1],
-              longitude: booking.location?.coordinates?.[0],
+              latitude: jobLocation.latitude,
+              longitude: jobLocation.longitude,
               distanceMeters,
               effectiveRadiusMeters: techEffectiveRadiusM,
             }),
@@ -1639,6 +1644,7 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
     // All in a single transaction for atomicity.
     // NOTE: jobDataPayload is constructed BEFORE the transaction so the
     // DispatchOutbox rows inside the transaction can reference it (B-01 TDZ fix).
+    const jobLocation = resolveBookingJobLocation(booking);
     const jobDataPayload = buildJobDispatchPayload({
       bookingId: booking._id,
       serviceId: service._id,
@@ -1647,15 +1653,14 @@ export const matchAndBroadcastBooking = async (bookingId, io, traceId) => {
       description: service.description,
       duration: service.duration,
       durationMinutes: service.durationMinutes ?? booking.estimatedDurationMinutes ?? 60,
-      bookingType: booking.bookingType,
-      customerName: booking.addressSnapshot?.name || "Customer",
+      ...buildJobScheduleFields(booking),
+      customerName: jobLocation.customerName,
+      customerMobile: jobLocation.customerMobile,
       baseAmount: booking.baseAmount,
-      address: booking.addressSnapshot?.addressLine || booking.address || "Pinned Location",
-      scheduledAt: booking.scheduledAt,
-      slotKey: booking.slotKey || null,
-      slotLabel: booking.slotLabel || null,
-      slotStartAt: booking.slotStartAt || null,
-      slotEndAt: booking.slotEndAt || null,
+      address: jobLocation.address,
+      city: jobLocation.city,
+      state: jobLocation.state,
+      pincode: jobLocation.pincode,
       customerStatusLabel: booking.customerStatusLabel || null,
     }, { latitude, longitude });
     const session = await mongoose.startSession();

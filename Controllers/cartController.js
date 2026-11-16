@@ -1033,6 +1033,30 @@ export const checkout = async (req, res) => {
             });
         }
 
+        // A client that asks for a scheduled checkout must have selected a
+        // valid per-item schedule first. Without this guard the request would
+        // silently create an instant booking (the bug surfaced on mobile).
+        const requestedBookingType = String(req.body?.bookingType || "").toLowerCase();
+        const requestedSchedule =
+            requestedBookingType === "schedule" ||
+            requestedBookingType === "scheduled" ||
+            (!requestedBookingType &&
+                Boolean(req.body?.scheduledDate || req.body?.scheduledTime || scheduledAt));
+        if (requestedSchedule) {
+            const hasItemSchedule = validServiceItems.some(
+                (item) => Boolean(item.scheduledAt || (item.scheduledDate && item.scheduledTime))
+            );
+            if (!hasItemSchedule) {
+                await session.abortTransaction();
+                return res.status(400).json({
+                    success: false,
+                    code: "SCHEDULE_SELECTION_REQUIRED",
+                    message: "Select a valid date and time for this service before scheduling checkout.",
+                    result: {},
+                });
+            }
+        }
+
         for (const cartItem of validServiceItems) {
             checkoutKeys.push(
                 resolveBookingIdempotencyKey({

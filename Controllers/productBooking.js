@@ -4,6 +4,8 @@ import Product from "../Schemas/Product.js";
 import { buildProductFinancialSnapshot, validateProductAmountAgainstCatalog } from "../Utils/productPricing.js";
 import { buildPaymentDetailsSummary } from "../Utils/paymentReadModel.js";
 import { emitProductBookingChanged } from "../Utils/productRealtime.js";
+import { sendAppNotification } from "../Services/unifiedNotificationService.js";
+import { writeAuditLog } from "../Utils/audit.js";
 
 const ensureAdminOrOwner = (req) => {
   const role = (req.user?.role || "").toLowerCase();
@@ -299,6 +301,140 @@ export const productBookingCancel = async (req, res) => {
       success: false,
       message: "Server error",
       result: { error: error.message }
+    });
+  }
+};
+
+/* ===============================
+   ADMIN / OWNER — REQUEST PRODUCT PAYMENT
+   Sends an in-app/push payment request without changing payment state.
+   =============================== */
+export const adminRequestProductPayment = async (req, res) => {
+  try {
+    ensureAdminOrOwner(req);
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID format", result: {} });
+    }
+
+    const booking = await ProductBooking.findById(id).populate("productId", "productName");
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Product booking not found", result: {} });
+    }
+
+    if (booking.status !== "active") {
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_BOOKING_NOT_PAYABLE",
+        message: `Payment cannot be requested for a ${booking.status} product booking`,
+        result: { status: booking.status },
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_ALREADY_PAID",
+        message: "This product booking is already paid",
+        result: { paymentStatus: booking.paymentStatus },
+      });
+    }
+
+    const totalPaise = Math.round(Number(
+      booking.financialSnapshot?.totalAmountPaise ||
+      booking.amountPaise ||
+      (Number(booking.amount || 0) * 100)
+    ));
+    const paidPaise = Math.round(Number(booking.paidAmountPaise || 0));
+    const amountPaise = Math.max(totalPaise - paidPaise, 0);
+
+    if (!Number.isFinite(amountPaise) || amountPaise <= 0) {
+      return res.status(400).json({
+        success: false,
+        code: "PRODUCT_NO_PAYABLE_AMOUNT",
+        message: "This product booking has no payable balance",
+        result: {},
+      });
+    }
+
+    if (!booking.customerId) {
+      return res.status(400).json({
+        success: false,
+        message: "Product booking has no customer to notify",
+        result: {},
+      });
+    }
+
+    const requestedAt = new Date();
+    booking.paymentRequestedAt = requestedAt;
+    booking.paymentRequestedBy = req.user.userId;
+    await booking.save();
+
+    const productName = booking.productId?.productName || "your product";
+    const amount = amountPaise / 100;
+
+    await sendAppNotification({
+      userId: String(booking.customerId),
+      recipientType: "customer",
+      type: "PAYMENT_DUE",
+      title: "Product payment due",
+      message: `Payment of ₹${amount.toFixed(2)} is due for ${productName}. Pay securely from the app.`,
+      bookingId: booking._id,
+      metadata: {
+        route: "/quotations?tab=3",
+        socketEvent: "payment_due",
+        stage: "product_payment_requested",
+        amountPaise,
+        paymentStatus: booking.paymentStatus || "pending",
+        quotationId: booking.quotationId ? String(booking.quotationId) : null,
+      },
+      priority: "high",
+      category: "payment",
+      io: req.io,
+    });
+
+    await writeAuditLog({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "ADMIN_PRODUCT_PAYMENT_REQUESTED",
+      targetType: "ProductBooking",
+      targetId: booking._id,
+      after: {
+        amountPaise,
+        paymentStatus: booking.paymentStatus,
+        requestedAt,
+      },
+      reason: "Admin requested customer payment from the app",
+    });
+
+    emitProductBookingChanged({
+      action: "payment_requested",
+      bookingId: booking._id,
+      quotationId: booking.quotationId,
+      requestId: booking.quoteRequestId,
+      status: booking.status,
+      paymentStatus: booking.paymentStatus,
+      amountPaise,
+      paymentRequestedAt: requestedAt,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment request sent to the customer",
+      result: {
+        bookingId: booking._id,
+        amountPaise,
+        amount,
+        paymentStatus: booking.paymentStatus,
+        paymentRequestedAt: requestedAt,
+      },
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      success: false,
+      message: "Server error",
+      result: { error: error.message },
     });
   }
 };

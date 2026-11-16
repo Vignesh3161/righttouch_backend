@@ -388,6 +388,10 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
     }
 
     const jobDTO = toJobNewDTO(jobData, broadcast);
+    const offerTitle = isScheduled ? "🗓 New Scheduled Job Available" : "🆕 New Job Available";
+    const offerBody = isScheduled
+      ? `Scheduled ${jobDTO.serviceName || "service"}${jobDTO.slotLabel ? ` · ${jobDTO.slotLabel}` : ""}`
+      : `New ${jobDTO.serviceName || "service"} job in your area`;
 
     if (await alreadySent(jobDTO.broadcastId, technicianId, jobDTO.version)) {
       console.log(`⚠️ Skipped duplicate job:new ${jobDTO.broadcastId} → tech ${technicianId}`);
@@ -414,9 +418,12 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
           io.to(userRoom).emit(SOCKET_EVENTS.NOTIFICATION_NEW, {
             id: `job-${jobDTO.bookingId}`,
             type: "JOB_NEW",
-            title: "🆕 New Job Available",
-            message: `New ${jobDTO.serviceName || "service"} job in your area`,
+            title: offerTitle,
+            message: offerBody,
             bookingId: String(jobDTO.bookingId || ""),
+            bookingType: jobDTO.bookingType,
+            scheduledAt: jobDTO.scheduledAt,
+            slotLabel: jobDTO.slotLabel,
             createdAt: new Date().toISOString(),
           });
         }
@@ -486,13 +493,15 @@ export const notifyTechnicianOfNewJob = async (io, technicianId, jobData, broadc
     let pushResult = null;
     if (deliverPush) {
       pushResult = await sendPushNotification(technicianId, {
-        title: "🆕 New Job Available",
-        body: `New ${jobDTO.serviceName || "service"} job in your area`,
+        title: offerTitle,
+        body: offerBody,
         data: {
           type: "new_job",
           bookingId: String(jobDTO.bookingId || ""),
           serviceId: String(jobDTO.serviceId || ""),
+          bookingType: String(jobDTO.bookingType || "instant"),
           scheduledAt: String(jobDTO.scheduledAt || ""),
+          slotLabel: String(jobDTO.slotLabel || ""),
         },
       }, { recipientType: "technician" }).catch((err) => ({
         success: false,

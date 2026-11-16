@@ -20,7 +20,7 @@ router.get("/product-payments", Auth, adminOnly, adminGetProductPaymentsListCont
 // GET /api/admin/payments/product-payments/summary
 router.get("/product-payments/summary", Auth, adminOnly, adminGetProductPaymentsSummaryController);
 
-// POST /api/admin/payments/record-offline (body: { bookingId, paymentMode, transactionReference, amount, notes, receivedAt })
+// POST /api/admin/payments/record-offline (product bookings only; body: { bookingId, paymentMode, transactionReference, amount, notes, receivedAt })
 router.post("/record-offline", Auth, adminOnly, recordAdminOfflinePayment);
 
 // POST /api/admin/payments/record-offline/:bookingId

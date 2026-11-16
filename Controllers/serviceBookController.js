@@ -26,6 +26,7 @@ import { canTransition, normalizeBookingStatus } from "../Utils/bookingStatus.js
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
 import { paiseToRupees, percentageOf, toPaise, isPayableTotalPaise } from "../Utils/money.js";
 import { toBookingCreatedDTO, toBookingCancelledDTO } from "../Utils/socketDTO.js";
+import { buildJobScheduleFields } from "../Utils/jobPayload.js";
 import { notifyCustomerOfRebroadcast } from "../Utils/sendReminder.js";
 import {
   resolveScheduleInput,
@@ -1431,12 +1432,12 @@ export const getTechnicianCurrentJobs = async (req, res) => {
 
       const responseData = {
         jobId: jobObj._id,
+        ...buildJobScheduleFields(jobObj),
         status: normalizeBookingStatus(jobObj.status),
         customer,
         technician,
         service,
         address,
-        scheduledAt: jobObj.scheduledAt,
         createdAt: jobObj.createdAt,
         acceptedAt: jobObj.assignedAt,
         paymentStatus: jobObj.paymentStatus,
@@ -1532,16 +1533,19 @@ export const getAllAcceptedJobs = async (req, res) => {
       const address = jobObj.addressId
         ? { name: jobObj.addressId.name || "", phone: jobObj.addressId.phone || "", addressLine: jobObj.addressId.addressLine || "", city: jobObj.addressId.city || "", state: jobObj.addressId.state || "", pincode: jobObj.addressId.pincode || "", latitude: jobObj.addressId.latitude, longitude: jobObj.addressId.longitude }
         : (jobObj.addressSnapshot || null);
+      if (address && (address.latitude == null || address.longitude == null) && jobObj.location?.coordinates) {
+        address.longitude = jobObj.location.coordinates[0];
+        address.latitude = jobObj.location.coordinates[1];
+      }
 
       const responseData = {
         jobId: jobObj._id,
-        bookingType: jobObj.bookingType,
+        ...buildJobScheduleFields(jobObj),
         status: normalizeBookingStatus(jobObj.status),
         customer,
         technician,
         service: jobObj.serviceId || null,
         address,
-        scheduledAt: jobObj.scheduledAt,
         createdAt: jobObj.createdAt,
         acceptedAt: jobObj.assignedAt,
         paymentStatus: jobObj.paymentStatus,
@@ -1633,16 +1637,19 @@ export const getAcceptedScheduledJobs = async (req, res) => {
       const address = jobObj.addressId
         ? { name: jobObj.addressId.name || "", phone: jobObj.addressId.phone || "", addressLine: jobObj.addressId.addressLine || "", city: jobObj.addressId.city || "", state: jobObj.addressId.state || "", pincode: jobObj.addressId.pincode || "", latitude: jobObj.addressId.latitude, longitude: jobObj.addressId.longitude }
         : (jobObj.addressSnapshot || null);
+      if (address && (address.latitude == null || address.longitude == null) && jobObj.location?.coordinates) {
+        address.longitude = jobObj.location.coordinates[0];
+        address.latitude = jobObj.location.coordinates[1];
+      }
 
       const responseData = {
         jobId: jobObj._id,
-        bookingType: jobObj.bookingType,
+        ...buildJobScheduleFields(jobObj),
         status: normalizeBookingStatus(jobObj.status),
         customer,
         technician,
         service: jobObj.serviceId || null,
         address,
-        scheduledAt: jobObj.scheduledAt,
         createdAt: jobObj.createdAt,
         acceptedAt: jobObj.assignedAt,
         paymentStatus: jobObj.paymentStatus,
@@ -3296,23 +3303,11 @@ export const getOwnerAllBookings = async (req, res) => {
       }
     }
 
-    // 📌 Filter by Status
+    // 📌 Filter by Status — always the booking's own terminal status. Expired
+    // broadcast rows are historical and must not surface active/cancelled
+    // bookings under the "expired" filter.
     if (status) {
-      if (status === "expired") {
-        const JobBroadcast = mongoose.model("JobBroadcast");
-        const expiredBroadcasts = await JobBroadcast.find({ status: "expired" }).select("bookingId");
-        const expiredBookingIds = expiredBroadcasts.map(b => b.bookingId);
-        query = {
-          ...query,
-          $or: [
-            { _id: { $in: expiredBookingIds } },
-            { status: "expired" }
-          ]
-        };
-      } else {
-        // Support any other status (accepted, completed, in_progress, etc.)
-        query.status = status;
-      }
+      query.status = status;
     }
 
     const bookings = await ServiceBooking.find(query)

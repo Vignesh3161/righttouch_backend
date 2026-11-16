@@ -8,6 +8,7 @@ import { resolveOperationalCityFromCoordinates } from "./technicianMatching.js";
 import { evaluateTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getGpsState } from "./locationConfig.js";
 import { bookingDeadlineFilter } from "./bookingStatus.js";
+import { buildJobScheduleFields, resolveBookingJobLocation } from "./jobPayload.js";
 
 /**
  * Internal logic to fetch jobs for a technician (shared by Controller and Socket)
@@ -170,20 +171,23 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             (booking.customerId ? `${booking.customerId.fname || ''} ${booking.customerId.lname || ''}`.trim() : "Customer");
 
         const broadcastRow = broadcasts.find(br => String(br.bookingId) === bookingIdStr);
+        const jobLocation = resolveBookingJobLocation(booking);
 
         validJobs.push({
             bookingId: booking._id,
+            ...buildJobScheduleFields(booking),
             serviceName: booking.serviceId?.serviceName || "Service",
             serviceType: booking.serviceId?.serviceType || "General",
             description: booking.serviceId?.description || "",
             duration: booking.serviceId?.duration || "Flexible",
             customerName: customerName,
-            customerMobile: booking.customerId?.mobileNumber || "",
-            address: booking.addressSnapshot?.addressLine || booking.address || "Location unavailable",
-            city: booking.addressSnapshot?.city || "",
-            pincode: booking.addressSnapshot?.pincode || "",
-            latitude: booking.location?.coordinates?.[1] || null,
-            longitude: booking.location?.coordinates?.[0] || null,
+            customerMobile: booking.customerId?.mobileNumber || jobLocation.customerMobile || "",
+            address: jobLocation.address,
+            city: jobLocation.city,
+            state: jobLocation.state,
+            pincode: jobLocation.pincode,
+            latitude: jobLocation.latitude,
+            longitude: jobLocation.longitude,
             distanceStr: distanceKm != null ? `${distanceKm} km` : null,
             distanceKm: distanceKm != null ? Number(distanceKm) : null,
             distanceMeters: distanceMeters != null ? Math.round(distanceMeters) : null,
@@ -192,7 +196,6 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             maxAllowedMeters: eligibility.details.effectiveRadiusMeters,
             technicianAmount: booking.serviceId?.technicianAmount || booking.technicianAmount || 0,
             service: booking.serviceId || null,
-            scheduledAt: booking.scheduledAt,
             faultProblem: booking.faultProblem,
             createdAt: booking.createdAt,
             broadcastedAt: booking.broadcastedAt,
@@ -200,8 +203,6 @@ export const fetchTechnicianJobsInternal = async (technicianProfileId) => {
             expiresAt: broadcastRow?.expiresAt || null,
             isBackupOffer,
             bookingStatus: booking.status,
-            slotKey: booking.slotKey || null,
-            slotLabel: booking.slotLabel || null,
         });
     }
 

@@ -19,7 +19,7 @@ import {
   CUSTOMER_NO_SHOW_MIN_COMPENSATION_PAISE,
 } from "./schedulingConfig.js";
 import { hasActiveCompletionChallenge, closeActiveChallengesForBooking } from "./completionOtp.js";
-import { expireUnassignedBooking } from "./bookingExpiry.js";
+import { expireUnassignedBooking, resolveExpiryCancelReason } from "./bookingExpiry.js";
 import { releaseScheduledSlot, expireStaleSlotHolds, reconcileSlotCapacity, cleanupZeroCapacityRows } from "../Services/slotCapacityService.js";
 import { runLateCompletionWatchdog } from "../Services/lateCompletionService.js";
 
@@ -232,16 +232,18 @@ export const initBookingCrons = (io) => {
                 status: { $in: ["pending", "broadcasted"] },
                 autoCancelAt: { $lte: now },
                 technicianId: null,
-            }).select("_id").limit(100);
+            }).select("_id assignmentAttempts").limit(100);
 
             const owner = `expiry-worker:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
 
-            for (const { _id } of expiredJobs) {
+            for (const job of expiredJobs) {
+                const { _id } = job;
+                const cancelReason = resolveExpiryCancelReason(job);
                 const claimed = await claimLease(_id, owner);
                 if (!claimed) continue;
 
                 try {
-                    const expired = await expireUnassignedBooking(_id, owner, now);
+                    const expired = await expireUnassignedBooking(_id, owner, now, { cancelReason });
                     if (!expired) continue;
 
                     await closeActiveChallengesForBooking(_id, { to: "expired", now }).catch((err) => {
@@ -251,7 +253,7 @@ export const initBookingCrons = (io) => {
                     // Batch: expire all broadcasts + offers for this booking,
                     // bump cursors, and tell live techs the offer died
                     // (jobs_changed + job:expired).
-                    await expireBroadcastsForBooking(io, _id, "no_technician_accept", now);
+                    await expireBroadcastsForBooking(io, _id, cancelReason, now);
                     await releaseScheduledSlot({
                       bookingId: _id,
                       reason: "booking_expired",
@@ -260,9 +262,17 @@ export const initBookingCrons = (io) => {
                       console.error(`[Cron:Expiry] Slot release failed for ${_id}:`, releaseErr.message);
                     });
 
-                    const message = expired.bookingType === "instant"
-                        ? "We couldn't find a technician for your immediate booking. It has expired. Please try again later."
+                    const hadPriorAssignment = cancelReason === "technician_no_action";
+                    let message;
+                    if (expired.bookingType === "instant") {
+                      message = hadPriorAssignment
+                        ? "Your assigned technician was released and we couldn't find a replacement in time. Your booking has expired. Please try again."
+                        : "We couldn't find a technician for your immediate booking. It has expired. Please try again later.";
+                    } else {
+                      message = hadPriorAssignment
+                        ? "Your assigned technician was released and no replacement accepted before the booking expired. Please book again."
                         : "No technician accepted your scheduled booking 5 hours before the start. It has been cancelled automatically.";
+                    }
                     await notifyCustomer(expired, message, io);
                     console.log(`[Cron:Expiry] Auto-cancelled ${expired.bookingType} job ${_id}`);
                 } finally {
