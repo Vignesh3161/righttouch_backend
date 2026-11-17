@@ -40,51 +40,51 @@ const router = express.Router();
 /* ================= ADMIN WALLET ================= */
 
 // Summary
-router.get("/wallet", Auth, authorizeRoles("Admin", "Owner"), getAdminWalletSummary);
+router.get("/wallet", Auth, authorizeRoles("Owner"), getAdminWalletSummary);
 
 // All withdrawal requests (?status=pending|approved|paid|rejected|processing, ?type=auto|manual)
-router.get("/wallet/withdrawalhistory", Auth, authorizeRoles("Admin", "Owner"), getAllWithdrawalRequests);
-router.get("/wallet/withdrawals", Auth, authorizeRoles("Admin", "Owner"), getAllWithdrawalRequests);
-router.get("/wallet/export", Auth, authorizeRoles("Admin", "Owner"), exportWithdrawalRequests);
-router.get("/wallet/bulk-payment-export", Auth, authorizeRoles("Admin", "Owner"), exportApprovedBulkPayments);
-router.get("/wallet/withdrawal/:id/receipt", Auth, authorizeRoles("Admin", "Owner"), getWithdrawalReceipt);
-router.get("/wallet/withdrawal/:id/details", Auth, authorizeRoles("Admin", "Owner"), getWithdrawalDetails);
+router.get("/wallet/withdrawalhistory", Auth, authorizeRoles("Owner"), getAllWithdrawalRequests);
+router.get("/wallet/withdrawals", Auth, authorizeRoles("Owner"), getAllWithdrawalRequests);
+router.get("/wallet/export", Auth, authorizeRoles("Owner"), exportWithdrawalRequests);
+router.get("/wallet/bulk-payment-export", Auth, authorizeRoles("Owner"), exportApprovedBulkPayments);
+router.get("/wallet/withdrawal/:id/receipt", Auth, authorizeRoles("Owner"), getWithdrawalReceipt);
+router.get("/wallet/withdrawal/:id/details", Auth, authorizeRoles("Owner"), getWithdrawalDetails);
 
 // 💸 Auto-payout monitoring — dashboard summary (counts + amounts)
-router.get("/wallet/auto-payouts/summary", Auth, authorizeRoles("Admin", "Owner"), getAutoPayoutSummary);
+router.get("/wallet/auto-payouts/summary", Auth, authorizeRoles("Owner"), getAutoPayoutSummary);
 
 // 💸 Global auto-payout configuration (enabled / threshold / maintenance floor)
-router.get("/settings/auto-payout", Auth, authorizeRoles("Admin", "Owner"), getAutoPayoutSettings);
-router.put("/settings/auto-payout", Auth, authorizeRoles("Admin", "Owner"), updateAutoPayoutSettings);
+router.get("/settings/auto-payout", Auth, authorizeRoles("Owner"), getAutoPayoutSettings);
+router.put("/settings/auto-payout", Auth, authorizeRoles("Owner"), updateAutoPayoutSettings);
 
 // Decide withdrawal
-router.put("/wallet/withdrawal/:id/approve", Auth, authorizeRoles("Admin", "Owner"), approveWithdrawal);
-router.put("/wallet/withdrawal/:id/reject", Auth, authorizeRoles("Admin", "Owner"), rejectWithdrawal);
+router.put("/wallet/withdrawal/:id/approve", Auth, authorizeRoles("Owner"), approveWithdrawal);
+router.put("/wallet/withdrawal/:id/reject", Auth, authorizeRoles("Owner"), rejectWithdrawal);
 
 // 💰 Manual bank-transfer flow: record an offline transfer (approved->paid)
 // and revert a wrongly-recorded payment (paid->failed). No provider calls.
-router.post("/wallet/withdrawal/:id/mark-paid", Auth, authorizeRoles("Admin", "Owner"), markWithdrawalPaid);
-router.post("/wallet/withdrawal/:id/revert-paid", Auth, authorizeRoles("Admin", "Owner"), revertPaidWithdrawal);
+router.post("/wallet/withdrawal/:id/mark-paid", Auth, authorizeRoles("Owner"), markWithdrawalPaid);
+router.post("/wallet/withdrawal/:id/revert-paid", Auth, authorizeRoles("Owner"), revertPaidWithdrawal);
 
 // 🔍 Admin technician wallet overview — inspect balances, blocks, KYC
 // summary and payout history before selecting a technician for payout.
-router.get("/wallet/technician/:technicianId", Auth, authorizeRoles("Admin", "Owner"), getTechnicianWalletOverview);
+router.get("/wallet/technician/:technicianId", Auth, authorizeRoles("Owner"), getTechnicianWalletOverview);
 
 // 🔒 Admin Freeze/Unfreeze technician payouts
-router.put("/wallet/technician/:technicianId/freeze", Auth, authorizeRoles("Admin", "Owner"), toggleTechnicianPayoutFreeze);
+router.put("/wallet/technician/:technicianId/freeze", Auth, authorizeRoles("Owner"), toggleTechnicianPayoutFreeze);
 
 // 💸 Admin manual "Send Money" to a technician — reserve-at-request model.
 // origin = admin_direct; below the configurable dual-approval threshold it
 // parks in `approved`, at/above it parks in `requested` for a second admin.
-router.post("/wallet/technician/:technicianId/send-money", Auth, authorizeRoles("Admin", "Owner"), adminManualPayoutToTechnician);
+router.post("/wallet/technician/:technicianId/send-money", Auth, authorizeRoles("Owner"), adminManualPayoutToTechnician);
 
 // ✅ Second-admin approval for a high-value (dual-approval) admin_direct payout.
-router.put("/wallet/withdrawal/:id/approve-manual-payout", Auth, authorizeRoles("Admin", "Owner"), approveAdminManualPayout);
+router.put("/wallet/withdrawal/:id/approve-manual-payout", Auth, authorizeRoles("Owner"), approveAdminManualPayout);
 
 // 🛠️ Admin resolves an ambiguous (manual_review) payout: complete | revert.
-router.put("/wallet/withdrawal/:id/resolve-manual-review", Auth, authorizeRoles("Admin", "Owner"), resolveManualReviewPayout);
+router.put("/wallet/withdrawal/:id/resolve-manual-review", Auth, authorizeRoles("Owner"), resolveManualReviewPayout);
 
-/* ================= COMMISSION GOVERNANCE (Admin/Owner, audited) ================= */
+/* ================= COMMISSION GOVERNANCE (Owner, audited) ================= */
 
 // List all services with their commission config (admin UI) — must be
 // registered BEFORE /commission/service/:serviceId so "services" is not
@@ -92,7 +92,7 @@ router.put("/wallet/withdrawal/:id/resolve-manual-review", Auth, authorizeRoles(
 router.get(
   "/commission/services",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   getAllServiceCommissions
 );
 
@@ -100,7 +100,7 @@ router.get(
 router.get(
   "/commission/service/:serviceId",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   getServiceCommission
 );
 
@@ -109,7 +109,7 @@ router.get(
 router.put(
   "/commission/service/:serviceId",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   setServiceCommission
 );
 
@@ -117,13 +117,13 @@ router.put(
 router.put(
   "/commission/booking/:bookingId/override",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   overrideBookingCommission
 );
 
 /* ================= AUDIT ================= */
 
-router.get("/audit-logs", Auth, authorizeRoles("Admin", "Owner"), getAuditLogs);
+router.get("/audit-logs", Auth, authorizeRoles("Owner"), getAuditLogs);
 
 /* ================= GLOBAL SETTINGS (Admin/Owner, audited) ================= */
 
@@ -132,13 +132,13 @@ router.get("/audit-logs", Auth, authorizeRoles("Admin", "Owner"), getAuditLogs);
 router.get(
   "/settings/reaccept-penalty",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   getReacceptPenaltySetting
 );
 router.put(
   "/settings/reaccept-penalty",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   setReacceptPenaltySetting
 );
 

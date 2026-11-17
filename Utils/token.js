@@ -15,13 +15,34 @@ const issuer = process.env.JWT_ISSUER || undefined;
 const audience = process.env.JWT_AUDIENCE || undefined;
 
 // Session lifetime: env-overridable, defaults to 7 days for mobile apps.
-// MUST stay in sync with client re-login handling.
-const expiresIn = process.env.JWT_EXPIRES_IN || "7d";
+// Privileged dashboard accounts use a short access token and rely on the
+// rotating refresh token. MUST stay in sync with client re-login handling.
+const defaultExpiresIn = process.env.JWT_EXPIRES_IN || "7d";
+const privilegedExpiresIn = process.env.JWT_PRIVILEGED_EXPIRES_IN || "1h";
 
-export const signToken = (payload) =>
+const PRIVILEGED_ROLES = new Set(["Owner", "Admin"]);
+
+export const accessTokenExpiresIn = (role) =>
+  PRIVILEGED_ROLES.has(role) ? privilegedExpiresIn : defaultExpiresIn;
+
+const UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+// JWT accepts "30m"/"7d"; API clients need a numeric `expires_in`.
+export const durationToSeconds = (value) => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  const match = String(value || "").trim().match(/^(\d+)\s*([smhd])$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  return amount * (UNIT_SECONDS[unit] || 0);
+};
+
+export const signToken = (payload, options = {}) =>
   jwt.sign(payload, process.env.JWT_SECRET, {
     algorithm: ALGORITHM,
-    expiresIn,
+    expiresIn: options.expiresIn || defaultExpiresIn,
     ...(issuer ? { issuer } : {}),
     ...(audience ? { audience } : {}),
   });

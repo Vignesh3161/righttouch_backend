@@ -153,10 +153,10 @@ router.get("/technician/me", Auth, getMyTechnician);
 router.put("/updateTechnician", Auth, updateTechnician);
 router.put("/technician/skills/add", Auth, isTechnician, addTechnicianSkills);
 router.put("/technician/skills/remove", Auth, isTechnician, removeTechnicianSkills);
-router.put("/technician/status", Auth, updateTechnicianStatus);
+router.put("/technician/status", Auth, authorizeRoles("Owner"), updateTechnicianStatus);
 router.put("/:technicianId/training", Auth, authorizeRoles("Admin", "Owner"), updateTechnicianTraining);
 router.post("/technician/profile-image", Auth, isTechnician, upload.single("profileImage"), uploadProfileImage);
-router.delete("/technicianDelete/:id", Auth, deleteTechnician);
+router.delete("/technicianDelete/:id", Auth, authorizeRoles("Owner", "Technician"), deleteTechnician);
 
 /* ================= TECHNICIAN KYC ================= */
 
@@ -195,16 +195,16 @@ router.post(
 router.get("/kyc/me", Auth, isTechnician, getMyTechnicianKyc);
 router.get("/technician/kyc/me", Auth, isTechnician, getMyTechnicianKyc);
 
-router.get("/kyc", Auth, getAllTechnicianKyc);
-router.get("/technician/kyc", Auth, getAllTechnicianKyc);
+router.get("/kyc", Auth, authorizeRoles("Admin", "Owner"), getAllTechnicianKyc);
+router.get("/technician/kyc", Auth, authorizeRoles("Admin", "Owner"), getAllTechnicianKyc);
 
 // 🔏 Full unmasked PII — audited access, Owner/Admin only. Define BEFORE
 // the generic /:technicianId route (explicit match wins by order).
-router.get("/kyc/:technicianId/full", Auth, getTechnicianKycFull);
-router.get("/technician/kyc/:technicianId/full", Auth, getTechnicianKycFull);
+router.get("/kyc/:technicianId/full", Auth, authorizeRoles("Admin", "Owner"), getTechnicianKycFull);
+router.get("/technician/kyc/:technicianId/full", Auth, authorizeRoles("Admin", "Owner"), getTechnicianKycFull);
 
-router.get("/kyc/:technicianId", Auth, getTechnicianKyc);
-router.get("/technician/kyc/:technicianId", Auth, getTechnicianKyc);
+router.get("/kyc/:technicianId", Auth, authorizeRoles("Admin", "Owner", "Technician"), getTechnicianKyc);
+router.get("/technician/kyc/:technicianId", Auth, authorizeRoles("Admin", "Owner", "Technician"), getTechnicianKyc);
 
 // 🔒 Rate-limited admin decisions — every approval/rejection is audited
 const kycAdminLimiter = rateLimit({
@@ -219,23 +219,23 @@ const kycAdminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-router.put("/kyc/verify", Auth, kycAdminLimiter, verifyTechnicianKyc);
-router.put("/technician/kyc/verify", Auth, kycAdminLimiter, verifyTechnicianKyc);
+router.put("/kyc/verify", Auth, authorizeRoles("Admin", "Owner"), kycAdminLimiter, verifyTechnicianKyc);
+router.put("/technician/kyc/verify", Auth, authorizeRoles("Admin", "Owner"), kycAdminLimiter, verifyTechnicianKyc);
 
-router.put("/kyc/bank/verify", Auth, kycAdminLimiter, verifyBankDetails);
-router.put("/technician/kyc/bank/verify", Auth, kycAdminLimiter, verifyBankDetails);
+router.put("/kyc/bank/verify", Auth, authorizeRoles("Admin", "Owner"), kycAdminLimiter, verifyBankDetails);
+router.put("/technician/kyc/bank/verify", Auth, authorizeRoles("Admin", "Owner"), kycAdminLimiter, verifyBankDetails);
 
-router.delete("/deletekyc/:technicianId", Auth, deleteTechnicianKyc);
-router.delete("/technician/deletekyc/:technicianId", Auth, deleteTechnicianKyc);
+router.delete("/deletekyc/:technicianId", Auth, authorizeRoles("Admin", "Owner"), deleteTechnicianKyc);
+router.delete("/technician/deletekyc/:technicianId", Auth, authorizeRoles("Admin", "Owner"), deleteTechnicianKyc);
 
-router.get("/kyc/orphaned/list", Auth, getOrphanedKyc);
-router.get("/technician/kyc/orphaned/list", Auth, getOrphanedKyc);
+router.get("/kyc/orphaned/list", Auth, authorizeRoles("Admin", "Owner"), getOrphanedKyc);
+router.get("/technician/kyc/orphaned/list", Auth, authorizeRoles("Admin", "Owner"), getOrphanedKyc);
 
-router.delete("/kyc/orphaned/cleanup/all", Auth, deleteAllOrphanedKyc);
-router.delete("/technician/kyc/orphaned/cleanup/all", Auth, deleteAllOrphanedKyc);
+router.delete("/kyc/orphaned/cleanup/all", Auth, authorizeRoles("Admin", "Owner"), deleteAllOrphanedKyc);
+router.delete("/technician/kyc/orphaned/cleanup/all", Auth, authorizeRoles("Admin", "Owner"), deleteAllOrphanedKyc);
 
-router.delete("/kyc/orphaned/:kycId", Auth, deleteOrphanedKyc);
-router.delete("/technician/kyc/orphaned/:kycId", Auth, deleteOrphanedKyc);
+router.delete("/kyc/orphaned/:kycId", Auth, authorizeRoles("Admin", "Owner"), deleteOrphanedKyc);
+router.delete("/technician/kyc/orphaned/:kycId", Auth, authorizeRoles("Admin", "Owner"), deleteOrphanedKyc);
 
 /* ================= JOB BROADCAST ================= */
 
@@ -281,17 +281,17 @@ router.post(
   ]),
   uploadWorkImages
 );
-router.get("/jobs/current", Auth, getTechnicianCurrentJobs); // Supports both Technician and Owner roles
-router.get("/jobs/accepted", Auth, getAllAcceptedJobs); // Technician/Owner/Admin — all accepted jobs, new→old
-router.get("/jobs/accepted/scheduled", Auth, getAcceptedScheduledJobs); // Technician/Owner/Admin — accepted scheduled jobs
+router.get("/jobs/current", Auth, authorizeRoles("Admin", "Owner", "Technician"), getTechnicianCurrentJobs); // Supports both Technician and Owner roles
+router.get("/jobs/accepted", Auth, authorizeRoles("Admin", "Owner", "Technician"), getAllAcceptedJobs); // Technician/Owner/Admin — all accepted jobs, new→old
+router.get("/jobs/accepted/scheduled", Auth, authorizeRoles("Admin", "Owner", "Technician"), getAcceptedScheduledJobs); // Technician/Owner/Admin — accepted scheduled jobs
 router.get("/jobs/history", Auth, isTechnician, getTechnicianJobHistory);
 
 /* ================= ADMIN JOB HISTORY (WITH DELETED TECHNICIAN SUPPORT) ================= */
-router.get("/admin/jobs/history", Auth, getAdminJobHistory); // Owner/Admin only
+router.get("/admin/jobs/history", Auth, authorizeRoles("Admin", "Owner"), getAdminJobHistory); // Owner/Admin only
 
 /* ================= TECHNICIAN WALLET ================= */
 
-router.post("/wallet/transaction", Auth, createWalletTransaction);
+router.post("/wallet/transaction", Auth, authorizeRoles("Owner"), createWalletTransaction);
 router.get("/wallet/history", Auth, isTechnician, getWalletTransactions);
 
 // Technician withdrawal requests

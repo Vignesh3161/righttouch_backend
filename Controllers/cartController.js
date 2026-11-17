@@ -20,6 +20,7 @@ import {
   isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { prepareScheduledBooking } from "../Services/slotCapacityService.js";
+import { resolveCartItemSchedule } from "../Utils/scheduleIntent.js";
 import {
   validateScheduledAtUtc,
   validateSlot,
@@ -798,7 +799,6 @@ export const checkout = async (req, res) => {
         }
 
         const addressId = normalizeAddressId(req.body?.addressId);
-        const scheduledAt = req.body?.scheduledAt;
 
         // Check for nested address object (Frontend sends this)
         const addressPayload = req.body?.address || req.body || {};
@@ -831,28 +831,8 @@ export const checkout = async (req, res) => {
             });
         }
 
-        // ─── Resolve Time ────────────────────────────────────────────────
+        // ─── Resolve checkout timing ───────────────────────────────
         const now = new Date();
-
-        // Use scheduledAt if provided, otherwise null (Instant)
-        const finalScheduledAt = scheduledAt ? new Date(scheduledAt) : null;
-
-        // 🛡️ PRODUCTION VALIDATION (timezone-safe): Scheduled bookings must be
-        // Tomorrow or Day after Tomorrow in the business timezone.
-        if (finalScheduledAt) {
-            const windowCheck = validateScheduledAtUtc(finalScheduledAt, { now });
-            if (!windowCheck.valid) {
-                await session.abortTransaction();
-                return res.status(400).json({
-                    success: false,
-                    message: windowCheck.error,
-                    result: {
-                        tomorrow: scheduleBookingWindow().from.toISOString().split("T")[0],
-                        dayAfter: scheduleBookingWindow().to.toISOString().split("T")[0]
-                    },
-                });
-            }
-        }
 
         // 🔁 Decision Logic: Address ID vs Current Location (Automated locationType)
         let resolvedLocation;
@@ -1033,31 +1013,55 @@ export const checkout = async (req, res) => {
             });
         }
 
-        // A client that asks for a scheduled checkout must have selected a
-        // valid per-item schedule first. Without this guard the request would
-        // silently create an instant booking (the bug surfaced on mobile).
-        const requestedBookingType = String(req.body?.bookingType || "").toLowerCase();
+        // Resolve top-level schedule intent once. Per-item schedules stay
+        // authoritative; a valid top-level schedule fills only items that do
+        // not have their own date/time. This keeps older clients from
+        // silently creating instant bookings for a scheduled checkout.
+        const topLevelSchedule = resolveScheduleInput(req.body, { now });
         const requestedSchedule =
-            requestedBookingType === "schedule" ||
-            requestedBookingType === "scheduled" ||
-            (!requestedBookingType &&
-                Boolean(req.body?.scheduledDate || req.body?.scheduledTime || scheduledAt));
-        if (requestedSchedule) {
-            const hasItemSchedule = validServiceItems.some(
-                (item) => Boolean(item.scheduledAt || (item.scheduledDate && item.scheduledTime))
-            );
-            if (!hasItemSchedule) {
+            topLevelSchedule.scheduleIntent === true ||
+            topLevelSchedule.bookingType === "schedule";
+
+        const itemHasSchedule = (item) =>
+            Boolean(item.scheduledAt || (item.scheduledDate && item.scheduledTime));
+
+        const unscheduledItems = validServiceItems.filter((item) => !itemHasSchedule(item));
+        const fallbackSchedule =
+            topLevelSchedule.bookingType === "schedule" && !topLevelSchedule.error
+                ? topLevelSchedule
+                : null;
+
+        if (requestedSchedule && unscheduledItems.length > 0 && !fallbackSchedule) {
+            await session.abortTransaction();
+            return res.status(400).json({
+                success: false,
+                code: topLevelSchedule.errorCode || "SCHEDULE_SELECTION_REQUIRED",
+                message:
+                    topLevelSchedule.error ||
+                    "Select a valid date and time for this service before scheduling checkout.",
+                result: {
+                    unscheduledItems: unscheduledItems.map((item) => ({
+                        cartItemId: item._id,
+                        itemId: item.itemId,
+                    })),
+                },
+            });
+        }
+
+        const effectiveScheduleFor = (cartItem) =>
+            resolveCartItemSchedule(cartItem, { now, fallbackSchedule });
+
+        for (const cartItem of validServiceItems) {
+            const effectiveSchedule = effectiveScheduleFor(cartItem);
+            if (effectiveSchedule.error) {
                 await session.abortTransaction();
                 return res.status(400).json({
                     success: false,
-                    code: "SCHEDULE_SELECTION_REQUIRED",
-                    message: "Select a valid date and time for this service before scheduling checkout.",
+                    code: "INVALID_SCHEDULE",
+                    message: effectiveSchedule.error,
                     result: {},
                 });
             }
-        }
-
-        for (const cartItem of validServiceItems) {
             checkoutKeys.push(
                 resolveBookingIdempotencyKey({
                     req,
@@ -1066,13 +1070,20 @@ export const checkout = async (req, res) => {
                     suffix: String(cartItem._id),
                     fingerprint: {
                         serviceId: String(cartItem.itemId),
-                        bookingType: cartItem.scheduledDate || cartItem.scheduledAt ? "schedule" : "instant",
-                        scheduledAt: cartItem.scheduledAt ? new Date(cartItem.scheduledAt).toISOString() : null,
-                        scheduledDate: cartItem.scheduledDate || null,
-                        scheduledTime: cartItem.scheduledTime || null,
+                        bookingType: effectiveSchedule.bookingType,
+                        scheduledAt: effectiveSchedule.scheduledAt
+                            ? new Date(effectiveSchedule.scheduledAt).toISOString()
+                            : null,
+                        slotKey: effectiveSchedule.slotKey || null,
+                        scheduledDate:
+                            cartItem.scheduledDate || effectiveSchedule.scheduledDateLocal || null,
+                        scheduledTime:
+                            cartItem.scheduledTime || effectiveSchedule.scheduledTimeLocal || null,
                         quantity: cartItem.quantity || 1,
                         tipAmount: Math.max(toFiniteNumber(cartItem?.tipAmount) || 0, 0),
-                        addressId: resolvedLocation.addressId ? String(resolvedLocation.addressId) : null,
+                        addressId: resolvedLocation.addressId
+                            ? String(resolvedLocation.addressId)
+                            : null,
                         latitude: resolvedLocation.latitude,
                         longitude: resolvedLocation.longitude,
                     },
@@ -1111,7 +1122,6 @@ export const checkout = async (req, res) => {
         };
 
         const serviceBroadcastTasks = [];
-        const scheduledSlotKeys = new Map();
         preparedBookings = [];
         const cartGroupId = `cart_${customerId}_${Date.now()}`;
 
@@ -1147,50 +1157,17 @@ export const checkout = async (req, res) => {
                 });
             }
 
-            // ─── Resolve schedule per item (same utility as GET /slots) ─────
-            let schedule;
-            if (cartItem.scheduledDate && cartItem.scheduledTime) {
-                schedule = resolveScheduleInput(cartItem, { now });
-            } else if (cartItem.scheduledAt) {
-                const check = validateScheduledAtUtc(new Date(cartItem.scheduledAt), { now });
-                schedule = check.valid
-                    ? {
-                        bookingType: "schedule",
-                        scheduledAt: check.normalizedScheduledAt || check.scheduledAt,
-                        slotKey: check.slot?.slotKey || null,
-                        slotValue: check.slot?.slotValue || null,
-                        slotLabel: check.slot?.slotLabel || null,
-                        slotStartAt: check.slot?.slotStartAt || null,
-                        slotEndAt: check.slot?.slotEndAt || null,
-                        timezone: check.timezone,
-                        scheduledDateLocal: check.scheduledDateLocal,
-                        scheduledTimeLocal: check.scheduledTimeLocal,
-                    }
-                    : { bookingType: "schedule", error: check.error };
-            } else {
-                schedule = { bookingType: "instant", scheduledAt: null, timezone: null, scheduledDateLocal: null, scheduledTimeLocal: null };
-            }
+            // ─── Resolve effective schedule per item (per-item first) ───
+            const schedule = effectiveScheduleFor(cartItem);
 
             if (schedule.error) {
                 await session.abortTransaction();
                 return res.status(400).json({
                     success: false,
+                    code: "INVALID_SCHEDULE",
                     message: schedule.error,
                     result: {},
                 });
-            }
-
-            if (schedule.bookingType === "schedule" && schedule.slotKey) {
-                if (scheduledSlotKeys.has(schedule.slotKey)) {
-                    await session.abortTransaction();
-                    return res.status(400).json({
-                        success: false,
-                        code: "MULTI_ITEM_SAME_SLOT_NOT_SUPPORTED",
-                        message: "Multiple cart services cannot be booked into the same slot yet. Please choose different slots.",
-                        result: { slotKey: schedule.slotKey },
-                    });
-                }
-                scheduledSlotKeys.set(schedule.slotKey, cartItem._id || cartItem.itemId);
             }
 
             // 💰 SERVER-SIDE SPLIT — canonical financial snapshot per cart item.

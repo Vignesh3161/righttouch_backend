@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import CityZone from "../Schemas/CityZone.js";
+import OperationalCity from "../Schemas/OperationalCity.js";
 import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import Service from "../Schemas/Service.js";
 import { resolveDistrictAndZoneFromCoordinates, resolveServiceZoneFromCoordinates } from "../Utils/resolveZoneFromCoordinates.js";
@@ -220,36 +221,64 @@ export const getMyZone = async (req, res) => {
 
     const TechnicianProfile = mongoose.model("TechnicianProfile");
     const profile = await TechnicianProfile.findById(technicianProfileId)
-      .select("cityZoneId zoneMismatch zoneMismatchSince location")
+      .select(
+        "cityZoneId zoneMismatch zoneMismatchSince location enabledCityZoneIds primaryDistrictId primaryCityId"
+      )
       .lean();
 
     if (!profile) {
       return res.status(404).json({ success: false, message: "Technician profile not found", result: {} });
     }
 
-    if (!profile.cityZoneId) {
-      return res.status(200).json({
-        success: true,
-        result: {
-          zone: null,
-          mismatch: false,
-          message: "No zone assigned. Please update your location to register for a zone.",
-        },
-      });
-    }
+    const mapZone = (zone) =>
+      zone
+        ? {
+            _id: zone._id,
+            name: zone.name,
+            zoneCode: zone.zoneCode,
+            operationalCity: zone.operationalCityId,
+          }
+        : null;
 
-    const zone = await CityZone.findById(profile.cityZoneId)
+    const approvedZoneDocs = await CityZone.find({
+      _id: { $in: profile.enabledCityZoneIds || [] },
+      active: { $ne: false },
+    })
       .populate("operationalCityId", "name")
       .lean();
+
+    const approvedZones = approvedZoneDocs.map(mapZone).filter(Boolean);
+    const registrationZoneDoc = profile.cityZoneId
+      ? await CityZone.findById(profile.cityZoneId)
+          .populate("operationalCityId", "name")
+          .lean()
+      : null;
+    const registrationZone = mapZone(registrationZoneDoc);
+
+    const registrationDistrictId = profile.primaryCityId || profile.primaryDistrictId || null;
+    const registrationDistrict = registrationDistrictId
+      ? await OperationalCity.findById(registrationDistrictId)
+          .select("name city state")
+          .lean()
+      : null;
 
     return res.status(200).json({
       success: true,
       result: {
-        zone: zone
-          ? { _id: zone._id, name: zone.name, zoneCode: zone.zoneCode, operationalCity: zone.operationalCityId }
-          : null,
+        zone: approvedZones[0] || null,
+        approvedZones,
+        hasApprovedCoverage: approvedZones.length > 0,
+        coveragePending: approvedZones.length === 0,
+        registrationZone,
+        registrationDistrict,
         mismatch: profile.zoneMismatch,
         mismatchSince: profile.zoneMismatchSince,
+        ...(approvedZones.length === 0
+          ? {
+              message:
+                "Coverage pending Admin/Owner approval. Your registered location does not grant work permission.",
+            }
+          : {}),
       },
     });
   } catch (err) {

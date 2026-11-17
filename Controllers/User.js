@@ -153,7 +153,16 @@ export const verifyOtp = async (req, res) => {
     req.body = req.body || {};
     const { identifier, mobileNumber, otp, role } = req.body;
 
-    const result = await verifyOtpInternal({ identifier, mobileNumber, otp, role });
+    const result = await verifyOtpInternal({
+      identifier,
+      mobileNumber,
+      otp,
+      role,
+      meta: {
+        ip: req.ip,
+        userAgent: req.get ? req.get("user-agent") : "",
+      },
+    });
 
     if (result.user && result.token) {
       // SIGNUP completion returns 201, LOGIN returns 200
@@ -205,11 +214,18 @@ export const login = async (req, res, opts = {}) => {
       role,
       password,
       privileged,
+      meta: {
+        ip: req.ip,
+        userAgent: req.get ? req.get("user-agent") : "",
+      },
     });
 
     if (result.type === "PASSWORD_LOGIN") {
       return ok(res, 200, "Login successful", {
         token: result.token,
+        refresh_token: result.refreshToken,
+        refreshToken: result.refreshToken,
+        expires_in: result.expiresInSeconds,
         userId: result.userId,
         role: result.role,
       });

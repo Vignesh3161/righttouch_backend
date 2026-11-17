@@ -1,4 +1,5 @@
 import express from "express";
+import { authorizeRoles } from "../Middleware/Auth.js";
 import {
   getMyRewardBalance,
   getMyRewardHistory,
@@ -23,10 +24,11 @@ customerRewardRoutes.get("/reconcile", reconcileMyRewards);
 customerRewardRoutes.get("/redemption-preview", getMyRedemptionPreview);
 customerRewardRoutes.get("/redemptions", getMyRedemptions);
 
-// Admin/Owner governance (mounted behind Auth + authorizeRoles).
+// Owner governance (mounted behind Auth + authorizeRoles).
 // Read-only support views, policy/metrics governance, and redemption audit.
 // Mutations happen only through the payment-order flow.
 export const adminRewardRoutes = express.Router();
+adminRewardRoutes.use(authorizeRoles("Owner"));
 adminRewardRoutes.get("/policy", getRewardPolicy);
 adminRewardRoutes.post("/policy", createRewardPolicy);
 adminRewardRoutes.get("/metrics", getRewardMetrics);

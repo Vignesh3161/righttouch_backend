@@ -34,15 +34,11 @@ export const getTechnicianDistricts = async (req, res) => {
 
     const profile = await TechnicianProfile.findById(technicianId)
       .populate("primaryCityId", "name city state country active isRegistrationEnabled isJobEnabled")
+      .populate("primaryDistrictId", "name city state country active isRegistrationEnabled isJobEnabled")
       .lean();
 
     if (!profile) {
       return res.status(404).json({ success: false, message: "Technician profile not found", result: {} });
-    }
-
-    // Auto-heal primary district if null
-    if (!profile.primaryCityId) {
-      await technicianDistrictService.getAllowedDistrictsForTechnician(profile);
     }
 
     const permissions = await TechnicianDistrictPermission.find({ technicianId })
@@ -58,26 +54,30 @@ export const getTechnicianDistricts = async (req, res) => {
     const orphanedPermissions = permissions.filter((p) => !p.districtId);
     const activePermissions = permissions.filter((p) => p.districtId);
 
-    const primaryDistrictId = profile.primaryCityId?._id || profile.primaryCityId || null;
-    const primaryDistrictPermission = primaryDistrictId
+    const registrationDistrict = profile.primaryCityId || profile.primaryDistrictId || null;
+    const registrationDistrictId = registrationDistrict?._id || registrationDistrict || null;
+    const primaryDistrictPermission = registrationDistrictId
       ? activePermissions.find(
           (p) =>
             p.districtId &&
-            String(p.districtId._id || p.districtId) === String(primaryDistrictId)
+            String(p.districtId._id || p.districtId) === String(registrationDistrictId)
         ) || null
       : null;
+    const allowedDistrictIds = await technicianDistrictService.getAllowedDistrictsForTechnician(profile);
 
     return res.status(200).json({
       success: true,
       message: "Technician district permissions fetched",
       result: {
         technicianId,
-        primaryDistrict: profile.primaryCityId || null,
+        registrationDistrict,
+        primaryDistrict: registrationDistrict,
         primaryDistrictHasPermission: Boolean(primaryDistrictPermission?.isEnabled),
         primaryDistrictPermission,
         additionalPermissions: activePermissions,
         orphanedPermissions,
-        allowedDistrictIds: await technicianDistrictService.getAllowedDistrictsForTechnician(profile),
+        allowedDistrictIds,
+        coveragePending: allowedDistrictIds.length === 0,
       },
     });
   } catch (err) {

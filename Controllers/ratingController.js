@@ -3,7 +3,9 @@ import {
   createServiceRating,
   createProductRating,
   updateRating,
+  adminUpdateRating,
   deleteRating,
+  adminDeleteRating,
   rebuildRatingAggregate,
   isValidObjectId,
 } from "../Services/ratingService.js";
@@ -231,6 +233,62 @@ export const deleteRatingController = async (req, res) => {
       return res.status(status).json({ success: false, message: error.message, result: {} });
     }
     console.error("Delete rating error:", error);
+    res.status(500).json({ success: false, message: "Server Error", result: { error: error.message } });
+  }
+};
+
+export const adminUpdateRatingController = async (req, res) => {
+  try {
+    const { rates, comment } = req.body;
+    const { rating, aggregates } = await adminUpdateRating(req.params.id, { rates, comment });
+
+    const data = {
+      ratingId: rating._id,
+      bookingId: rating.bookingId,
+      rates: rating.rates,
+      content: rating.content,
+    };
+    if (rating.bookingType === "service") {
+      data.technician = aggregates.technician || null;
+      data.service = aggregates.service || null;
+    } else {
+      data.product = aggregates.product || null;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Rating updated successfully",
+      data,
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    if (status !== 500) {
+      return res.status(status).json({ success: false, message: error.message, result: {} });
+    }
+    console.error("Admin update rating error:", error);
+    return res.status(500).json({ success: false, message: "Server Error", result: { error: error.message } });
+  }
+};
+
+export const adminDeleteRatingController = async (req, res) => {
+  try {
+    const { rating, aggregates } = await adminDeleteRating(req.params.id);
+
+    const data = { ratingId: rating._id, bookingId: rating.bookingId };
+    if (rating.bookingType === "service") {
+      data.technician = aggregates.technician || { avg: 0, count: 0 };
+      data.service = aggregates.service || { avg: 0, count: 0 };
+    } else {
+      data.product = aggregates.product || { avg: 0, count: 0 };
+    }
+
+    res.status(200).json({ success: true, message: "Rating deleted successfully", data });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    if (status !== 500) {
+      return res.status(status).json({ success: false, message: error.message, result: {} });
+    }
+    console.error("Admin delete rating error:", error);
     res.status(500).json({ success: false, message: "Server Error", result: { error: error.message } });
   }
 };

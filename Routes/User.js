@@ -22,6 +22,11 @@ import {
 } from "../Controllers/User.js";
 
 import { deleteMyAccount } from "../Controllers/accountController.js";
+import {
+  refreshSession,
+  logoutSession,
+  logoutAllSessions,
+} from "../Controllers/refreshTokenController.js";
 
 // ...existing code...
 
@@ -43,6 +48,8 @@ import {
   getRatingById,
   updateRatingController,
   deleteRatingController,
+  adminUpdateRatingController,
+  adminDeleteRatingController,
   getMyRatings,
   rebuildAggregateController,
 } from "../Controllers/ratingController.js";
@@ -184,6 +191,11 @@ const otpLimiter = rateLimit({
 router.post("/auth/login/request-otp", otpLimiter, requestLoginOtp);
 router.post("/auth/login/verify-otp", otpLimiter, verifyLoginOtp);
 
+// Rotating refresh tokens (all roles) + current-device / all-device logout.
+router.post("/auth/refresh", authLimiter, refreshSession);
+router.post("/auth/logout", authLimiter, logoutSession);
+router.post("/auth/logout-all", Auth, logoutAllSessions);
+
 /* ================= USER ================= */
 router.post("/signup", authLimiter, signupAndSendOtp);
 router.post("/resend-otp", otpLimiter, resendOtp);
@@ -256,19 +268,19 @@ router.get("/users/:role", Auth, authorizeRoles("Admin", "Owner"), getAllUsers);
 router.delete("/users/:id", Auth, authorizeRoles("Owner"), deleteUserById);
 
 /* ================= CATEGORY ================= */
-router.post("/category", Auth, authorizeRoles("Admin", "Owner"), serviceCategory);
+router.post("/category", Auth, authorizeRoles("Owner"), serviceCategory);
 router.post(
   "/category/upload-image",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.single("image"),
   uploadCategoryImage
 );
-router.delete("/category/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeCategoryImage);
+router.delete("/category/remove-image", Auth, authorizeRoles("Owner"), removeCategoryImage);
 router.get("/getAllcategory", getAllCategory);
 router.get("/getByIdcategory/:id", getByIdCategory);
-router.put("/updatecategory/:id", Auth, authorizeRoles("Admin", "Owner"), updateCategory);
-router.delete("/deletecategory/:id", Auth, authorizeRoles("Admin", "Owner"), deleteCategory);
+router.put("/updatecategory/:id", Auth, authorizeRoles("Owner"), updateCategory);
+router.delete("/deletecategory/:id", Auth, authorizeRoles("Owner"), deleteCategory);
 
 /* ================= REPORT ================= */
 router.post("/report", Auth, userReport);
@@ -278,33 +290,33 @@ router.get("/getReportById/:id", Auth, authorizeRoles("Admin", "Owner"), getRepo
 router.put("/report/resolve/:id", Auth, authorizeRoles("Admin", "Owner"), resolveReport);
 
 /* ================= SERVICE ================= */
-router.post("/service", Auth, authorizeRoles("Admin", "Owner"), createService);
+router.post("/service", Auth, authorizeRoles("Owner"), createService);
 router.post(
   "/services/upload-images",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.array("serviceImages", 5),
   uploadServiceImages
 );
-router.delete("/services/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeServiceImage);
+router.delete("/services/remove-image", Auth, authorizeRoles("Owner"), removeServiceImage);
 router.put(
   "/services/replace-images",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.array("serviceImages", 5),
   replaceServiceImages
 );
 router.get("/getAllServices", getAllServices);
 router.get("/getServiceById/:id", getServiceById);
-router.put("/updateService/:id", Auth, authorizeRoles("Admin", "Owner"), updateService);
-router.put("/service/:id/zone-restriction", Auth, authorizeRoles("Admin", "Owner"), toggleZoneRestriction);
-router.delete("/services/:id", Auth, authorizeRoles("Admin", "Owner"), deleteService);
+router.put("/updateService/:id", Auth, authorizeRoles("Owner"), updateService);
+router.put("/service/:id/zone-restriction", Auth, authorizeRoles("Owner"), toggleZoneRestriction);
+router.delete("/services/:id", Auth, authorizeRoles("Owner"), deleteService);
 
 /* ================= SERVICE COVERAGE POLYGON (Admin/Owner) ================= */
 // Polygon = where the service can be booked + where technicians get matched
 router.get("/service/:id/polygon", Auth, getServicePolygon);
-router.put("/service/:id/polygon", Auth, setServicePolygon);
-router.delete("/service/:id/polygon", Auth, removeServicePolygon);
+router.put("/service/:id/polygon", Auth, authorizeRoles("Owner"), setServicePolygon);
+router.delete("/service/:id/polygon", Auth, authorizeRoles("Owner"), removeServicePolygon);
 
 /* ================= SERVICE BOOKING ================= */
 router.get("/service/booking", Auth, getBookings);
@@ -324,7 +336,7 @@ router.post("/booking/:id/customer-no-show/respond", Auth, respondToCustomerNoSh
 router.delete("/booking/deleteAll", Auth, deleteAllCustomerBookings);
 router.delete("/booking/:id", Auth, deleteServiceBooking);
 router.delete("/booking/admin/:id", Auth, authorizeRoles("Admin", "Owner"), deleteBookingAsAdmin);
-router.put("/booking/:id/customer-no-show/compensation", Auth, authorizeRoles("Admin", "Owner"), reviewCustomerNoShowCompensation);
+router.put("/booking/:id/customer-no-show/compensation", Auth, authorizeRoles("Owner"), reviewCustomerNoShowCompensation);
 
 /* ================= BOOK AGAIN ================= */
 router.get("/booking/completed-services", Auth, getCompletedServices);
@@ -363,21 +375,33 @@ router.get(
   authorizeRoles("Admin", "Owner"),
   getAllRatings
 );
+router.put(
+  "/admin/ratings/:id",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  adminUpdateRatingController
+);
+router.delete(
+  "/admin/ratings/:id",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  adminDeleteRatingController
+);
 
 /* ================= PRODUCT ================= */
-router.post("/product", Auth, authorizeRoles("Admin", "Owner"), createProduct);
+router.post("/product", Auth, authorizeRoles("Owner"), createProduct);
 router.post(
   "/product/upload-images",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.array("productImages", 5),
   uploadProductImages
 );
-router.delete("/product/remove-image", Auth, authorizeRoles("Admin", "Owner"), removeProductImage);
+router.delete("/product/remove-image", Auth, authorizeRoles("Owner"), removeProductImage);
 router.put(
   "/product/replace-images",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.array("productImages", 5),
   replaceProductImages
 );
@@ -386,11 +410,11 @@ router.get("/getOneProduct/:id", getOneProduct);
 router.put(
   "/updateProduct/:id",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   upload.array("productImages", 5),
   updateProduct
 );
-router.delete("/deleteProduct/:id", Auth, authorizeRoles("Admin", "Owner"), deleteProduct);
+router.delete("/deleteProduct/:id", Auth, authorizeRoles("Owner"), deleteProduct);
 
 /* ================= PRODUCT BOOKING ================= */
 router.get("/getAllProductBooking", Auth, getAllProductBooking);
@@ -401,7 +425,7 @@ router.put("/productBookingCancel/:id", Auth, productBookingCancel);
 router.put(
   "/admin/productBooking/:id/complete",
   Auth,
-  authorizeRoles("Admin", "Owner"),
+  authorizeRoles("Owner"),
   adminCompleteProductBooking
 );
 
@@ -410,11 +434,11 @@ router.post("/payment/order", Auth, createPaymentOrder);
 router.post("/payment/verify", Auth, verifyPayment);
 router.post("/payment/webhook/razorpay", razorpayWebhook);
 // RBAC: only Admin/Owner may mutate payment state by hand (audited)
-router.put("/payment/:id/status", Auth, authorizeRoles("Admin", "Owner"), updatePaymentStatus);
+router.put("/payment/:id/status", Auth, authorizeRoles("Owner"), updatePaymentStatus);
 router.get("/payment/:bookingId", Auth, getPaymentByBooking);
 
 // ✅ Manual retry for stuck settlements (Admin/Owner)
-router.post("/payment/retry-settlement", Auth, retryPaymentSettlement);
+router.post("/payment/retry-settlement", Auth, authorizeRoles("Owner"), retryPaymentSettlement);
 
 /* ================= CART ================= */
 router.post("/cart/add", Auth, addToCart);

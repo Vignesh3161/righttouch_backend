@@ -616,7 +616,7 @@ App.get("/health/metrics", async (req, res) => {
   res.status(200).json(notificationMetrics.getSummary());
 });
 
-App.get("/health/socket-rooms/:userId", async (req, res) => {
+App.get("/health/socket-rooms/:userId", Auth, authorizeRoles("Admin", "Owner"), async (req, res) => {
   const { userId } = req.params;
   if (!mongoose.Types.ObjectId.isValid(userId)) {
     return res.status(400).json({ success: false, message: "Invalid userId" });
@@ -707,7 +707,7 @@ App.use("/api/user/notifications", Auth, notificationRoutes);
 App.use("/api/user/permissions", Auth, makePermissionRouter("Customer"));
 App.use("/api/user/device-token", Auth, makeDeviceRouter("Customer"));
 App.use("/api/user/rewards", Auth, customerRewardRoutes);
-App.use("/api/admin/rewards", Auth, authorizeRoles("Admin", "Owner"), adminRewardRoutes);
+App.use("/api/admin/rewards", Auth, authorizeRoles("Owner"), adminRewardRoutes);
 App.use("/api/addresses", AddressRoutes);
 App.use("/api", userZoneRoutes);
 

@@ -563,12 +563,8 @@ export const getDistrictTechnicians = async (req, res) => {
 
     const districtObjId = new mongoose.Types.ObjectId(id);
 
-    // Primary technicians
-    const primaryTechs = await TechnicianProfile.find({ primaryCityId: districtObjId })
-      .populate("userId", "name phone email role")
-      .lean();
-
-    // Additional permissions
+    // Explicit approvals only. Registration address / primaryDistrictId is
+    // location metadata and never implies dispatch coverage.
     const permissions = await TechnicianDistrictPermission.find({ districtId: districtObjId, isEnabled: true })
       .populate({
         path: "technicianId",
@@ -576,16 +572,19 @@ export const getDistrictTechnicians = async (req, res) => {
       })
       .lean();
 
+    const technicians = permissions.map((p) => p.technicianId).filter(Boolean);
+
     return res.status(200).json({
       success: true,
       result: {
         districtId: id,
-        primaryTechnicians: primaryTechs,
-        additionalTechnicians: permissions.map((p) => p.technicianId).filter(Boolean),
+        primaryTechnicians: [],
+        additionalTechnicians: technicians,
+        technicians,
         meta: {
-          primaryCount: primaryTechs.length,
-          additionalCount: permissions.length,
-          total: primaryTechs.length + permissions.length,
+          primaryCount: 0,
+          additionalCount: technicians.length,
+          total: technicians.length,
         },
       },
     });

@@ -22,8 +22,8 @@ import { resolveServiceZoneFromCoordinates } from "./resolveZoneFromCoordinates.
 import { resolveCommissionSnapshot } from "./commission.js";
 import { paiseToRupees } from "./money.js";
 import { matchAndBroadcastBooking } from "./technicianMatching.js";
-import { validateSlot, BUSINESS_TIMEZONE, localDateInBusinessTimezone, formatInBusinessTimezone } from "./slots.js";
 import { isBookingPastAutoCancel, normalizeBookingStatus } from "./bookingStatus.js";
+import { normalizeScheduleRequest } from "./scheduleIntent.js";
 import { computeDispatchEligibleAt } from "./schedulingConfig.js";
 import { assertServiceFitsSlot } from "../Services/slotAvailabilityService.js";
 
@@ -129,50 +129,8 @@ export const resolveServiceZoneAvailability = async ({
  *             timezone: string|null, scheduledDateLocal: string|null,
  *             scheduledTimeLocal: string|null, error?: string }}
  */
-export const resolveScheduleInput = (body, { now = new Date() } = {}) => {
-  const requestedType = String(body?.bookingType || "").toLowerCase();
-  const hasScheduleInput = Boolean(body?.scheduledDate && body?.scheduledTime);
-  const bookingType =
-    requestedType === "schedule" || requestedType === "scheduled" || hasScheduleInput
-      ? "schedule"
-      : "instant";
-
-  if (bookingType === "instant") {
-    return {
-      bookingType,
-      scheduledAt: null,
-      slotKey: null,
-      slotValue: null,
-      slotLabel: null,
-      slotStartAt: null,
-      slotEndAt: null,
-      timezone: null,
-      scheduledDateLocal: null,
-      scheduledTimeLocal: null,
-    };
-  }
-
-  const { scheduledDate, scheduledTime } = body;
-  const validation = validateSlot(scheduledDate, scheduledTime, { now });
-
-  if (!validation.valid) {
-    return { bookingType, error: validation.error };
-  }
-
-  const local = formatInBusinessTimezone(validation.scheduledAt);
-  return {
-    bookingType,
-    scheduledAt: validation.slot?.slotStartAt || validation.scheduledAt,
-    slotKey: validation.slot?.slotKey || null,
-    slotValue: validation.slot?.slotValue || scheduledTime,
-    slotLabel: validation.slot?.slotLabel || null,
-    slotStartAt: validation.slot?.slotStartAt || validation.scheduledAt,
-    slotEndAt: validation.slot?.slotEndAt || null,
-    timezone: BUSINESS_TIMEZONE,
-    scheduledDateLocal: localDateInBusinessTimezone(validation.scheduledAt),
-    scheduledTimeLocal: `${local.hours}:${local.minutes}`,
-  };
-};
+export const resolveScheduleInput = (body, { now = new Date() } = {}) =>
+  normalizeScheduleRequest(body, { now });
 
 /**
  * Compute autoCancelAt from the canonical rules:

@@ -17,9 +17,15 @@ postmancollection/
 │   ├── 04-scheduled-booking-and-technician-jobs.md
 │   │                                  Scheduled booking + technician lifecycle
 │   ├── 05-manual-payouts.md          Manual payout flows, sockets, notifications
-│   └── 06-scheduling-flow-sockets-endpoints.md
-│                                      Consolidated scheduling flow, sockets,
-│                                      and per-role endpoint map
+│   ├── 06-scheduling-flow-sockets-endpoints.md
+│   │                                  Consolidated scheduling flow, sockets,
+│   │                                  and per-role endpoint map
+│   ├── 07-frontend-scheduling-integration.md
+│   │                                  Frontend implementation guide for
+│   │                                  scheduling across apps and website
+│   └── 08-technician-job-filters-and-schedule-vs-instant.md
+│                                      Technician filter matrix and type
+│                                      separation reference
 ├── collections/
 │   ├── righttouch_dispatch_and_socket.postman_collection.json
 │   ├── righttouch_manual_payouts.postman_collection.json
@@ -136,7 +142,11 @@ inserted into the canonical role collections under
 `14.1 Scheduling, Dispatch & No-Show` (Admin).
 
 See `docs/06-scheduling-flow-sockets-endpoints.md` for the consolidated flow,
-socket event matrix, and endpoint map.
+socket event matrix, and endpoint map,
+`docs/07-frontend-scheduling-integration.md` for the per-app implementation
+guide, and
+`docs/08-technician-job-filters-and-schedule-vs-instant.md` for the technician
+tab/endpoint filters and scheduled-vs-instant separation.
 
 ## Environment variables
 
@@ -173,3 +183,5 @@ socket event matrix, and endpoint map.
 - `docs/04-scheduled-booking-and-technician-jobs.md`
 - `docs/05-manual-payouts.md`
 - `docs/06-scheduling-flow-sockets-endpoints.md`
+- `docs/07-frontend-scheduling-integration.md`
+- `docs/08-technician-job-filters-and-schedule-vs-instant.md`

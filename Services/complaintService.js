@@ -282,6 +282,13 @@ export const adminUpdateComplaintStatusInternal = async ({
     throw err;
   }
 
+  const isOwner = adminUser?.role === "Owner";
+  if (!isOwner && (status === "resolved_refunded" || refundId || Number(refundAmount) > 0 || Number(penaltyAmount) > 0)) {
+    const err = new Error("Owner access required for refund or financial actions");
+    err.statusCode = 403;
+    throw err;
+  }
+
   const report = await Report.findById(reportId);
   if (!report) {
     const err = new Error("Complaint not found");
@@ -428,6 +435,13 @@ export const adminUpdateComplaintStatusInternal = async ({
  * Resolves legacy report (fixing the legacy "resolved" enum error by mapping to valid terminal enum).
  */
 export const resolveLegacyReportInternal = async ({ reportId, inputStatus, resolutionNote, refundId, adminUser }) => {
+  const isOwner = adminUser?.role === "Owner";
+  if (!isOwner && (inputStatus === "resolved_refunded" || refundId)) {
+    const err = new Error("Owner access required for refund or financial actions");
+    err.statusCode = 403;
+    throw err;
+  }
+
   const report = await Report.findById(reportId);
   if (!report) {
     const err = new Error("Report not found");

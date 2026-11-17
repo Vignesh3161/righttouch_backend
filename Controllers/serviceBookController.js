@@ -204,7 +204,7 @@ export const createBooking = async (req, res) => {
     // ─── Booking type & scheduled time ───────────────────────────────
     const schedule = resolveScheduleInput(req.body);
     if (schedule.error) {
-      return res.status(400).json({ success: false, message: schedule.error, result: {} });
+      return res.status(400).json({ success: false, message: schedule.error, code: schedule.errorCode || "INVALID_SCHEDULE", result: {} });
     }
     const bookingType = schedule.bookingType === "schedule" ? "scheduled" : "instant";
     const finalScheduledAt = schedule.scheduledAt || null;
@@ -446,7 +446,7 @@ export const storeBookingSchedule = async (req, res) => {
     // ─── Schedule resolution (timezone-safe, same utility as GET /slots) ──
     const schedule = resolveScheduleInput(req.body);
     if (schedule.error) {
-      return res.status(400).json({ success: false, message: schedule.error, result: {} });
+      return res.status(400).json({ success: false, message: schedule.error, code: schedule.errorCode || "INVALID_SCHEDULE", result: {} });
     }
 
     if (!serviceId) {
@@ -667,7 +667,7 @@ export const rescheduleBooking = async (req, res) => {
       { now }
     );
     if (schedule.error) {
-      return res.status(400).json({ success: false, message: schedule.error, result: {} });
+      return res.status(400).json({ success: false, message: schedule.error, code: schedule.errorCode || "INVALID_SCHEDULE", result: {} });
     }
 
     if (schedule.scheduledAt.getTime() === booking.scheduledAt.getTime()) {
@@ -1025,6 +1025,10 @@ export const getBookings = async (req, res) => {
       filter.technicianId = technicianProfileId;
     }
 
+    if (req.user.role !== "Customer" && req.user.role !== "Technician" && req.user.role !== "Admin" && req.user.role !== "Owner") {
+      return res.status(403).json({ success: false, message: "Access denied", result: {} });
+    }
+
     // For Admin/Owner: no filter, shows all bookings (intended — admins see all).
     // For Customer/Technician: filtered by their ID (data isolation).
 
@@ -1304,10 +1308,10 @@ export const getTechnicianCurrentJobs = async (req, res) => {
     const userRole = req.user?.role;
 
     // Validate role access
-    if (userRole !== "Technician" && userRole !== "Owner") {
+    if (userRole !== "Technician" && userRole !== "Owner" && userRole !== "Admin") {
       return res.status(403).json({
         success: false,
-        message: "Access denied. Technician or Owner access only.",
+        message: "Access denied. Technician, Owner, or Admin access only.",
         result: {},
       });
     }

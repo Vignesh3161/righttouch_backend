@@ -345,9 +345,69 @@ export const updateRating = async (id, userId, { rates, comment }) => {
   return { rating, aggregates };
 };
 
+export const adminUpdateRating = async (id, { rates, comment }) => {
+  const allowed = {};
+  if (rates !== undefined) {
+    if (!isValidRate(rates)) {
+      const err = new Error("rates must be an integer between 1 and 5");
+      err.statusCode = 400;
+      throw err;
+    }
+    allowed.rates = rates;
+  }
+  if (comment !== undefined) allowed.comment = comment;
+
+  if (Object.keys(allowed).length === 0) {
+    const err = new Error("Nothing to update");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const rating = await Rating.findByIdAndUpdate(id, allowed, {
+    new: true,
+    runValidators: true,
+  });
+
+  if (!rating) {
+    const err = new Error("Rating not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  logRating("info", `rating.admin_updated.${rating.bookingType}`, {
+    ratingId: rating._id.toString(),
+    bookingId: rating.bookingId?.toString(),
+    customerId: rating.userId,
+    rates: rating.rates,
+  });
+  emitMetric(
+    rating.bookingType === "service" ? METRICS.updatedService : METRICS.updatedProduct,
+    { ratingId: rating._id.toString(), bookingId: rating.bookingId?.toString(), customerId: rating.userId, rates: rating.rates }
+  );
+
+  const aggregates = await rollupForRating(rating);
+  return { rating, aggregates };
+};
+
 /* ===============================
    DELETE RATING
    =============================== */
+const finalizeDeletedRating = async (rating) => {
+  const customerId = rating.userId;
+  logRating("info", `rating.deleted.${rating.bookingType}`, {
+    ratingId: rating._id.toString(),
+    bookingId: rating.bookingId?.toString(),
+    customerId,
+  });
+  emitMetric(
+    rating.bookingType === "service" ? METRICS.deletedService : METRICS.deletedProduct,
+    { ratingId: rating._id.toString(), bookingId: rating.bookingId?.toString(), customerId }
+  );
+
+  const aggregates = await rollupForRating(rating);
+  return { rating, aggregates };
+};
+
 export const deleteRating = async (id, userId) => {
   const rating = await Rating.findOneAndDelete({ _id: id, userId });
   if (!rating) {
@@ -356,18 +416,18 @@ export const deleteRating = async (id, userId) => {
     throw err;
   }
 
-  logRating("info", `rating.deleted.${rating.bookingType}`, {
-    ratingId: rating._id.toString(),
-    bookingId: rating.bookingId?.toString(),
-    customerId: userId,
-  });
-  emitMetric(
-    rating.bookingType === "service" ? METRICS.deletedService : METRICS.deletedProduct,
-    { ratingId: rating._id.toString(), bookingId: rating.bookingId?.toString(), customerId: userId }
-  );
+  return finalizeDeletedRating(rating);
+};
 
-  const aggregates = await rollupForRating(rating);
-  return { rating, aggregates };
+export const adminDeleteRating = async (id) => {
+  const rating = await Rating.findByIdAndDelete(id);
+  if (!rating) {
+    const err = new Error("Rating not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  return finalizeDeletedRating(rating);
 };
 
 /* ===============================

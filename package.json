@@ -9,6 +9,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",
+    "audit:technician-coverage": "node scripts/auditTechnicianCoverage.js",
     "backfill:service-base-location": "node scripts/backfillServiceBaseLocation.js",
     "backfill:product-booking-keys": "node scripts/backfillProductBookingKeys.js",
     "backfill:scheduled-slots": "node scripts/backfillScheduledSlots.js",

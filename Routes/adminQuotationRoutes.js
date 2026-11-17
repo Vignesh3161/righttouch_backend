@@ -20,7 +20,7 @@ import {
 } from "../Controllers/quotationController.js";
 
 const router = express.Router();
-const adminOnly = authorizeRoles("Admin", "Owner");
+const adminOnly = authorizeRoles("Owner");
 
 import {
   getAllProductBooking,

@@ -1345,8 +1345,6 @@ export const getAllTechnicians = async (req, res) => {
 
       conditions.push({
         $or: [
-          { primaryDistrictId: targetObjId },
-          { primaryCityId: targetObjId },
           { enabledDistrictIds: targetObjId },
           { allowedCityIds: targetObjId },
           { _id: { $in: permTechIds } },
@@ -1370,12 +1368,8 @@ export const getAllTechnicians = async (req, res) => {
 
       conditions.push({
         $or: [
-          { primaryDistrictId: { $in: cityIds } },
-          { primaryCityId: { $in: cityIds } },
           { enabledDistrictIds: { $in: cityIds } },
           { allowedCityIds: { $in: cityIds } },
-          { city: districtRegex },
-          { locality: districtRegex },
           { _id: { $in: permTechIds } },
         ],
       });
@@ -1439,7 +1433,10 @@ export const getAllTechnicians = async (req, res) => {
       technicians.map(async (tech) => {
         const enriched = await enrichTechnicianWithActivationStatus(tech, { includeFullBank: false });
         const enforced = await enforceOnlinePrerequisites(enriched);
-        return enforced;
+        return {
+          ...enforced,
+          coveragePending: !(enforced.enabledDistrictIds || []).some(Boolean),
+        };
       })
     );
 
@@ -1966,6 +1963,8 @@ export const updateTechnicianStatus = async (req, res) => {
       });
     }
 
+    let coverage = null;
+
     if (trainingCompleted !== undefined) {
       technician.trainingCompleted = Boolean(trainingCompleted);
       if (trainingCompleted === false) {
@@ -1986,7 +1985,7 @@ export const updateTechnicianStatus = async (req, res) => {
       if (workStatus === "approved") {
         try {
           await assertTechnicianActivationPrerequisites(technician._id, { trainingCompleted });
-          await ensureApprovedDistrictZones({
+          coverage = await ensureApprovedDistrictZones({
             technicianId: technician._id,
             adminUserId: req.user?.userId,
             reason: "Technician workStatus approved",
@@ -2048,6 +2047,7 @@ export const updateTechnicianStatus = async (req, res) => {
 
     const result = technician.toObject();
     delete result.password;
+    if (coverage) result.coverage = coverage;
 
     return res.status(200).json({
       success: true,

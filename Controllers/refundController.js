@@ -140,7 +140,15 @@ export const adminListRefunds = async (req, res) => {
   try {
     const { status } = req.query;
     const q = status ? { status } : {};
-    const refunds = await Refund.find(q).sort({ createdAt: -1 }).lean();
+    const refunds = await Refund.find(q)
+      .populate({ path: "customerId", select: "fname lname mobileNumber email" })
+      .populate({
+        path: "paymentId",
+        select:
+          "bookingId status mode providerPaymentId totalAmountPaise capturedAmountPaise amountRefundedPaise createdAt",
+      })
+      .sort({ createdAt: -1 })
+      .lean();
     return ok(res, 200, "Refunds", { refunds });
   } catch (e) {
     return fail(res, 500, e.message);

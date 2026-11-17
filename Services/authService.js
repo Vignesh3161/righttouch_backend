@@ -7,11 +7,20 @@ import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import { isStandaloneTransactionError } from "../Utils/mongoTransactions.js";
 import { normalizeIndianMobile } from "../Utils/phoneValidation.js";
 import { generateSecureOtp } from "../Utils/otpGenerator.js";
-import { signToken } from "../Utils/token.js";
+import {
+  signToken,
+  accessTokenExpiresIn,
+  durationToSeconds,
+} from "../Utils/token.js";
 import sendSms from "../Utils/sendSMS.js";
 import { broadcastAdminUnreadCounts } from "../Controllers/adminNotificationController.js";
 import { getIo } from "../Utils/ioAccess.js";
 import { sendWelcomeNotification } from "../Utils/sendNotification.js";
+import {
+  issueRefreshToken,
+  revokeStaleForUser,
+} from "./refreshTokenService.js";
+import { replaceSocketSession } from "../Utils/socketSessionControl.js";
 
 /**
  * Internal Auth Service
@@ -64,6 +73,97 @@ const mobileAlreadyExistsError = (existingUser, identifier) => {
   err.code = "MOBILE_ALREADY_EXISTS";
   err.details = { identifier, existingRole: existingUser.role };
   return err;
+};
+
+const sessionError = (message, code, statusCode = 409) => {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  err.code = code;
+  return err;
+};
+
+/**
+ * Issues the access + refresh token pair for every login path.
+ *
+ * `replaceExistingSessions` is enabled for technicians only: a new login
+ * bumps User.tokenVersion (invalidating every older access token), revokes
+ * older refresh generations, and force-disconnects the old device's socket.
+ */
+export const issueSessionForUser = async ({
+  user,
+  role,
+  tokenVersion,
+  technicianProfileId = null,
+  meta = {},
+  replaceExistingSessions = false,
+}) => {
+  let version = Number(tokenVersion ?? user?.tokenVersion ?? 0);
+
+  if (replaceExistingSessions && role === "Technician") {
+    const updated = await User.findOneAndUpdate(
+      { _id: user._id, role: "Technician" },
+      { $inc: { tokenVersion: 1 } },
+      { new: true }
+    )
+      .select("tokenVersion")
+      .lean();
+
+    if (!updated) {
+      throw sessionError("Technician account not found", "USER_NOT_FOUND", 404);
+    }
+    version = updated.tokenVersion ?? 0;
+
+    // Only prune generations older than this one: a concurrent login that
+    // bumped again must not have its newer refresh token revoked by us.
+    await revokeStaleForUser(user._id, version, "session_replaced");
+  }
+
+  const refresh = await issueRefreshToken({
+    userId: user._id,
+    role,
+    tokenVersion: version,
+    meta,
+  });
+
+  const expiresIn = accessTokenExpiresIn(role);
+  const payload = {
+    userId: user._id,
+    role,
+    tokenVersion: version,
+    sid: refresh.familyId,
+  };
+  if (technicianProfileId) {
+    payload.technicianProfileId = technicianProfileId;
+  }
+  const token = signToken(payload, { expiresIn });
+
+  if (replaceExistingSessions && role === "Technician") {
+    // A concurrent login may have bumped the generation again. Only the
+    // newest generation is allowed to answer successfully.
+    const current = await User.findById(user._id)
+      .select("tokenVersion")
+      .lean();
+    if ((current?.tokenVersion ?? 0) !== version) {
+      throw sessionError(
+        "Another login just completed on this account. Please retry.",
+        "CONCURRENT_LOGIN",
+        409
+      );
+    }
+    replaceSocketSession(
+      getIo(),
+      user._id,
+      "You have been signed in on another device."
+    );
+  }
+
+  return {
+    token,
+    refreshToken: refresh.refreshToken,
+    refreshTokenExpiresAt: refresh.expiresAt,
+    expiresInSeconds:
+      durationToSeconds(expiresIn) ?? refresh.expiresInSeconds,
+  };
 };
 
 /**
@@ -467,7 +567,13 @@ const completeSignup = async ({ record, finalIdentifier, session }) => {
 /**
  * Verifies OTP for SIGNUP or LOGIN in a transaction-safe manner.
  */
-export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role }) => {
+export const verifyOtpInternal = async ({
+  identifier,
+  mobileNumber,
+  otp,
+  role,
+  meta = {},
+}) => {
   const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
   if (!finalIdentifier || !otp) {
     const err = new Error("Identifier and OTP required");
@@ -549,19 +655,18 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
       technicianProfileId: technicianProfile?._id || null,
     }).catch((e) => console.warn("Welcome notification error:", e.message));
 
-    const tokenPayload = {
-      userId: user._id,
+    const session = await issueSessionForUser({
+      user,
       role: record.role,
-      // H4: bind the token to the current revocation generation.
       tokenVersion: user.tokenVersion ?? 0,
-    };
-    if (technicianProfile) {
-      tokenPayload.technicianProfileId = technicianProfile._id;
-    }
-    const token = signToken(tokenPayload);
+      technicianProfileId: technicianProfile?._id || null,
+      meta,
+      // First login on a brand-new signup; nothing older to replace.
+      replaceExistingSessions: false,
+    });
 
     return {
-      token,
+      ...session,
       user: {
         _id: user._id,
         fname: user.fname || "",
@@ -624,12 +729,15 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
       technicianProfileId = tech?._id || null;
     }
 
-    const token = signToken({
-      userId: user._id,
+    // Technicians are single-device: this login invalidates older sessions
+    // and force-disconnects the previous device.
+    const session = await issueSessionForUser({
+      user,
       role: user.role,
-      technicianProfileId,
-      // H4: bind the token to the current revocation generation.
       tokenVersion: user.tokenVersion ?? 0,
+      technicianProfileId,
+      meta,
+      replaceExistingSessions: user.role === "Technician",
     });
 
     // 🔔 Welcome-back notification (socket + FCM; best-effort)
@@ -642,7 +750,7 @@ export const verifyOtpInternal = async ({ identifier, mobileNumber, otp, role })
     }).catch((e) => console.warn("Welcome notification error:", e.message));
 
     return {
-      token,
+      ...session,
       user: {
         _id: user._id,
         fname: user.fname || "",
@@ -744,7 +852,14 @@ export const bumpTokenVersion = async (userId) => {
 /**
  * Handles user login (password for Owner/Admin, OTP request for Customer/Technician).
  */
-export const loginInternal = async ({ identifier, mobileNumber, role, password, privileged }) => {
+export const loginInternal = async ({
+  identifier,
+  mobileNumber,
+  role,
+  password,
+  privileged,
+  meta = {},
+}) => {
   const finalIdentifier = normalizeIndianMobile((identifier || mobileNumber)?.trim());
   const requestedRole = privileged ? null : normalizeRole(role);
 
@@ -823,12 +938,19 @@ export const loginInternal = async ({ identifier, mobileNumber, role, password, 
     }
 
     await User.updateOne({ _id: user._id }, { $set: { lastLoginAt: new Date() } });
-    // H4: bind the token to the current revocation generation.
-    const token = signToken({ userId: user._id, role: user.role, tokenVersion: user.tokenVersion ?? 0 });
+
+    // Owner/Admin remain multi-device: every login gets its own family.
+    const session = await issueSessionForUser({
+      user,
+      role: user.role,
+      tokenVersion: user.tokenVersion ?? 0,
+      meta,
+      replaceExistingSessions: false,
+    });
 
     return {
       type: "PASSWORD_LOGIN",
-      token,
+      ...session,
       userId: user._id,
       role: user.role,
     };

@@ -12,7 +12,7 @@ import {
 
 const router = express.Router();
 
-const adminOnly = authorizeRoles("Admin", "Owner");
+const adminOnly = authorizeRoles("Owner");
 
 // GET /api/admin/payments/product-payments
 router.get("/product-payments", Auth, adminOnly, adminGetProductPaymentsListController);

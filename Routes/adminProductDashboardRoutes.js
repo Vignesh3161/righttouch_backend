@@ -8,7 +8,7 @@ import {
 } from "../Controllers/productDashboardController.js";
 
 const router = express.Router();
-const adminOnly = authorizeRoles("Admin", "Owner");
+const adminOnly = authorizeRoles("Owner");
 
 // GET /api/admin/product-dashboard
 router.get("/product-dashboard", Auth, adminOnly, getProductDashboardSummaryController);

@@ -19,8 +19,8 @@ import {
 const router = express.Router();
 
 // 🔴 Admin Sidebar Notification Badges endpoints
-router.get("/unread-counts", getAdminUnreadCounts);
-router.patch("/mark-read", markAdminItemRead);
+router.get("/unread-counts", authorizeRoles("Admin", "Owner"), getAdminUnreadCounts);
+router.patch("/mark-read", authorizeRoles("Admin", "Owner"), markAdminItemRead);
 
 router.get("/", listNotifications);
 router.get("/unread-count", unreadCount);
@@ -28,6 +28,6 @@ router.patch("/:id/read", markRead);
 router.patch("/read-all", markReadAll);
 router.post("/:id/received", markReceived);
 router.post("/:id/opened", markOpened);
-router.post("/test-push", sendTestNotification);
+router.post("/test-push", authorizeRoles("Admin", "Owner"), sendTestNotification);
 
 export default router;

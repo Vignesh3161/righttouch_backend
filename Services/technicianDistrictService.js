@@ -8,8 +8,6 @@ import DistrictPermissionHistory from "../Schemas/DistrictPermissionHistory.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { withZoneWriteTransaction } from "./zoneWriteService.js";
 
-const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 /**
  * B-13 source-of-truth contract (documented):
  * - AUTHORITATIVE: TechnicianDistrictPermission documents (unique
@@ -219,37 +217,10 @@ export const getAllowedDistrictsForTechnician = async (techProfile) => {
 
   let profileDoc = techProfile;
   if (typeof techProfile === "string" || techProfile instanceof mongoose.Types.ObjectId) {
-    profileDoc = await TechnicianProfile.findById(techProfile)
-      .select("_id primaryCityId primaryDistrictId allowedCityIds cityZoneId city")
-      .lean();
+    profileDoc = await TechnicianProfile.findById(techProfile).select("_id").lean();
   }
 
-  if (!profileDoc) return [];
-
-  let primaryId = profileDoc.primaryCityId || profileDoc.primaryDistrictId;
-
-  // Auto-heal legacy profile if primary is null.
-  if (!primaryId && profileDoc.city) {
-    const cityRegex = new RegExp(`^${escapeRegExp(String(profileDoc.city).trim())}$`, "i");
-    const matchedCity = await OperationalCity.findOne({
-      $or: [
-        { city: cityRegex },
-        { name: cityRegex },
-        { name: new RegExp(escapeRegExp(String(profileDoc.city).trim()), "i") },
-      ],
-      active: true,
-    })
-      .select("_id")
-      .lean();
-
-    if (matchedCity?._id) {
-      primaryId = matchedCity._id;
-      await TechnicianProfile.updateOne(
-        { _id: profileDoc._id },
-        { $set: { primaryCityId: primaryId, primaryDistrictId: primaryId } }
-      ).catch(() => {});
-    }
-  }
+  if (!profileDoc?._id) return [];
 
   const permissions = await TechnicianDistrictPermission.find({
     technicianId: profileDoc._id,
@@ -363,131 +334,138 @@ export const addDistrictPermission = async ({ technicianId, districtId, adminUse
 };
 
 /**
- * Approval gate: an approved technician must have a registered district with
- * at least one active zone. Sets primary district metadata only — coverage is
- * granted exclusively by explicit permission rows. Safe to call repeatedly.
+ * Reconciles technician coverage at approval time.
+ *
+ * Registration metadata (address, primary district, registered zone, current
+ * GPS) is never used to grant coverage. Only explicit enabled district
+ * permission rows are considered. Coverage is advisory at approval: a
+ * technician may be approved with zero valid permission rows, in which case
+ * `coveragePending` is true and no dispatch coverage is enabled.
+ *
+ * Safe to call repeatedly.
  */
-export const ensureApprovedDistrictZones = async ({
-  technicianId,
-  adminUserId,
-  reason,
-}) => {
-  const fail = (code, message, statusCode = 400) => {
-    const err = new Error(message);
-    err.code = code;
-    err.statusCode = statusCode;
-    throw err;
-  };
-
+export const ensureApprovedDistrictZones = async ({ technicianId }) => {
   const profile = await TechnicianProfile.findById(technicianId).select(
-    "primaryDistrictId primaryCityId cityZoneId enabledDistrictIds allowedCityIds enabledCityZoneIds currentDistrictId currentCityZoneId"
+    "_id primaryDistrictId primaryCityId"
   );
-  if (!profile) fail("TECHNICIAN_NOT_FOUND", "Technician not found", 404);
-
-  const candidates = [];
-  const addCandidate = (value) => {
-    const id = value?._id || value;
-    const normalized = id ? String(id) : null;
-    if (
-      normalized &&
-      mongoose.Types.ObjectId.isValid(normalized) &&
-      !candidates.includes(normalized)
-    ) {
-      candidates.push(normalized);
-    }
-  };
-
-  addCandidate(profile.primaryDistrictId);
-  addCandidate(profile.primaryCityId);
-
-  const registeredZone = profile.cityZoneId
-    ? await CityZone.findById(profile.cityZoneId).select("operationalCityId").lean()
-    : null;
-  addCandidate(registeredZone?.operationalCityId);
+  if (!profile) {
+    const err = new Error("Technician not found");
+    err.code = "TECHNICIAN_NOT_FOUND";
+    err.statusCode = 404;
+    throw err;
+  }
 
   const permissionRows = await TechnicianDistrictPermission.find({
     technicianId,
     isEnabled: true,
-  }).select("districtId").lean();
-  for (const row of permissionRows) addCandidate(row.districtId);
+  })
+    .select("districtId")
+    .lean();
 
-  for (const id of [...(profile.enabledDistrictIds || []), ...(profile.allowedCityIds || [])]) {
-    addCandidate(id);
-  }
+  const grantedDistrictIds = [
+    ...new Set(
+      permissionRows
+        .map((row) => String(row.districtId || ""))
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    ),
+  ];
 
-  const currentZone = profile.currentCityZoneId
-    ? await CityZone.findById(profile.currentCityZoneId).select("operationalCityId").lean()
-    : null;
-  addCandidate(currentZone?.operationalCityId);
-  addCandidate(profile.currentDistrictId);
+  const warnings = [];
+  const validDistricts = [];
+  const approvedZoneIds = [];
 
-  if (candidates.length === 0) {
-    fail("PRIMARY_DISTRICT_REQUIRED", "Assign the technician to a district/zone before approval");
-  }
-
-  let districtId = candidates[0];
-  for (const candidate of candidates) {
-    const candidateDistrict = await OperationalCity.findById(candidate)
+  for (const districtId of grantedDistrictIds) {
+    const district = await OperationalCity.findById(districtId)
       .select("active isActive isJobEnabled")
       .lean();
-    if (!candidateDistrict) continue;
-    if (candidateDistrict.active === false || candidateDistrict.isActive === false) continue;
-    if (candidateDistrict.isJobEnabled === false) continue;
-    const zoneCount = await CityZone.countDocuments({
-      operationalCityId: candidate,
+
+    if (!district) {
+      warnings.push({
+        code: "DISTRICT_MISSING",
+        districtId,
+        message: "Granted district no longer exists.",
+      });
+      continue;
+    }
+    if (district.active === false || district.isActive === false) {
+      warnings.push({
+        code: "DISTRICT_INACTIVE",
+        districtId,
+        message: "Granted district is inactive.",
+      });
+      continue;
+    }
+    if (district.isJobEnabled === false) {
+      warnings.push({
+        code: "DISTRICT_JOBS_DISABLED",
+        districtId,
+        message: "Granted district job assignment is disabled.",
+      });
+      continue;
+    }
+
+    const zones = await CityZone.find({
+      operationalCityId: districtId,
       active: { $ne: false },
+    })
+      .select("_id")
+      .lean();
+
+    if (zones.length === 0) {
+      warnings.push({
+        code: "NO_ACTIVE_ZONES",
+        districtId,
+        message: "Granted district has no active zones.",
+      });
+      continue;
+    }
+
+    validDistricts.push({ _id: district._id, districtId });
+    for (const zone of zones) {
+      const zoneId = String(zone._id);
+      if (!approvedZoneIds.includes(zoneId)) approvedZoneIds.push(zoneId);
+    }
+  }
+
+  const approvedDistrictIds = validDistricts.map((district) => district.districtId);
+  const coveragePending = approvedDistrictIds.length === 0;
+
+  if (coveragePending) {
+    warnings.push({
+      code: "COVERAGE_PENDING",
+      districtId: null,
+      message: "No valid district coverage. Admin/Owner approval is required before dispatch.",
     });
-    if (zoneCount === 0) continue;
-    districtId = candidate;
-    break;
-  }
-
-  const district = await OperationalCity.findById(districtId);
-  if (!district || district.active === false || district.isActive === false) {
-    fail("DISTRICT_INACTIVE", "Cannot approve: technician's district is inactive");
-  }
-  if (district.isJobEnabled === false) {
-    fail("DISTRICT_JOBS_DISABLED", "Cannot approve: technician's district job assignment is disabled");
-  }
-
-  const primaryActiveZones = await CityZone.find({
-    operationalCityId: districtId,
-    active: { $ne: false },
-  }).select("_id").lean();
-  if (primaryActiveZones.length === 0) {
-    fail("NO_ACTIVE_ZONES", "Cannot approve: technician's district has no active zones");
   }
 
   try {
     await withZoneWriteTransaction(async (session) => {
       const opts = session ? { session } : {};
+      const updates = { enabledCityZoneIds: approvedZoneIds };
+
+      if (!profile.primaryDistrictId && !profile.primaryCityId && validDistricts.length > 0) {
+        updates.primaryDistrictId = validDistricts[0]._id;
+        updates.primaryCityId = validDistricts[0]._id;
+      }
+
       await TechnicianProfile.updateOne(
         { _id: technicianId },
-        { $set: { primaryDistrictId: districtId, primaryCityId: districtId } },
+        { $set: updates },
         opts
       );
       await resyncDerivedArrays(technicianId, session);
-
-      const grantedDistrictIds = [
-        ...new Set(permissionRows.map((row) => String(row.districtId)).filter(Boolean)),
-      ];
-      for (const grantedDistrictId of grantedDistrictIds) {
-        await syncDistrictZones({
-          technicianId,
-          districtId: grantedDistrictId,
-          enabled: true,
-          adminUserId,
-          reason: reason || "Technician approved",
-          session,
-        });
-      }
     });
   } catch (err) {
-    if (err.statusCode) throw err;
     throw asConflict(err);
   }
 
-  return { districtId: String(districtId) };
+  return {
+    coveragePending,
+    districtId: approvedDistrictIds[0] || null,
+    approvedDistrictIds,
+    approvedZoneIds,
+    warnings,
+  };
 };
 
 /**

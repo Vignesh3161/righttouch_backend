@@ -73,6 +73,7 @@ export const Auth = async (req, res, next) => {
       role: effectiveRole,
       email: decoded.email,
       technicianProfileId: resolvedTechProfileId,
+      sid: decoded.sid || null,
     };
 
     next();

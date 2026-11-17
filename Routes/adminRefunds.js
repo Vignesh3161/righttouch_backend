@@ -18,18 +18,19 @@ import {
 
 const router = express.Router();
 const admin = authorizeRoles("Admin", "Owner");
+const owner = authorizeRoles("Owner");
 
-router.post("/refunds/preview", Auth, admin, adminPreviewRefund);
-router.post("/refunds", Auth, admin, adminCreateRefund);
-router.post("/refunds/:id/approve", Auth, admin, adminApproveRefund);
-router.post("/refunds/:id/retry", Auth, admin, adminRetryRefund);
-router.post("/refunds/:id/customer-payout", Auth, admin, adminCreateCustomerPayoutRefund);
-router.get("/refunds", Auth, admin, adminListRefunds);
+router.post("/refunds/preview", Auth, owner, adminPreviewRefund);
+router.post("/refunds", Auth, owner, adminCreateRefund);
+router.post("/refunds/:id/approve", Auth, owner, adminApproveRefund);
+router.post("/refunds/:id/retry", Auth, owner, adminRetryRefund);
+router.post("/refunds/:id/customer-payout", Auth, owner, adminCreateCustomerPayoutRefund);
+router.get("/refunds", Auth, owner, adminListRefunds);
 
+router.get("/complaints/categories", Auth, admin, listReportCategories);
 router.get("/complaints", Auth, admin, adminListComplaints);
 router.get("/complaints/:id", Auth, admin, adminGetComplaint);
 router.post("/complaints/:id/reject", Auth, admin, adminRejectComplaint);
 router.post("/complaints/:id/status", Auth, admin, adminUpdateComplaintStatus);
-router.get("/complaints/categories", Auth, admin, listReportCategories);
 
 export default router;
