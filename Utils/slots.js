@@ -1,36 +1,74 @@
 /**
  * 🕒 SLOT ENGINE — single authoritative source for booking slots.
  *
+ * Slot timings, bookable-day count and slot count are admin-configurable via
+ * GlobalSetting key "schedule.slots" (see Utils/slotConfig.js). Defaults:
+ * five bookable days (tomorrow + the next four), four 3-hour slots from
+ * 09:00 to 21:00.
+ *
  * Used by BOTH the slots endpoint (GET /booking/slots) and booking creation
  * (POST /booking/schedule, cart checkout, book-again), so slot rules can never
  * drift between display and validation.
  *
- * Rules (four-slot model):
- *   - Five bookable days: tomorrow + the next four days
- *   - Four 3-hour slots: 09:00–12:00, 12:00–15:00, 15:00–18:00, 18:00–21:00
- *   - The creation endpoint rejects any slot this utility did not generate
- *   - All comparisons use the business timezone + UTC timestamps
- *
- * Legacy rows (30-minute slots) are mapped to their containing 3-hour slot by
+ * Legacy bookings are mapped to their containing configured slot by
  * getSlotForTime(), so old bookings still block the correct modern slot.
  *
  * Configure the business timezone via BUSINESS_TIMEZONE env
  * (default: Asia/Kolkata — India display convention).
  */
 
+import { getSlotConfig } from "./slotConfig.js";
+
 export const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "Asia/Kolkata";
 
-export const SCHEDULE_DAYS = 5;
-export const SLOT_DURATION_MINUTES = 180;
-export const SLOT_START_HOUR = 9;
-export const SLOT_END_HOUR = 21;
+const pad2 = (value) => String(value).padStart(2, "0");
 
-export const SLOT_DEFINITIONS = [
-  { value: "09:00", startHour: 9, endHour: 12, startLabel: "09:00 AM", endLabel: "12:00 PM", label: "09:00 AM - 12:00 PM" },
-  { value: "12:00", startHour: 12, endHour: 15, startLabel: "12:00 PM", endLabel: "03:00 PM", label: "12:00 PM - 03:00 PM" },
-  { value: "15:00", startHour: 15, endHour: 18, startLabel: "03:00 PM", endLabel: "06:00 PM", label: "03:00 PM - 06:00 PM" },
-  { value: "18:00", startHour: 18, endHour: 21, startLabel: "06:00 PM", endLabel: "09:00 PM", label: "06:00 PM - 09:00 PM" },
-];
+const formatTimeFromMinutes = (minutesOfDay) =>
+  `${pad2(Math.floor(minutesOfDay / 60))}:${pad2(minutesOfDay % 60)}`;
+
+const formatLabelFromMinutes = (minutesOfDay) => {
+  const hour = Math.floor(minutesOfDay / 60) % 24;
+  const minute = minutesOfDay % 60;
+  const suffix = hour >= 12 ? "PM" : "AM";
+  const displayHour = hour % 12 === 0 ? 12 : hour % 12;
+  return `${pad2(displayHour)}:${pad2(minute)} ${suffix}`;
+};
+
+export const getScheduleDaysCount = () => getSlotConfig().scheduleDays;
+
+export const getSlotDurationMinutes = () => {
+  const config = getSlotConfig();
+  return ((config.windowEndHour - config.windowStartHour) * 60) / config.slotCount;
+};
+
+export const getSlotDefinitions = () => {
+  const config = getSlotConfig();
+  const windowStartMinutes = config.windowStartHour * 60;
+  const windowEndMinutes = config.windowEndHour * 60;
+  const slotMinutes = (windowEndMinutes - windowStartMinutes) / config.slotCount;
+  const definitions = [];
+
+  for (let index = 0; index < config.slotCount; index++) {
+    const startMinutes = windowStartMinutes + index * slotMinutes;
+    const endMinutes = startMinutes + slotMinutes;
+    const startLabel = formatLabelFromMinutes(startMinutes);
+    const endLabel = formatLabelFromMinutes(endMinutes);
+    definitions.push({
+      value: formatTimeFromMinutes(startMinutes),
+      startTime: formatTimeFromMinutes(startMinutes),
+      endTime: formatTimeFromMinutes(endMinutes),
+      startMinutes,
+      endMinutes,
+      startHour: Math.floor(startMinutes / 60),
+      endHour: Math.floor(endMinutes / 60),
+      startLabel,
+      endLabel,
+      label: `${startLabel} - ${endLabel}`,
+    });
+  }
+
+  return definitions;
+};
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_NAMES = [
@@ -94,7 +132,6 @@ export const localDateTimeToUtc = (localDate, localTime, tz = BUSINESS_TIMEZONE)
 
   if (mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59) return null;
 
-  // Interpret the wall-clock time in `tz` and convert to UTC epoch.
   const asUTC = Date.UTC(y, mo - 1, d, h, mi, 0);
   const probe = new Date(asUTC);
   const offsetMinutes = tzOffsetMinutesAt(probe, tz);
@@ -133,11 +170,11 @@ export const startOfBusinessDayUtc = (date = new Date(), tz = BUSINESS_TIMEZONE)
  * All valid slot definitions (display + value).
  */
 export const generateTimeSlots = () =>
-  SLOT_DEFINITIONS.map((slot) => ({
+  getSlotDefinitions().map((slot) => ({
     label: slot.label,
     value: slot.value,
-    startTime: slot.value,
-    endTime: `${String(slot.endHour).padStart(2, "0")}:00`,
+    startTime: slot.startTime,
+    endTime: slot.endTime,
     startLabel: slot.startLabel,
     endLabel: slot.endLabel,
     startHour: slot.startHour,
@@ -145,14 +182,15 @@ export const generateTimeSlots = () =>
   }));
 
 /**
- * Generate the schedule day options (tomorrow + next four days in the
+ * Generate the schedule day options (tomorrow + the next N-1 days in the
  * business timezone).
  * @returns {Array<{ date, month, fullDate, dayName, weekday, label }>}
  */
 export const generateScheduleDays = (now = new Date(), tz = BUSINESS_TIMEZONE) => {
   const todayStart = startOfBusinessDayUtc(now, tz);
+  const scheduleDays = getScheduleDaysCount();
   const days = [];
-  for (let i = 1; i <= SCHEDULE_DAYS; i++) {
+  for (let i = 1; i <= scheduleDays; i++) {
     const d = new Date(todayStart.getTime() + i * 24 * 60 * 60 * 1000);
     const { day, month, weekday } = formatInBusinessTimezone(d, tz);
     days.push({
@@ -169,19 +207,20 @@ export const generateScheduleDays = (now = new Date(), tz = BUSINESS_TIMEZONE) =
 
 /**
  * Slot availability window for booking creation:
- * { from: tomorrowStartUtc, to: day-fiveEndUtc }
+ * { from: tomorrowStartUtc, to: lastBookableDayEndUtc }
  */
 export const scheduleBookingWindow = (now = new Date(), tz = BUSINESS_TIMEZONE) => {
   const todayStart = startOfBusinessDayUtc(now, tz);
-  const from = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000); // tomorrow 00:00
-  const lastDayStart = new Date(todayStart.getTime() + SCHEDULE_DAYS * 24 * 60 * 60 * 1000);
+  const scheduleDays = getScheduleDaysCount();
+  const from = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+  const lastDayStart = new Date(todayStart.getTime() + scheduleDays * 24 * 60 * 60 * 1000);
   const to = new Date(lastDayStart.getTime() + 23 * 60 * 60 * 1000 + 59 * 60 * 1000 + 59 * 1000 + 999);
   return { from, to };
 };
 
 /**
- * Resolve the containing modern slot for an arbitrary timestamp.
- * Legacy 30-minute bookings map to the 3-hour slot that contains them.
+ * Resolve the containing configured slot for an arbitrary timestamp.
+ * Legacy bookings map to the configured slot that contains them.
  *
  * @returns {{ slotKey, slotValue, slotLabel, slotStartAt, slotEndAt, localDate }|null}
  */
@@ -191,17 +230,13 @@ export const getSlotForTime = (scheduledAt, tz = BUSINESS_TIMEZONE) => {
   const parts = formatInBusinessTimezone(date, tz);
   const localDate = `${parts.year}-${parts.month}-${parts.day}`;
   const minutes = Number(parts.hours) * 60 + Number(parts.minutes);
-  const definition = SLOT_DEFINITIONS.find(
-    (slot) => minutes >= slot.startHour * 60 && minutes < slot.endHour * 60
+  const definition = getSlotDefinitions().find(
+    (slot) => minutes >= slot.startMinutes && minutes < slot.endMinutes
   );
   if (!definition) return null;
 
-  const slotStartAt = localDateTimeToUtc(localDate, definition.value, tz);
-  const slotEndAt = localDateTimeToUtc(
-    localDate,
-    `${String(definition.endHour).padStart(2, "0")}:00`,
-    tz
-  );
+  const slotStartAt = localDateTimeToUtc(localDate, definition.startTime, tz);
+  const slotEndAt = localDateTimeToUtc(localDate, definition.endTime, tz);
   if (!slotStartAt || !slotEndAt) return null;
 
   return {
@@ -218,14 +253,10 @@ export const getSlotForTime = (scheduledAt, tz = BUSINESS_TIMEZONE) => {
  * Slot key + UTC window for a local date + exact slot start.
  */
 export const getSlotWindow = (localDate, slotValue, tz = BUSINESS_TIMEZONE) => {
-  const definition = SLOT_DEFINITIONS.find((slot) => slot.value === slotValue);
+  const definition = getSlotDefinitions().find((slot) => slot.value === slotValue);
   if (!definition) return null;
-  const slotStartAt = localDateTimeToUtc(localDate, definition.value, tz);
-  const slotEndAt = localDateTimeToUtc(
-    localDate,
-    `${String(definition.endHour).padStart(2, "0")}:00`,
-    tz
-  );
+  const slotStartAt = localDateTimeToUtc(localDate, definition.startTime, tz);
+  const slotEndAt = localDateTimeToUtc(localDate, definition.endTime, tz);
   if (!slotStartAt || !slotEndAt) return null;
   return {
     slotKey: `${localDate}|${definition.value}`,
@@ -257,28 +288,24 @@ export const validateSlot = (
     return { valid: false, error: "scheduledDate and scheduledTime are required" };
   }
 
-  // 1. Slot must exist in the generated set
   const validTimes = generateTimeSlots().map((s) => s.value);
   if (!validTimes.includes(scheduledTime)) {
     return { valid: false, error: "Slot is not one of the available slots" };
   }
 
-  // 2. Convert to UTC using the business timezone
   const scheduledAt = localDateTimeToUtc(scheduledDate, scheduledTime, timezone);
   if (!scheduledAt) {
     return { valid: false, error: "Invalid scheduledDate or scheduledTime format" };
   }
 
-  // 3. Date must be within the five-day booking window
   const { from, to } = scheduleBookingWindow(now, timezone);
   if (scheduledAt < from || scheduledAt > to) {
     return {
       valid: false,
-      error: "Scheduled bookings are only allowed within the next five days",
+      error: `Scheduled bookings are only allowed within the next ${getScheduleDaysCount()} days`,
     };
   }
 
-  // 4. Minimum lead time — checked against the real UTC scheduledAt
   const minFuture = new Date(now.getTime() + minLeadMinutes * 60 * 1000);
   if (scheduledAt < minFuture) {
     return {
@@ -294,7 +321,7 @@ export const validateSlot = (
  * Validate an already-resolved UTC scheduledAt (used for cart items that
  * store `scheduledAt` as ISO instead of date+time).
  *
- * New bookings must land on a modern slot boundary. Legacy timestamps are
+ * New bookings must land inside a configured slot. Legacy timestamps are
  * normalized to the containing slot by the caller.
  */
 export const validateScheduledAtUtc = (
@@ -307,7 +334,10 @@ export const validateScheduledAtUtc = (
   }
   const { from, to } = scheduleBookingWindow(now, timezone);
   if (date < from || date > to) {
-    return { valid: false, error: "Scheduled bookings are only allowed within the next five days" };
+    return {
+      valid: false,
+      error: `Scheduled bookings are only allowed within the next ${getScheduleDaysCount()} days`,
+    };
   }
   const minFuture = new Date(now.getTime() + minLeadMinutes * 60 * 1000);
   if (date < minFuture) {
@@ -315,7 +345,10 @@ export const validateScheduledAtUtc = (
   }
   const slot = getSlotForTime(date, timezone);
   if (!slot) {
-    return { valid: false, error: "Scheduled time is outside the bookable 09:00–21:00 window" };
+    return {
+      valid: false,
+      error: "Scheduled time is outside the bookable window",
+    };
   }
   const local = formatInBusinessTimezone(date, timezone);
   return {
@@ -333,20 +366,29 @@ export const validateScheduledAtUtc = (
  * Full slot payload for GET /booking/slots.
  */
 export const getBookingSchedulePayload = (now = new Date(), tz = BUSINESS_TIMEZONE, availability = null) => {
-  const instantArrival = new Date(now.getTime() + 30 * 60 * 1000);
+  const days = generateScheduleDays(now, tz).map(({ date, month, fullDate, weekday, label }) => ({
+    date,
+    month,
+    fullDate,
+    weekday,
+    label,
+  }));
+  const timeSlots = generateTimeSlots().map(({ value, label, startTime, endTime }) => ({
+    value,
+    label,
+    startTime,
+    endTime,
+  }));
+
   return {
     instant: {
       label: "Instant",
-      arrivalTime: instantArrival,
       displayValue: "In 30 mins",
-      estimatedArrivalAt: instantArrival,
-      etaGeneratedAt: now,
-      note: "Estimated arrival — not a guaranteed SLA",
     },
     schedule: {
-      days: generateScheduleDays(now, tz),
-      timeSlots: generateTimeSlots(),
       timezone: tz,
+      days,
+      timeSlots,
       availability: availability || null,
     },
   };

@@ -17,24 +17,7 @@ import {
 } from "../Services/profileService.js";
 
 import { deleteUserByIdInternal } from "../Services/accountService.js";
-
-/* ======================================================
-  RESPONSE HELPERS (Consistent API shape)
-====================================================== */
-const ok = (res, status, message, result = {}) =>
-  res.status(status).json({
-    success: true,
-    message,
-    result,
-  });
-
-const fail = (res, status, message, code, details) =>
-  res.status(status).json({
-    success: false,
-    message,
-    code,
-    details,
-  });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 /* ======================================================
   ADMIN / USER MANAGEMENT CONTROLLERS
@@ -125,8 +108,11 @@ export const signupAndSendOtp = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR",
-      err.details
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -143,7 +129,11 @@ export const resendOtp = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR"
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -178,8 +168,11 @@ export const verifyOtp = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR",
-      err.details
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -197,7 +190,11 @@ export const setPassword = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR"
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -242,8 +239,11 @@ export const login = async (req, res, opts = {}) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR",
-      err.details
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -302,7 +302,11 @@ export const getMyProfile = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR"
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -317,7 +321,11 @@ export const completeProfile = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR"
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -332,8 +340,11 @@ export const updateMyProfile = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR",
-      err.details
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };
@@ -349,7 +360,11 @@ export const acceptTerms = async (req, res) => {
       res,
       err.statusCode || 500,
       err.message || "Internal server error",
-      err.code || "SERVER_ERROR"
+      {},
+      {
+        code: err.code || "SERVER_ERROR",
+        details: err.details,
+      }
     );
   }
 };

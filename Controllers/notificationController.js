@@ -1,8 +1,6 @@
 import Notification from "../Schemas/Notification.js";
+import { ok, fail, okLegacy } from "../Utils/apiResponse.js";
 import { sendPushNotification } from "../Utils/sendNotification.js";
-
-const ok = (res, status, message, result = {}) => res.status(status).json({ success: true, message, result });
-const fail = (res, status, message, result = {}) => res.status(status).json({ success: false, message, result });
 
 const getRecipient = (req) => {
   const role = (req.user?.role || "").toLowerCase();
@@ -42,15 +40,14 @@ export const listNotifications = async (req, res) => {
       isRead: Boolean(item.readAt),
     }));
 
-    return res.status(200).json({
-      success: true,
-      message: "Notifications",
-      data: formattedItems,
-      result: {
-        items: formattedItems,
-        nextCursor,
-      },
-    });
+    // TODO(api-contract): remove legacy top-level data mirror after mobile clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Notifications",
+      { items: formattedItems, nextCursor },
+      { data: formattedItems }
+    );
   } catch (e) {
     fail(res, 500, e.message);
   }
@@ -66,14 +63,14 @@ export const unreadCount = async (req, res) => {
       ...notExpired(),
     });
 
-    return res.status(200).json({
-      success: true,
-      message: "Unread count",
-      count,
-      unreadCount: count,
-      data: { count, unreadCount: count },
-      result: { count, unreadCount: count },
-    });
+    // TODO(api-contract): remove legacy top-level count/data mirrors after mobile clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Unread count",
+      { count, unreadCount: count },
+      { count, unreadCount: count, data: { count, unreadCount: count } }
+    );
   } catch (e) {
     fail(res, 500, e.message);
   }

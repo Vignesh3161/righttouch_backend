@@ -5,6 +5,7 @@ import {
   syncServiceToZones,
   withZoneWriteTransaction,
 } from "../Services/zoneWriteService.js";
+import { ok, okLegacy } from "../Utils/apiResponse.js";
 
 const SERVICE_TYPES = ["Repair", "Installation", "Maintenance", "Inspection"];
 const PRICING_TYPES = ["fixed", "after_inspection", "per_unit"];
@@ -440,35 +441,43 @@ export const getAllServices = async (req, res) => {
 
     // Zone deactivation is STRICT: address inside inactive zone → no services.
     if (zoneDocForGate && zoneDocForGate.active === false) {
-      return res.status(200).json({
-        success: true,
-        message: "Services are currently unavailable in this area",
-        availabilityPrompt: null,
-        locationContext: {
-          source: locationSource,
-          zoneId: String(zoneDocForGate._id),
-          zoneActive: false,
-          districtId: resolvedDistrictId || String(zoneDocForGate.operationalCityId || "") || null,
-          defaultAddressId,
-        },
-        result: [],
-      });
+      // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+      return okLegacy(
+        res,
+        200,
+        "Services are currently unavailable in this area",
+        [],
+        {
+          availabilityPrompt: null,
+          locationContext: {
+            source: locationSource,
+            zoneId: String(zoneDocForGate._id),
+            zoneActive: false,
+            districtId: resolvedDistrictId || String(zoneDocForGate.operationalCityId || "") || null,
+            defaultAddressId,
+          },
+        }
+      );
     }
 
     // INVALID ZONE: explicit zoneId that does not resolve to any zone → no services.
     if (knownZoneId && !zoneDocForGate) {
-      return res.status(200).json({
-        success: true,
-        message: "Services are currently unavailable in this area",
-        availabilityPrompt: null,
-        locationContext: {
-          source: locationSource,
-          zoneId: String(knownZoneId),
-          districtId: resolvedDistrictId || null,
-          defaultAddressId,
-        },
-        result: [],
-      });
+      // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+      return okLegacy(
+        res,
+        200,
+        "Services are currently unavailable in this area",
+        [],
+        {
+          availabilityPrompt: null,
+          locationContext: {
+            source: locationSource,
+            zoneId: String(knownZoneId),
+            districtId: resolvedDistrictId || null,
+            defaultAddressId,
+          },
+        }
+      );
     }
 
     if (!resolvedDistrictId) {
@@ -495,18 +504,22 @@ export const getAllServices = async (req, res) => {
       // Explicit location was supplied but resolved to nothing (outside all
       // polygons / unsupported area) → empty, NOT the full catalog.
       if (hasExplicitLocation) {
-        return res.status(200).json({
-          success: true,
-          message: "No services available in your area",
-          availabilityPrompt: null,
-          locationContext: {
-            source: locationSource,
-            zoneId: null,
-            districtId: null,
-            defaultAddressId,
-          },
-          result: [],
-        });
+        // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+        return okLegacy(
+          res,
+          200,
+          "No services available in your area",
+          [],
+          {
+            availabilityPrompt: null,
+            locationContext: {
+              source: locationSource,
+              zoneId: null,
+              districtId: null,
+              defaultAddressId,
+            },
+          }
+        );
       }
 
       // STRICT DEFAULT-ADDRESS RULE: an authenticated Customer with no
@@ -517,18 +530,22 @@ export const getAllServices = async (req, res) => {
         !hasExplicitLocation &&
         (locationSource === "no_default_address" || locationSource === "address_lookup_failed")
       ) {
-        return res.status(200).json({
-          success: true,
-          message: "Service unavailable in this area",
-          availabilityPrompt: "Add a default address to check service availability.",
-          locationContext: {
-            source: locationSource,
-            zoneId: null,
-            districtId: null,
-            defaultAddressId,
-          },
-          result: [],
-        });
+        // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+        return okLegacy(
+          res,
+          200,
+          "Service unavailable in this area",
+          [],
+          {
+            availabilityPrompt: "Add a default address to check service availability.",
+            locationContext: {
+              source: locationSource,
+              zoneId: null,
+              districtId: null,
+              defaultAddressId,
+            },
+          }
+        );
       }
 
       let services = await Service.find(query)
@@ -555,36 +572,44 @@ export const getAllServices = async (req, res) => {
         );
       }
 
-      return res.status(200).json({
-        success: true,
-        message: "Services fetched successfully",
-        availabilityPrompt: "Select an address to check exact service availability.",
-        locationContext: {
-          source: locationSource,
-          zoneId: null,
-          districtId: null,
-          defaultAddressId,
-        },
-        result: services,
-      });
+      // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+      return okLegacy(
+        res,
+        200,
+        "Services fetched successfully",
+        services,
+        {
+          availabilityPrompt: "Select an address to check exact service availability.",
+          locationContext: {
+            source: locationSource,
+            zoneId: null,
+            districtId: null,
+            defaultAddressId,
+          },
+        }
+      );
     }
 
     // POST-ADDRESS RULE: address must resolve to BOTH valid District AND valid Zone.
     // District-only (gap outside all zone polygons) or outside supported area
     // → no services. No district fallback for listing.
     if (!knownZoneId || !resolvedDistrictId) {
-      return res.status(200).json({
-        success: true,
-        message: "No services available in your area",
-        availabilityPrompt: null,
-        locationContext: {
-          source: locationSource,
-          zoneId: knownZoneId || null,
-          districtId: resolvedDistrictId || null,
-          defaultAddressId,
-        },
-        result: [],
-      });
+      // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+      return okLegacy(
+        res,
+        200,
+        "No services available in your area",
+        [],
+        {
+          availabilityPrompt: null,
+          locationContext: {
+            source: locationSource,
+            zoneId: knownZoneId || null,
+            districtId: resolvedDistrictId || null,
+            defaultAddressId,
+          },
+        }
+      );
     }
 
     const services = await Service.find(query)
@@ -631,18 +656,22 @@ export const getAllServices = async (req, res) => {
       );
     }
 
-    return res.status(200).json({
-      success: true,
-      message: "Services fetched successfully",
-      availabilityPrompt: resolvedDistrictId ? null : "Select an address to check exact service availability.",
-      locationContext: {
-        source: locationSource,
-        zoneId: knownZoneId || null,
-        districtId: resolvedDistrictId || null,
-        defaultAddressId,
-      },
-      result: filteredServices,
-    });
+    // TODO(api-contract): remove legacy availabilityPrompt/locationContext mirrors after clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Services fetched successfully",
+      filteredServices,
+      {
+        availabilityPrompt: resolvedDistrictId ? null : "Select an address to check exact service availability.",
+        locationContext: {
+          source: locationSource,
+          zoneId: knownZoneId || null,
+          districtId: resolvedDistrictId || null,
+          defaultAddressId,
+        },
+      }
+    );
 
   } catch (error) {
     if (res.headersSent) return;
@@ -867,12 +896,13 @@ export const updateService = async (req, res) => {
     const responseDoc = await Service.findById(updated._id)
       .populate("categoryId", "category categoryType description");
 
-    return res.status(200).json({
-      success: true,
-      message: "Service updated successfully",
-      result: responseDoc,
-      ...(isActiveChanged ? { meta: { zoneSync: result.synced } } : {}),
-    });
+    return ok(
+      res,
+      200,
+      "Service updated successfully",
+      responseDoc,
+      isActiveChanged ? { meta: { zoneSync: result.synced } } : {}
+    );
   } catch (error) {
     if (res.headersSent) return;
     return res.status(500).json({

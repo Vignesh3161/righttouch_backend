@@ -4,6 +4,7 @@ import Service from "../Schemas/Service.js";
 import { resolveUserLocation } from "../Utils/resolveUserLocation.js";
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
 import { paiseToRupees, toPaise, isPayableTotalPaise } from "../Utils/money.js";
+import { failLegacy } from "../Utils/apiResponse.js";
 import { matchAndBroadcastBooking } from "../Utils/technicianMatching.js";
 import { toBookingCreatedDTO } from "../Utils/socketDTO.js";
 import {
@@ -17,6 +18,7 @@ import {
   isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { validateScheduledAtUtc } from "../Utils/slots.js";
+import { refreshSlotConfigIfStale } from "../Utils/slotConfig.js";
 import { prepareScheduledBooking } from "../Services/slotCapacityService.js";
 
 const toFiniteNumber = (val) => {
@@ -247,6 +249,8 @@ export const getCompletedServices = async (req, res) => {
  */
 export const rebookService = async (req, res) => {
   try {
+    await refreshSlotConfigIfStale();
+
     // 🔒 Security Check 1: Role Verification
     if (req.user?.role !== "Customer") {
       return res.status(403).json({
@@ -548,11 +552,14 @@ export const rebookService = async (req, res) => {
           return sendRebookReplay(res, existing, previousBooking, latestBaseAmount);
         }
         if (retryableConflict) {
-          return res.status(409).json({
-            success: false,
-            message: "Booking creation is already in progress. Please retry.",
-            reason: "duplicate_booking_request",
-          });
+          // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+          return failLegacy(
+            res,
+            409,
+            "Booking creation is already in progress. Please retry.",
+            { reason: "duplicate_booking_request" },
+            { reason: "duplicate_booking_request" }
+          );
         }
       }
       throw txError;

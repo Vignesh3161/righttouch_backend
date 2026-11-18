@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "RightTouch - Scheduling (Technician)",
-    "description": "Technician-side scheduling flow: offer feed, accept/decline, backup offers, execution status, masked calls, customer no-show, and completion OTP.",
+    "description": "Technician-side scheduling flow: offer feed, accept/decline, backup offers, grouped scheduled-job calendar, execution status, masked calls, customer no-show, and completion OTP.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -258,6 +258,41 @@
             ],
             "url": "{{baseUrl}}/api/technician/jobs/accepted/scheduled",
             "description": "Accepted scheduled jobs only, including slot metadata."
+          },
+          "response": []
+        },
+        {
+          "name": "Technician - Scheduled Jobs By Date & Time",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Scheduled jobs fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json(); const r = j.result || {};",
+                  "pm.test('Result is grouped by day', function () { pm.expect(r.days).to.be.an('array'); });",
+                  "pm.test('Total count is present', function () { pm.expect(r.totalJobs).to.be.a('number'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{technicianToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/technician/jobs/scheduled?includeCompleted=false&includeCancelled=false",
+            "description": "Scheduled jobs grouped by business date and time slot. Defaults to today through the last bookable day and active statuses (accepted, on_the_way, reached, in_progress). Optional query: date=YYYY-MM-DD or fromDate/toDate (max 31 days), status=accepted,on_the_way (comma separated), includeCompleted=true, includeCancelled=true, includeEmptySlots=false. Owner/Admin may pass technicianId or includeUnassigned=true."
           },
           "response": []
         },
@@ -1063,6 +1098,14 @@
     },
     {
       "key": "isBackupOffer",
+      "value": ""
+    },
+    {
+      "key": "fromDate",
+      "value": ""
+    },
+    {
+      "key": "toDate",
       "value": ""
     }
   ]

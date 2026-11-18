@@ -2,6 +2,7 @@ import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import Report from "../Schemas/Report.js";
 import { SOCKET_ROOMS } from "../Utils/socketConstants.js";
+import { fail, okLegacy } from "../Utils/apiResponse.js";
 
 // Active status filter for ProductQuoteRequests requiring admin attention
 const ACTIVE_QUOTE_STATUSES = [
@@ -53,17 +54,17 @@ export const broadcastAdminUnreadCounts = async (io) => {
 export const getAdminUnreadCounts = async (req, res) => {
   try {
     const counts = await calculateAdminUnreadCounts();
-    return res.status(200).json({
-      success: true,
-      message: "Unread counts retrieved successfully",
-      counts
-    });
+    // TODO(api-contract): remove legacy top-level counts mirror after dashboard clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Unread counts retrieved successfully",
+      { counts },
+      { counts }
+    );
   } catch (err) {
     console.error("Error in getAdminUnreadCounts:", err.message);
-    return res.status(500).json({
-      success: false,
-      message: err.message || "Failed to retrieve unread counts"
-    });
+    return fail(res, 500, err.message || "Failed to retrieve unread counts");
   }
 };
 
@@ -142,16 +143,16 @@ export const markAdminItemRead = async (req, res) => {
       });
     }
 
-    return res.status(200).json({
-      success: true,
-      message: "Notifications marked as read",
-      counts: updatedCounts
-    });
+    // TODO(api-contract): remove legacy top-level counts mirror after dashboard clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Notifications marked as read",
+      { counts: updatedCounts },
+      { counts: updatedCounts }
+    );
   } catch (err) {
     console.error("Error in markAdminItemRead:", err.message);
-    return res.status(500).json({
-      success: false,
-      message: err.message || "Failed to mark item as read"
-    });
+    return fail(res, 500, err.message || "Failed to mark item as read");
   }
 };

@@ -3,14 +3,7 @@ import {
   handleTwilioStatusCallback,
   validateTwilioSignature,
 } from "../Services/callLogService.js";
-
-const fail = (res, status, message, code = null) =>
-  res.status(status).json({
-    success: false,
-    ...(code ? { code } : {}),
-    message,
-    result: {},
-  });
+import { fail } from "../Utils/apiResponse.js";
 
 export const initiateBookingCall = async (req, res) => {
   try {
@@ -31,7 +24,7 @@ export const initiateBookingCall = async (req, res) => {
       result: callLog,
     });
   } catch (error) {
-    return fail(res, error.statusCode || 500, error.message, error.code || null);
+    return fail(res, error.statusCode || 500, error.message, {}, { code: error.code || undefined });
   }
 };
 
@@ -49,6 +42,7 @@ export const twilioStatusWebhook = async (req, res) => {
     });
     if (!valid) return fail(res, 403, "Invalid Twilio signature");
     await handleTwilioStatusCallback({ body: req.body || {} });
+    // api-envelope-exception: Twilio webhook contract requires an empty 204 response.
     return res.status(204).send();
   } catch (error) {
     return fail(res, error.statusCode || 500, error.message);

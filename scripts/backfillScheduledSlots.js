@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import ServiceBooking from "../Schemas/ServiceBooking.js";
 import TechnicianSlot from "../Schemas/TechnicianSlot.js";
 import { getSlotForTime } from "../Utils/slots.js";
+import { initSlotConfig } from "../Utils/slotConfig.js";
 
 const ACTIVE_STATUSES = ["accepted", "on_the_way", "reached", "in_progress"];
 
@@ -44,6 +45,7 @@ const run = async () => {
   if (!process.env.MONGO_URI) throw new Error("MONGO_URI is not configured");
 
   await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 });
+  await initSlotConfig();
 
   const filter = {
     $or: [

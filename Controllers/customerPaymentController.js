@@ -8,8 +8,7 @@ import { createAttempt, hasLiveAttempt } from "../Utils/paymentAttempts.js";
 import { ensureReceipt, buildInvoiceHtml } from "../Utils/receiptService.js";
 import { toPaise } from "../Utils/money.js";
 
-const ok = (res, status, message, result = {}) => res.status(status).json({ success: true, message, result });
-const fail = (res, status, message, result = {}) => res.status(status).json({ success: false, message, result });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 const requireCustomer = (req, res) => {
   if (req.user?.role !== "Customer") {

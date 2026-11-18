@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { isValidObjectId, internalError } from "../Utils/safeQuery.js";
+import { okLegacy } from "../Utils/apiResponse.js";
 import TechnicianProfile from "../Schemas/TechnicianProfile.js";
 import CityZone from "../Schemas/CityZone.js";
 import OperationalCity from "../Schemas/OperationalCity.js";
@@ -112,8 +113,7 @@ export const getTechnicianZonePermissions = async (req, res) => {
 
     const radiusVal = tech.coverageRadiusKm || tech.serviceRadius || tech.radius || 10;
 
-    return res.status(200).json({
-      success: true,
+    const payload = {
       technicianId: String(tech._id),
       primaryDistrict,
       enabledDistricts,
@@ -123,7 +123,16 @@ export const getTechnicianZonePermissions = async (req, res) => {
       coverageRadiusKm: radiusVal,
       serviceRadius: radiusVal,
       radius: radiusVal,
-    });
+    };
+
+    // TODO(api-contract): remove legacy top-level technician zone mirrors after clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Technician zone permissions",
+      payload,
+      payload
+    );
   } catch (error) {
     console.error("❌ getTechnicianZonePermissions error:", error);
     return internalError(res, error);

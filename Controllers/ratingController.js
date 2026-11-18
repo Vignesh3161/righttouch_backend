@@ -9,6 +9,7 @@ import {
   rebuildRatingAggregate,
   isValidObjectId,
 } from "../Services/ratingService.js";
+import { okLegacy } from "../Utils/apiResponse.js";
 
 const requireUser = (req, res) => {
   const userId = req.user?.userId;
@@ -63,7 +64,8 @@ export const userRating = async (req, res) => {
       data.product = aggregates.product || null;
     }
 
-    res.status(201).json({ success: true, message: successMessage, data });
+    // TODO(api-contract): remove legacy top-level data mirror after clients migrate.
+    return okLegacy(res, 201, successMessage, data, { data });
   } catch (error) {
     const status = error.statusCode || 500;
     const code = error.code;
@@ -197,7 +199,8 @@ export const updateRatingController = async (req, res) => {
       data.product = aggregates.product || null;
     }
 
-    res.status(200).json({ success: true, message: "Rating updated successfully", data });
+    // TODO(api-contract): remove legacy top-level data mirror after clients migrate.
+    return okLegacy(res, 200, "Rating updated successfully", data, { data });
   } catch (error) {
     const status = error.statusCode || 500;
     if (status !== 500) {
@@ -226,7 +229,8 @@ export const deleteRatingController = async (req, res) => {
       data.product = aggregates.product || { avg: 0, count: 0 };
     }
 
-    res.status(200).json({ success: true, message: "Rating deleted successfully", data });
+    // TODO(api-contract): remove legacy top-level data mirror after clients migrate.
+    return okLegacy(res, 200, "Rating deleted successfully", data, { data });
   } catch (error) {
     const status = error.statusCode || 500;
     if (status !== 500) {
@@ -255,11 +259,8 @@ export const adminUpdateRatingController = async (req, res) => {
       data.product = aggregates.product || null;
     }
 
-    return res.status(200).json({
-      success: true,
-      message: "Rating updated successfully",
-      data,
-    });
+    // TODO(api-contract): remove legacy top-level data mirror after clients migrate.
+    return okLegacy(res, 200, "Rating updated successfully", data, { data });
   } catch (error) {
     const status = error.statusCode || 500;
     if (status !== 500) {
@@ -282,7 +283,8 @@ export const adminDeleteRatingController = async (req, res) => {
       data.product = aggregates.product || { avg: 0, count: 0 };
     }
 
-    res.status(200).json({ success: true, message: "Rating deleted successfully", data });
+    // TODO(api-contract): remove legacy top-level data mirror after clients migrate.
+    return okLegacy(res, 200, "Rating deleted successfully", data, { data });
   } catch (error) {
     const status = error.statusCode || 500;
     if (status !== 500) {

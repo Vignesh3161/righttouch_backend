@@ -4,9 +4,10 @@ import "dotenv/config";
 
 import express from "express";
 import mongoose from "mongoose";
+import { apiEnvelope, apiNotFound, apiErrorHandler } from "./Middleware/apiEnvelope.js";
+import { ok, fail } from "./Utils/apiResponse.js";
 import cors from "cors";
 import helmet from "helmet";
-import multer from "multer";
 import rateLimit from "express-rate-limit";
 import { createServer } from "http";
 import { Server } from "socket.io";
@@ -122,6 +123,8 @@ const checkTechLocationBudget = (techProfileId) => {
 
 const App = express();
 
+App.use(apiEnvelope);
+
 // Express 5-safe sanitizers (mutate objects in place; do not reassign req.query)
 const sanitizeNoSqlPayload = (value) => {
   if (!value || typeof value !== "object") return;
@@ -174,7 +177,7 @@ App.use((req, res, next) => {
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
-  message: "Too many requests from this IP",
+  handler: (req, res) => fail(res, 429, "Too many requests from this IP"),
   validate: { trustProxy: false },
 });
 App.use("/api", limiter);
@@ -444,6 +447,7 @@ import { getRefundPolicy } from "./Utils/refundPolicy.js";
 import { validateSecrets } from "./Utils/secretValidation.js";
 import { enforceTransactionSupport } from "./Utils/mongoTransactions.js";
 import { assertScheduleSlotBootConfig } from "./Utils/schedulingConfig.js";
+import { initSlotConfig } from "./Utils/slotConfig.js";
 
 // Middleware to attach io to all requests
 App.use((req, res, next) => {
@@ -491,11 +495,8 @@ const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   //sk
   max: 1000, // 1000 requests per window (increased for development)
-  message: {
-    success: false,
-    message: "Too many requests, please try again later",
-    result: {},
-  },
+  handler: (req, res) =>
+    fail(res, 429, "Too many requests, please try again later"),
   standardHeaders: true,
   legacyHeaders: false,
   // Don't crash the process if req.ip is temporarily unavailable (e.g. aborted connections)
@@ -512,10 +513,8 @@ App.use((req, res, next) => {
   res.setTimeout(60000, () => {
     console.log("⏳ Request timed out");
     if (!res.headersSent) {
-      res.status(408).json({
-        success: false,
-        message: "Request timeout",
-        result: "Request took too long to process",
+      fail(res, 408, "Request timeout", {}, {
+        details: "Request took too long to process",
       });
     }
   });
@@ -588,13 +587,18 @@ const startBackgroundWorkers = async () => {
 
 // 🩺 Health endpoints — wire into the process supervisor / LB health checks
 App.get("/health/live", (req, res) => {
-  res.status(200).json({ status: "ok", uptime: process.uptime() });
+  return ok(res, 200, "Alive", { status: "ok", uptime: process.uptime() });
 });
 
 App.get("/health/ready", async (req, res) => {
   const mongoOk = mongoose.connection.readyState === 1;
-  if (mongoOk) return res.status(200).json({ status: "ready", mongo: true });
-  return res.status(503).json({ status: "not_ready", mongo: mongoOk });
+  if (mongoOk) {
+    return ok(res, 200, "Ready", { status: "ready", mongo: true });
+  }
+  return fail(res, 503, "Service not ready", {
+    status: "not_ready",
+    mongo: mongoOk,
+  });
 });
 
 App.get("/health/fcm", async (req, res) => {
@@ -602,24 +606,26 @@ App.get("/health/fcm", async (req, res) => {
   const fcmEnabled = isFcmEnabled();
   const validation = fcmEnabled ? validateFcmConfig() : { valid: false, reason: "not_initialized" };
   const status = fcmEnabled && validation.valid ? 200 : 503;
-  res.status(status).json({
+  const result = {
     fcmEnabled,
     fcmProjectId: validation.projectId,
     valid: validation.valid,
     reason: validation.reason,
     expectedProjectId: validation.expected,
-  });
+  };
+  if (status === 200) return ok(res, 200, "FCM ready", result);
+  return fail(res, 503, "FCM unavailable", result);
 });
 
 App.get("/health/metrics", async (req, res) => {
   const { notificationMetrics } = await import("./Utils/notificationMetrics.js");
-  res.status(200).json(notificationMetrics.getSummary());
+  return ok(res, 200, "Notification metrics", notificationMetrics.getSummary());
 });
 
 App.get("/health/socket-rooms/:userId", Auth, authorizeRoles("Admin", "Owner"), async (req, res) => {
   const { userId } = req.params;
   if (!mongoose.Types.ObjectId.isValid(userId)) {
-    return res.status(400).json({ success: false, message: "Invalid userId" });
+    return fail(res, 400, "Invalid userId");
   }
 
   const techProfile = await TechnicianProfile.findOne({ userId }).select("_id workStatus").lean();
@@ -644,19 +650,18 @@ App.get("/health/socket-rooms/:userId", Auth, authorizeRoles("Admin", "Owner"), 
   });
 
   const missing = expectedRooms.filter(r => !actualRooms.has(r));
-  const unexpected = Array.from(actualRooms).filter(r => 
-    !expectedRooms.includes(r) && !r.startsWith("socket:") && r !== socket.id
+  const unexpected = Array.from(actualRooms).filter(r =>
+    !expectedRooms.includes(r) && !r.startsWith("socket:")
   );
 
-  res.json({
-    success: true,
+  return ok(res, 200, "Socket room status", {
     userId,
     techProfileId,
     expectedRooms,
     actualRooms: Array.from(actualRooms),
     missingRooms: missing,
     unexpectedRooms: unexpected,
-    healthy: missing.length === 0 && unexpected.length === 0
+    healthy: missing.length === 0 && unexpected.length === 0,
   });
 });
 
@@ -716,45 +721,10 @@ App.use("/api", userZoneRoutes);
    -------------------------------------------------------------------------- */
 App.use("/api/admin/dispatch", adminDispatchRoutes);
 
+App.use(apiNotFound);
+
 // ❗ GLOBAL ERROR HANDLER (MUST BE LAST)
-App.use((err, req, res, next) => {
-  console.error("GLOBAL ERROR:", err);
-
-  // Handle Multer Errors
-  if (err instanceof multer.MulterError) {
-    let message = err.message;
-    if (err.code === "LIMIT_UNEXPECTED_FILE" && err.field) {
-      message = `Unexpected field: ${err.field}`;
-    } else if (err.code === "LIMIT_FILE_SIZE") {
-      message = "File size too large. Max limit is 20MB.";
-    }
-
-    return res.status(400).json({
-      success: false,
-      message: message,
-      code: err.code,
-    });
-  }
-
-  // Handle Body-Parser Errors (JSON Syntax Errors)
-  if (err && err.type === "entity.parse.failed") {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid JSON body",
-      result: {},
-    });
-  }
-
-  if (res.headersSent) {
-    return next(err);
-  }
-
-  const statusCode = err.statusCode || err.status || 500;
-  return res.status(statusCode).json({
-    success: false,
-    message: err.message || "Internal server error",
-  });
-});
+App.use(apiErrorHandler);
 
 // 🚀 UNIFIED SERVER STARTUP SEQUENCE
 const startServer = async () => {
@@ -796,6 +766,7 @@ const startServer = async () => {
     // closed in production on standalone topologies (warn in dev/test).
     const transactionSupported = await enforceTransactionSupport();
     assertScheduleSlotBootConfig({ transactionSupported });
+    await initSlotConfig();
 
     // 3b. Initialize Redis Socket.IO Adapter for multi-server pub/sub
     await initRedisAdapter(io);
@@ -821,6 +792,7 @@ mongoose.connection.on("disconnected", () => {
 });
 mongoose.connection.on("reconnected", () => {
   console.log("✅ MongoDB reconnected — workers resumed.");
+  initSlotConfig().catch((err) => console.error("Slot config reload failed:", err.message));
 });
 mongoose.connection.on("error", (err) => {
   console.error("MongoDB connection error:", err.message);

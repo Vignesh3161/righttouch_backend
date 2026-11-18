@@ -13,8 +13,7 @@ import {
 } from "../Utils/refundEngine.js";
 import { writeAuditLog } from "../Utils/audit.js";
 
-const ok = (res, status, message, result = {}) => res.status(status).json({ success: true, message, result });
-const fail = (res, status, message, result = {}) => res.status(status).json({ success: false, message, result });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 const requireAdmin = (req, res) => {
   if (!["Admin", "Owner"].includes(req.user?.role)) {

@@ -6,51 +6,112 @@ import mongoose from "mongoose";
  * Resolve user location from either:
  * 1. Saved Address (addressId) - Preferred
  * 2. GPS coordinates (latitude, longitude)
- * 3. Address line + City/State/Pincode - Fallback
+ *
+ * locationType "saved" requires a valid, owned addressId. Whenever an
+ * addressId is supplied it is authoritative and never silently falls back to
+ * GPS. Empty coordinate strings are treated as missing, never as 0.
  */
+const validationError = (message, code) => {
+  const error = new Error(message);
+  error.statusCode = 400;
+  error.code = code;
+  return error;
+};
+
+const hasValue = (value) =>
+  value !== null && value !== undefined && String(value).trim() !== "";
+
+const normalizeCoordinate = (value) => {
+  if (!hasValue(value)) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+};
+
+const isSavedLocation = (locationType) =>
+  typeof locationType === "string" && locationType.trim().toLowerCase() === "saved";
+
 export const resolveUserLocation = async ({
-  locationType = "ADDRESS", // ADDRESS or GPS
+  locationType = "ADDRESS",
   addressId = null,
   latitude = null,
   longitude = null,
   userId = null,
 } = {}) => {
   try {
-    // Priority 1: Use saved address if addressId provided
-    if (addressId && mongoose.Types.ObjectId.isValid(addressId)) {
-      const address = await Address.findOne({
-        _id: addressId,
-        customerId: userId, // 🔒 SECURITY: Verify ownership
-      });
-      if (address) {
-        return {
-          success: true,
-          locationType: "saved",
-          addressId: address._id.toString(),
-          latitude: address.latitude || null,
-          longitude: address.longitude || null,
-          addressSnapshot: {
-            label: address.label || "address",
-            name: address.name || "",
-            phone: address.phone || "",
-            addressLine: address.addressLine || "",
-            city: address.city || "",
-            state: address.state || "",
-            pincode: address.pincode || "",
-            latitude: address.latitude || null,
-            longitude: address.longitude || null,
-            isDefault: address.isDefault || false,
-          },
-        };
+    if (hasValue(addressId)) {
+      const rawAddressId = String(addressId).trim();
+      if (!mongoose.Types.ObjectId.isValid(rawAddressId)) {
+        throw validationError("Invalid addressId", "INVALID_ADDRESS");
       }
+
+      const address = await Address.findOne({
+        _id: rawAddressId,
+        customerId: userId,
+      });
+      if (!address) {
+        throw validationError(
+          "Selected address was not found for this customer",
+          "ADDRESS_NOT_FOUND"
+        );
+      }
+
+      const addressLat = normalizeCoordinate(address.latitude);
+      const addressLng = normalizeCoordinate(address.longitude);
+      if (addressLat === null || addressLng === null) {
+        throw validationError(
+          "Selected address is missing latitude/longitude coordinates",
+          "ADDRESS_LOCATION_REQUIRED"
+        );
+      }
+
+      return {
+        success: true,
+        locationType: "saved",
+        addressId: address._id.toString(),
+        latitude: addressLat,
+        longitude: addressLng,
+        addressSnapshot: {
+          label: address.label || "address",
+          name: address.name || "",
+          phone: address.phone || "",
+          addressLine: address.addressLine || "",
+          city: address.city || "",
+          state: address.state || "",
+          pincode: address.pincode || "",
+          latitude: addressLat,
+          longitude: addressLng,
+          isDefault: address.isDefault || false,
+        },
+      };
     }
 
-    // Priority 2: Use GPS coordinates if provided
-    const lat = latitude !== null && latitude !== undefined ? Number(latitude) : null;
-    const lng = longitude !== null && longitude !== undefined ? Number(longitude) : null;
+    if (isSavedLocation(locationType)) {
+      throw validationError(
+        "addressId is required when locationType is saved",
+        "ADDRESS_REQUIRED"
+      );
+    }
 
-    if (Number.isFinite(lat) && Number.isFinite(lng)) {
-      // Fetch user details for name/phone if available
+    const hasLat = hasValue(latitude);
+    const hasLng = hasValue(longitude);
+    const lat = normalizeCoordinate(latitude);
+    const lng = normalizeCoordinate(longitude);
+
+    if (hasLat !== hasLng || (hasLat && (lat === null || lng === null))) {
+      throw validationError(
+        "Both valid latitude and longitude are required",
+        "INVALID_COORDINATES"
+      );
+    }
+
+    if (lat !== null && lng !== null) {
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        throw validationError(
+          "Latitude or longitude is out of range",
+          "INVALID_COORDINATES"
+        );
+      }
+
       let userName = "";
       let userPhone = "";
 
@@ -83,13 +144,14 @@ export const resolveUserLocation = async ({
       };
     }
 
-    // No valid location found - throw error to prevent booking with invalid location
-    const error = new Error("No valid address or GPS coordinates provided");
-    error.statusCode = 400;
-    throw error;
+    throw validationError(
+      "No valid address or GPS coordinates provided",
+      "LOCATION_REQUIRED"
+    );
   } catch (error) {
-    console.error("resolveUserLocation Error:", error);
-    // Rethrow the error so checkout can catch it properly
+    if (!error.statusCode || error.statusCode >= 500) {
+      console.error("resolveUserLocation Error:", error);
+    }
     if (error.statusCode) {
       throw error;
     }
@@ -98,4 +160,3 @@ export const resolveUserLocation = async ({
     throw err;
   }
 };
-

@@ -2,9 +2,7 @@ import { createQuoteRequest, updateQuoteRequest, getCustomerRequests, getCustome
 import ProductQuoteRequest from "../Schemas/ProductQuoteRequest.js";
 import { emitProductQuoteRequestChanged } from "../Utils/productRealtime.js";
 
-const ok = (res, code, message, result) => res.status(code).json({ success: true, message, result: result || {} });
-const fail = (res, code, message, result) => res.status(code).json({ success: false, message, result: result || {} });
-const failErr = (res, err) => fail(res, err.statusCode || 500, err.message, err.code ? { code: err.code } : {});
+import { ok, fail, failFromError } from "../Utils/apiResponse.js";
 
 /* ----------------------------- Customer ----------------------------- */
 
@@ -13,7 +11,7 @@ export const createQuoteRequestController = async (req, res) => {
     const request = await createQuoteRequest({ customerId: req.user.userId, body: req.body });
     return ok(res, 201, "Quote request created", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -22,7 +20,7 @@ export const listMyQuoteRequestsController = async (req, res) => {
     const requests = await getCustomerRequests({ customerId: req.user.userId, query: req.query });
     return ok(res, 200, "Quote requests", requests);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -31,7 +29,7 @@ export const getMyQuoteRequestController = async (req, res) => {
     const request = await getCustomerRequestById({ customerId: req.user.userId, id: req.params.id });
     return ok(res, 200, "Quote request", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -40,7 +38,7 @@ export const cancelMyQuoteRequestController = async (req, res) => {
     const request = await cancelQuoteRequest({ customerId: req.user.userId, id: req.params.id });
     return ok(res, 200, "Quote request cancelled", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -49,7 +47,7 @@ export const updateMyQuoteRequestController = async (req, res) => {
     const request = await updateQuoteRequest({ customerId: req.user.userId, id: req.params.id, body: req.body });
     return ok(res, 200, "Quote request updated", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -60,7 +58,7 @@ export const adminListQuoteRequestsController = async (req, res) => {
     const requests = await getAdminRequests({ query: req.query });
     return ok(res, 200, "Quote requests", requests);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -69,7 +67,7 @@ export const adminGetQuoteRequestController = async (req, res) => {
     const request = await getAdminRequestById(req.params.id);
     return ok(res, 200, "Quote request", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -78,7 +76,7 @@ export const adminAssignQuoteRequestController = async (req, res) => {
     const request = await assignRequest({ id: req.params.id, adminId: req.user.userId });
     return ok(res, 200, "Quote request assigned", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -87,7 +85,7 @@ export const adminUpdateQuoteRequestStatusController = async (req, res) => {
     const request = await updateRequestStatus({ id: req.params.id, status: req.body.status, adminId: req.user.userId });
     return ok(res, 200, "Quote request status updated", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -107,6 +105,6 @@ export const adminDeleteQuoteRequestController = async (req, res) => {
     });
     return ok(res, 200, "Quote request deleted", request);
   } catch (err) {
-    return failErr(res, err);
+    return failFromError(res, err);
   }
 };

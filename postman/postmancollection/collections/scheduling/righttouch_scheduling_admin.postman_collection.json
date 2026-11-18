@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "RightTouch - Scheduling (Admin)",
-    "description": "Admin/Owner scheduling operations: dispatch health, booking inspection, broadcast audit, base-location review, and customer no-show compensation review.",
+    "description": "Admin/Owner scheduling operations: global slot configuration, dispatch health, booking inspection, broadcast audit, base-location review, and customer no-show compensation review.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -463,6 +463,127 @@
       ]
     },
     {
+      "name": "01b - Schedule Slot Settings",
+      "item": [
+        {
+          "name": "Admin - Get Schedule Slot Settings",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Schedule slot settings fetched\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "pm.test('Config and preview returned', function () { pm.expect(j.result.config).to.be.an('object'); pm.expect(j.result.preview.schedule).to.be.an('object'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/settings/schedule-slots",
+            "description": "Global slot configuration: bookable days, window start/end hour, slot count, defaults and a live preview."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Update Schedule Slot Settings",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Schedule slot settings updated\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "pm.test('Updated config returned', function () { pm.expect(j.result.config.slotCount).to.be.a('number'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scheduleDays\": {{scheduleDays}},\n  \"windowStartHour\": {{windowStartHour}},\n  \"windowEndHour\": {{windowEndHour}},\n  \"slotCount\": {{slotCount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{baseUrl}}/api/admin/settings/schedule-slots",
+            "description": "Updates the global slot configuration. Rules: scheduleDays 1-30; windowStartHour 0-22; windowEndHour 1-23 with end > start; slotCount 1-12; window must divide evenly and each slot must be at least 30 minutes."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin - Reset Schedule Slot Settings",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Schedule slot settings reset\", function () { pm.response.to.have.status(200); });",
+                  "const j = pm.response.json();",
+                  "pm.test('Defaults restored', function () { pm.expect(j.result.config.scheduleDays).to.eql(5); pm.expect(j.result.config.slotCount).to.eql(4); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": "{{baseUrl}}/api/admin/settings/schedule-slots/reset",
+            "description": "Restores the default configuration: 5 bookable days, 09:00-21:00 window, 4 slots."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
       "name": "02 - No-Show Compensation",
       "item": [
         {
@@ -778,6 +899,22 @@
     {
       "key": "longitude",
       "value": "77.5946"
+    },
+    {
+      "key": "scheduleDays",
+      "value": "5"
+    },
+    {
+      "key": "windowStartHour",
+      "value": "9"
+    },
+    {
+      "key": "windowEndHour",
+      "value": "21"
+    },
+    {
+      "key": "slotCount",
+      "value": "4"
     }
   ]
 }

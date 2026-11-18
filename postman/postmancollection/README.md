@@ -111,12 +111,12 @@ Use the dedicated collection
    captures `technicianId`).
 2. `02 - Technician Base Location & Availability` (set base location, update
    GPS, go online).
-3. `01 - Customer Scheduled Booking` (get slots, create scheduled booking,
-   optional reschedule/cancel).
+3. `01 - Customer Scheduled Booking` (get slots with the saved address, create
+   scheduled booking, optional reschedule/cancel).
 4. `03 - Technician Job Feed & Lifecycle` (My Jobs -> accept/decline -> status
-   updates -> completion).
+   updates -> grouped scheduled-job calendar -> completion).
 5. `04 - Admin Base Location & Dispatch Ops` (review missing base locations,
-   queue health/retry).
+   slot configuration, queue health/retry).
 6. `05 - Socket.IO Handshake & Event Reference`.
 7. `90 - Guard Checks (optional)`.
 
@@ -132,9 +132,9 @@ runnable flow per role:
    discovery, create/reschedule/cancel, no-show response.
 2. `righttouch_scheduling_technician.postman_collection.json` — auth, offer
    feed, accept/decline, execution status, masked call, no-show, completion.
-3. `righttouch_scheduling_admin.postman_collection.json` — auth, dispatch
-   health/retry, booking inspection, broadcast audit, base location, no-show
-   compensation review.
+3. `righttouch_scheduling_admin.postman_collection.json` — auth, schedule slot
+   settings, dispatch health/retry, booking inspection, broadcast audit, base
+   location, no-show compensation review.
 
 Run them in that order for a combined smoke test. The same requests are also
 inserted into the canonical role collections under
@@ -167,13 +167,20 @@ tab/endpoint filters and scheduled-vs-instant separation.
 | `firebaseToken` | Optional FCM token for `/fcm-token` |
 | `razorpayOrderId` / `razorpayPaymentId` / `razorpaySignature` | Values for the payment verify request |
 | `completionOtp` | Customer SMS OTP read from the phone and submitted by the technician |
-| `addressId` | Optional saved address for slots/booking |
+| `addressId` | Saved address for slots and scheduled booking; must belong to the customer and include latitude/longitude |
 | `scheduledDate` / `scheduledTime` | Slot captured from the slots response |
+| `fromDate` / `toDate` | Optional range for the grouped technician calendar |
+| `scheduleDays` / `slotCount` | Admin slot config: bookable days and slots per day |
+| `windowStartHour` / `windowEndHour` | Admin slot config: daily start/end hour (24h) |
 | `rescheduleDate` / `rescheduleTime` | Second slot used by reschedule |
 | `scheduledAt` | UTC scheduled instant captured from create/reschedule |
 | `scheduledBookingId` | First accepted scheduled job, if any |
 | `technicianId` | Technician profile id for admin base-location requests |
 | `districtId` | Optional district filter for missing-base-location review |
+
+Scheduled-booking requests default to `locationType: "saved"` with `addressId`.
+Set `addressId` before running them. GPS coordinates remain supported by the API
+but are no longer sent by the Postman scheduled-booking requests.
 
 ## Related docs
 

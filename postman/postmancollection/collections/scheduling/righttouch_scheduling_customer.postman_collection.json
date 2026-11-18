@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "RightTouch - Scheduling (Customer)",
-    "description": "Customer-side four-slot scheduling flow: slot discovery, scheduled booking, reschedule, cancellation, no-show response, and socket reference.",
+    "description": "Customer-side scheduling flow with admin-configurable days and slots: slot discovery, scheduled booking, reschedule, cancellation, no-show response, and socket reference.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -113,7 +113,7 @@
                   "const schedule = (j.result && j.result.schedule) || {};",
                   "const days = schedule.days || [];",
                   "const slots = schedule.timeSlots || [];",
-                  "pm.test('Five days and four slots returned', function () { pm.expect(days.length).to.eql(5); pm.expect(slots.length).to.eql(4); });",
+                  "pm.test('Dynamic days and slots returned', function () { pm.expect(days.length).to.be.greaterThan(0); pm.expect(slots.length).to.be.greaterThan(0); });",
                   "if (days[0]) pm.collectionVariables.set('scheduledDate', days[0].fullDate);",
                   "if (slots[0]) pm.collectionVariables.set('scheduledTime', slots[0].value);",
                   "if (days[1]) pm.collectionVariables.set('rescheduleDate', days[1].fullDate);",
@@ -133,7 +133,7 @@
               }
             ],
             "url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&latitude={{latitude}}&longitude={{longitude}}",
-            "description": "Public. Returns instant ETA plus five days (tomorrow + 4) and four 3-hour slots."
+            "description": "Public. Returns an instant option plus scheduled days starting tomorrow. Defaults: 5 bookable days, 09:00-21:00 split into 4 equal slots. Days and slots are generated from the admin-configured GlobalSetting key schedule.slots, so today is instant-only and scheduled dates always start tomorrow."
           },
           "response": []
         },
@@ -173,6 +173,16 @@
           "name": "Customer - Create Scheduled Booking",
           "event": [
             {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const addressId = pm.variables.get('addressId');",
+                  "if (!addressId || !String(addressId).trim()) { throw new Error('Set addressId to a saved customer address before running this request.'); }"
+                ]
+              }
+            },
+            {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
@@ -205,10 +215,10 @@
               }
             ],
             "url": "{{baseUrl}}/api/user/booking/schedule",
-            "description": "Creates a scheduled booking in a slot returned by GET /booking/slots. Dispatch starts immediately; the booking remains pending until a technician accepts.",
+            "description": "Creates a scheduled booking for a saved customer address. The address must belong to the authenticated customer and include latitude/longitude. Set addressId before running; GPS coordinates are no longer sent by this request.",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"faultProblem\": \"Postman scheduling smoke test\"\n}",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"saved\",\n  \"faultProblem\": \"Postman scheduling smoke test\",\n  \"addressId\": \"{{addressId}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -331,7 +341,7 @@
               }
             ],
             "url": "{{baseUrl}}/api/user/cart/set-schedule",
-            "description": "Schedules a service cart item using the same four-slot engine. Products are quotation-only.",
+            "description": "Schedules a service cart item using the same admin-configurable slot engine. Products are quotation-only.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"itemId\": \"{{cartItemId}}\",\n  \"bookingDate\": \"{{scheduledDate}}\",\n  \"timeSlot\": \"{{scheduledTime}}\",\n  \"faultProblem\": \"Cart scheduling smoke test\"\n}",
@@ -638,6 +648,16 @@
           "name": "Guard - Invalid Slot",
           "event": [
             {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const addressId = pm.variables.get('addressId');",
+                  "if (!addressId || !String(addressId).trim()) { throw new Error('Set addressId to a saved customer address before running this request.'); }"
+                ]
+              }
+            },
+            {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
@@ -667,10 +687,10 @@
               }
             ],
             "url": "{{baseUrl}}/api/user/booking/schedule",
-            "description": "Expected 400: time is outside the four bookable slots.",
+            "description": "Creates a scheduled booking for a saved customer address. The address must belong to the authenticated customer and include latitude/longitude. Set addressId before running; GPS coordinates are no longer sent by this request.",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"23:45\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\"\n}",
+              "raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"23:45\",\n  \"locationType\": \"saved\",\n  \"addressId\": \"{{addressId}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"

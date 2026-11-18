@@ -4,9 +4,7 @@ import Quotation from "../Schemas/Quotation.js";
 import Payment from "../Schemas/Payment.js";
 import AuditLog from "../Schemas/AuditLog.js";
 import User from "../Schemas/User.js";
-
-const ok = (res, code, message, result) => res.status(code).json({ success: true, message, result });
-const fail = (res, code, message, result = {}) => res.status(code).json({ success: false, message, result });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 /**
  * 📊 Product Dashboard Financial & Operational Overview
@@ -96,12 +94,12 @@ export const getProductDashboardSummaryController = async (req, res) => {
       outOfStockCount: 0,
     };
 
-    return res.status(200).json({
-      success: true,
-      message: "Product dashboard summary fetched successfully",
-      result: summaryResult,
-      ...summaryResult
-    });
+    return ok(
+      res,
+      200,
+      "Product dashboard summary fetched successfully",
+      summaryResult
+    );
   } catch (error) {
     console.error("getProductDashboardSummaryController error:", error);
     return fail(res, 500, "Error fetching product dashboard summary", { error: error.message });
@@ -160,13 +158,13 @@ export const getSalesReportController = async (req, res) => {
       };
     });
 
-    return res.status(200).json({
-      success: true,
-      message: "Sales report fetched successfully",
-      result: reportData,
-      data: reportData,
-      totalSales,
-    });
+    return ok(
+      res,
+      200,
+      "Sales report fetched successfully",
+      reportData,
+      { meta: { totalSales } }
+    );
   } catch (error) {
     console.error("getSalesReportController error:", error);
     return fail(res, 500, "Error fetching sales report", { error: error.message });
@@ -204,20 +202,21 @@ export const getProductAuditLogsController = async (req, res) => {
       .limit(limitNum)
       .lean();
 
-    return res.status(200).json({
-      success: true,
-      message: "Audit logs fetched successfully",
-      result: logs,
+    return ok(
+      res,
+      200,
+      "Audit logs fetched successfully",
       logs,
-      data: logs,
-      total,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
+      {
         total,
-        totalPages: Math.ceil(total / limitNum)
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum),
+        },
       }
-    });
+    );
   } catch (error) {
     console.error("getProductAuditLogsController error:", error);
     return fail(res, 500, "Error fetching audit logs", { error: error.message });

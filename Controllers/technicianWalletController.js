@@ -19,6 +19,7 @@ import { fingerprintBankDetails, maskAccount } from "../Utils/kycPrivacy.js";
 import { SOCKET_ROOMS } from "../Utils/socketConstants.js";
 import { atomicWalletDebit } from "../Utils/walletDebit.js";
 import { getIo } from "../Utils/ioAccess.js";
+import { fail, okLegacy } from "../Utils/apiResponse.js";
 
 const isValidObjectId = mongoose.Types.ObjectId.isValid;
 
@@ -367,8 +368,7 @@ export const getTechnicianWallet = async (req, res) => {
       console.warn("[getTechnicianWallet] bank display unavailable:", displayErr.message);
     }
 
-    res.json({
-      success: true,
+    const wallet = {
       // Four explicit balances (paise) + legacy rupee mirrors
       availableBalancePaise: currentAvailablePaise,
       reservedBalancePaise: tech?.reservedBalancePaise ?? 0,
@@ -449,10 +449,12 @@ export const getTechnicianWallet = async (req, res) => {
                   ? "Auto-payout is disabled for your account"
                   : `Earn ₹${paiseToRupees(autoEstimate.remainingToThresholdPaise).toFixed(2)} more to trigger auto-payout`,
           },
-    });
+    };
+    // TODO(api-contract): remove legacy top-level wallet mirrors after clients migrate.
+    return okLegacy(res, 200, "Wallet fetched successfully", wallet);
   } catch (error) {
     console.error("Error in getTechnicianWallet:", error);
-    res.status(500).json({ success: false, message: "Internal Server Error", error: error.message });
+    return fail(res, 500, "Internal Server Error", { error: error.message });
   }
 };
 
@@ -1132,9 +1134,7 @@ export const getWithdrawalReceipt = async (req, res) => {
     const requestedPaise = withdrawal.requestedAmountPaise ?? withdrawal.amountPaise ?? rupeesToPaise(withdrawal.amount);
     const netPayoutPaise = withdrawal.netPayoutAmountPaise ?? requestedPaise;
 
-    res.json({
-      success: true,
-      receipt: {
+    const receipt = {
         receiptId: `RCP-${withdrawal._id.toString().slice(-8).toUpperCase()}`,
         issuer: "RightTouch Technologies Private Limited",
         withdrawalId: withdrawal._id,
@@ -1169,9 +1169,10 @@ export const getWithdrawalReceipt = async (req, res) => {
           paidAt: withdrawal.paidAt,
           failedAt: withdrawal.failedAt,
         },
-      },
-    });
+    };
+    // TODO(api-contract): remove legacy top-level receipt mirror after clients migrate.
+    return okLegacy(res, 200, "Payout receipt fetched successfully", { receipt });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+    return fail(res, error.statusCode || 500, error.message);
   }
 };

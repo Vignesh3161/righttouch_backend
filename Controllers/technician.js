@@ -18,6 +18,7 @@ import ZoneServiceMapping from "../Schemas/ZoneServiceMapping.js";
 import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 import CityZone from "../Schemas/CityZone.js";
 import TechnicianSkillRequest from "../Schemas/TechnicianSkillRequest.js";
+import { okLegacy } from "../Utils/apiResponse.js";
 import { getDekForKycDoc, decryptBankDetails } from "../Utils/kycFieldCrypto.js";
 import { maskAccount } from "../Utils/kycPrivacy.js";
 import { writeAuditLog } from "../Utils/audit.js";
@@ -1891,13 +1892,14 @@ export const updateTechnician = async (req, res) => {
       .populate("skills.serviceId", "serviceName")
       .select("-password");
 
-    return res.status(200).json({
-      success: true,
-      message: "Technician profile updated successfully",
-      result: updatedProfile,
-      broadcast: broadcastResult,
-      gps: afterGps,
-    });
+    // TODO(api-contract): remove legacy broadcast/gps mirrors after clients migrate.
+    return okLegacy(
+      res,
+      200,
+      "Technician profile updated successfully",
+      updatedProfile,
+      { broadcast: broadcastResult, gps: afterGps }
+    );
 
   } catch (error) {
     if (res.headersSent) return;

@@ -13,8 +13,7 @@ import {
   technicianGetMyRefundsInternal,
 } from "../Services/complaintService.js";
 
-const ok = (res, status, message, result = {}) => res.status(status).json({ success: true, message, result });
-const fail = (res, status, message, result = {}) => res.status(status).json({ success: false, message, result });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 export const customerCreateReport = async (req, res) => {
   try {

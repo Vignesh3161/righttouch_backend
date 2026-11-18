@@ -3,14 +3,7 @@ import ServiceBooking from "../Schemas/ServiceBooking.js";
 import PlatformLedgerEntry from "../Schemas/PlatformLedgerEntry.js";
 import { postLedgerEntry } from "../Utils/ledger.js";
 import { writeAuditLog } from "../Utils/audit.js";
-
-const fail = (res, status, message, code = null) =>
-  res.status(status).json({
-    success: false,
-    ...(code ? { code } : {}),
-    message,
-    result: {},
-  });
+import { fail } from "../Utils/apiResponse.js";
 
 const compensationKey = (bookingId) => `customer-no-show-compensation:${bookingId}`;
 
@@ -25,13 +18,13 @@ export const reviewCustomerNoShowCompensation = async (req, res) => {
     }
     const action = String(req.body?.action || "").trim().toLowerCase();
     if (!["approve", "reject", "mark_paid"].includes(action)) {
-      return fail(res, 400, "action must be approve, reject, or mark_paid", "INVALID_ACTION");
+      return fail(res, 400, "action must be approve, reject, or mark_paid", {}, { code: "INVALID_ACTION" });
     }
 
     const booking = await ServiceBooking.findById(id);
     if (!booking) return fail(res, 404, "Booking not found");
     if (booking.customerNoShowStatus !== "confirmed") {
-      return fail(res, 409, "Only a confirmed customer no-show can be reviewed", "NO_SHOW_NOT_CONFIRMED");
+      return fail(res, 409, "Only a confirmed customer no-show can be reviewed", {}, { code: "NO_SHOW_NOT_CONFIRMED" });
     }
 
     const amountPaise = Math.max(0, Number(booking.customerNoShowCompensationPaise) || 0);
@@ -46,10 +39,10 @@ export const reviewCustomerNoShowCompensation = async (req, res) => {
 
     if (action === "approve") {
       if (amountPaise <= 0) {
-        return fail(res, 400, "There is no compensation amount to approve", "NOTHING_TO_APPROVE");
+        return fail(res, 400, "There is no compensation amount to approve", {}, { code: "NOTHING_TO_APPROVE" });
       }
       if (current !== "recorded") {
-        return fail(res, 409, "Compensation is not in a reviewable state", "INVALID_COMPENSATION_STATE");
+        return fail(res, 409, "Compensation is not in a reviewable state", {}, { code: "INVALID_COMPENSATION_STATE" });
       }
       await postLedgerEntry({
         type: "manual_adjustment",
@@ -78,7 +71,7 @@ export const reviewCustomerNoShowCompensation = async (req, res) => {
       booking.customerNoShowReviewNote = note;
     } else if (action === "reject") {
       if (!["recorded", "approved"].includes(current)) {
-        return fail(res, 409, "Compensation is not in a reviewable state", "INVALID_COMPENSATION_STATE");
+        return fail(res, 409, "Compensation is not in a reviewable state", {}, { code: "INVALID_COMPENSATION_STATE" });
       }
       await PlatformLedgerEntry.updateOne(
         { idempotencyKey: compensationKey(booking._id), status: "pending" },
@@ -97,7 +90,7 @@ export const reviewCustomerNoShowCompensation = async (req, res) => {
       booking.customerNoShowReviewNote = note;
     } else {
       if (current !== "approved") {
-        return fail(res, 409, "Compensation must be approved before it is marked paid", "INVALID_COMPENSATION_STATE");
+        return fail(res, 409, "Compensation must be approved before it is marked paid", {}, { code: "INVALID_COMPENSATION_STATE" });
       }
       const providerReference =
         typeof req.body?.providerReference === "string"
@@ -113,7 +106,7 @@ export const reviewCustomerNoShowCompensation = async (req, res) => {
         }
       );
       if (!ledgerUpdate.matchedCount) {
-        return fail(res, 409, "Compensation liability entry is missing", "LEDGER_ENTRY_MISSING");
+        return fail(res, 409, "Compensation liability entry is missing", {}, { code: "LEDGER_ENTRY_MISSING" });
       }
       await ServiceBooking.updateOne(
         { _id: booking._id },

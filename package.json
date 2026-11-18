@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "check:api-responses": "node scripts/checkApiResponses.mjs",
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:technician-districts": "node scripts/backfillTechnicianDistrictZones.js",

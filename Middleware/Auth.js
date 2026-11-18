@@ -89,7 +89,7 @@ export const authorizeRoles = (...allowedRoles) => {
   return (req, res, next) => {
     // Auth middleware MUST run before this
     if (!req.user || !req.user.role) {
-      return res.status(401).json({ success: false, message: "Authentication required" });
+      return res.status(401).json({ success: false, message: "Authentication required", result: {} });
     }
 
     const isAllowed = allowedRoles
@@ -97,7 +97,7 @@ export const authorizeRoles = (...allowedRoles) => {
       .includes((req.user.role || "").toLowerCase());
 
     if (!isAllowed) {
-      return res.status(403).json({ success: false, message: `Access denied: ${allowedRoles.join(", ")} only` });
+      return res.status(403).json({ success: false, message: `Access denied: ${allowedRoles.join(", ")} only`, result: {} });
     }
 
     next();

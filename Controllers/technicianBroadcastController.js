@@ -19,6 +19,7 @@ import TechnicianSlot from "../Schemas/TechnicianSlot.js";
 import { confirmScheduledSlot, confirmSlotCapacity } from "../Services/slotCapacityService.js";
 import { getSlotForTime, startOfBusinessDayUtc } from "../Utils/slots.js";
 import { promoteBackup } from "../Services/lateCompletionService.js";
+import { failLegacy } from "../Utils/apiResponse.js";
 
 const DISPATCH_LOCK_MS = 10000;
 
@@ -132,12 +133,11 @@ export const respondToJob = async (req, res) => {
 
     // ⏱ Offer must still be unexpired — a re-broadcasted job's old offer is dead.
     if (broadcast.expiresAt && new Date(broadcast.expiresAt).getTime() < Date.now()) {
-      return res.status(410).json({
-        success: false,
-        message: "This job offer has expired. Pull to refresh your job list.",
+      // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+      return failLegacy(res, 410, "This job offer has expired. Pull to refresh your job list.", {
         reason: "offer_expired",
         expiresAt: broadcast.expiresAt,
-        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000),
+        nextRefreshHintAt: new Date(Math.ceil(Date.now() / (10 * 60 * 1000)) * 10 * 60 * 1000)
       });
     }
 
@@ -165,29 +165,26 @@ export const respondToJob = async (req, res) => {
 
         if (!fresh) {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "This job offer is no longer active. Please refresh.",
-            reason: "offer_closed",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "This job offer is no longer active. Please refresh.", {
+            reason: "offer_closed"
           });
         }
         if (fresh.version !== requestedVersion) {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "This job offer has been updated. Please refresh and try again.",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
             reason: "version_mismatch",
             requestedVersion,
-            currentVersion: fresh.version,
+            currentVersion: fresh.version
           });
         }
         if (fresh.expiresAt && new Date(fresh.expiresAt).getTime() <= Date.now()) {
           await session.abortTransaction();
-          return res.status(410).json({
-            success: false,
-            message: "This job offer has expired. Pull to refresh your job list.",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 410, "This job offer has expired. Pull to refresh your job list.", {
             reason: "offer_expired",
-            expiresAt: fresh.expiresAt,
+            expiresAt: fresh.expiresAt
           });
         }
 
@@ -196,10 +193,9 @@ export const respondToJob = async (req, res) => {
           .select("status technicianId");
         if (!live || live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "Too late! Booking already taken or closed.",
-            reason: "booking_closed",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "Too late! Booking already taken or closed.", {
+            reason: "booking_closed"
           });
         }
 
@@ -216,11 +212,10 @@ export const respondToJob = async (req, res) => {
         );
         if (declined.matchedCount === 0) {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "This job offer has been updated. Please refresh and try again.",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
             reason: "version_mismatch",
-            requestedVersion,
+            requestedVersion
           });
         }
 
@@ -341,12 +336,11 @@ export const respondToJob = async (req, res) => {
     // 🎯 VERSION VALIDATION (advisory) — reject stale broadcast versions.
     // The authoritative version gate runs inside the Phase-B transaction.
     if (broadcast.version && requestedVersion !== broadcast.version) {
-      return res.status(409).json({
-        success: false,
-        message: "This job offer has been updated. Please refresh and try again.",
+      // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+      return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
         reason: "version_mismatch",
         requestedVersion,
-        currentVersion: broadcast.version,
+        currentVersion: broadcast.version
       });
     }
 
@@ -360,11 +354,10 @@ export const respondToJob = async (req, res) => {
     });
 
     if (!eligibility.eligible) {
-      return res.status(403).json({
-        success: false,
-        message: "You are no longer eligible to accept this job.",
+      // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+      return failLegacy(res, 403, "You are no longer eligible to accept this job.", {
         reasons: eligibility.reasons,
-        details: eligibility.details,
+        details: eligibility.details
       });
     }
 
@@ -392,10 +385,9 @@ export const respondToJob = async (req, res) => {
         ? { slotKey: candidate.slotKey }
         : getSlotForTime(candidate.scheduledAt);
       if (!candidateSlot?.slotKey) {
-        return res.status(409).json({
-          success: false,
-          message: "This scheduled booking has no valid slot. Please refresh and try again.",
-          reason: "slot_missing",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This scheduled booking has no valid slot. Please refresh and try again.", {
+          reason: "slot_missing"
         });
       }
       const activeSlotConflict = (techQueue?.slots || []).find(
@@ -404,10 +396,9 @@ export const respondToJob = async (req, res) => {
           (!backupSlot || String(slot._id) !== String(backupSlot._id))
       );
       if (activeSlotConflict) {
-        return res.status(409).json({
-          success: false,
-          message: "You already have a scheduled job in this slot.",
-          reason: "slot_conflict",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "You already have a scheduled job in this slot.", {
+          reason: "slot_conflict"
         });
       }
 
@@ -423,10 +414,9 @@ export const respondToJob = async (req, res) => {
       const maxDaily =
         techProfileForCheck?.notificationPreferences?.maxScheduledJobsPerDay ?? 3;
       if (scheduledToday >= maxDaily) {
-        return res.status(409).json({
-          success: false,
-          message: `You have reached your daily scheduled job limit (${maxDaily}).`,
-          reason: "daily_scheduled_cap",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, `You have reached your daily scheduled job limit (${maxDaily}).`, {
+          reason: "daily_scheduled_cap"
         });
       }
 
@@ -512,12 +502,11 @@ export const respondToJob = async (req, res) => {
 
       if (!fresh || (broadcast.version && fresh.version !== requestedVersion)) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "This job offer has been updated. Please refresh and try again.",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
           reason: "version_mismatch",
           requestedVersion,
-          currentVersion: fresh?.version ?? broadcast.version,
+          currentVersion: fresh?.version ?? broadcast.version
         });
       }
 
@@ -542,10 +531,9 @@ export const respondToJob = async (req, res) => {
           !["accepted", "on_the_way", "reached", "in_progress"].includes(live.status)
         ) {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "This backup offer is no longer available.",
-            reason: "backup_offer_expired",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "This backup offer is no longer available.", {
+            reason: "backup_offer_expired"
           });
         }
       } else if (live.technicianId || !["pending", "broadcasted"].includes(live.status)) {
@@ -563,12 +551,11 @@ export const respondToJob = async (req, res) => {
         : 0;
       if (liveActiveBroadcastVersion !== observedActiveBroadcastVersion) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "This job offer has been updated. Please refresh and try again.",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
           reason: "version_mismatch",
           requestedVersion,
-          currentVersion: fresh.version,
+          currentVersion: fresh.version
         });
       }
       // H19: a booking past its auto-cancel deadline is expired even if the
@@ -576,20 +563,18 @@ export const respondToJob = async (req, res) => {
       // (The expiry cron owns the terminal transition; the claim only refuses.)
       if (live.autoCancelAt && new Date(live.autoCancelAt).getTime() <= Date.now()) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "Too late! This booking has expired.",
-          reason: "booking_expired",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "Too late! This booking has expired.", {
+          reason: "booking_expired"
         });
       }
       // H19: an offer past its own expiry is dead even if its status row has
       // not been swept yet — fail before any state changes.
       if (fresh.expiresAt && new Date(fresh.expiresAt).getTime() <= Date.now()) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "This job offer has expired. Please refresh and try again.",
-          reason: "offer_expired",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This job offer has expired. Please refresh and try again.", {
+          reason: "offer_expired"
         });
       }
 
@@ -601,11 +586,10 @@ export const respondToJob = async (req, res) => {
       });
       if (!recheck.eligible) {
         await session.abortTransaction();
-        return res.status(403).json({
-          success: false,
-          message: "You are no longer eligible to accept this job.",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 403, "You are no longer eligible to accept this job.", {
           reasons: recheck.reasons,
-          details: recheck.details,
+          details: recheck.details
         });
       }
 
@@ -649,12 +633,11 @@ export const respondToJob = async (req, res) => {
       );
       if (flip.matchedCount === 0) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "This job offer has been updated. Please refresh and try again.",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This job offer has been updated. Please refresh and try again.", {
           reason: "version_mismatch",
           requestedVersion,
-          currentVersion: fresh.version,
+          currentVersion: fresh.version
         });
       }
 
@@ -712,10 +695,9 @@ export const respondToJob = async (req, res) => {
         : getSlotForTime(live.scheduledAt);
       if (!slot?.slotKey) {
         await session.abortTransaction();
-        return res.status(409).json({
-          success: false,
-          message: "This scheduled booking has no valid slot. Please refresh and try again.",
-          reason: "slot_missing",
+        // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+        return failLegacy(res, 409, "This scheduled booking has no valid slot. Please refresh and try again.", {
+          reason: "slot_missing"
         });
       }
       acceptUpdate.slotKey = slot.slotKey;
@@ -780,20 +762,18 @@ export const respondToJob = async (req, res) => {
           } catch (legacySlotError) {
             if (legacySlotError?.code === 11000) {
               await session.abortTransaction();
-              return res.status(409).json({
-                success: false,
-                message: "You already have a scheduled job in this slot.",
-                reason: "slot_conflict",
+              // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+              return failLegacy(res, 409, "You already have a scheduled job in this slot.", {
+                reason: "slot_conflict"
               });
             }
             throw legacySlotError;
           }
         } else if (slotError.code === "SLOT_BUSY") {
           await session.abortTransaction();
-          return res.status(409).json({
-            success: false,
-            message: "You already have a scheduled job in this slot.",
-            reason: "slot_conflict",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "You already have a scheduled job in this slot.", {
+            reason: "slot_conflict"
           });
         } else {
           throw slotError;
@@ -879,18 +859,19 @@ export const respondToJob = async (req, res) => {
           /* classification is best-effort */
         }
         if (expiredNow) {
-          return res.status(409).json({
-            success: false,
-            message: "Too late! This booking has expired.",
-            reason: "booking_expired",
+          // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+          return failLegacy(res, 409, "Too late! This booking has expired.", {
+            reason: "booking_expired"
           });
         }
       }
-      return res.status(retryable ? 409 : 500).json({
-        success: false,
-        message: retryable ? "Too late! Booking already taken or updated. Please retry." : "Failed to accept job",
-        ...(retryable ? { reason: "claim_conflict" } : {}),
-      });
+      // TODO(api-contract): remove legacy top-level error context mirror after clients migrate.
+      return failLegacy(
+        res,
+        retryable ? 409 : 500,
+        retryable ? "Too late! Booking already taken or updated. Please retry." : "Failed to accept job",
+        retryable ? { reason: "claim_conflict" } : {}
+      );
     }
 
     if (isBackupAccept && booking.originalTechnicianId) {

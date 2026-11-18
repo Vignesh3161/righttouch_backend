@@ -25,6 +25,7 @@ import { checkTechnicianActivation } from "../Utils/technicianActivation.js";
 import { canTransition, normalizeBookingStatus } from "../Utils/bookingStatus.js";
 import { resolveCommissionSnapshot } from "../Utils/commission.js";
 import { paiseToRupees, percentageOf, toPaise, isPayableTotalPaise } from "../Utils/money.js";
+import { failLegacy } from "../Utils/apiResponse.js";
 import { toBookingCreatedDTO, toBookingCancelledDTO } from "../Utils/socketDTO.js";
 import { buildJobScheduleFields } from "../Utils/jobPayload.js";
 import { notifyCustomerOfRebroadcast } from "../Utils/sendReminder.js";
@@ -41,7 +42,14 @@ import {
   isDuplicateKeyError,
 } from "../Utils/bookingService.js";
 import { writeAuditLog } from "../Utils/audit.js";
-import { getBookingSchedulePayload, getSlotForTime } from "../Utils/slots.js";
+import {
+  BUSINESS_TIMEZONE,
+  getBookingSchedulePayload,
+  getScheduleDaysCount,
+  getSlotForTime,
+} from "../Utils/slots.js";
+import { refreshSlotConfigIfStale } from "../Utils/slotConfig.js";
+import { buildScheduledJobCalendar, resolveCalendarRange } from "../Utils/jobScheduleView.js";
 import {
   computeDispatchEligibleAt,
   RESCHEDULE_CUTOFF_MINUTES,
@@ -441,6 +449,8 @@ export const storeBookingSchedule = async (req, res) => {
       return res.status(403).json({ success: false, message: "Customer access only", result: {} });
     }
 
+    await refreshSlotConfigIfStale();
+
     const { serviceId, faultProblem, addressId, locationType, latitude, longitude } = req.body;
 
     // ─── Schedule resolution (timezone-safe, same utility as GET /slots) ──
@@ -594,11 +604,14 @@ export const storeBookingSchedule = async (req, res) => {
         const existing = await findBookingByIdempotencyKeyWithRetry(idempotencyKey);
         if (existing) return sendScheduleReplay(res, existing);
         if (retryableConflict) {
-          return res.status(409).json({
-            success: false,
-            message: "Booking creation is already in progress. Please retry.",
-            reason: "duplicate_booking_request",
-          });
+          // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+          return failLegacy(
+            res,
+            409,
+            "Booking creation is already in progress. Please retry.",
+            { reason: "duplicate_booking_request" },
+            { reason: "duplicate_booking_request" }
+          );
         }
       }
       throw txError;
@@ -610,6 +623,7 @@ export const storeBookingSchedule = async (req, res) => {
     return res.status(error?.statusCode || 500).json({
       success: false,
       message: error.message,
+      code: error.code || undefined,
       result: { error: error.message },
     });
   }
@@ -621,6 +635,8 @@ export const storeBookingSchedule = async (req, res) => {
 export const rescheduleBooking = async (req, res) => {
   const session = await mongoose.startSession();
   try {
+    await refreshSlotConfigIfStale();
+
     const { id } = req.params;
     const { scheduledDate, scheduledTime, reason } = req.body || {};
 
@@ -893,6 +909,8 @@ export const rescheduleBooking = async (req, res) => {
 /* ================= GET BOOKING SCHEDULE ================= */
 export const getBookingSchedule = async (req, res) => {
   try {
+    await refreshSlotConfigIfStale();
+
     const { serviceId, addressId } = req.query;
     let availability = {
       enabled: false,
@@ -1074,6 +1092,7 @@ export const getCustomerBookings = async (req, res) => {
   //   { success: bool, message: string, result: array, meta: {totalCount, page, limit, filtersApplied} }
   // `result` is ALWAYS an array (empty on error) — never {} / {error} / null,
   // so client model parsing can never break.
+  // api-envelope-allow-dynamic-success: local helper always returns the full envelope.
   const envelope = (success, message, bookings = [], meta = {}) =>
     res.status(200).json({
       success,
@@ -1573,6 +1592,40 @@ export const getAllAcceptedJobs = async (req, res) => {
   }
 };
 
+const formatScheduledJobPayload = (jobObj, userRole) => {
+  const customer = jobObj.customerId
+    ? { fname: jobObj.customerId.fname || "", lname: jobObj.customerId.lname || "", mobileNumber: jobObj.customerId.mobileNumber || "", email: jobObj.customerId.email || "" }
+    : null;
+  const technician = jobObj.technicianId
+    ? { fname: jobObj.technicianId.userId?.fname || "", lname: jobObj.technicianId.userId?.lname || "", mobileNumber: jobObj.technicianId.userId?.mobileNumber || "", email: jobObj.technicianId.userId?.email || "", profileImage: jobObj.technicianId.profileImage || null, locality: jobObj.technicianId.locality || "" }
+    : null;
+  const address = jobObj.addressId
+    ? { name: jobObj.addressId.name || "", phone: jobObj.addressId.phone || "", addressLine: jobObj.addressId.addressLine || "", city: jobObj.addressId.city || "", state: jobObj.addressId.state || "", pincode: jobObj.addressId.pincode || "", latitude: jobObj.addressId.latitude, longitude: jobObj.addressId.longitude }
+    : (jobObj.addressSnapshot || null);
+  if (address && (address.latitude == null || address.longitude == null) && jobObj.location?.coordinates) {
+    address.longitude = jobObj.location.coordinates[0];
+    address.latitude = jobObj.location.coordinates[1];
+  }
+
+  const responseData = {
+    jobId: jobObj._id,
+    ...buildJobScheduleFields(jobObj),
+    status: normalizeBookingStatus(jobObj.status),
+    customer,
+    technician,
+    service: jobObj.serviceId || null,
+    address,
+    createdAt: jobObj.createdAt,
+    acceptedAt: jobObj.assignedAt,
+    paymentStatus: jobObj.paymentStatus,
+  };
+  if (userRole !== "Technician") {
+    responseData.baseAmount = jobObj.baseAmount;
+    responseData.technicianAmount = jobObj.serviceId?.technicianAmount || jobObj.technicianAmount || 0;
+  }
+  return responseData;
+};
+
 /* =====================================================
    GET ACCEPTED SCHEDULED JOBS (TECHNICIAN & OWNER)
    Status: accepted → in_progress, bookingType: schedule.
@@ -1630,40 +1683,7 @@ export const getAcceptedScheduledJobs = async (req, res) => {
       ServiceBooking.countDocuments(query),
     ]);
 
-    const formattedJobs = jobs.map((job) => {
-      const jobObj = job.toObject();
-      const customer = jobObj.customerId
-        ? { fname: jobObj.customerId.fname || "", lname: jobObj.customerId.lname || "", mobileNumber: jobObj.customerId.mobileNumber || "", email: jobObj.customerId.email || "" }
-        : null;
-      const technician = jobObj.technicianId
-        ? { fname: jobObj.technicianId.userId?.fname || "", lname: jobObj.technicianId.userId?.lname || "", mobileNumber: jobObj.technicianId.userId?.mobileNumber || "", email: jobObj.technicianId.userId?.email || "", profileImage: jobObj.technicianId.profileImage || null, locality: jobObj.technicianId.locality || "" }
-        : null;
-      const address = jobObj.addressId
-        ? { name: jobObj.addressId.name || "", phone: jobObj.addressId.phone || "", addressLine: jobObj.addressId.addressLine || "", city: jobObj.addressId.city || "", state: jobObj.addressId.state || "", pincode: jobObj.addressId.pincode || "", latitude: jobObj.addressId.latitude, longitude: jobObj.addressId.longitude }
-        : (jobObj.addressSnapshot || null);
-      if (address && (address.latitude == null || address.longitude == null) && jobObj.location?.coordinates) {
-        address.longitude = jobObj.location.coordinates[0];
-        address.latitude = jobObj.location.coordinates[1];
-      }
-
-      const responseData = {
-        jobId: jobObj._id,
-        ...buildJobScheduleFields(jobObj),
-        status: normalizeBookingStatus(jobObj.status),
-        customer,
-        technician,
-        service: jobObj.serviceId || null,
-        address,
-        createdAt: jobObj.createdAt,
-        acceptedAt: jobObj.assignedAt,
-        paymentStatus: jobObj.paymentStatus,
-      };
-      if (userRole !== "Technician") {
-        responseData.baseAmount = jobObj.baseAmount;
-        responseData.technicianAmount = jobObj.serviceId?.technicianAmount || jobObj.technicianAmount || 0;
-      }
-      return responseData;
-    });
+    const formattedJobs = jobs.map((job) => formatScheduledJobPayload(job.toObject(), userRole));
 
     return res.status(200).json({
       success: true,
@@ -1673,6 +1693,134 @@ export const getAcceptedScheduledJobs = async (req, res) => {
     });
   } catch (err) {
     console.error("getAcceptedScheduledJobs Error:", err);
+    return res.status(500).json({ success: false, message: err.message, result: { error: err.message } });
+  }
+};
+
+/* =====================================================
+   GET SCHEDULED JOBS GROUPED BY DATE & TIME SLOT
+   Technician → own jobs. Owner/Admin → all (optional technicianId).
+==================================================== */
+const SCHEDULED_ACTIVE_STATUSES = ["accepted", "on_the_way", "reached", "in_progress"];
+const SCHEDULED_ALLOWED_STATUSES = new Set([
+  ...SCHEDULED_ACTIVE_STATUSES,
+  "pending",
+  "broadcasted",
+  "completed",
+  "cancelled",
+  "expired",
+]);
+
+const parseScheduledStatusFilter = (raw, { includeCompleted = false, includeCancelled = false } = {}) => {
+  const values = String(raw || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (values.length) {
+    const invalid = values.filter((value) => !SCHEDULED_ALLOWED_STATUSES.has(value));
+    if (invalid.length) {
+      return { error: `Invalid status: ${invalid.join(", ")}` };
+    }
+    return { statuses: [...new Set(values)] };
+  }
+
+  const statuses = [...SCHEDULED_ACTIVE_STATUSES];
+  if (includeCompleted) statuses.push("completed");
+  if (includeCancelled) statuses.push("cancelled", "expired");
+  return { statuses };
+};
+
+export const getTechnicianScheduledCalendar = async (req, res) => {
+  try {
+    const userRole = req.user?.role;
+    if (!["Technician", "Owner", "Admin"].includes(userRole)) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Technician/Owner/Admin access only.",
+        result: {},
+      });
+    }
+
+    await refreshSlotConfigIfStale();
+
+    const now = new Date();
+    const range = resolveCalendarRange({
+      date: req.query.date,
+      fromDate: req.query.fromDate,
+      toDate: req.query.toDate,
+      now,
+      defaultDays: getScheduleDaysCount() + 1,
+      maxDays: 31,
+    });
+    if (range.error) {
+      return res.status(400).json({ success: false, message: range.error, result: {} });
+    }
+
+    const statusFilter = parseScheduledStatusFilter(req.query.status, {
+      includeCompleted: String(req.query.includeCompleted || "").toLowerCase() === "true",
+      includeCancelled: String(req.query.includeCancelled || "").toLowerCase() === "true",
+    });
+    if (statusFilter.error) {
+      return res.status(400).json({ success: false, message: statusFilter.error, result: {} });
+    }
+
+    const query = {
+      bookingType: "schedule",
+      status: { $in: statusFilter.statuses },
+      scheduledAt: { $gte: range.from, $lte: range.to },
+    };
+
+    if (userRole === "Technician") {
+      const technicianProfileId = req.user?.technicianProfileId;
+      if (!technicianProfileId) {
+        return res.status(401).json({
+          success: false,
+          message: "Unauthorized. Technician profile not found.",
+          result: {},
+        });
+      }
+      query.technicianId = technicianProfileId;
+    } else if (req.query.technicianId) {
+      if (!mongoose.Types.ObjectId.isValid(req.query.technicianId)) {
+        return res.status(400).json({ success: false, message: "Invalid technician ID", result: {} });
+      }
+      query.technicianId = req.query.technicianId;
+    } else if (String(req.query.includeUnassigned || "").toLowerCase() !== "true") {
+      query.technicianId = { $ne: null };
+    }
+
+    const jobs = await ServiceBooking.find(query)
+      .populate({ path: "customerId", select: "fname lname mobileNumber email" })
+      .populate({
+        path: "technicianId",
+        populate: { path: "userId", select: "fname lname mobileNumber email" },
+        select: "userId profileImage locality workStatus",
+      })
+      .populate({ path: "serviceId", populate: { path: "categoryId" } })
+      .populate({ path: "addressId", select: "name phone addressLine city state pincode latitude longitude" })
+      .sort({ scheduledAt: 1 })
+      .limit(5000);
+
+    const formattedJobs = jobs.map((job) => formatScheduledJobPayload(job.toObject(), userRole));
+    const calendar = buildScheduledJobCalendar({
+      jobs: formattedJobs,
+      fromDate: range.fromDate,
+      toDate: range.toDate,
+      now,
+      tz: BUSINESS_TIMEZONE,
+      includeEmptySlots: String(req.query.includeEmptySlots || "").toLowerCase() !== "false",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: calendar.totalJobs > 0
+        ? "Scheduled jobs fetched"
+        : "No scheduled jobs found for the selected date range",
+      result: calendar,
+    });
+  } catch (err) {
+    console.error("getTechnicianScheduledCalendar Error:", err);
     return res.status(500).json({ success: false, message: err.message, result: { error: err.message } });
   }
 };
@@ -2810,11 +2958,14 @@ export const acceptCancelledJob = async (req, res) => {
       { new: true, select: "_id" }
     );
     if (!dispatchLock) {
-      return res.status(409).json({
-        success: false,
-        message: "Another dispatch action is in progress. Please retry.",
-        reason: "dispatch_lock_busy",
-      });
+      // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+      return failLegacy(
+        res,
+        409,
+        "Another dispatch action is in progress. Please retry.",
+        { reason: "dispatch_lock_busy" },
+        { reason: "dispatch_lock_busy" }
+      );
     }
     reacceptLockAt = dispatchLockAt;
     reacceptLockTechId = techId;
@@ -2836,12 +2987,14 @@ export const acceptCancelledJob = async (req, res) => {
 
     const reacceptPolicy = evaluateReacceptEligibility({ booking });
     if (!reacceptPolicy.eligible) {
-      return res.status(reacceptPolicy.reason === "not_cancelled" ? 400 : 409).json({
-        success: false,
-        message: REACCEPT_REJECT_MESSAGES[reacceptPolicy.reason] || "This job cannot be re-accepted",
-        code: "REACCEPT_NOT_ALLOWED",
-        reason: reacceptPolicy.reason,
-      });
+      // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+      return failLegacy(
+        res,
+        reacceptPolicy.reason === "not_cancelled" ? 400 : 409,
+        REACCEPT_REJECT_MESSAGES[reacceptPolicy.reason] || "This job cannot be re-accepted",
+        { reason: reacceptPolicy.reason },
+        { code: "REACCEPT_NOT_ALLOWED", reason: reacceptPolicy.reason }
+      );
     }
 
     // ⚔️ One active job at a time — same guard as a fresh accept.
@@ -2870,13 +3023,18 @@ export const acceptCancelledJob = async (req, res) => {
       booking,
     });
     if (!eligibility.eligible) {
-      return res.status(403).json({
-        success: false,
-        message: "You are no longer eligible to accept this job.",
-        code: "TECHNICIAN_INELIGIBLE",
-        reasons: eligibility.reasons,
-        details: eligibility.details,
-      });
+      // TODO(api-contract): remove legacy top-level reasons mirror after clients migrate.
+      return failLegacy(
+        res,
+        403,
+        "You are no longer eligible to accept this job.",
+        { reasons: eligibility.reasons },
+        {
+          code: "TECHNICIAN_INELIGIBLE",
+          reasons: eligibility.reasons,
+          details: eligibility.details,
+        }
+      );
     }
 
     const [queueMap, techProfileForCheck] = await Promise.all([
@@ -2889,13 +3047,14 @@ export const acceptCancelledJob = async (req, res) => {
       queue: queueMap.get(String(techId)),
     });
     if (!feasibility.feasible) {
-      return res.status(409).json({
-        success: false,
-        message: "This job no longer fits your schedule.",
-        code: "JOB_NOT_FEASIBLE",
-        reason: feasibility.reason,
-        result: { feasibility },
-      });
+      // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+      return failLegacy(
+        res,
+        409,
+        "This job no longer fits your schedule.",
+        { reason: feasibility.reason, feasibility },
+        { code: "JOB_NOT_FEASIBLE", reason: feasibility.reason }
+      );
     }
 
     // B-09 deterministic test hook (inert in production): runs after the
@@ -2924,12 +3083,14 @@ export const acceptCancelledJob = async (req, res) => {
     const liveReacceptPolicy = evaluateReacceptEligibility({ booking: live });
     if (!liveReacceptPolicy.eligible) {
       await session.abortTransaction();
-      return res.status(liveReacceptPolicy.reason === "not_cancelled" ? 400 : 409).json({
-        success: false,
-        message: REACCEPT_REJECT_MESSAGES[liveReacceptPolicy.reason] || "This job cannot be re-accepted",
-        code: "REACCEPT_NOT_ALLOWED",
-        reason: liveReacceptPolicy.reason,
-      });
+      // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+      return failLegacy(
+        res,
+        liveReacceptPolicy.reason === "not_cancelled" ? 400 : 409,
+        REACCEPT_REJECT_MESSAGES[liveReacceptPolicy.reason] || "This job cannot be re-accepted",
+        { reason: liveReacceptPolicy.reason },
+        { code: "REACCEPT_NOT_ALLOWED", reason: liveReacceptPolicy.reason }
+      );
     }
 
     const liveActiveJob = await ServiceBooking.findOne({
@@ -2951,13 +3112,18 @@ export const acceptCancelledJob = async (req, res) => {
     const recheck = await checkTechnicianEligibility({ technician: techId, booking: live });
     if (!recheck.eligible) {
       await session.abortTransaction();
-      return res.status(403).json({
-        success: false,
-        message: "You are no longer eligible to accept this job.",
-        code: "TECHNICIAN_INELIGIBLE",
-        reasons: recheck.reasons,
-        details: recheck.details,
-      });
+      // TODO(api-contract): remove legacy top-level reasons mirror after clients migrate.
+      return failLegacy(
+        res,
+        403,
+        "You are no longer eligible to accept this job.",
+        { reasons: recheck.reasons },
+        {
+          code: "TECHNICIAN_INELIGIBLE",
+          reasons: recheck.reasons,
+          details: recheck.details,
+        }
+      );
     }
 
     const now = new Date();
@@ -3147,11 +3313,14 @@ export const acceptCancelledJob = async (req, res) => {
         /WriteConflict|WriteConcern|wtimeout/i.test(msg));
     console.error("acceptCancelledJob Error:", msg);
     if (retryable && !res.headersSent) {
-      return res.status(409).json({
-        success: false,
-        message: "Booking changed concurrently. Please retry.",
-        reason: "claim_conflict",
-      });
+      // TODO(api-contract): remove legacy top-level reason mirror after clients migrate.
+      return failLegacy(
+        res,
+        409,
+        "Booking changed concurrently. Please retry.",
+        { reason: "claim_conflict" },
+        { reason: "claim_conflict" }
+      );
     }
     return res.status(500).json({ success: false, message: error.message });
   } finally {

@@ -11,6 +11,7 @@ import AuditLog from "../Schemas/AuditLog.js";
 import { checkTechnicianEligibility } from "../Services/technicianEligibilityService.js";
 import { getAvailabilitySnapshot } from "../Services/serviceAvailabilityService.js";
 import { isValidObjectId, containsRegex, internalError } from "../Utils/safeQuery.js";
+import { ok, fail, okLegacy } from "../Utils/apiResponse.js";
 
 /**
  * 🛠 ADMIN: CREATE SERVICE AVAILABILITY CONFIGURATION
@@ -80,11 +81,12 @@ export const createServiceAvailability = async (req, res) => {
     });
 
     if (existing) {
-      return res.status(409).json({
-        success: false,
-        message: "A service availability configuration already exists for this service, district, and scope.",
-        existingId: existing._id,
-      });
+      return fail(
+        res,
+        409,
+        "A service availability configuration already exists for this service, district, and scope.",
+        { existingId: existing._id }
+      );
     }
 
     const config = await ServiceAvailability.create({
@@ -460,21 +462,20 @@ export const dispatchDiagnostics = async (req, res) => {
       booking,
     });
 
-    return res.status(200).json({
-      success: true,
-      diagnostic: {
-        technician: {
-          id: tech._id,
-          workStatus: tech.workStatus,
-          isOnline: tech.availability?.isOnline,
-          primaryDistrict: tech.primaryDistrictId?.name || null,
-          enabledDistricts: (tech.enabledDistrictIds || []).map((d) => d.name || d._id),
-          currentGps: tech.location?.coordinates || null,
-          locationUpdatedAt: tech.locationUpdatedAt,
-        },
-        eligibility,
+    const diagnostic = {
+      technician: {
+        id: tech._id,
+        workStatus: tech.workStatus,
+        isOnline: tech.availability?.isOnline,
+        primaryDistrict: tech.primaryDistrictId?.name || null,
+        enabledDistricts: (tech.enabledDistrictIds || []).map((d) => d.name || d._id),
+        currentGps: tech.location?.coordinates || null,
+        locationUpdatedAt: tech.locationUpdatedAt,
       },
-    });
+      eligibility,
+    };
+
+    return ok(res, 200, "Dispatch diagnostic", { diagnostic }, { diagnostic });
   } catch (error) {
     console.error("dispatchDiagnostics error:", error);
     return internalError(res, error);
@@ -671,8 +672,7 @@ export const getServiceZoneDetail = async (req, res) => {
       };
     });
 
-    return res.status(200).json({
-      success: true,
+    const payload = {
       service: {
         serviceId: service._id,
         serviceName: service.serviceName,
@@ -680,7 +680,16 @@ export const getServiceZoneDetail = async (req, res) => {
         isActive: service.isActive,
       },
       districts: districtDetails,
-    });
+    };
+
+    // TODO(api-contract): remove legacy top-level service/districts mirror after CityZones migrates.
+    return okLegacy(
+      res,
+      200,
+      "Service zone detail",
+      payload,
+      payload
+    );
   } catch (error) {
     console.error("getServiceZoneDetail error:", error);
     return internalError(res, error);

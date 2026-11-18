@@ -8,6 +8,7 @@ const isTechnician = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: "Access denied. Technician only.",
+        result: {},
       });
     }
     
@@ -18,6 +19,7 @@ const isTechnician = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: "Technician profile not found",
+        result: {},
       });
     }
 
@@ -26,6 +28,7 @@ const isTechnician = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: "Technician profile not found",
+        result: {},
       });
     }
 
@@ -35,12 +38,14 @@ const isTechnician = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: "Technician account suspended. Contact support.",
+        result: {},
       });
     }
     if (technician.workStatus === "deleted") {
       return res.status(403).json({
         success: false,
         message: "Technician profile not found",
+        result: {},
       });
     }
 
@@ -52,6 +57,7 @@ const isTechnician = async (req, res, next) => {
     return res.status(500).json({
       success: false,
       message: "Server error",
+      result: {},
     });
   }
 };

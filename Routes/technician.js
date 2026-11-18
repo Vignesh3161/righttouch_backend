@@ -45,7 +45,7 @@ import {
   deleteOrphanedKyc,
   deleteAllOrphanedKyc,
 } from "../Controllers/technicianKycController.js";
-import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, acceptCancelledJob, requestCompletionOtp, resendCompletionOtp, verifyCompletionOtp, getCompletionStatus, reportCustomerNoShow } from "../Controllers/serviceBookController.js";
+import { updateBookingStatus, getTechnicianJobHistory, getTechnicianCurrentJobs, uploadWorkImages, getAdminJobHistory, technicianCancelBooking, getAllAcceptedJobs, getAcceptedScheduledJobs, getTechnicianScheduledCalendar, acceptCancelledJob, requestCompletionOtp, resendCompletionOtp, verifyCompletionOtp, getCompletionStatus, reportCustomerNoShow } from "../Controllers/serviceBookController.js";
 import { createWalletTransaction, getWalletTransactions, requestWithdrawal, getMyWithdrawalRequests, cancelMyWithdrawal } from "../Controllers/technicianWalletController.js";
 import { getMyZone, getServicesInMyZone } from "../Controllers/zoneAvailabilityController.js";
 import { technicianListMyComplaints, technicianGetComplaintDetail, technicianRespondToComplaint } from "../Controllers/complaintController.js";
@@ -284,6 +284,7 @@ router.post(
 router.get("/jobs/current", Auth, authorizeRoles("Admin", "Owner", "Technician"), getTechnicianCurrentJobs); // Supports both Technician and Owner roles
 router.get("/jobs/accepted", Auth, authorizeRoles("Admin", "Owner", "Technician"), getAllAcceptedJobs); // Technician/Owner/Admin — all accepted jobs, new→old
 router.get("/jobs/accepted/scheduled", Auth, authorizeRoles("Admin", "Owner", "Technician"), getAcceptedScheduledJobs); // Technician/Owner/Admin — accepted scheduled jobs
+router.get("/jobs/scheduled", Auth, authorizeRoles("Admin", "Owner", "Technician"), getTechnicianScheduledCalendar); // Technician/Owner/Admin — scheduled jobs grouped by date & slot
 router.get("/jobs/history", Auth, isTechnician, getTechnicianJobHistory);
 
 /* ================= ADMIN JOB HISTORY (WITH DELETED TECHNICIAN SUPPORT) ================= */

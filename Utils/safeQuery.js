@@ -17,7 +17,12 @@ export const isValidObjectId = (id) => {
 
 /** 400 for a malformed identifier. Returns true when the response was sent. */
 export const rejectBadId = (res, name = "id") => {
-  res.status(400).json({ success: false, message: `Invalid ${name}`, code: "INVALID_ID" });
+  res.status(400).json({
+    success: false,
+    message: `Invalid ${name}`,
+    result: {},
+    code: "INVALID_ID",
+  });
   return true;
 };
 
@@ -55,5 +60,10 @@ export const clampPage = (value) => {
 /** Generic 500 that never leaks driver/validation internals to clients. */
 export const internalError = (res, err) => {
   if (err) console.error("[safeQuery] internal:", err.message || err);
-  return res.status(500).json({ success: false, message: "Internal server error", code: "INTERNAL_ERROR" });
+  return res.status(500).json({
+    success: false,
+    message: "Internal server error",
+    result: {},
+    code: "INTERNAL_ERROR",
+  });
 };

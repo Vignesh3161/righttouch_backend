@@ -38,7 +38,7 @@ export const serviceCategory = async (req, res) => {
       return res.status(409).json({
         success: false,
         message: `Category '${existing.category}' already exists for type '${existing.categoryType}'. Note: Same category name is allowed for different types.`,
-        error: "DUPLICATE_CATEGORY",
+        code: "DUPLICATE_CATEGORY",
         result: {
           existingCategory: {
             id: existing._id,
@@ -291,7 +291,7 @@ export const updateCategory = async (req, res) => {
         return res.status(409).json({
           success: false,
           message: `Category '${existing.category}' already exists for type '${existing.categoryType}'. Note: Same category name is allowed for different types.`,
-          error: "DUPLICATE_CATEGORY",
+          code: "DUPLICATE_CATEGORY",
           result: {
             existingCategory: {
               id: existing._id,

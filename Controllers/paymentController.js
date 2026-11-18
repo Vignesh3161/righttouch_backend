@@ -91,11 +91,7 @@ import { emitProductBookingChanged } from "../Utils/productRealtime.js";
 
 /* ================= HELPERS ================= */
 
-const ok = (res, status, message, result = {}) =>
-  res.status(status).json({ success: true, message, result });
-
-const fail = (res, status, message, result = {}) =>
-  res.status(status).json({ success: false, message, result });
+import { ok, fail } from "../Utils/apiResponse.js";
 
 const toMoney = (v) => {
   const n = Number(v);

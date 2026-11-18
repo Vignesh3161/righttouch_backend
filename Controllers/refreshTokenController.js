@@ -19,17 +19,7 @@ import {
 } from "../Utils/token.js";
 import { getIo } from "../Utils/ioAccess.js";
 import { replaceSocketSession } from "../Utils/socketSessionControl.js";
-
-const ok = (res, status, message, result = {}) =>
-  res.status(status).json({ success: true, message, result });
-
-const fail = (res, err) =>
-  res.status(err.statusCode || 500).json({
-    success: false,
-    message: err.message || "Internal server error",
-    code: err.code || "SERVER_ERROR",
-    ...(err.details ? { details: err.details } : {}),
-  });
+import { ok, failFromError } from "../Utils/apiResponse.js";
 
 const sessionResponse = ({ token, refreshToken, expiresInSeconds, role, userId }) => ({
   token,
@@ -165,7 +155,7 @@ export const refreshSession = async (req, res) => {
       userId: user._id,
     }));
   } catch (err) {
-    return fail(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -206,7 +196,7 @@ export const logoutSession = async (req, res) => {
 
     return ok(res, 200, "Logged out successfully");
   } catch (err) {
-    return fail(res, err);
+    return failFromError(res, err);
   }
 };
 
@@ -236,6 +226,6 @@ export const logoutAllSessions = async (req, res) => {
 
     return ok(res, 200, "Logged out from all devices");
   } catch (err) {
-    return fail(res, err);
+    return failFromError(res, err);
   }
 };

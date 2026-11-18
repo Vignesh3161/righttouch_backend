@@ -20,6 +20,7 @@
 import {
   BUSINESS_TIMEZONE,
   generateScheduleDays,
+  getScheduleDaysCount,
   localDateTimeToUtc,
   localDateInBusinessTimezone,
   formatInBusinessTimezone,
@@ -263,7 +264,7 @@ const buildFromDateAndTime = (dateValue, timeValue, now, source) => {
   const isoDate = resolveDisplayDate(dateValue, now);
   if (!isoDate) {
     return errorResult(
-      "Scheduled date must be one of the next five bookable days",
+      `Scheduled date must be one of the next ${getScheduleDaysCount()} bookable days`,
       "INVALID_SCHEDULE",
       source
     );

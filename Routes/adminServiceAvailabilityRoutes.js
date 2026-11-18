@@ -13,8 +13,35 @@ import {
   clearDistrictZoneAvailability,
   toggleServiceStatus,
 } from "../Controllers/adminServiceAvailabilityController.js";
+import {
+  getScheduleSlotSetting,
+  setScheduleSlotSetting,
+  resetScheduleSlotSetting,
+} from "../Controllers/adminSettingsController.js";
 
 const router = express.Router();
+
+// Schedule slot configuration (global bookable days, window and slot count)
+router.get(
+  "/settings/schedule-slots",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  getScheduleSlotSetting
+);
+
+router.put(
+  "/settings/schedule-slots",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  setScheduleSlotSetting
+);
+
+router.post(
+  "/settings/schedule-slots/reset",
+  Auth,
+  authorizeRoles("Admin", "Owner"),
+  resetScheduleSlotSetting
+);
 
 // Service-Zone Matrix & Checklist APIs (Defined BEFORE generic /:id parameter route)
 router.get(

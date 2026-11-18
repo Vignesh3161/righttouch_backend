@@ -1,5 +1,15 @@
 import GlobalSetting from "../Schemas/GlobalSetting.js";
 import { writeAuditLog } from "../Utils/audit.js";
+import {
+  DEFAULT_SLOT_CONFIG,
+  SLOT_CONFIG_KEY,
+  getSlotConfigState,
+  loadSlotConfig,
+  resetSlotConfig,
+  saveSlotConfig,
+} from "../Utils/slotConfig.js";
+import { getBookingSchedulePayload } from "../Utils/slots.js";
+import { clearSlotAvailabilityCache } from "../Services/slotAvailabilityService.js";
 
 /* =====================================================
    GLOBAL SETTINGS — admin-governed platform policy
@@ -97,5 +107,97 @@ export const setReacceptPenaltySetting = async (req, res) => {
   } catch (err) {
     console.error("setReacceptPenaltySetting Error:", err);
     return res.status(500).json({ success: false, message: err.message });
+  }
+};
+/* ============ ADMIN: SCHEDULE SLOT SETTINGS ============ */
+
+const buildSlotSettingResponse = (state) => ({
+  key: SLOT_CONFIG_KEY,
+  config: state.config,
+  defaults: { ...DEFAULT_SLOT_CONFIG },
+  updatedBy: state.updatedBy,
+  updatedByRole: state.updatedByRole,
+  lastUpdatedAt: state.updatedAt,
+  preview: getBookingSchedulePayload(),
+});
+
+const slotConfigRequestBody = (body = {}) =>
+  body && typeof body.config === "object" && body.config !== null ? body.config : body;
+
+export const getScheduleSlotSetting = async (req, res) => {
+  try {
+    const state = await loadSlotConfig({ force: true });
+    return res.status(200).json({
+      success: true,
+      message: "Schedule slot settings fetched",
+      result: buildSlotSettingResponse(state),
+    });
+  } catch (err) {
+    console.error("getScheduleSlotSetting Error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+export const setScheduleSlotSetting = async (req, res) => {
+  try {
+    const before = getSlotConfigState();
+    const state = await saveSlotConfig(slotConfigRequestBody(req.body), req.user);
+    clearSlotAvailabilityCache();
+
+    await writeAuditLog({
+      actor: req.user?.userId || null,
+      actorRole: req.user?.role || null,
+      action: "setting.update",
+      targetType: "GlobalSetting",
+      before: { key: SLOT_CONFIG_KEY, value: before.config },
+      after: { key: SLOT_CONFIG_KEY, value: state.config },
+      reason: "Admin updated schedule slot configuration",
+      metadata: { key: SLOT_CONFIG_KEY },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Schedule slot settings updated",
+      result: buildSlotSettingResponse(state),
+    });
+  } catch (err) {
+    console.error("setScheduleSlotSetting Error:", err);
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message,
+      result: err.details || {},
+    });
+  }
+};
+
+export const resetScheduleSlotSetting = async (req, res) => {
+  try {
+    const before = getSlotConfigState();
+    const state = await resetSlotConfig(req.user);
+    clearSlotAvailabilityCache();
+
+    await writeAuditLog({
+      actor: req.user?.userId || null,
+      actorRole: req.user?.role || null,
+      action: "setting.update",
+      targetType: "GlobalSetting",
+      before: { key: SLOT_CONFIG_KEY, value: before.config },
+      after: { key: SLOT_CONFIG_KEY, value: state.config },
+      reason: "Admin reset schedule slot configuration to defaults",
+      metadata: { key: SLOT_CONFIG_KEY },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Schedule slot settings reset to defaults",
+      result: buildSlotSettingResponse(state),
+    });
+  } catch (err) {
+    console.error("resetScheduleSlotSetting Error:", err);
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message,
+      result: err.details || {},
+    });
   }
 };

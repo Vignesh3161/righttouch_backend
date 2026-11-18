@@ -2,13 +2,37 @@
 	"info": {
 		"_postman_id": "6f1c9d2a-4b7e-4c8f-9a0d-2e3f4a5b6c7d",
 		"name": "RightTouch - Dispatch, Jobs & Socket Companion",
-		"description": "HTTP companion collection for RightTouch dispatch, scheduled bookings, technician job handling, base-location setup, completion/payment, and Socket.IO reference. Socket.IO itself is documented in postmancollection/docs/02-socket-notifications.md and docs/04-scheduled-booking-and-technician-jobs.md, and probed here with an Engine.IO handshake request.",
+		"description": "HTTP companion collection for RightTouch dispatch, scheduled bookings with admin-configurable slots, technician job handling including the grouped scheduled-job calendar, base-location setup, completion/payment, and Socket.IO reference. Socket.IO itself is documented in postmancollection/docs/02-socket-notifications.md and docs/04-scheduled-booking-and-technician-jobs.md, and probed here with an Engine.IO handshake request.",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"variable": [
 		{
 			"key": "baseUrl",
 			"value": "http://localhost:5000"
+		},
+		{
+			"key": "fromDate",
+			"value": ""
+		},
+		{
+			"key": "toDate",
+			"value": ""
+		},
+		{
+			"key": "scheduleDays",
+			"value": "5"
+		},
+		{
+			"key": "windowStartHour",
+			"value": "9"
+		},
+		{
+			"key": "windowEndHour",
+			"value": "21"
+		},
+		{
+			"key": "slotCount",
+			"value": "4"
 		}
 	],
 	"item": [
@@ -1033,12 +1057,18 @@
 			"name": "06 - Scheduled Booking & Base Location",
 			"item": [
 				{
-					"name": "Customer - Get Booking Slots (GPS)",
+					"name": "Customer - Get Booking Slots (Saved Address)",
 					"request": {
 						"method": "GET",
-						"header": [],
-						"url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&latitude={{latitude}}&longitude={{longitude}}",
-						"description": "Public slot options. Returns instant ETA, the next two business days, 09:00-20:30 slots, timezone, and availability. Captures scheduledDate/scheduledTime and a second slot for rescheduling."
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{customerToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/user/booking/slots?serviceId={{serviceId}}&addressId={{addressId}}",
+						"description": "Requires a customer token. Uses the selected saved address and returns admin-configured days/slots with supply-aware availability. Captures scheduledDate/scheduledTime and a second slot for rescheduling."
 					},
 					"event": [
 						{
@@ -1093,16 +1123,26 @@
 						},
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"gps\",\n  \"latitude\": \"{{latitude}}\",\n  \"longitude\": \"{{longitude}}\",\n  \"faultProblem\": \"Postman scheduled booking smoke test\"\n}",
+							"raw": "{\n  \"serviceId\": \"{{serviceId}}\",\n  \"bookingType\": \"scheduled\",\n  \"scheduledDate\": \"{{scheduledDate}}\",\n  \"scheduledTime\": \"{{scheduledTime}}\",\n  \"locationType\": \"saved\",\n  \"faultProblem\": \"Postman scheduled booking smoke test\",\n  \"addressId\": \"{{addressId}}\"\n}",
 							"options": {
 								"raw": {
 									"language": "json"
 								}
 							}
 						},
-						"description": "Creates a scheduled booking. Captures bookingId and scheduledAt. Dispatch starts at dispatchEligibleAt (scheduledAt minus SCHEDULED_DISPATCH_LEAD_HOURS, default 24h)."
+						"description": "Creates a scheduled booking for a saved customer address. The address must belong to the authenticated customer and include latitude/longitude. Set addressId before running; GPS coordinates are no longer sent by this request."
 					},
 					"event": [
+						{
+							"listen": "prerequest",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"const addressId = pm.variables.get('addressId');",
+									"if (!addressId || !String(addressId).trim()) { throw new Error('Set addressId to a saved customer address before running this request.'); }"
+								]
+							}
+						},
 						{
 							"listen": "test",
 							"script": {
@@ -1300,6 +1340,41 @@
 					]
 				},
 				{
+					"name": "Technician - Scheduled Jobs By Date & Time",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Scheduled jobs fetched\", function () { pm.response.to.have.status(200); });",
+									"const j = pm.response.json(); const r = j.result || {};",
+									"pm.test('Result is grouped by day', function () { pm.expect(r.days).to.be.an('array'); });",
+									"pm.test('Total count is present', function () { pm.expect(r.totalJobs).to.be.a('number'); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{technicianToken}}",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/technician/jobs/scheduled?includeCompleted=false&includeCancelled=false",
+						"description": "Scheduled jobs grouped by business date and time slot. Defaults to today through the last bookable day and active statuses (accepted, on_the_way, reached, in_progress). Optional query: date=YYYY-MM-DD or fromDate/toDate (max 31 days), status=accepted,on_the_way (comma separated), includeCompleted=true, includeCancelled=true, includeEmptySlots=false. Owner/Admin may pass technicianId or includeUnassigned=true."
+					},
+					"response": []
+				},
+				{
 					"name": "Technician - Cancel Assigned Job",
 					"request": {
 						"method": "PUT",
@@ -1470,6 +1545,134 @@
 							}
 						}
 					]
+				},
+				{
+					"name": "Admin - Get Schedule Slot Settings",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Schedule slot settings fetched\", function () { pm.response.to.have.status(200); });",
+									"const j = pm.response.json();",
+									"pm.test('Config and preview returned', function () { pm.expect(j.result.config).to.be.an('object'); pm.expect(j.result.preview.schedule).to.be.an('object'); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/settings/schedule-slots",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Global slot configuration: bookable days, window start/end hour, slot count, defaults and a live preview."
+					}
+				},
+				{
+					"name": "Admin - Update Schedule Slot Settings",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Schedule slot settings updated\", function () { pm.response.to.have.status(200); });",
+									"const j = pm.response.json();",
+									"pm.test('Updated config returned', function () { pm.expect(j.result.config.slotCount).to.be.a('number'); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/settings/schedule-slots",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Updates the global slot configuration. Rules: scheduleDays 1-30; windowStartHour 0-22; windowEndHour 1-23 with end > start; slotCount 1-12; window must divide evenly and each slot must be at least 30 minutes.",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"scheduleDays\": {{scheduleDays}},\n  \"windowStartHour\": {{windowStartHour}},\n  \"windowEndHour\": {{windowEndHour}},\n  \"slotCount\": {{slotCount}}\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						}
+					}
+				},
+				{
+					"name": "Admin - Reset Schedule Slot Settings",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test(\"Schedule slot settings reset\", function () { pm.response.to.have.status(200); });",
+									"const j = pm.response.json();",
+									"pm.test('Defaults restored', function () { pm.expect(j.result.config.scheduleDays).to.eql(5); pm.expect(j.result.config.slotCount).to.eql(4); });"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": "{{baseUrl}}/api/admin/settings/schedule-slots/reset",
+						"auth": {
+							"type": "bearer",
+							"bearer": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}",
+									"type": "string"
+								}
+							]
+						},
+						"description": "Restores the default configuration: 5 bookable days, 09:00-21:00 window, 4 slots."
+					}
 				}
 			],
 			"description": "Scheduled-booking smoke path: slots -> create scheduled -> feed/accept -> status updates -> reschedule/cancel guards -> base-location admin review."

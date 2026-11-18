@@ -8,10 +8,11 @@ import {
   BUSINESS_TIMEZONE,
   generateScheduleDays,
   generateTimeSlots,
+  getSlotDurationMinutes,
   getSlotWindow,
   scheduleBookingWindow,
-  SLOT_DURATION_MINUTES,
 } from "../Utils/slots.js";
+import { getSlotConfigVersion } from "../Utils/slotConfig.js";
 import { haversineMeters } from "../Utils/feasibility.js";
 import {
   getEffectiveRadiusMeters,
@@ -31,7 +32,7 @@ const LIMITED_THRESHOLD = 3;
 const cache = new Map();
 
 const cacheKey = ({ serviceId, districtId, cityZoneId, latitude, longitude, now }) =>
-  `${serviceId}|${districtId || "-"}|${cityZoneId || "-"}|${Number(latitude ?? 0).toFixed(3)}|${Number(longitude ?? 0).toFixed(3)}|${new Date(now).toISOString().slice(0, 13)}`;
+  `${getSlotConfigVersion()}|${serviceId}|${districtId || "-"}|${cityZoneId || "-"}|${Number(latitude ?? 0).toFixed(3)}|${Number(longitude ?? 0).toFixed(3)}|${new Date(now).toISOString().slice(0, 13)}`;
 
 const availabilityLabel = (count) => {
   if (count <= 0) return "UNAVAILABLE";
@@ -136,10 +137,11 @@ export const countEligibleTechniciansForSlot = async ({
 
 export const assertServiceFitsSlot = (durationMinutes) => {
   const duration = Number(durationMinutes) > 0 ? Number(durationMinutes) : DEFAULT_DURATION_MINUTES;
+  const slotDurationMinutes = getSlotDurationMinutes();
   const required = duration + SLOT_TRAVEL_BUFFER_MINUTES;
-  if (required > SLOT_DURATION_MINUTES) {
+  if (required > slotDurationMinutes) {
     const error = new Error(
-      `This service takes ${duration} minutes plus a ${SLOT_TRAVEL_BUFFER_MINUTES}-minute travel buffer, which exceeds the 3-hour scheduled slot. Book it as an instant service instead.`
+      `This service takes ${duration} minutes plus a ${SLOT_TRAVEL_BUFFER_MINUTES}-minute travel buffer, which exceeds the ${slotDurationMinutes}-minute scheduled slot. Book it as an instant service instead.`
     );
     error.statusCode = 400;
     error.code = "SERVICE_DURATION_EXCEEDS_SLOT";
@@ -215,7 +217,7 @@ export const getSlotAvailability = async ({
   const durationMinutes = Number(service.durationMinutes) > 0
     ? Number(service.durationMinutes)
     : DEFAULT_DURATION_MINUTES;
-  const fits = durationMinutes + SLOT_TRAVEL_BUFFER_MINUTES <= SLOT_DURATION_MINUTES;
+  const fits = durationMinutes + SLOT_TRAVEL_BUFFER_MINUTES <= getSlotDurationMinutes();
 
   const techIds = await findEligibleTechnicianIds({
     serviceId,

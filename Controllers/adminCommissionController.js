@@ -10,6 +10,7 @@ import AuditLog from "../Schemas/AuditLog.js";
 import { writeAuditLog } from "../Utils/audit.js";
 import { toPaise, rupeesToPaise, paiseToRupees, percentageOf } from "../Utils/money.js";
 import { CALCULATION_VERSION } from "../Utils/money.js";
+import { ok, fail } from "../Utils/apiResponse.js";
 
 const toMoney = (v) => {
   const n = Number(v);
@@ -33,12 +34,6 @@ const ensureAdmin = (req) => {
     throw err;
   }
 };
-
-const ok = (res, status, message, result = {}) =>
-  res.status(status).json({ success: true, message, result });
-
-const fail = (res, status, message, result = {}) =>
-  res.status(status).json({ success: false, message, result });
 
 /* =====================================================
    SET SERVICE COMMISSION  (Admin gives the %)

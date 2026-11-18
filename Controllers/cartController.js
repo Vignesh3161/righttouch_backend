@@ -30,7 +30,9 @@ import {
   localDateInBusinessTimezone,
   generateScheduleDays,
   generateTimeSlots,
+  getScheduleDaysCount,
 } from "../Utils/slots.js";
+import { refreshSlotConfigIfStale } from "../Utils/slotConfig.js";
 
 
 
@@ -531,6 +533,7 @@ const parseTimeString = (timeInput) => {
  */
 export const getCartScheduleSlots = async (req, res) => {
     try {
+        await refreshSlotConfigIfStale();
         const days = generateScheduleDays();
         const timeSlots = generateTimeSlots().map((slot) => ({
             timeSlot: slot.label,
@@ -549,7 +552,7 @@ export const getCartScheduleSlots = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message: "Cart schedule slots retrieved successfully (next five days)",
+            message: `Cart schedule slots retrieved successfully (next ${getScheduleDaysCount()} days)`,
             result: {
                 allowedDates,
                 timeSlots,
@@ -574,6 +577,7 @@ export const getCartScheduleSlots = async (req, res) => {
 export const setCartItemSchedule = async (req, res) => {
     try {
         ensureCustomer(req);
+        await refreshSlotConfigIfStale();
         const { itemId, scheduledDate, bookingDate, scheduledTime, timeSlot, scheduledAt, faultProblem } = req.body;
         const itemType = req.body.itemType || "service"; // Default to service
         const customerId = req.user.userId;
@@ -770,6 +774,7 @@ export const checkout = async (req, res) => {
 
     try {
         ensureCustomer(req);
+        await refreshSlotConfigIfStale();
         const customerId = req.user.userId;
 
         // Optional safety: ensure user still exists
